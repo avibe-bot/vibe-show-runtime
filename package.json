@@ -1,0 +1,42 @@
+{
+  "name": "vibe-show-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Runtime packages for interactive Vibe Remote Show Pages.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/avibe-bot/vibe-show-runtime.git"
+  },
+  "bugs": {
+    "url": "https://github.com/avibe-bot/vibe-show-runtime/issues"
+  },
+  "homepage": "https://github.com/avibe-bot/vibe-show-runtime#readme",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "check": "npm run build && npm run typecheck"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.4",
+    "vitest": "^4.0.14"
+  },
+  "keywords": [
+    "vibe-remote",
+    "show-page",
+    "vite",
+    "react",
+    "shadcn"
+  ],
+  "license": "MIT"
+}

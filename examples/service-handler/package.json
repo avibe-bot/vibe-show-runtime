@@ -1,0 +1,16 @@
+{
+  "name": "@avibe/show-example-service-handler",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@avibe/show-sdk": "0.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

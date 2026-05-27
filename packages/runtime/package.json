@@ -1,0 +1,29 @@
+{
+  "name": "@avibe/show-runtime",
+  "version": "0.0.0",
+  "description": "Managed Vite runtime for Vibe Remote Show Pages.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@avibe/show-ui": "0.0.0"
+  },
+  "devDependencies": {
+    "vite": "^7.2.4"
+  },
+  "license": "MIT"
+}
