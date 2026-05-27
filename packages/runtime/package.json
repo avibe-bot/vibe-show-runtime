@@ -12,6 +12,9 @@
       "import": "./dist/index.js"
     }
   },
+  "bin": {
+    "avibe-show-runtime": "./dist/cli.js"
+  },
   "files": [
     "dist"
   ],
@@ -20,9 +23,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@avibe/show-ui": "0.0.0"
+    "@avibe/show-ui": "0.0.0",
+    "@vitejs/plugin-react": "^5.1.1"
   },
   "devDependencies": {
+    "@vitejs/plugin-react": "^5.2.0",
     "vite": "^7.2.4"
   },
   "license": "MIT"

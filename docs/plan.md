@@ -68,6 +68,18 @@ WS   /sessions/:sessionId/hmr
 Vibe Remote calls `ensure` before proxying a cold session. The runtime may
 return a warming state and complete startup asynchronously.
 
+Current implementation status:
+
+- `GET /health`
+- `POST /sessions/:sessionId/ensure`
+- `GET /sessions/:sessionId/status`
+- `POST /sessions/:sessionId/suspend`
+- `ANY /sessions/:sessionId/app/*`
+- `ANY /sessions/:sessionId/app/api/*` method dispatch via Vite SSR module
+  loading
+
+HMR WebSocket proxying is still pending for Vibe Remote integration.
+
 ## Session Lifecycle
 
 ```text

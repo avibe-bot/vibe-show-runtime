@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "start": "avibe-show-runtime --workspace-root .show --port 4177",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@avibe/show-runtime": "0.0.0",
     "@avibe/show-sdk": "0.0.0"
   },
   "devDependencies": {

@@ -76,7 +76,8 @@ export default function App() {
 
 ```bash
 npm install
-npm run build
+npm run check
+npm run smoke
 npm run build -w @avibe/show-example-shadcn-alias
 ```
 
@@ -84,8 +85,37 @@ The `examples/shadcn-alias` app demonstrates the agent-facing alias model.
 The `examples/service-handler` package demonstrates the first handler type
 shape.
 
+## Runtime Server
+
+The first runtime server is available through `@avibe/show-runtime`:
+
+```bash
+npx avibe-show-runtime --workspace-root .show --port 4177
+```
+
+Local API:
+
+```text
+GET  /health
+POST /sessions/:sessionId/ensure
+GET  /sessions/:sessionId/status
+POST /sessions/:sessionId/suspend
+ANY  /sessions/:sessionId/app/*
+```
+
+`/sessions/:sessionId/app/api/*` dispatches to Web-standard handlers in the
+session workspace:
+
+```ts
+export function GET(_request: Request, context: VibeContext) {
+  return Response.json({ sessionId: context.session.id })
+}
+```
+
 ## Status
 
-This project is pre-release. The package names and high-level boundaries are
-intended to be stable, but runtime sidecar APIs will evolve as Vibe Remote
-integration starts.
+This project is pre-release. The current server is a minimal sidecar suitable
+for integration work: it can create session workspaces, serve React through
+Vite middleware, resolve shadcn aliases to `@avibe/show-ui`, and dispatch
+basic method-based handlers. HMR proxying, LRU eviction, stronger isolation,
+and Vibe Remote integration are still in progress.
