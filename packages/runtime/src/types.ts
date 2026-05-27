@@ -1,7 +1,9 @@
+import type { Server } from "node:http"
 import type { ViteDevServer } from "vite"
 
 export type ShowRuntimeOptions = {
   workspaceRoot: string
+  server?: Server
   dependencyRoot?: string
   host?: string
   port?: number

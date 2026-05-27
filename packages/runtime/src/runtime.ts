@@ -67,9 +67,9 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       base: `/show/${encodeURIComponent(session.id)}/`,
       root: session.workspace,
       server: {
-        middlewareMode: true,
+        middlewareMode: options.server ? { server: options.server } : true,
         hmr: {
-          path: `/show/${encodeURIComponent(session.id)}/__vite_hmr`
+          path: `__vite_hmr`
         },
         fs: {
           strict: true,

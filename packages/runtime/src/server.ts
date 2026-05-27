@@ -6,7 +6,6 @@ import { createShowRuntime } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
 
 export async function startShowRuntimeServer(options: ShowRuntimeOptions = { workspaceRoot: ".show" }) {
-  const runtime = createShowRuntime(options)
   const host = options.host ?? "127.0.0.1"
   const port = options.port ?? 0
 
@@ -19,6 +18,7 @@ export async function startShowRuntimeServer(options: ShowRuntimeOptions = { wor
       response.end(JSON.stringify({ error: error instanceof Error ? error.message : "Runtime error" }))
     }
   })
+  const runtime = createShowRuntime({ ...options, server })
 
   await new Promise<void>((resolve) => server.listen(port, host, resolve))
 
