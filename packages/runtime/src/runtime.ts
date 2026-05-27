@@ -69,6 +69,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       server: {
         middlewareMode: options.server ? { server: options.server } : true,
         hmr: {
+          server: options.server,
           path: `__vite_hmr`
         },
         fs: {
