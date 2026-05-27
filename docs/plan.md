@@ -77,8 +77,8 @@ Current implementation status:
 - `ANY /sessions/:sessionId/app/*`
 - `ANY /sessions/:sessionId/app/api/*` method dispatch via Vite SSR module
   loading
-
-HMR WebSocket proxying is still pending for Vibe Remote integration.
+- Vite HMR bound to the parent sidecar server with path `__vite_hmr`, so Vibe
+  Remote can proxy `/show/<session-id>/__vite_hmr`
 
 ## Session Lifecycle
 
@@ -137,11 +137,11 @@ bottleneck, but it should not be the first design.
 Default generated files:
 
 ```text
-show.json
+index.html
 src/App.tsx
 src/main.tsx
 src/styles.css
-api/index.ts        optional
+api/health.ts       sample handler
 ```
 
 Minimal app:
@@ -247,14 +247,16 @@ implemented with Vite resolver configuration and/or a thin session-local
 Agents should use real dependency names:
 
 ```tsx
-import { Button, Card, Group, Stack } from "@mantine/core"
-import { IconGitBranch } from "@tabler/icons-react"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent } from "@/components/ui/card"
 import { Line } from "react-chartjs-2"
 import mermaid from "mermaid"
 ```
 
 Do not invent custom aliases for common packages unless the package is truly a
-Vibe-owned API such as `@vibe/show/server`.
+Vibe-owned API such as `@avibe/show-ui` or `@avibe/show-sdk`. The shadcn-style
+`@/components/ui/*` aliases are intentionally supported to match common agent
+priors while still resolving to the shared `@avibe/show-ui` package.
 
 ## Package Structure
 
