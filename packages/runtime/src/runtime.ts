@@ -64,9 +64,13 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     await ensureSharedDependencyLink(session.workspace, options.dependencyRoot)
     await ensureSessionTemplate(session.workspace)
     const viteConfig = {
+      base: `/show/${encodeURIComponent(session.id)}/`,
       root: session.workspace,
       server: {
         middlewareMode: true,
+        hmr: {
+          path: `/show/${encodeURIComponent(session.id)}/__vite_hmr`
+        },
         fs: {
           strict: true,
           allow: [session.workspace],

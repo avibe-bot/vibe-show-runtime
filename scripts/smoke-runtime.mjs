@@ -28,6 +28,9 @@ try {
   if (!app.includes("Vibe Show")) {
     throw new Error("Expected app HTML to include Vibe Show")
   }
+  if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
+    throw new Error("Expected app HTML asset URLs to stay under /show/<session>/")
+  }
 
   console.log("smoke runtime ok")
 } finally {
