@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 import { resolve } from "node:path"
 import { startShowRuntimeServer } from "./server.js"
 
