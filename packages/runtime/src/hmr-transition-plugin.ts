@@ -1,9 +1,20 @@
 import type { Plugin } from "vite"
 
+const clientModuleId = "virtual:avibe-show-hmr-transition-client"
+const resolvedClientModuleId = `\0${clientModuleId}`
+
 export function showHmrTransitionPlugin(): Plugin {
   return {
     name: "avibe-show-hmr-transition",
     apply: "serve",
+    resolveId(id) {
+      if (id === clientModuleId) return resolvedClientModuleId
+      return null
+    },
+    load(id) {
+      if (id === resolvedClientModuleId) return hmrTransitionScript()
+      return null
+    },
     transformIndexHtml() {
       return [
         {
@@ -13,8 +24,10 @@ export function showHmrTransitionPlugin(): Plugin {
         },
         {
           tag: "script",
-          attrs: { type: "module" },
-          children: hmrTransitionScript(),
+          attrs: {
+            type: "module",
+            src: `./@id/__x00__${clientModuleId}`
+          },
           injectTo: "head"
         }
       ]
@@ -74,11 +87,15 @@ if (hot && typeof window !== "undefined" && typeof document !== "undefined" && !
   let beforeTimer;
   let afterTimer;
   let textSnapshot = new Map();
+  let overlayTimer;
+
+  showDebug("HMR ready");
 
   hot.on("vite:beforeUpdate", () => {
     clearTimeout(beforeTimer);
     clearTimeout(afterTimer);
     textSnapshot = snapshotTextNodes();
+    showDebug("beforeUpdate: " + textSnapshot.size + " text nodes");
     document.documentElement.classList.remove("avs-hmr-updated");
     document.documentElement.classList.add("avs-hmr-updating");
     beforeTimer = setTimeout(() => {
@@ -91,9 +108,9 @@ if (hot && typeof window !== "undefined" && typeof document !== "undefined" && !
     clearTimeout(afterTimer);
     document.documentElement.classList.remove("avs-hmr-updating");
     document.documentElement.classList.add("avs-hmr-updated");
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => animateChangedText(textSnapshot));
-    });
+    requestAnimationFrame(() => requestAnimationFrame(() => animateChangedText(textSnapshot, "afterUpdate")));
+    setTimeout(() => animateChangedText(textSnapshot, "afterUpdate+80ms"), 80);
+    setTimeout(() => animateChangedText(textSnapshot, "afterUpdate+220ms"), 220);
     afterTimer = setTimeout(() => {
       document.documentElement.classList.remove("avs-hmr-updated");
     }, 1100);
@@ -108,14 +125,17 @@ function snapshotTextNodes() {
   return snapshot;
 }
 
-function animateChangedText(before) {
+function animateChangedText(before, label) {
+  let animated = 0;
   for (const node of collectTextNodes()) {
     const key = textNodePath(node);
     const previous = before.get(key);
     const next = node.nodeValue || "";
     if (!shouldAnimateText(previous, next)) continue;
+    animated += 1;
     typeTextNode(node, next);
   }
+  showDebug(label + ": typed " + animated);
 }
 
 function collectTextNodes() {
@@ -161,6 +181,36 @@ function typeTextNode(node, text) {
     if (index < core.length) setTimeout(tick, 18);
   };
   tick();
+}
+
+function showDebug(message) {
+  const params = new URLSearchParams(window.location.search);
+  const enabled = params.has("avibe_hmr_debug") || window.localStorage.getItem("avibe:hmr-debug") === "1";
+  if (!enabled) return;
+  clearTimeout(overlayTimer);
+  let overlay = document.getElementById("avs-hmr-debug-overlay");
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.id = "avs-hmr-debug-overlay";
+    overlay.style.cssText = [
+      "position:fixed",
+      "right:16px",
+      "top:16px",
+      "z-index:2147483647",
+      "padding:12px 14px",
+      "border-radius:12px",
+      "background:#0f172a",
+      "color:white",
+      "font:700 13px/1.35 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+      "box-shadow:0 18px 50px rgba(15,23,42,.28)",
+      "max-width:min(360px,calc(100vw - 32px))"
+    ].join(";");
+    document.body.appendChild(overlay);
+  }
+  overlay.textContent = "AVIBE " + message;
+  overlayTimer = setTimeout(() => {
+    overlay?.remove();
+  }, 2400);
 }
 
 function textNodePath(node) {
