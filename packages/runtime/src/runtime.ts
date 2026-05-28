@@ -6,6 +6,7 @@ import { createServer as createViteServer } from "vite"
 import type { InlineConfig } from "vite"
 import type { ShowRuntime, ShowRuntimeOptions, ShowSession, ShowSessionStatus } from "./types.js"
 import { createShadcnAlias } from "./aliases.js"
+import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
 import { ensureSessionTemplate } from "./templates.js"
 
 export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
@@ -82,7 +83,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
           deny: []
         }
       },
-      plugins: [react()] as InlineConfig["plugins"],
+      plugins: [showHmrTransitionPlugin(), react()] as InlineConfig["plugins"],
       resolve: {
         alias: createShadcnAlias(options.uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never
       }
