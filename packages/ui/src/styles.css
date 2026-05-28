@@ -176,21 +176,26 @@
 .avs-dialog-header { padding-right: 2.25rem; }
 
 .avs-hmr-updating body {
-  opacity: 0.78;
-  filter: blur(1px) saturate(1.08);
-  transform: translateY(2px);
+  opacity: 0.58;
+  filter: blur(3px) saturate(1.18) brightness(1.04);
+  transform: translateY(10px) scale(0.992);
   transition: opacity 0.16s ease, filter 0.16s ease, transform 0.16s ease;
 }
 
 .avs-hmr-updated body {
-  animation: avs-hmr-updated 0.48s cubic-bezier(.2,.8,.2,1) both;
+  animation: avs-hmr-updated 0.82s cubic-bezier(.18,.9,.25,1) both;
 }
 
 @keyframes avs-hmr-updated {
   from {
-    opacity: 0.72;
-    filter: blur(3px) saturate(1.12) brightness(1.03);
-    transform: translateY(8px);
+    opacity: 0.5;
+    filter: blur(8px) saturate(1.22) brightness(1.08);
+    transform: translateY(18px) scale(0.982);
+  }
+  45% {
+    opacity: 1;
+    filter: blur(0) saturate(1.08) brightness(1.02);
+    transform: translateY(-2px) scale(1.002);
   }
   to {
     opacity: 1;
