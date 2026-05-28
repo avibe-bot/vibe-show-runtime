@@ -47,13 +47,32 @@
   border-radius: calc(var(--avs-radius) + 0.125rem);
   box-shadow: 0 1px 2px rgb(16 24 40 / 4%);
   overflow: hidden;
-  animation: avs-enter 0.36s cubic-bezier(.2,.8,.2,1) both;
+  will-change: transform, opacity;
 }
 
 .avs-card-header { padding: 1rem 1rem 0.5rem; }
 .avs-card-title { font-size: 1.0625rem; line-height: 1.25; margin: 0; color: hsl(var(--avs-foreground)); }
 .avs-card-description { font-size: 0.8125rem; color: hsl(var(--avs-muted-foreground)); line-height: 1.5; margin: 0.375rem 0 0; }
 .avs-card-content { padding: 1rem; }
+
+.avs-metric-value {
+  display: flex;
+  align-items: baseline;
+  gap: 0.25rem;
+  font-size: 2rem;
+  font-weight: 760;
+  line-height: 1;
+  letter-spacing: 0;
+  color: hsl(var(--avs-foreground));
+}
+
+.avs-metric-status {
+  margin-top: 0.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
 
 .avs-badge {
   display: inline-flex;
@@ -175,44 +194,19 @@
 .avs-dialog-description { margin: 0.5rem 0 0; color: hsl(var(--avs-muted-foreground)); line-height: 1.55; }
 .avs-dialog-header { padding-right: 2.25rem; }
 
-.avs-hmr-updating body {
-  opacity: 0.58;
-  filter: blur(3px) saturate(1.18) brightness(1.04);
-  transform: translateY(10px) scale(0.992);
-  transition: opacity 0.16s ease, filter 0.16s ease, transform 0.16s ease;
+.avs-typewriter-caret {
+  display: inline-block;
+  width: 0.08em;
+  min-width: 2px;
+  height: 0.95em;
+  margin-left: 0.08em;
+  transform: translateY(0.12em);
+  background: currentColor;
+  animation: avs-caret-blink 0.8s steps(2, start) infinite;
 }
 
-.avs-hmr-updated body {
-  animation: avs-hmr-updated 0.82s cubic-bezier(.18,.9,.25,1) both;
-}
-
-@keyframes avs-hmr-updated {
-  from {
-    opacity: 0.5;
-    filter: blur(8px) saturate(1.22) brightness(1.08);
-    transform: translateY(18px) scale(0.982);
-  }
-  45% {
-    opacity: 1;
-    filter: blur(0) saturate(1.08) brightness(1.02);
-    transform: translateY(-2px) scale(1.002);
-  }
-  to {
-    opacity: 1;
-    filter: blur(0) saturate(1) brightness(1);
-    transform: translateY(0);
-  }
-}
-
-@keyframes avs-enter {
-  from {
-    opacity: 0;
-    transform: translateY(0.625rem);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+@keyframes avs-caret-blink {
+  50% { opacity: 0; }
 }
 
 @keyframes avs-fade-in {
@@ -235,21 +229,14 @@
   .avs-card,
   .avs-dialog-overlay,
   .avs-dialog-content,
-  .avs-hmr-updated body {
+  .avs-typewriter-caret {
     animation: none;
   }
 
   .avs-button,
   .avs-progress span,
-  .avs-switch button span,
-  .avs-hmr-updating body {
+  .avs-switch button span {
     transition: none;
-  }
-
-  .avs-hmr-updating body {
-    opacity: 1;
-    filter: none;
-    transform: none;
   }
 }
 

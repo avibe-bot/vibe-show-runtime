@@ -78,7 +78,6 @@ if (hot && typeof window !== "undefined" && typeof document !== "undefined" && !
   window.__avibeShowHmrTransitionsInstalled = true;
   let beforeTimer;
   let afterTimer;
-  let textSnapshot = new Map();
   let overlayTimer;
   const debugEnabled = new URLSearchParams(window.location.search).has("avibe_hmr_debug") || window.localStorage.getItem("avibe:hmr-debug") === "1";
   if (debugEnabled) document.documentElement.classList.add("avs-hmr-debug");
@@ -86,10 +85,10 @@ if (hot && typeof window !== "undefined" && typeof document !== "undefined" && !
   showDebug("HMR ready");
 
   hot.on("vite:beforeUpdate", () => {
+    if (!debugEnabled) return;
     clearTimeout(beforeTimer);
     clearTimeout(afterTimer);
-    textSnapshot = snapshotTextNodes();
-    showDebug("beforeUpdate: " + textSnapshot.size + " text nodes");
+    showDebug("beforeUpdate");
     document.documentElement.classList.remove("avs-hmr-updated");
     document.documentElement.classList.add("avs-hmr-updating");
     beforeTimer = setTimeout(() => {
@@ -98,83 +97,16 @@ if (hot && typeof window !== "undefined" && typeof document !== "undefined" && !
   });
 
   hot.on("vite:afterUpdate", () => {
+    if (!debugEnabled) return;
     clearTimeout(beforeTimer);
     clearTimeout(afterTimer);
     document.documentElement.classList.remove("avs-hmr-updating");
     document.documentElement.classList.add("avs-hmr-updated");
-    requestAnimationFrame(() => requestAnimationFrame(() => animateChangedText(textSnapshot, "afterUpdate")));
-    setTimeout(() => animateChangedText(textSnapshot, "afterUpdate+80ms"), 80);
-    setTimeout(() => animateChangedText(textSnapshot, "afterUpdate+220ms"), 220);
+    showDebug("afterUpdate");
     afterTimer = setTimeout(() => {
       document.documentElement.classList.remove("avs-hmr-updated");
     }, 1100);
   });
-}
-
-function snapshotTextNodes() {
-  const snapshot = new Map();
-  for (const node of collectTextNodes()) {
-    snapshot.set(textNodePath(node), node.nodeValue || "");
-  }
-  return snapshot;
-}
-
-function animateChangedText(before, label) {
-  let animated = 0;
-  for (const node of collectTextNodes()) {
-    const key = textNodePath(node);
-    const previous = before.get(key);
-    const next = node.nodeValue || "";
-    if (!shouldAnimateText(previous, next)) continue;
-    animated += 1;
-    typeTextNode(node, next);
-  }
-  showDebug(label + ": typed " + animated);
-}
-
-function collectTextNodes() {
-  const root = document.getElementById("root") || document.body;
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      const parent = node.parentElement;
-      if (!parent || !node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-      if (isUnsafeTextContainer(parent)) return NodeFilter.FILTER_REJECT;
-      return NodeFilter.FILTER_ACCEPT;
-    }
-  });
-  const nodes = [];
-  let current = walker.nextNode();
-  while (current) {
-    nodes.push(current);
-    current = walker.nextNode();
-  }
-  return nodes;
-}
-
-function isUnsafeTextContainer(element) {
-  return Boolean(element.closest("script,style,noscript,textarea,input,select,option,button,pre,code,kbd,samp,svg,canvas,[contenteditable=true],[data-avs-no-typewriter]"));
-}
-
-function shouldAnimateText(previous, next) {
-  const trimmed = next.trim();
-  if (!trimmed || previous === undefined || previous === next) return false;
-  if (trimmed.length < 3 || trimmed.length > 220) return false;
-  return /[A-Za-z0-9\\u4e00-\\u9fff]/.test(trimmed);
-}
-
-function typeTextNode(node, text) {
-  const leading = (text.match(/^\\s*/) || [""])[0];
-  const trailing = (text.match(/\\s*$/) || [""])[0];
-  const core = text.slice(leading.length, text.length - trailing.length);
-  node.nodeValue = leading;
-  let index = 0;
-  const step = Math.max(1, Math.ceil(core.length / 56));
-  const tick = () => {
-    index = Math.min(core.length, index + step);
-    node.nodeValue = leading + core.slice(0, index) + (index >= core.length ? trailing : "");
-    if (index < core.length) setTimeout(tick, 18);
-  };
-  tick();
 }
 
 function showDebug(message) {
@@ -205,15 +137,5 @@ function showDebug(message) {
   }, 2400);
 }
 
-function textNodePath(node) {
-  const parts = [];
-  let current = node;
-  while (current && current.parentNode && current !== document.body) {
-    const parent = current.parentNode;
-    parts.push(Array.prototype.indexOf.call(parent.childNodes, current));
-    current = parent;
-  }
-  return parts.reverse().join(".");
-}
 `
 }

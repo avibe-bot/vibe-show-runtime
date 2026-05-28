@@ -43,6 +43,10 @@
       "types": "./dist/input.d.ts",
       "import": "./dist/input.js"
     },
+    "./metric-card": {
+      "types": "./dist/metric-card.d.ts",
+      "import": "./dist/metric-card.js"
+    },
     "./progress": {
       "types": "./dist/progress.d.ts",
       "import": "./dist/progress.js"

@@ -13,6 +13,7 @@ export default defineConfig({
         dialog: "src/dialog.tsx",
         "animated-text": "src/animated-text.tsx",
         input: "src/input.tsx",
+        "metric-card": "src/metric-card.tsx",
         progress: "src/progress.tsx",
         switch: "src/switch.tsx",
         theme: "src/theme.tsx",
