@@ -12,17 +12,21 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
   const idleTtlMs = options.idleTtlMs ?? 15 * 60 * 1000
 
-  async function ensureSession(sessionId: string): Promise<ShowSessionStatus> {
+  async function ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus> {
     const existing = getOrCreateSession(sessionId)
     existing.lastAccessedAt = new Date()
-    if (existing.state === "active") {
+    const normalizedBasePath = normalizeBasePath(basePath, sessionId)
+    if (existing.state === "active" && existing.basePath === normalizedBasePath) {
       existing.updatedAt = new Date()
       return toStatus(existing)
+    }
+    if (existing.state === "active" && existing.basePath !== normalizedBasePath) {
+      await closeSession(existing)
     }
     if (!existing.warming) {
       existing.state = "warming"
       existing.updatedAt = new Date()
-      existing.warming = warmSession(existing)
+      existing.warming = warmSession(existing, normalizedBasePath)
     }
     const warmed = await existing.warming
     return toStatus(warmed)
@@ -59,12 +63,12 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     return session
   }
 
-  async function warmSession(session: ShowSession): Promise<ShowSession> {
+  async function warmSession(session: ShowSession, basePath: string): Promise<ShowSession> {
     await mkdir(session.workspace, { recursive: true })
     await ensureSharedDependencyLink(session.workspace, options.dependencyRoot)
     await ensureSessionTemplate(session.workspace)
     const viteConfig = {
-      base: `/show/${encodeURIComponent(session.id)}/`,
+      base: basePath,
       root: session.workspace,
       server: {
         middlewareMode: options.server ? { server: options.server } : true,
@@ -85,6 +89,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     } satisfies InlineConfig
     session.vite = await createViteServer(viteConfig)
     session.state = "active"
+    session.basePath = basePath
     session.updatedAt = new Date()
     session.warming = undefined
     return session
@@ -108,6 +113,13 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     suspendSession,
     close
   }
+}
+
+function normalizeBasePath(basePath: string | undefined, sessionId: string) {
+  const fallback = `/show/${encodeURIComponent(sessionId)}/`
+  const raw = (basePath || fallback).trim()
+  const withLeadingSlash = raw.startsWith("/") ? raw : `/${raw}`
+  return withLeadingSlash.endsWith("/") ? withLeadingSlash : `${withLeadingSlash}/`
 }
 
 async function ensureSharedDependencyLink(workspace: string, dependencyRoot?: string) {

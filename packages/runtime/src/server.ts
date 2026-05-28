@@ -64,7 +64,7 @@ async function routeRequest(runtime: ReturnType<typeof createShowRuntime>, reque
   if (appMatch) {
     const sessionId = appMatch[1]
     const appPath = `/${appMatch[2] || ""}`
-    const status = await runtime.ensureSession(sessionId)
+    const status = await runtime.ensureSession(sessionId, publicBasePath(request))
     const session = runtime.getSession(sessionId)
     if (!session) {
       sendJson(response, 503, { error: "Session not ready", status })
@@ -107,6 +107,12 @@ async function routeRequest(runtime: ReturnType<typeof createShowRuntime>, reque
   }
 
   sendJson(response, 404, { error: "Not found" })
+}
+
+function publicBasePath(request: IncomingMessage) {
+  const value = request.headers["x-vibe-show-base"]
+  const raw = Array.isArray(value) ? value[0] : value
+  return typeof raw === "string" && raw.trim() ? raw.trim() : undefined
 }
 
 function sendJson(response: ServerResponse, statusCode: number, body: unknown) {

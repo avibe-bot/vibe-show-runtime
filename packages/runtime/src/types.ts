@@ -24,6 +24,7 @@ export type ShowSessionStatus = {
 export type ShowSession = {
   id: string
   workspace: string
+  basePath?: string
   state: ShowSessionState
   updatedAt: Date
   lastAccessedAt?: Date
@@ -32,7 +33,7 @@ export type ShowSession = {
 }
 
 export type ShowRuntime = {
-  ensureSession(sessionId: string): Promise<ShowSessionStatus>
+  ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus>
   getSessionStatus(sessionId: string): ShowSessionStatus
   getSession(sessionId: string): ShowSession | undefined
   suspendSession(sessionId: string): Promise<ShowSessionStatus>
