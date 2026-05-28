@@ -37,31 +37,23 @@ export function showHmrTransitionPlugin(): Plugin {
 
 function hmrTransitionCss() {
   return `
-html.avs-hmr-updating body {
-  opacity: 0.45;
-  filter: blur(5px) saturate(1.2) brightness(1.05);
-  transform: translateY(14px) scale(0.985);
+html.avs-hmr-debug.avs-hmr-updating body {
+  opacity: 0.9;
+  transform: translateY(3px);
   transition: opacity 0.16s ease, filter 0.16s ease, transform 0.16s ease;
 }
 
-html.avs-hmr-updated body {
-  animation: avs-runtime-hmr-updated 1.1s cubic-bezier(.18,.9,.25,1) both;
+html.avs-hmr-debug.avs-hmr-updated body {
+  animation: avs-runtime-hmr-updated 0.28s cubic-bezier(.2,.8,.2,1) both;
 }
 
 @keyframes avs-runtime-hmr-updated {
   from {
-    opacity: 0.42;
-    filter: blur(10px) saturate(1.24) brightness(1.08);
-    transform: translateY(24px) scale(0.975);
-  }
-  45% {
-    opacity: 1;
-    filter: blur(0) saturate(1.08) brightness(1.02);
-    transform: translateY(-4px) scale(1.004);
+    opacity: 0.9;
+    transform: translateY(3px);
   }
   to {
     opacity: 1;
-    filter: blur(0) saturate(1) brightness(1);
     transform: translateY(0) scale(1);
   }
 }
@@ -88,6 +80,8 @@ if (hot && typeof window !== "undefined" && typeof document !== "undefined" && !
   let afterTimer;
   let textSnapshot = new Map();
   let overlayTimer;
+  const debugEnabled = new URLSearchParams(window.location.search).has("avibe_hmr_debug") || window.localStorage.getItem("avibe:hmr-debug") === "1";
+  if (debugEnabled) document.documentElement.classList.add("avs-hmr-debug");
 
   showDebug("HMR ready");
 
@@ -184,9 +178,7 @@ function typeTextNode(node, text) {
 }
 
 function showDebug(message) {
-  const params = new URLSearchParams(window.location.search);
-  const enabled = params.has("avibe_hmr_debug") || window.localStorage.getItem("avibe:hmr-debug") === "1";
-  if (!enabled) return;
+  if (!debugEnabled) return;
   clearTimeout(overlayTimer);
   let overlay = document.getElementById("avs-hmr-debug-overlay");
   if (!overlay) {

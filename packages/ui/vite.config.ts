@@ -11,6 +11,7 @@ export default defineConfig({
         card: "src/card.tsx",
         badge: "src/badge.tsx",
         dialog: "src/dialog.tsx",
+        "animated-text": "src/animated-text.tsx",
         input: "src/input.tsx",
         progress: "src/progress.tsx",
         switch: "src/switch.tsx",
@@ -20,7 +21,7 @@ export default defineConfig({
       formats: ["es"]
     },
     rollupOptions: {
-      external: ["react", "react-dom", "react/jsx-runtime"]
+      external: ["react", "react-dom", "react/jsx-runtime", "motion/react"]
     },
     cssCodeSplit: false
   }
