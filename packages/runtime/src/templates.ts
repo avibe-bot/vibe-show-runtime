@@ -30,6 +30,11 @@ function indexHtml() {
   </head>
   <body>
     <div id="root"></div>
+    <main class="avs-fallback">
+      <div class="avs-fallback-eyebrow">Vibe Show Runtime</div>
+      <h1>Ready to visualize</h1>
+      <p>This session's React workspace is ready. Replace <code>src/App.tsx</code> with a focused visual explanation, report, dashboard, or prototype.</p>
+    </main>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
@@ -89,6 +94,47 @@ function stylesCss() {
   display: grid;
   place-items: center;
   padding: 24px;
+}
+
+#root:not(:empty) + .avs-fallback {
+  display: none;
+}
+
+.avs-fallback {
+  width: min(720px, calc(100% - 36px));
+  margin: 32px auto;
+  border: 1px solid rgba(23, 32, 51, 0.12);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.86);
+  padding: clamp(24px, 5vw, 48px);
+  box-shadow: 0 24px 80px rgba(23, 32, 51, 0.10);
+  box-sizing: border-box;
+}
+
+.avs-fallback p {
+  line-height: 1.65;
+  margin: 10px 0 0;
+}
+
+.avs-fallback h1 {
+  margin: 12px 0 0;
+  font-size: clamp(32px, 8vw, 56px);
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.avs-fallback code {
+  background: rgba(82, 96, 120, 0.12);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
+.avs-fallback-eyebrow {
+  color: #526078;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 `
 }
