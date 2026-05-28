@@ -25,10 +25,13 @@
   font-weight: 650;
   cursor: pointer;
   white-space: nowrap;
-  transition: background 0.16s, border-color 0.16s, color 0.16s, transform 0.16s;
+  transition: background 0.16s, border-color 0.16s, color 0.16s, transform 0.16s, box-shadow 0.16s;
 }
 
-.avs-button:hover { transform: translateY(-1px); }
+.avs-button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 0.5rem 1.25rem rgb(15 23 42 / 8%);
+}
 .avs-button-default { background: hsl(var(--avs-primary)); color: hsl(var(--avs-primary-foreground)); }
 .avs-button-secondary { background: hsl(var(--avs-muted)); color: hsl(var(--avs-foreground)); }
 .avs-button-outline { background: hsl(var(--avs-background)); color: hsl(var(--avs-foreground)); border-color: hsl(var(--avs-border)); }
@@ -44,6 +47,7 @@
   border-radius: calc(var(--avs-radius) + 0.125rem);
   box-shadow: 0 1px 2px rgb(16 24 40 / 4%);
   overflow: hidden;
+  animation: avs-enter 0.36s cubic-bezier(.2,.8,.2,1) both;
 }
 
 .avs-card-header { padding: 1rem 1rem 0.5rem; }
@@ -127,6 +131,7 @@
   height: 100%;
   border-radius: inherit;
   background: hsl(var(--avs-primary));
+  transition: width 0.32s cubic-bezier(.2,.8,.2,1);
 }
 
 .avs-dialog-overlay {
@@ -134,6 +139,7 @@
   inset: 0;
   background: rgb(17 24 39 / 45%);
   z-index: 40;
+  animation: avs-fade-in 0.16s ease both;
 }
 
 .avs-dialog-content {
@@ -148,6 +154,7 @@
   background: hsl(var(--avs-background));
   box-shadow: 0 24px 80px rgb(17 24 39 / 22%);
   padding: 1.125rem;
+  animation: avs-dialog-in 0.2s cubic-bezier(.2,.8,.2,1) both;
 }
 
 .avs-dialog-close {
@@ -167,6 +174,79 @@
 .avs-dialog-title { margin: 0; font-size: 1.125rem; color: hsl(var(--avs-foreground)); }
 .avs-dialog-description { margin: 0.5rem 0 0; color: hsl(var(--avs-muted-foreground)); line-height: 1.55; }
 .avs-dialog-header { padding-right: 2.25rem; }
+
+.avs-hmr-updating body {
+  opacity: 0.78;
+  filter: blur(1px) saturate(1.08);
+  transform: translateY(2px);
+  transition: opacity 0.16s ease, filter 0.16s ease, transform 0.16s ease;
+}
+
+.avs-hmr-updated body {
+  animation: avs-hmr-updated 0.48s cubic-bezier(.2,.8,.2,1) both;
+}
+
+@keyframes avs-hmr-updated {
+  from {
+    opacity: 0.72;
+    filter: blur(3px) saturate(1.12) brightness(1.03);
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    filter: blur(0) saturate(1) brightness(1);
+    transform: translateY(0);
+  }
+}
+
+@keyframes avs-enter {
+  from {
+    opacity: 0;
+    transform: translateY(0.625rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes avs-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes avs-dialog-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, calc(-50% + 0.75rem)) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .avs-card,
+  .avs-dialog-overlay,
+  .avs-dialog-content,
+  .avs-hmr-updated body {
+    animation: none;
+  }
+
+  .avs-button,
+  .avs-progress span,
+  .avs-switch button span,
+  .avs-hmr-updating body {
+    transition: none;
+  }
+
+  .avs-hmr-updating body {
+    opacity: 1;
+    filter: none;
+    transform: none;
+  }
+}
 
 @media (max-width: 540px) {
   .avs-dialog-content {

@@ -31,6 +31,10 @@
       "types": "./dist/dialog.d.ts",
       "import": "./dist/dialog.js"
     },
+    "./hmr-transition": {
+      "types": "./dist/hmr-transition.d.ts",
+      "import": "./dist/hmr-transition.js"
+    },
     "./input": {
       "types": "./dist/input.d.ts",
       "import": "./dist/input.js"

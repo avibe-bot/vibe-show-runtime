@@ -40,8 +40,11 @@ function mainTsx() {
   return `import React from "react"
 import { createRoot } from "react-dom/client"
 import "@avibe/show-ui/styles.css"
+import { installShowHmrTransitions } from "@avibe/show-ui/hmr-transition"
 import "./styles.css"
 import App from "./App"
+
+installShowHmrTransitions()
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
