@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
@@ -43,6 +43,10 @@ try {
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
     throw new Error("Expected app HTML asset URLs to stay under /show/<session>/")
   }
+  const generatedMain = await readFile(join(root, "smoke", "src", "main.tsx"), "utf8")
+  if (!generatedMain.includes("basePath: showBasePath()")) {
+    throw new Error("Expected generated client shell to derive basePath from the session root")
+  }
 
   const eventResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {
     method: "POST",
@@ -80,6 +84,9 @@ try {
   const reader = stream.body.getReader()
   try {
     const firstFrame = await readUntil(reader, "event: show.event")
+    if (!firstFrame.includes(`id: ${event.id}`)) {
+      throw new Error(`Expected SSE event id for replayed mark: ${firstFrame}`)
+    }
     if (!firstFrame.includes("Please review the summary again.")) {
       throw new Error(`Expected replayed mark event in SSE stream: ${firstFrame}`)
     }
@@ -96,6 +103,10 @@ try {
       })
     })
     const liveFrame = await readUntil(reader, "mark-default-live")
+    const liveEvent = JSON.parse(liveFrame.split("data: ")[1].split("\n\n")[0])
+    if (!liveFrame.includes(`id: ${liveEvent.id}`)) {
+      throw new Error(`Expected SSE event id for live mark: ${liveFrame}`)
+    }
     if (!liveFrame.includes("Live event should reach the stream.")) {
       throw new Error(`Expected live mark event in SSE stream: ${liveFrame}`)
     }
@@ -103,6 +114,26 @@ try {
     streamController.abort()
     try {
       await reader.cancel()
+    } catch {
+      // the abort above may already close the reader
+    }
+  }
+
+  const resumeController = new AbortController()
+  const resumedStream = await fetch(`${runtime.url}/sessions/smoke/app/__show/events?stream=1`, {
+    headers: { "Last-Event-ID": event.id },
+    signal: resumeController.signal
+  })
+  const resumedReader = resumedStream.body.getReader()
+  try {
+    const resumedFrame = await readUntil(resumedReader, "mark-default-live")
+    if (resumedFrame.includes("Please review the summary again.")) {
+      throw new Error(`Expected resumed stream to skip prior event: ${resumedFrame}`)
+    }
+  } finally {
+    resumeController.abort()
+    try {
+      await resumedReader.cancel()
     } catch {
       // the abort above may already close the reader
     }

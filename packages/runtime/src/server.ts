@@ -29,6 +29,7 @@ export async function startShowRuntimeServer(options: ShowRuntimeOptions = { wor
     server,
     url: `http://${host}:${(server.address() as AddressInfo).port}`,
     async close() {
+      eventStreams.close()
       await runtime.close()
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
     }
@@ -66,7 +67,7 @@ async function routeRequest(
     const sessionId = eventMatch[1]
     if (request.method === "GET") {
       if (parsed.query.stream === "1") {
-        const stream = eventStreams.subscribe(sessionId, response)
+        const stream = eventStreams.subscribe(sessionId, response, lastEventId(request))
         sendEventStream(response)
         stream.replay(runtime.listSessionEvents(sessionId))
         return
@@ -113,7 +114,7 @@ async function routeRequest(
     if (appPath.startsWith("/__show/events")) {
       if (request.method === "GET") {
         if (parsed.query.stream === "1") {
-          const stream = eventStreams.subscribe(sessionId, response)
+          const stream = eventStreams.subscribe(sessionId, response, lastEventId(request))
           sendEventStream(response)
           stream.replay(runtime.listSessionEvents(sessionId))
           return
@@ -191,11 +192,16 @@ type ShowEventRequest = {
 
 class ShowEventStreamBroker {
   private readonly subscribers = new Map<string, Set<(event: ShowEvent) => void>>()
+  private readonly responses = new Set<ServerResponse>()
 
-  subscribe(sessionId: string, response: ServerResponse) {
+  subscribe(sessionId: string, response: ServerResponse, afterId?: string) {
     const seenIds = new Set<string>()
+    if (afterId) {
+      seenIds.add(afterId)
+    }
     const subscribers = this.subscribers.get(sessionId) ?? new Set<(event: ShowEvent) => void>()
     this.subscribers.set(sessionId, subscribers)
+    this.responses.add(response)
 
     const write = (event: ShowEvent) => {
       const eventId = typeof event.id === "string" ? event.id : undefined
@@ -211,6 +217,7 @@ class ShowEventStreamBroker {
 
     const unsubscribe = () => {
       subscribers.delete(write)
+      this.responses.delete(response)
       if (subscribers.size === 0) {
         this.subscribers.delete(sessionId)
       }
@@ -220,7 +227,8 @@ class ShowEventStreamBroker {
 
     return {
       replay(events: ShowEvent[]) {
-        for (const event of events) {
+        const startIndex = afterId ? events.findIndex((event) => event.id === afterId) + 1 : 0
+        for (const event of events.slice(Math.max(startIndex, 0))) {
           write(event)
         }
       },
@@ -232,6 +240,14 @@ class ShowEventStreamBroker {
     for (const write of this.subscribers.get(sessionId) ?? []) {
       write(event)
     }
+  }
+
+  close() {
+    for (const response of this.responses) {
+      response.end()
+    }
+    this.responses.clear()
+    this.subscribers.clear()
   }
 }
 
@@ -252,6 +268,12 @@ function publicBasePath(request: IncomingMessage) {
   return typeof raw === "string" && raw.trim() ? raw.trim() : undefined
 }
 
+function lastEventId(request: IncomingMessage) {
+  const raw = request.headers["last-event-id"]
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return typeof value === "string" && value.trim() ? value.trim() : undefined
+}
+
 function sendJson(response: ServerResponse, statusCode: number, body: unknown) {
   response.statusCode = statusCode
   response.setHeader("content-type", "application/json")
@@ -268,5 +290,5 @@ function sendEventStream(response: ServerResponse) {
 }
 
 function showEventSseFrame(event: ShowEvent) {
-  return `event: show.event\ndata: ${JSON.stringify(event)}\n\n`
+  return `id: ${event.id}\nevent: show.event\ndata: ${JSON.stringify(event)}\n\n`
 }

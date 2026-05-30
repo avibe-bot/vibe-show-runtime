@@ -172,11 +172,15 @@ import "@avibe/show-ui/styles.css"
 import "./styles.css"
 import App from "./App"
 
+function showBasePath() {
+  return window.location.pathname.match(/^\\/(?:show|p)\\/[^/]+\\//)?.[0] || window.location.pathname.replace(/[^/]*$/, "")
+}
+
 globalThis.__AVIBE_SHOW__ = {
   sessionId: window.location.pathname.match(/\\/show\\/([^/]+)/)?.[1]
     ? decodeURIComponent(window.location.pathname.match(/\\/show\\/([^/]+)/)![1])
     : undefined,
-  basePath: window.location.pathname.match(/^(.*\\/(?:show|p)\\/[^/]+\\/)$/)?.[1] || window.location.pathname.replace(/[^/]*$/, ""),
+  basePath: showBasePath(),
   eventsPath: "__show/events",
   streamPath: "__show/events?stream=1"
 }
