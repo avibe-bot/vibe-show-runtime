@@ -11,6 +11,7 @@ const platform = runtimePlatform()
 const archivePath = join(outDir, `vibe-show-runtime-node-${platform}.tgz`)
 
 const packages = ["runtime", "ui", "sdk"]
+const isWindows = process.platform === "win32"
 
 try {
   mkdirSync(join(stage, "packages"), { recursive: true })
@@ -36,8 +37,10 @@ try {
           "@avibe/show-runtime": "file:./packages/runtime",
           "@avibe/show-ui": "file:./packages/ui",
           "@avibe/show-sdk": "file:./packages/sdk",
+          "@vitejs/plugin-react": "^5.1.1",
           react: "^19.2.0",
-          "react-dom": "^19.2.0"
+          "react-dom": "^19.2.0",
+          vite: "^7.2.4"
         }
       },
       null,
@@ -48,7 +51,8 @@ try {
 
   execFileSync("npm", ["install", "--omit=dev", "--no-audit", "--no-fund"], {
     cwd: stage,
-    stdio: "inherit"
+    stdio: "inherit",
+    shell: isWindows
   })
 
   mkdirSync(outDir, { recursive: true })
