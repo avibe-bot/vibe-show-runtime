@@ -67,7 +67,7 @@ async function routeRequest(
     const sessionId = eventMatch[1]
     if (request.method === "GET") {
       if (parsed.query.stream === "1") {
-        const stream = eventStreams.subscribe(sessionId, response, lastEventId(request))
+        const stream = eventStreams.subscribe(sessionId, response, streamAfterId(request, parsed.query.after_id))
         sendEventStream(response)
         stream.replay(runtime.listSessionEvents(sessionId))
         return
@@ -114,7 +114,7 @@ async function routeRequest(
     if (appPath.startsWith("/__show/events")) {
       if (request.method === "GET") {
         if (parsed.query.stream === "1") {
-          const stream = eventStreams.subscribe(sessionId, response, lastEventId(request))
+          const stream = eventStreams.subscribe(sessionId, response, streamAfterId(request, parsed.query.after_id))
           sendEventStream(response)
           stream.replay(runtime.listSessionEvents(sessionId))
           return
@@ -271,6 +271,15 @@ function publicBasePath(request: IncomingMessage) {
 function lastEventId(request: IncomingMessage) {
   const raw = request.headers["last-event-id"]
   const value = Array.isArray(raw) ? raw[0] : raw
+  return typeof value === "string" && value.trim() ? value.trim() : undefined
+}
+
+function streamAfterId(request: IncomingMessage, queryAfterId: unknown) {
+  const headerValue = lastEventId(request)
+  if (headerValue) {
+    return headerValue
+  }
+  const value = Array.isArray(queryAfterId) ? queryAfterId[0] : queryAfterId
   return typeof value === "string" && value.trim() ? value.trim() : undefined
 }
 

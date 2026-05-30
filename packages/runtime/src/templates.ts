@@ -5,6 +5,7 @@ export async function ensureSessionTemplate(workspace: string) {
   await mkdir(join(workspace, "src"), { recursive: true })
   await mkdir(join(workspace, "api"), { recursive: true })
   await writeIfMissing(join(workspace, "index.html"), indexHtml())
+  await writeIfMissing(join(workspace, "src", "show-runtime-config.ts"), showRuntimeConfigTs())
   await writeIfMissing(join(workspace, "src", "main.tsx"), mainTsx())
   await writeIfMissing(join(workspace, "src", "App.tsx"), appTsx())
   await writeIfMissing(join(workspace, "src", "styles.css"), stylesCss())
@@ -170,26 +171,37 @@ function mainTsx() {
 import { createRoot } from "react-dom/client"
 import "@avibe/show-ui/styles.css"
 import "./styles.css"
+import "./show-runtime-config"
 import App from "./App"
-
-function showBasePath() {
-  return window.location.pathname.match(/^\\/(?:show|p)\\/[^/]+\\//)?.[0] || window.location.pathname.replace(/[^/]*$/, "")
-}
-
-globalThis.__AVIBE_SHOW__ = {
-  sessionId: window.location.pathname.match(/\\/show\\/([^/]+)/)?.[1]
-    ? decodeURIComponent(window.location.pathname.match(/\\/show\\/([^/]+)/)![1])
-    : undefined,
-  basePath: showBasePath(),
-  eventsPath: "__show/events",
-  streamPath: "__show/events?stream=1"
-}
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <App />
   </React.StrictMode>
 )
+`
+}
+
+function showRuntimeConfigTs() {
+  return `import type { RuntimeConfig } from "@avibe/show-sdk"
+
+function showBasePath() {
+  return window.location.pathname.match(/^\\/(?:show|p)\\/[^/]+\\//)?.[0] || window.location.pathname.replace(/[^/]*$/, "")
+}
+
+function showSessionId() {
+  const match = window.location.pathname.match(/\\/show\\/([^/]+)/)
+  return match ? decodeURIComponent(match[1]) : undefined
+}
+
+const injected = globalThis.__AVIBE_SHOW__ ?? {}
+
+globalThis.__AVIBE_SHOW__ = {
+  sessionId: injected.sessionId ?? showSessionId(),
+  basePath: injected.basePath ?? showBasePath(),
+  eventsPath: injected.eventsPath ?? "__show/events",
+  streamPath: injected.streamPath ?? "__show/events?stream=1"
+} satisfies RuntimeConfig
 `
 }
 

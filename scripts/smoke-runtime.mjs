@@ -44,8 +44,12 @@ try {
     throw new Error("Expected app HTML asset URLs to stay under /show/<session>/")
   }
   const generatedMain = await readFile(join(root, "smoke", "src", "main.tsx"), "utf8")
-  if (!generatedMain.includes("basePath: showBasePath()")) {
-    throw new Error("Expected generated client shell to derive basePath from the session root")
+  if (!generatedMain.includes('import "./show-runtime-config"') || generatedMain.indexOf('import "./show-runtime-config"') > generatedMain.indexOf('import App from "./App"')) {
+    throw new Error("Expected generated client shell to initialize runtime config before importing App")
+  }
+  const generatedConfig = await readFile(join(root, "smoke", "src", "show-runtime-config.ts"), "utf8")
+  if (!generatedConfig.includes("basePath: injected.basePath ?? showBasePath()")) {
+    throw new Error("Expected generated client shell to preserve injected runtime config")
   }
 
   const eventResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {
@@ -134,6 +138,25 @@ try {
     resumeController.abort()
     try {
       await resumedReader.cancel()
+    } catch {
+      // the abort above may already close the reader
+    }
+  }
+
+  const queryResumeController = new AbortController()
+  const queryResumedStream = await fetch(`${runtime.url}/sessions/smoke/app/__show/events?stream=1&after_id=${encodeURIComponent(event.id)}`, {
+    signal: queryResumeController.signal
+  })
+  const queryResumedReader = queryResumedStream.body.getReader()
+  try {
+    const queryResumedFrame = await readUntil(queryResumedReader, "mark-default-live")
+    if (queryResumedFrame.includes("Please review the summary again.")) {
+      throw new Error(`Expected after_id stream to skip prior event: ${queryResumedFrame}`)
+    }
+  } finally {
+    queryResumeController.abort()
+    try {
+      await queryResumedReader.cancel()
     } catch {
       // the abort above may already close the reader
     }
