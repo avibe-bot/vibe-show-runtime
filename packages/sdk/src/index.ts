@@ -558,8 +558,8 @@ export function formatShowEventMessage(event: ShowEvent) {
     const annotationEvent = event as HumanAnnotationEvent
     return annotationEvent.message?.content ?? formatHumanAnnotationMessage(annotationEvent.type, annotationEvent.annotation, annotationEvent.anchor)
   }
-  if (event.type === "assistant.page.updated" && typeof event.summary === "string" && event.summary.trim()) {
-    return `[show-page-updated] ${event.summary.trim()}`
+  if (event.type === "assistant.page.updated") {
+    return event.message?.content ?? (typeof event.summary === "string" && event.summary.trim() ? `[show-page-updated] ${event.summary.trim()}` : undefined)
   }
   if (event.type === "system.runtime.error") {
     return `[show-runtime-error] ${event.error || "Runtime error"}`
@@ -882,7 +882,7 @@ function rectFromElement(element: Element): MarkAnchorRect {
   if (rect.width || rect.height) {
     return rectFromDomRect(rect)
   }
-  return rectFromDomRect(unionChildRect(element) ?? rect)
+  return rectFromDomRect(unionContentRect(element) ?? rect)
 }
 
 function rectFromDomRect(rect: DOMRect | DOMRectReadOnly): MarkAnchorRect {
@@ -1103,10 +1103,27 @@ function normalizeTextContent(value: string) {
   return value.replace(/\s+/g, " ").trim()
 }
 
-function unionChildRect(element: Element): DOMRect | undefined {
-  const rects = Array.from(element.querySelectorAll("*"))
-    .map((child) => child.getBoundingClientRect())
-    .filter((rect) => rect.width > 0 || rect.height > 0)
+function unionContentRect(element: Element): DOMRect | undefined {
+  const rects = Array.from(element.querySelectorAll("*")).flatMap((child) =>
+    Array.from(child.getClientRects()).filter((rect) => rect.width > 0 || rect.height > 0)
+  )
+  const ownerDocument = element.ownerDocument ?? (typeof document !== "undefined" ? document : undefined)
+  if (ownerDocument && typeof NodeFilter !== "undefined") {
+    const walker = ownerDocument.createTreeWalker(element, NodeFilter.SHOW_TEXT)
+    let node = walker.nextNode()
+    while (node) {
+      if (normalizeTextContent(node.textContent || "")) {
+        const range = ownerDocument.createRange()
+        range.selectNodeContents(node)
+        const rect = range.getBoundingClientRect()
+        if (rect.width > 0 || rect.height > 0) {
+          rects.push(rect)
+        }
+        range.detach()
+      }
+      node = walker.nextNode()
+    }
+  }
   if (!rects.length) return undefined
   const left = Math.min(...rects.map((rect) => rect.left))
   const top = Math.min(...rects.map((rect) => rect.top))

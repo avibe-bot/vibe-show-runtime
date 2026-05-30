@@ -293,15 +293,10 @@ export function useSubmitIntent() {
 }
 
 export function useAnchors(scope?: string) {
+  const registry = useMarkRegistry(scope)
   return React.useMemo(() => {
-    if (typeof document === "undefined") return []
-    const elements = scope
-      ? Array.from(document.querySelectorAll(`[${markAttributeName(scope)}]`))
-      : Array.from(document.querySelectorAll("*")).filter((element) =>
-          Array.from(element.attributes).some((attr) => attr.name.startsWith("mark-"))
-        )
-    return elements.map((element) => collectElementContext(element, { scope }))
-  }, [scope])
+    return Array.from(registry.values())
+  }, [registry])
 }
 
 export function useMarkRegistry(scope?: string) {
@@ -310,6 +305,7 @@ export function useMarkRegistry(scope?: string) {
     if (typeof document === "undefined") return
     const observer = new MutationObserver(() => setVersion((value) => value + 1))
     observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: scope ? [markAttributeName(scope)] : undefined })
+    setVersion((value) => value + 1)
     return () => observer.disconnect()
   }, [scope])
   return React.useMemo(() => {
@@ -335,7 +331,7 @@ export function ShowAgentMark({ id, scope, children }: ShowAgentMarkProps) {
     return React.cloneElement(children, attrs)
   }
   return (
-    <span {...attrs}>
+    <span {...attrs} style={{ display: "contents" }}>
       {children}
     </span>
   )
@@ -724,7 +720,7 @@ export function AnnotationOverlay({
           </CommentPopover>
         </>
       ) : null}
-      <AgentMarkLayer />
+      <AgentMarkLayer scope={scope} />
     </>,
     document.body
   )

@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
 import {
   assistantMarkEvent,
+  formatShowEventMessage,
   humanAnnotationEvent,
   humanIntentEvent,
   normalizeShowEvent,
@@ -13,7 +14,8 @@ import {
 globalThis.__AVIBE_SHOW__ = {
   basePath: "/show/smoke/",
   eventsPath: "__show/events",
-  streamPath: "__show/events?stream=1"
+  streamPath: "__show/events?stream=1",
+  writeToken: "smoke-token"
 }
 
 const configuredStreamPath = showEventsStreamUrl()
@@ -76,6 +78,15 @@ if (directIntent.message.content !== "Direct custom.") {
   throw new Error(`Expected humanIntentEvent to preserve supplied message: ${JSON.stringify(directIntent)}`)
 }
 
+const pageUpdateMessage = formatShowEventMessage(normalizeShowEvent({
+  type: "assistant.page.updated",
+  sessionId: "smoke",
+  message: { role: "assistant", content: "Page custom transcript." }
+}))
+if (pageUpdateMessage !== "Page custom transcript.") {
+  throw new Error(`Expected page updates to preserve supplied transcript message, got ${pageUpdateMessage}`)
+}
+
 const root = await mkdtemp(join(tmpdir(), "avibe-show-runtime-"))
 const runtime = await startShowRuntimeServer({ workspaceRoot: root })
 
@@ -111,6 +122,9 @@ try {
   const generatedConfig = await readFile(join(root, "smoke", "src", "show-runtime-config.ts"), "utf8")
   if (!generatedConfig.includes("basePath: injected.basePath ?? showBasePath()")) {
     throw new Error("Expected generated client shell to preserve injected runtime config")
+  }
+  if (!generatedConfig.includes("writeToken: injected.writeToken")) {
+    throw new Error("Expected generated client shell to preserve injected write tokens")
   }
 
   const eventResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {

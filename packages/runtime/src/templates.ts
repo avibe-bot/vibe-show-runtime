@@ -200,7 +200,8 @@ globalThis.__AVIBE_SHOW__ = {
   sessionId: injected.sessionId ?? showSessionId(),
   basePath: injected.basePath ?? showBasePath(),
   eventsPath: injected.eventsPath ?? "__show/events",
-  streamPath: injected.streamPath ?? "__show/events?stream=1"
+  streamPath: injected.streamPath ?? "__show/events?stream=1",
+  writeToken: injected.writeToken
 } satisfies RuntimeConfig
 `
 }
