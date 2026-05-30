@@ -1,6 +1,6 @@
 import type { Server } from "node:http"
 import type { ViteDevServer } from "vite"
-import type { AgentMark, MarkAnchor, ShowEvent } from "@avibe/show-sdk"
+import type { AgentMark, MarkAnchor, ShowEvent, ShowEventInput } from "@avibe/show-sdk"
 
 export type ShowRuntimeOptions = {
   workspaceRoot: string
@@ -43,6 +43,7 @@ export type ShowRuntime = {
   getSession(sessionId: string): ShowSession | undefined
   suspendSession(sessionId: string): Promise<ShowSessionStatus>
   recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor): ShowEvent
+  recordShowEvent(sessionId: string, payload: ShowEventInput | ShowEvent): ShowEvent
   listSessionEvents(sessionId: string): ShowEvent[]
   listSessionMessages(sessionId: string): ShowMessage[]
   close(): Promise<void>
@@ -50,7 +51,7 @@ export type ShowRuntime = {
 
 export type ShowMessage = {
   id: string
-  role: "assistant"
+  role: "assistant" | "user" | "system"
   content: string
   createdAt: string
   eventId: string

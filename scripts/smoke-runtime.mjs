@@ -2,7 +2,13 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
-import { showEventsStreamUrl } from "../packages/sdk/dist/index.js"
+import {
+  assistantMarkEvent,
+  humanAnnotationEvent,
+  humanIntentEvent,
+  normalizeShowEvent,
+  showEventsStreamUrl
+} from "../packages/sdk/dist/index.js"
 
 globalThis.__AVIBE_SHOW__ = {
   basePath: "/show/smoke/",
@@ -13,6 +19,61 @@ globalThis.__AVIBE_SHOW__ = {
 const configuredStreamPath = showEventsStreamUrl()
 if (configuredStreamPath !== "/show/smoke/__show/events?stream=1") {
   throw new Error(`Expected configured stream path, got ${configuredStreamPath}`)
+}
+
+const oldCreatedAt = "2026-01-01T00:00:00.000Z"
+const oldUpdatedAt = "2026-01-01T00:01:00.000Z"
+const updatedMark = assistantMarkEvent(
+  {
+    id: "mark_lifecycle",
+    role: "assistant",
+    scope: "default",
+    target: "summary",
+    body: "Updated.",
+    status: "active",
+    createdAt: oldCreatedAt,
+    updatedAt: oldUpdatedAt,
+    resolvedAt: ""
+  },
+  undefined,
+  "smoke",
+  "assistant.mark.updated"
+)
+if (updatedMark.createdAt === oldCreatedAt || updatedMark.mark.updatedAt === oldUpdatedAt) {
+  throw new Error(`Expected mark update event to use the lifecycle time: ${JSON.stringify(updatedMark)}`)
+}
+
+const resolvedAnnotation = humanAnnotationEvent(
+  "human.annotation.resolved",
+  {
+    id: "annotation_lifecycle",
+    scope: "default",
+    status: "pending",
+    comment: "Old comment",
+    createdAt: oldCreatedAt,
+    updatedAt: oldUpdatedAt
+  },
+  undefined,
+  "smoke"
+)
+if (resolvedAnnotation.createdAt === oldCreatedAt || resolvedAnnotation.annotation.updatedAt === oldUpdatedAt || resolvedAnnotation.annotation.resolvedAt !== resolvedAnnotation.createdAt) {
+  throw new Error(`Expected annotation lifecycle event to use the current event time: ${JSON.stringify(resolvedAnnotation)}`)
+}
+
+const customIntent = normalizeShowEvent({
+  id: "show_evt_custom",
+  type: "human.intent.submitted",
+  sessionId: "smoke",
+  payload: { comment: "Ship it." },
+  message: { role: "user", content: "Custom transcript." }
+})
+if (customIntent.message.content !== "Custom transcript.") {
+  throw new Error(`Expected normalizeShowEvent to preserve caller message: ${JSON.stringify(customIntent)}`)
+}
+
+const directIntent = humanIntentEvent({ comment: "Direct." }, undefined, "smoke", undefined, { role: "user", content: "Direct custom." })
+if (directIntent.message.content !== "Direct custom.") {
+  throw new Error(`Expected humanIntentEvent to preserve supplied message: ${JSON.stringify(directIntent)}`)
 }
 
 const root = await mkdtemp(join(tmpdir(), "avibe-show-runtime-"))
@@ -68,14 +129,76 @@ try {
     throw new Error(`Unexpected mark event: ${JSON.stringify(event)}`)
   }
 
+  const intentResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      type: "human.intent.submitted",
+      payload: {
+        component: "decision",
+        intent: "choose",
+        value: "approve",
+        comment: "Ship this direction.",
+        dispatch: true
+      },
+      anchor: {
+        kind: "mark",
+        scope: "default",
+        mark: "summary",
+        selector: "[mark-default=\"summary\"]"
+      }
+    })
+  }).then((res) => res.json())
+  if (intentResponse.event?.type !== "human.intent.submitted" || !intentResponse.event.message?.content.includes("[show-intent:default] choose")) {
+    throw new Error(`Unexpected intent event: ${JSON.stringify(intentResponse)}`)
+  }
+
+  const annotationResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      type: "human.annotation.created",
+      annotation: {
+        intent: "question",
+        severity: "important",
+        comment: "Clarify this claim.",
+        anchor: {
+          kind: "text-range",
+          scope: "default",
+          textQuote: "summary",
+          selector: "[mark-default=\"summary\"]",
+          rect: { x: 10, y: 20, width: 120, height: 24 }
+        }
+      }
+    })
+  }).then((res) => res.json())
+  if (annotationResponse.event?.type !== "human.annotation.created" || !annotationResponse.event.message?.content.includes("[show-annotation:default:created] question")) {
+    throw new Error(`Unexpected annotation event: ${JSON.stringify(annotationResponse)}`)
+  }
+
+  const invalidResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      type: "human.annotation.unknown",
+      annotation: { comment: "bad" }
+    })
+  })
+  if (invalidResponse.status !== 400) {
+    throw new Error(`Expected invalid show event to return 400, got ${invalidResponse.status}`)
+  }
+
   const messages = await fetch(`${runtime.url}/sessions/smoke/messages`).then((res) => res.json())
   if (!messages.messages?.[0]?.content.includes("Please review the summary again.")) {
     throw new Error(`Expected assistant mark message to be recorded: ${JSON.stringify(messages)}`)
   }
+  if (!messages.messages?.some((message) => message.role === "user" && message.content.includes("Clarify this claim."))) {
+    throw new Error(`Expected human annotation message to be recorded: ${JSON.stringify(messages)}`)
+  }
 
   const status = await fetch(`${runtime.url}/sessions/smoke/status`).then((res) => res.json())
-  if (status.messageCount !== 1 || status.eventCount !== 1) {
-    throw new Error(`Expected mark counters in status: ${JSON.stringify(status)}`)
+  if (status.messageCount !== 3 || status.eventCount !== 3) {
+    throw new Error(`Expected show event counters in status: ${JSON.stringify(status)}`)
   }
 
   const streamController = new AbortController()
