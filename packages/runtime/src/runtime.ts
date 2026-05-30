@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url"
 import react from "@vitejs/plugin-react"
 import { createServer as createViteServer } from "vite"
 import type { InlineConfig } from "vite"
+import { formatAgentMarkMessage, normalizeAgentMark, type AgentMark, type MarkAnchor, type ShowEvent } from "@avibe/show-sdk"
 import type { ShowRuntime, ShowRuntimeOptions, ShowSession, ShowSessionStatus } from "./types.js"
 import { createShadcnAlias } from "./aliases.js"
 import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
@@ -58,7 +59,9 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       id: sessionId,
       workspace: join(options.workspaceRoot, sessionId),
       state: "created",
-      updatedAt: new Date()
+      updatedAt: new Date(),
+      events: [],
+      messages: []
     }
     sessions.set(sessionId, session)
     return session
@@ -112,6 +115,39 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     getSessionStatus,
     getSession: (sessionId: string) => sessions.get(sessionId),
     suspendSession,
+    recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor) {
+      const session = getOrCreateSession(sessionId)
+      const normalizedMark = normalizeAgentMark(mark)
+      const content = formatAgentMarkMessage(normalizedMark, anchor)
+      const event: ShowEvent = {
+        id: normalizedMark.id,
+        type: "assistant.mark.created",
+        sessionId,
+        mark: normalizedMark,
+        anchor,
+        message: {
+          role: "assistant",
+          content
+        },
+        createdAt: normalizedMark.createdAt
+      }
+      session.events.push(event)
+      session.messages.push({
+        id: normalizedMark.id,
+        role: "assistant",
+        content,
+        createdAt: normalizedMark.createdAt,
+        eventId: normalizedMark.id
+      })
+      session.updatedAt = new Date()
+      return event
+    },
+    listSessionEvents(sessionId: string) {
+      return [...getOrCreateSession(sessionId).events]
+    },
+    listSessionMessages(sessionId: string) {
+      return [...getOrCreateSession(sessionId).messages]
+    },
     close
   }
 }
@@ -155,6 +191,8 @@ export function toStatus(session: ShowSession): ShowSessionStatus {
     state: session.state,
     workspace: session.workspace,
     updatedAt: session.updatedAt.toISOString(),
-    lastAccessedAt: session.lastAccessedAt?.toISOString()
+    lastAccessedAt: session.lastAccessedAt?.toISOString(),
+    eventCount: session.events.length,
+    messageCount: session.messages.length
   }
 }

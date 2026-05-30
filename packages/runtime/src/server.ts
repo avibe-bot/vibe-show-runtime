@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { parse } from "node:url"
 import type { AddressInfo } from "node:net"
+import type { AgentMark, MarkAnchor } from "@avibe/show-sdk"
 import type { ShowRuntimeOptions } from "./types.js"
 import { createShowRuntime } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
@@ -54,6 +55,30 @@ async function routeRequest(runtime: ReturnType<typeof createShowRuntime>, reque
     return
   }
 
+  const eventMatch = pathname.match(/^\/sessions\/([^/]+)\/events$/)
+  if (eventMatch) {
+    const sessionId = eventMatch[1]
+    if (request.method === "GET") {
+      sendJson(response, 200, { events: runtime.listSessionEvents(sessionId) })
+      return
+    }
+    if (request.method === "POST") {
+      const payload = await readJson<ShowEventRequest>(request)
+      if (payload.type !== "assistant.mark.created") {
+        sendJson(response, 400, { error: "Unsupported event type" })
+        return
+      }
+      sendJson(response, 201, { ok: true, event: runtime.recordAgentMark(sessionId, payload.mark, payload.anchor) })
+      return
+    }
+  }
+
+  const messageMatch = pathname.match(/^\/sessions\/([^/]+)\/messages$/)
+  if (request.method === "GET" && messageMatch) {
+    sendJson(response, 200, { messages: runtime.listSessionMessages(messageMatch[1]) })
+    return
+  }
+
   const suspendMatch = pathname.match(/^\/sessions\/([^/]+)\/suspend$/)
   if (request.method === "POST" && suspendMatch) {
     sendJson(response, 200, await runtime.suspendSession(suspendMatch[1]))
@@ -68,6 +93,25 @@ async function routeRequest(runtime: ReturnType<typeof createShowRuntime>, reque
     const session = runtime.getSession(sessionId)
     if (!session) {
       sendJson(response, 503, { error: "Session not ready", status })
+      return
+    }
+
+    if (appPath.startsWith("/__show/events")) {
+      if (!session.vite) {
+        sendJson(response, 503, { error: "Session not ready", status })
+        return
+      }
+      const payload = await readJson<ShowEventRequest>(request)
+      if (payload.type !== "assistant.mark.created") {
+        sendJson(response, 400, { error: "Unsupported event type" })
+        return
+      }
+      sendJson(response, 201, { ok: true, event: runtime.recordAgentMark(sessionId, payload.mark, payload.anchor) })
+      return
+    }
+
+    if (appPath.startsWith("/__show/messages")) {
+      sendJson(response, 200, { messages: runtime.listSessionMessages(sessionId) })
       return
     }
 
@@ -107,6 +151,23 @@ async function routeRequest(runtime: ReturnType<typeof createShowRuntime>, reque
   }
 
   sendJson(response, 404, { error: "Not found" })
+}
+
+type ShowEventRequest = {
+  type?: string
+  mark: AgentMark
+  anchor?: MarkAnchor
+}
+
+async function readJson<T>(request: IncomingMessage) {
+  const chunks: Buffer[] = []
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+  }
+  if (chunks.length === 0) {
+    return {} as T
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T
 }
 
 function publicBasePath(request: IncomingMessage) {
