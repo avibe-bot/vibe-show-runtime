@@ -202,16 +202,22 @@ export function ShowSessionProvider({
     let source: EventSource | undefined
     async function connect() {
       const { showEventsStreamUrl } = await import("./index.js")
+      if (closed) return
       const url = new URL(showEventsStreamUrl(options), window.location.href)
       if (lastEventIdRef.current) url.searchParams.set("after_id", lastEventIdRef.current)
-      source = new EventSource(url.toString())
-      source.onopen = () => {
+      const nextSource = new EventSource(url.toString())
+      if (closed) {
+        nextSource.close()
+        return
+      }
+      source = nextSource
+      nextSource.onopen = () => {
         if (!closed) setConnected(true)
       }
-      source.onerror = () => {
+      nextSource.onerror = () => {
         if (!closed) setConnected(false)
       }
-      source.addEventListener("show.event", (message) => {
+      nextSource.addEventListener("show.event", (message) => {
         try {
           appendEvent(JSON.parse((message as MessageEvent).data) as ShowEvent)
         } catch (parseError) {
@@ -303,7 +309,7 @@ export function useMarkRegistry(scope?: string) {
   React.useEffect(() => {
     if (typeof document === "undefined") return
     const observer = new MutationObserver(() => setVersion((value) => value + 1))
-    observer.observe(document.documentElement, { subtree: true, attributes: true, attributeFilter: scope ? [markAttributeName(scope)] : undefined })
+    observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: scope ? [markAttributeName(scope)] : undefined })
     return () => observer.disconnect()
   }, [scope])
   return React.useMemo(() => {
@@ -329,7 +335,7 @@ export function ShowAgentMark({ id, scope, children }: ShowAgentMarkProps) {
     return React.cloneElement(children, attrs)
   }
   return (
-    <span {...attrs} style={{ display: "contents" }}>
+    <span {...attrs}>
       {children}
     </span>
   )
@@ -677,9 +683,17 @@ export function AnnotationOverlay({
               }
             })
           }}
-          onPointerUp={() => {
+          onPointerUp={(event) => {
             if (!drag) return
-            const anchor = collectAreaAnchor(drag.rect, { scope, includeNearby: true })
+            const captureLayer = event.currentTarget
+            const previousPointerEvents = captureLayer.style.pointerEvents
+            let anchor: ShowAnchor
+            try {
+              captureLayer.style.pointerEvents = "none"
+              anchor = collectAreaAnchor(drag.rect, { scope, includeNearby: true })
+            } finally {
+              captureLayer.style.pointerEvents = previousPointerEvents
+            }
             if (anchor.rect && anchor.rect.width > 4 && anchor.rect.height > 4) {
               setDraft({ anchor, rect: anchor.rect, label: "Selected area" })
             }

@@ -723,24 +723,28 @@ export function collectAreaAnchor(rect: MarkAnchorRect, options: CollectElementC
   }
 }
 
-export function resolveAnchor(anchor: ShowAnchor, root: ParentNode = document): AnchorResolveResult {
+export function resolveAnchor(anchor: ShowAnchor, root?: ParentNode): AnchorResolveResult {
   if (anchor.kind === "area" && anchor.rect) {
     return { anchor, rect: anchor.rect, confidence: "area" }
   }
-  const byMark = anchor.mark ? queryOne(root, markSelector(anchor.mark, anchor.scope)) : undefined
+  const resolvedRoot = root ?? (typeof document !== "undefined" ? document : undefined)
+  if (!resolvedRoot) {
+    return { anchor, rect: anchor.rect, confidence: "missing", reason: "No DOM root available" }
+  }
+  const byMark = anchor.mark ? queryOne(resolvedRoot, markSelector(anchor.mark, anchor.scope)) : undefined
   if (byMark) {
     return { anchor, element: byMark, rect: rectFromElement(byMark), confidence: "exact" }
   }
-  const byId = anchor.id ? queryOne(root, markSelector(anchor.id, anchor.scope)) : undefined
+  const byId = anchor.id ? queryOne(resolvedRoot, markSelector(anchor.id, anchor.scope)) : undefined
   if (byId) {
     return { anchor, element: byId, rect: rectFromElement(byId), confidence: "exact" }
   }
-  const bySelector = anchor.selector ? queryOne(root, anchor.selector) : undefined
+  const bySelector = anchor.selector ? queryOne(resolvedRoot, anchor.selector) : undefined
   if (bySelector) {
     return { anchor, element: bySelector, rect: rectFromElement(bySelector), confidence: "selector" }
   }
   if (anchor.textQuote) {
-    const byText = findElementByText(anchor.textQuote, root)
+    const byText = findElementByText(anchor.textQuote, resolvedRoot)
     if (byText) {
       return { anchor, element: byText, rect: rectFromElement(byText), confidence: "text" }
     }
@@ -874,7 +878,11 @@ function elementFromNode(node: Node | null): Element | undefined {
 }
 
 function rectFromElement(element: Element): MarkAnchorRect {
-  return rectFromDomRect(element.getBoundingClientRect())
+  const rect = element.getBoundingClientRect()
+  if (rect.width || rect.height) {
+    return rectFromDomRect(rect)
+  }
+  return rectFromDomRect(unionChildRect(element) ?? rect)
 }
 
 function rectFromDomRect(rect: DOMRect | DOMRectReadOnly): MarkAnchorRect {
@@ -960,7 +968,7 @@ function domPath(element: Element): string {
 }
 
 function elementText(element: Element) {
-  return (element.textContent || "").replace(/\s+/g, " ").trim().slice(0, 320)
+  return normalizeTextContent(element.textContent || "").slice(0, 320)
 }
 
 function elementLabel(element: Element) {
@@ -1034,18 +1042,35 @@ function queryOne(root: ParentNode, selector: string) {
 }
 
 function findElementByText(text: string, root: ParentNode) {
-  const needle = text.replace(/\s+/g, " ").trim()
+  const needle = normalizeTextContent(text)
   if (!needle) return undefined
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
-  let current = walker.nextNode()
+  const ownerDocument = ownerDocumentForRoot(root)
+  if (!ownerDocument || typeof NodeFilter === "undefined") return undefined
+
+  const textWalker = ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  let textNode = textWalker.nextNode()
+  while (textNode) {
+    const parent = textNode.parentElement
+    if (parent && !isTextAnchorContainer(parent) && normalizeTextContent(textNode.textContent || "").includes(needle)) {
+      return parent
+    }
+    textNode = textWalker.nextNode()
+  }
+
+  let best: Element | undefined
+  if (typeof Element !== "undefined" && root instanceof Element && isTextAnchorCandidate(root, needle)) {
+    best = root
+  }
+  const elementWalker = ownerDocument.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
+  let current = elementWalker.nextNode()
   while (current) {
     const element = current as Element
-    if ((element.textContent || "").replace(/\s+/g, " ").includes(needle)) {
-      return element
+    if (isTextAnchorCandidate(element, needle) && (!best || best.contains(element))) {
+      best = element
     }
-    current = walker.nextNode()
+    current = elementWalker.nextNode()
   }
-  return undefined
+  return best
 }
 
 function cssEscape(value: string) {
@@ -1053,4 +1078,39 @@ function cssEscape(value: string) {
     return globalThis.CSS.escape(value)
   }
   return value.replace(/["\\]/g, "\\$&")
+}
+
+function ownerDocumentForRoot(root: ParentNode) {
+  if (typeof Document !== "undefined" && root instanceof Document) {
+    return root
+  }
+  return (root as Node).ownerDocument ?? (typeof document !== "undefined" ? document : undefined)
+}
+
+function isTextAnchorCandidate(element: Element, needle: string) {
+  return !isTextAnchorContainer(element) && normalizeTextContent(element.textContent || "").includes(needle)
+}
+
+function isTextAnchorContainer(element: Element) {
+  const tagName = element.tagName.toLowerCase()
+  if (["html", "body", "head", "script", "style", "template", "noscript"].includes(tagName)) {
+    return true
+  }
+  return Boolean(element.closest("[data-show-annotation-ui], [data-show-annotation-capture], [data-show-agent-mark-layer]"))
+}
+
+function normalizeTextContent(value: string) {
+  return value.replace(/\s+/g, " ").trim()
+}
+
+function unionChildRect(element: Element): DOMRect | undefined {
+  const rects = Array.from(element.querySelectorAll("*"))
+    .map((child) => child.getBoundingClientRect())
+    .filter((rect) => rect.width > 0 || rect.height > 0)
+  if (!rects.length) return undefined
+  const left = Math.min(...rects.map((rect) => rect.left))
+  const top = Math.min(...rects.map((rect) => rect.top))
+  const right = Math.max(...rects.map((rect) => rect.right))
+  const bottom = Math.max(...rects.map((rect) => rect.bottom))
+  return new DOMRect(left, top, right - left, bottom - top)
 }
