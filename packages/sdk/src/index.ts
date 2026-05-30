@@ -1077,7 +1077,7 @@ function cssEscape(value: string) {
   if (globalThis.CSS?.escape) {
     return globalThis.CSS.escape(value)
   }
-  return value.replace(/["\\]/g, "\\$&")
+  return value.replace(/[^a-zA-Z0-9_-]/g, "\\$&")
 }
 
 function ownerDocumentForRoot(root: ParentNode) {

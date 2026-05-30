@@ -319,7 +319,7 @@ export function useMarkRegistry(scope?: string) {
         )
     for (const element of elements) {
       const anchor = collectElementContext(element, { scope })
-      if (anchor.mark) anchors.set(anchor.mark, anchor)
+      if (anchor.mark) anchors.set(scope ? anchor.mark : `${anchor.scope ?? "default"}:${anchor.mark}`, anchor)
     }
     return anchors
   }, [scope, version])
@@ -338,6 +338,7 @@ export function ShowAgentMark({ id, scope, children }: ShowAgentMarkProps) {
 }
 
 export function AgentMarkForm({ target, scope, placeholder = "Write a mark...", onSubmitted, ...options }: AgentMarkFormProps) {
+  const context = React.useContext(ShowSessionContext)
   const [body, setBody] = React.useState("")
   const [submitting, setSubmitting] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
@@ -348,7 +349,9 @@ export function AgentMarkForm({ target, scope, placeholder = "Write a mark...", 
     setSubmitting(true)
     setError(null)
     try {
-      const response = await submitAgentMark(nextMark, options)
+      const response = context
+        ? await context.submitEvent({ type: "assistant.mark.created", mark: nextMark, anchor: options.anchor }, options)
+        : await submitAgentMark(nextMark, options)
       setBody("")
       onSubmitted?.(nextMark, response)
     } catch (submitError) {
@@ -528,6 +531,7 @@ export function ActionButton({
 }: ActionButtonProps) {
   const context = React.useContext(ShowSessionContext)
   const [submitting, setSubmitting] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
   const submitOptions: IntentSubmitOptions = {
     ...(sessionId ? { sessionId } : {}),
     ...(basePath ? { basePath } : {}),
@@ -548,17 +552,23 @@ export function ActionButton({
       dispatch: true
     }
     setSubmitting(true)
+    setError(null)
     try {
       const result = context ? await context.submitIntent(payload, { ...submitOptions, anchor }) : await submitIntent(payload, { ...submitOptions, anchor })
       onSubmitted?.(payload, result)
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to submit")
     } finally {
       setSubmitting(false)
     }
   }
   return (
-    <button {...buttonProps} type={buttonProps.type ?? "button"} disabled={buttonProps.disabled || submitting} onClick={(event) => void click(event)}>
-      {children}
-    </button>
+    <>
+      <button {...buttonProps} type={buttonProps.type ?? "button"} disabled={buttonProps.disabled || submitting} onClick={(event) => void click(event)}>
+        {children}
+      </button>
+      {error ? <span role="alert" style={errorStyle}>{error}</span> : null}
+    </>
   )
 }
 
@@ -581,6 +591,7 @@ export function AnnotationOverlay({
   const [comment, setComment] = React.useState("")
   const [drag, setDrag] = React.useState<{ startX: number; startY: number; rect: MarkAnchorRect } | null>(null)
   const [submitting, setSubmitting] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
 
   React.useEffect(() => {
     if (!active || mode !== "element") return
@@ -641,11 +652,14 @@ export function AnnotationOverlay({
       anchor: draft.anchor
     }
     setSubmitting(true)
+    setError(null)
     try {
       const result = context ? await context.submitAnnotation(annotation, { anchor: draft.anchor }) : await submitAnnotation(annotation, { anchor: draft.anchor })
       setComment("")
       setDraft(null)
       onSubmitted?.(annotation, result)
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to submit annotation")
     } finally {
       setSubmitting(false)
     }
@@ -722,6 +736,7 @@ export function AnnotationOverlay({
                 {submitting ? "Sending..." : submitLabel}
               </button>
             </div>
+            {error ? <p role="alert" style={errorStyle}>{error}</p> : null}
           </CommentPopover>
         </>
       ) : null}
