@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { parse } from "node:url"
 import type { AddressInfo } from "node:net"
-import type { AgentMark, MarkAnchor } from "@avibe/show-sdk"
+import type { AgentMark, MarkAnchor, ShowEvent } from "@avibe/show-sdk"
 import type { ShowRuntimeOptions } from "./types.js"
 import { createShowRuntime } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
@@ -12,7 +12,7 @@ export async function startShowRuntimeServer(options: ShowRuntimeOptions = { wor
 
   const server = createServer(async (request, response) => {
     try {
-      await routeRequest(runtime, request, response)
+      await routeRequest(runtime, request, response, eventStreams)
     } catch (error) {
       response.statusCode = 500
       response.setHeader("content-type", "application/json")
@@ -20,6 +20,7 @@ export async function startShowRuntimeServer(options: ShowRuntimeOptions = { wor
     }
   })
   const runtime = createShowRuntime({ ...options, server })
+  const eventStreams = new ShowEventStreamBroker()
 
   await new Promise<void>((resolve) => server.listen(port, host, resolve))
 
@@ -34,7 +35,12 @@ export async function startShowRuntimeServer(options: ShowRuntimeOptions = { wor
   }
 }
 
-async function routeRequest(runtime: ReturnType<typeof createShowRuntime>, request: IncomingMessage, response: ServerResponse) {
+async function routeRequest(
+  runtime: ReturnType<typeof createShowRuntime>,
+  request: IncomingMessage,
+  response: ServerResponse,
+  eventStreams: ShowEventStreamBroker
+) {
   const parsed = parse(request.url ?? "/", true)
   const pathname = parsed.pathname ?? "/"
 
@@ -59,6 +65,12 @@ async function routeRequest(runtime: ReturnType<typeof createShowRuntime>, reque
   if (eventMatch) {
     const sessionId = eventMatch[1]
     if (request.method === "GET") {
+      if (parsed.query.stream === "1") {
+        const stream = eventStreams.subscribe(sessionId, response)
+        sendEventStream(response)
+        stream.replay(runtime.listSessionEvents(sessionId))
+        return
+      }
       sendJson(response, 200, { events: runtime.listSessionEvents(sessionId) })
       return
     }
@@ -68,7 +80,9 @@ async function routeRequest(runtime: ReturnType<typeof createShowRuntime>, reque
         sendJson(response, 400, { error: "Unsupported event type" })
         return
       }
-      sendJson(response, 201, { ok: true, event: runtime.recordAgentMark(sessionId, payload.mark, payload.anchor) })
+      const event = runtime.recordAgentMark(sessionId, payload.mark, payload.anchor)
+      eventStreams.publish(sessionId, event)
+      sendJson(response, 201, { ok: true, event })
       return
     }
   }
@@ -97,6 +111,20 @@ async function routeRequest(runtime: ReturnType<typeof createShowRuntime>, reque
     }
 
     if (appPath.startsWith("/__show/events")) {
+      if (request.method === "GET") {
+        if (parsed.query.stream === "1") {
+          const stream = eventStreams.subscribe(sessionId, response)
+          sendEventStream(response)
+          stream.replay(runtime.listSessionEvents(sessionId))
+          return
+        }
+        sendJson(response, 200, { events: runtime.listSessionEvents(sessionId) })
+        return
+      }
+      if (request.method !== "POST") {
+        sendJson(response, 405, { error: "Method not allowed" })
+        return
+      }
       if (!session.vite) {
         sendJson(response, 503, { error: "Session not ready", status })
         return
@@ -106,7 +134,9 @@ async function routeRequest(runtime: ReturnType<typeof createShowRuntime>, reque
         sendJson(response, 400, { error: "Unsupported event type" })
         return
       }
-      sendJson(response, 201, { ok: true, event: runtime.recordAgentMark(sessionId, payload.mark, payload.anchor) })
+      const event = runtime.recordAgentMark(sessionId, payload.mark, payload.anchor)
+      eventStreams.publish(sessionId, event)
+      sendJson(response, 201, { ok: true, event })
       return
     }
 
@@ -159,6 +189,52 @@ type ShowEventRequest = {
   anchor?: MarkAnchor
 }
 
+class ShowEventStreamBroker {
+  private readonly subscribers = new Map<string, Set<(event: ShowEvent) => void>>()
+
+  subscribe(sessionId: string, response: ServerResponse) {
+    const seenIds = new Set<string>()
+    const subscribers = this.subscribers.get(sessionId) ?? new Set<(event: ShowEvent) => void>()
+    this.subscribers.set(sessionId, subscribers)
+
+    const write = (event: ShowEvent) => {
+      const eventId = typeof event.id === "string" ? event.id : undefined
+      if (eventId && seenIds.has(eventId)) {
+        return
+      }
+      if (eventId) {
+        seenIds.add(eventId)
+      }
+      response.write(showEventSseFrame(event))
+    }
+    subscribers.add(write)
+
+    const unsubscribe = () => {
+      subscribers.delete(write)
+      if (subscribers.size === 0) {
+        this.subscribers.delete(sessionId)
+      }
+    }
+    response.on("close", unsubscribe)
+    response.on("error", unsubscribe)
+
+    return {
+      replay(events: ShowEvent[]) {
+        for (const event of events) {
+          write(event)
+        }
+      },
+      unsubscribe
+    }
+  }
+
+  publish(sessionId: string, event: ShowEvent) {
+    for (const write of this.subscribers.get(sessionId) ?? []) {
+      write(event)
+    }
+  }
+}
+
 async function readJson<T>(request: IncomingMessage) {
   const chunks: Buffer[] = []
   for await (const chunk of request) {
@@ -180,4 +256,17 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown) {
   response.statusCode = statusCode
   response.setHeader("content-type", "application/json")
   response.end(JSON.stringify(body))
+}
+
+function sendEventStream(response: ServerResponse) {
+  response.statusCode = 200
+  response.setHeader("content-type", "text/event-stream")
+  response.setHeader("cache-control", "no-cache")
+  response.setHeader("connection", "keep-alive")
+  response.setHeader("x-accel-buffering", "no")
+  response.write(": show events connected\n\n")
+}
+
+function showEventSseFrame(event: ShowEvent) {
+  return `event: show.event\ndata: ${JSON.stringify(event)}\n\n`
 }

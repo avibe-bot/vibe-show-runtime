@@ -82,6 +82,7 @@ export type VibeHandler = (request: Request, context: VibeContext) => Response |
 export type ShowClientOptions = {
   basePath?: string
   eventsPath?: string
+  streamPath?: string
   fetch?: typeof fetch
 }
 
@@ -153,9 +154,12 @@ export function showEventsUrl(options: ShowClientOptions = {}) {
   return eventsUrl(options)
 }
 
+export function showEventsStreamUrl(options: ShowClientOptions = {}) {
+  return streamUrl(options)
+}
+
 export function subscribeShowEvents(options: ShowClientOptions & { afterId?: string } = {}) {
-  const url = new URL(eventsUrl(options), globalThis.location?.href ?? "http://127.0.0.1/")
-  url.searchParams.set("stream", "1")
+  const url = new URL(streamUrl(options), globalThis.location?.href ?? "http://127.0.0.1/")
   if (options.afterId) {
     url.searchParams.set("after_id", options.afterId)
   }
@@ -218,14 +222,28 @@ function eventsUrl(options: ShowClientOptions) {
   return joinPath(basePath, path)
 }
 
+function streamUrl(options: ShowClientOptions) {
+  const runtime = readRuntimeConfig()
+  const basePath = options.basePath ?? runtime.basePath ?? "./"
+  const streamPath = options.streamPath ?? runtime.streamPath
+  if (streamPath) {
+    return joinPath(basePath, streamPath)
+  }
+  const url = new URL(eventsUrl(options), globalThis.location?.href ?? "http://127.0.0.1/")
+  url.searchParams.set("stream", "1")
+  return url.toString()
+}
+
 function readSessionId() {
   return readRuntimeConfig().sessionId ?? readSessionIdFromLocation()
 }
 
 function joinPath(basePath: string, path: string) {
+  if (path.startsWith("/") || /^[a-z][a-z\d+.-]*:/i.test(path)) {
+    return path
+  }
   const base = basePath.endsWith("/") ? basePath : `${basePath}/`
-  const suffix = path.startsWith("/") ? path.slice(1) : path
-  return `${base}${suffix}`
+  return `${base}${path}`
 }
 
 function readSessionIdFromLocation() {
