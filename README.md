@@ -45,6 +45,40 @@ import { Button } from "@avibe/show-ui/button"
 import { ThemeProvider } from "@avibe/show-ui/theme"
 ```
 
+## Interaction SDK
+
+`@avibe/show-sdk` owns the shared interaction contract between Show Pages,
+Vibe Remote, and agents. It includes typed Show events, mark attributes,
+anchor collection/resolution helpers, browser submit clients, and React
+components for live annotation.
+
+```tsx
+import { ShowSessionProvider, AnnotationOverlay, ShowAgentMark, ChoiceGroup } from "@avibe/show-sdk/react"
+
+export default function App() {
+  return (
+    <ShowSessionProvider>
+      <ShowAgentMark id="summary">
+        <section>Quarterly summary</section>
+      </ShowAgentMark>
+      <ChoiceGroup
+        intent="choose"
+        options={[
+          { label: "Approve", value: "approved" },
+          { label: "Revise", value: "revise" }
+        ]}
+      />
+      <AnnotationOverlay defaultEnabled />
+    </ShowSessionProvider>
+  )
+}
+```
+
+Supported event families include `human.intent.submitted`,
+`human.annotation.*`, `assistant.mark.*`, `assistant.page.updated`, and
+`system.runtime.*`. Private Show Pages submit to `__show/events`; the runtime
+also exposes the same endpoint as an SSE stream for replay and live updates.
+
 ## Theme Customization
 
 `@avibe/show-ui` uses CSS-variable-backed tokens. Agents can use presets or
@@ -99,6 +133,9 @@ Local API:
 GET  /health
 POST /sessions/:sessionId/ensure
 GET  /sessions/:sessionId/status
+GET  /sessions/:sessionId/events
+POST /sessions/:sessionId/events
+GET  /sessions/:sessionId/messages
 POST /sessions/:sessionId/suspend
 ANY  /sessions/:sessionId/app/*
 ```

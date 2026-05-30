@@ -4,7 +4,14 @@ import { fileURLToPath } from "node:url"
 import react from "@vitejs/plugin-react"
 import { createServer as createViteServer } from "vite"
 import type { InlineConfig } from "vite"
-import { formatAgentMarkMessage, normalizeAgentMark, type AgentMark, type MarkAnchor, type ShowEvent } from "@avibe/show-sdk"
+import {
+  formatShowEventMessage,
+  normalizeShowEvent,
+  type AgentMark,
+  type MarkAnchor,
+  type ShowEvent,
+  type ShowEventInput
+} from "@avibe/show-sdk"
 import type { ShowRuntime, ShowRuntimeOptions, ShowSession, ShowSessionStatus } from "./types.js"
 import { createShadcnAlias } from "./aliases.js"
 import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
@@ -116,32 +123,9 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     getSession: (sessionId: string) => sessions.get(sessionId),
     suspendSession,
     recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor) {
-      const session = getOrCreateSession(sessionId)
-      const normalizedMark = normalizeAgentMark(mark)
-      const content = formatAgentMarkMessage(normalizedMark, anchor)
-      const event: ShowEvent = {
-        id: normalizedMark.id,
-        type: "assistant.mark.created",
-        sessionId,
-        mark: normalizedMark,
-        anchor,
-        message: {
-          role: "assistant",
-          content
-        },
-        createdAt: normalizedMark.createdAt
-      }
-      session.events.push(event)
-      session.messages.push({
-        id: normalizedMark.id,
-        role: "assistant",
-        content,
-        createdAt: normalizedMark.createdAt,
-        eventId: normalizedMark.id
-      })
-      session.updatedAt = new Date()
-      return event
+      return recordShowEvent(sessionId, { type: "assistant.mark.created", mark, anchor })
     },
+    recordShowEvent,
     listSessionEvents(sessionId: string) {
       return [...getOrCreateSession(sessionId).events]
     },
@@ -150,6 +134,30 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     },
     close
   }
+
+  function recordShowEvent(sessionId: string, payload: ShowEventInput | ShowEvent) {
+    const session = getOrCreateSession(sessionId)
+    const event = normalizeShowEvent(payload, sessionId)
+    const content = formatShowEventMessage(event)
+    session.events.push(event)
+    if (content) {
+      session.messages.push({
+        id: `${event.id}:message`,
+        role: messageRoleForEvent(event),
+        content,
+        createdAt: event.createdAt,
+        eventId: event.id
+      })
+    }
+    session.updatedAt = new Date()
+    return event
+  }
+}
+
+function messageRoleForEvent(event: ShowEvent): "assistant" | "user" | "system" {
+  if (event.type.startsWith("assistant.")) return "assistant"
+  if (event.type.startsWith("human.")) return "user"
+  return "system"
 }
 
 function normalizeBasePath(basePath: string | undefined, sessionId: string) {

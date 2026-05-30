@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { parse } from "node:url"
 import type { AddressInfo } from "node:net"
-import type { AgentMark, MarkAnchor, ShowEvent } from "@avibe/show-sdk"
+import { isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type ShowEventInput } from "@avibe/show-sdk"
 import type { ShowRuntimeOptions } from "./types.js"
 import { createShowRuntime } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
@@ -77,13 +77,13 @@ async function routeRequest(
     }
     if (request.method === "POST") {
       const payload = await readJson<ShowEventRequest>(request)
-      if (payload.type !== "assistant.mark.created") {
-        sendJson(response, 400, { error: "Unsupported event type" })
+      const event = recordShowEvent(runtime, sessionId, payload)
+      if (!event.ok) {
+        sendJson(response, event.status, { error: event.error })
         return
       }
-      const event = runtime.recordAgentMark(sessionId, payload.mark, payload.anchor)
-      eventStreams.publish(sessionId, event)
-      sendJson(response, 201, { ok: true, event })
+      eventStreams.publish(sessionId, event.value)
+      sendJson(response, 201, { ok: true, event: event.value })
       return
     }
   }
@@ -131,13 +131,13 @@ async function routeRequest(
         return
       }
       const payload = await readJson<ShowEventRequest>(request)
-      if (payload.type !== "assistant.mark.created") {
-        sendJson(response, 400, { error: "Unsupported event type" })
+      const event = recordShowEvent(runtime, sessionId, payload)
+      if (!event.ok) {
+        sendJson(response, event.status, { error: event.error })
         return
       }
-      const event = runtime.recordAgentMark(sessionId, payload.mark, payload.anchor)
-      eventStreams.publish(sessionId, event)
-      sendJson(response, 201, { ok: true, event })
+      eventStreams.publish(sessionId, event.value)
+      sendJson(response, 201, { ok: true, event: event.value })
       return
     }
 
@@ -188,6 +188,24 @@ type ShowEventRequest = {
   type?: string
   mark: AgentMark
   anchor?: MarkAnchor
+} | ShowEventInput
+
+type RecordShowEventResult =
+  | { ok: true; value: ShowEvent }
+  | { ok: false; status: number; error: string }
+
+function recordShowEvent(runtime: ReturnType<typeof createShowRuntime>, sessionId: string, payload: ShowEventRequest): RecordShowEventResult {
+  if (!payload.type && "mark" in payload && payload.mark) {
+    return { ok: true, value: runtime.recordAgentMark(sessionId, payload.mark, payload.anchor) }
+  }
+  if (!isShowEventType(payload.type)) {
+    return { ok: false, status: 400, error: "Unsupported event type" }
+  }
+  try {
+    return { ok: true, value: runtime.recordShowEvent(sessionId, payload as ShowEventInput) }
+  } catch (error) {
+    return { ok: false, status: 400, error: error instanceof Error ? error.message : "Invalid show event payload" }
+  }
 }
 
 class ShowEventStreamBroker {
