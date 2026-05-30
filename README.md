@@ -119,3 +119,13 @@ for integration work: it can create session workspaces, serve React through
 Vite middleware, resolve shadcn aliases to `@avibe/show-ui`, and dispatch
 basic method-based handlers. HMR proxying, LRU eviction, stronger isolation,
 and Vibe Remote integration are still in progress.
+
+## Design Docs
+
+- [Runtime plan](docs/plan.md) covers the sidecar, Vite, package, and handler
+  execution model.
+- [Agent OS interaction design](docs/agent-os-interaction.md) covers the
+  Show Page, interaction SDK, annotation, mark, session event, and Agentation
+  reference model.
+- [Agent OS implementation plan](docs/agent-os-implementation-plan.md) breaks
+  the design into repo-scoped milestones, PR order, and acceptance criteria.

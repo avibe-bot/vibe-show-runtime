@@ -1,5 +1,6 @@
 import type { Server } from "node:http"
 import type { ViteDevServer } from "vite"
+import type { AgentMark, MarkAnchor, ShowEvent } from "@avibe/show-sdk"
 
 export type ShowRuntimeOptions = {
   workspaceRoot: string
@@ -19,6 +20,8 @@ export type ShowSessionStatus = {
   workspace: string
   updatedAt: string
   lastAccessedAt?: string
+  eventCount: number
+  messageCount: number
 }
 
 export type ShowSession = {
@@ -30,6 +33,8 @@ export type ShowSession = {
   lastAccessedAt?: Date
   vite?: ViteDevServer
   warming?: Promise<ShowSession>
+  events: ShowEvent[]
+  messages: ShowMessage[]
 }
 
 export type ShowRuntime = {
@@ -37,5 +42,16 @@ export type ShowRuntime = {
   getSessionStatus(sessionId: string): ShowSessionStatus
   getSession(sessionId: string): ShowSession | undefined
   suspendSession(sessionId: string): Promise<ShowSessionStatus>
+  recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor): ShowEvent
+  listSessionEvents(sessionId: string): ShowEvent[]
+  listSessionMessages(sessionId: string): ShowMessage[]
   close(): Promise<void>
+}
+
+export type ShowMessage = {
+  id: string
+  role: "assistant"
+  content: string
+  createdAt: string
+  eventId: string
 }

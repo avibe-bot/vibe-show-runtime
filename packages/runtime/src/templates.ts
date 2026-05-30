@@ -5,6 +5,7 @@ export async function ensureSessionTemplate(workspace: string) {
   await mkdir(join(workspace, "src"), { recursive: true })
   await mkdir(join(workspace, "api"), { recursive: true })
   await writeIfMissing(join(workspace, "index.html"), indexHtml())
+  await writeIfMissing(join(workspace, "src", "show-runtime-config.ts"), showRuntimeConfigTs())
   await writeIfMissing(join(workspace, "src", "main.tsx"), mainTsx())
   await writeIfMissing(join(workspace, "src", "App.tsx"), appTsx())
   await writeIfMissing(join(workspace, "src", "styles.css"), stylesCss())
@@ -170,6 +171,7 @@ function mainTsx() {
 import { createRoot } from "react-dom/client"
 import "@avibe/show-ui/styles.css"
 import "./styles.css"
+import "./show-runtime-config"
 import App from "./App"
 
 createRoot(document.getElementById("root")!).render(
@@ -177,6 +179,29 @@ createRoot(document.getElementById("root")!).render(
     <App />
   </React.StrictMode>
 )
+`
+}
+
+function showRuntimeConfigTs() {
+  return `import type { RuntimeConfig } from "@avibe/show-sdk"
+
+function showBasePath() {
+  return window.location.pathname.match(/^\\/(?:show|p)\\/[^/]+\\//)?.[0] || window.location.pathname.replace(/[^/]*$/, "")
+}
+
+function showSessionId() {
+  const match = window.location.pathname.match(/\\/show\\/([^/]+)/)
+  return match ? decodeURIComponent(match[1]) : undefined
+}
+
+const injected = globalThis.__AVIBE_SHOW__ ?? {}
+
+globalThis.__AVIBE_SHOW__ = {
+  sessionId: injected.sessionId ?? showSessionId(),
+  basePath: injected.basePath ?? showBasePath(),
+  eventsPath: injected.eventsPath ?? "__show/events",
+  streamPath: injected.streamPath ?? "__show/events?stream=1"
+} satisfies RuntimeConfig
 `
 }
 

@@ -23,6 +23,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@avibe/show-sdk": "0.0.0",
     "@avibe/show-ui": "0.0.0",
     "@vitejs/plugin-react": "^5.1.1",
     "vite": "^7.2.4"
