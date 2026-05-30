@@ -313,7 +313,7 @@ export function useMarkRegistry(scope?: string) {
     const anchors = new Map<string, ShowAnchor>()
     if (typeof document === "undefined") return anchors
     const elements = scope
-      ? Array.from(document.querySelectorAll(`[${markAttributeName(scope)}]`))
+      ? Array.from(document.querySelectorAll(markAttributeSelector(scope)))
       : Array.from(document.querySelectorAll("*")).filter((element) =>
           Array.from(element.attributes).some((attr) => attr.name.startsWith("mark-"))
         )
@@ -450,6 +450,7 @@ export function IntentForm({ scope, component = "form", intent = "submit", field
 export function ChoiceGroup({ scope, component = "choice-group", intent = "choose", name = "choice", options, anchor, onSubmitted, ...clientOptions }: ChoiceGroupProps) {
   const context = React.useContext(ShowSessionContext)
   const [submitting, setSubmitting] = React.useState<string | null>(null)
+  const [error, setError] = React.useState<string | null>(null)
 
   async function choose(option: ChoiceGroupOption) {
     const payload: HumanIntentPayload = {
@@ -462,9 +463,12 @@ export function ChoiceGroup({ scope, component = "choice-group", intent = "choos
       dispatch: true
     }
     setSubmitting(option.value)
+    setError(null)
     try {
       const result = context ? await context.submitIntent(payload, { ...clientOptions, anchor }) : await submitIntent(payload, { ...clientOptions, anchor })
       onSubmitted?.(payload, result)
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to submit")
     } finally {
       setSubmitting(null)
     }
@@ -478,6 +482,7 @@ export function ChoiceGroup({ scope, component = "choice-group", intent = "choos
           {option.description ? <span>{option.description}</span> : null}
         </button>
       ))}
+      {error ? <p role="alert" style={errorStyle}>{error}</p> : null}
     </div>
   )
 }
@@ -857,6 +862,14 @@ function normalizeVisualRect(rect: MarkAnchorRect): MarkAnchorRect {
   const x = Math.min(rect.x, rect.x + rect.width)
   const y = Math.min(rect.y, rect.y + rect.height)
   return { x, y, width: Math.abs(rect.width), height: Math.abs(rect.height) }
+}
+
+function markAttributeSelector(scope: string) {
+  return `[${cssEscape(markAttributeName(scope))}]`
+}
+
+function cssEscape(value: string) {
+  return globalThis.CSS?.escape ? globalThis.CSS.escape(value) : value.replace(/[^a-zA-Z0-9_-]/g, "\\$&")
 }
 
 function agentMarkLabel(event: ShowEvent) {
