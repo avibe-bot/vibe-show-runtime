@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process"
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -12,6 +12,12 @@ const archivePath = join(outDir, `vibe-show-runtime-node-${platform}.tgz`)
 
 const packages = ["runtime", "ui", "sdk"]
 const isWindows = process.platform === "win32"
+const rootPackage = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"))
+const nodeEngine = rootPackage.engines?.node
+
+if (!nodeEngine) {
+  throw new Error("Missing root package engines.node")
+}
 
 try {
   mkdirSync(join(stage, "packages"), { recursive: true })
@@ -33,6 +39,9 @@ try {
       {
         private: true,
         type: "module",
+        engines: {
+          node: nodeEngine
+        },
         dependencies: {
           "@avibe/show-runtime": "file:./packages/runtime",
           "@avibe/show-ui": "file:./packages/ui",
