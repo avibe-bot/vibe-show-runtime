@@ -94,6 +94,38 @@ const hmrClientCode = hmrPlugin.load?.("\0virtual:avibe-show-hmr-transition-clie
 if (typeof hmrClientCode !== "string") {
   throw new Error("Expected HMR transition plugin to return client code")
 }
+const hmrIndexHtml = hmrPlugin.transformIndexHtml?.('<div id="root"></div><script type="module" src="/src/main.tsx"></script>')
+const hmrIndexHtmlWithRootAttributes = hmrPlugin.transformIndexHtml?.('<div class="app" id="root"\n  data-app="show"></div><script type="module" src="/src/main.tsx"></script>')
+const hmrLegacyAvsFallbackHtml = hmrPlugin.transformIndexHtml?.('<div id="root"></div><main class="avs-fallback">Legacy fallback</main><script type="module" src="/src/main.tsx"></script>')
+const hmrStyleTag = !Array.isArray(hmrIndexHtml) && typeof hmrIndexHtml === "object"
+  ? hmrIndexHtml.tags.find((tag) => tag.tag === "style")
+  : undefined
+if (
+  Array.isArray(hmrIndexHtml) ||
+  typeof hmrIndexHtml !== "object" ||
+  !hmrIndexHtml.html.includes("avs-fallback-shell") ||
+  !hmrIndexHtml.html.includes("Ready to visualize") ||
+  !hmrStyleTag?.children?.includes("Loading Show Page") ||
+  !hmrStyleTag.children.includes(".avs-fallback") ||
+  hmrStyleTag.children.includes(".fallback-shell") ||
+  !hmrStyleTag.children.includes("avs-show-fallback-recovery-in 0.22s ease 5s forwards")
+) {
+  throw new Error("Expected runtime HTML transform to inject and delay the fallback recovery screen")
+}
+if (
+  Array.isArray(hmrIndexHtmlWithRootAttributes) ||
+  typeof hmrIndexHtmlWithRootAttributes !== "object" ||
+  !hmrIndexHtmlWithRootAttributes.html.includes("avs-fallback-shell")
+) {
+  throw new Error("Expected runtime HTML transform to inject fallback recovery after root elements with attributes")
+}
+if (
+  Array.isArray(hmrLegacyAvsFallbackHtml) ||
+  typeof hmrLegacyAvsFallbackHtml !== "object" ||
+  hmrLegacyAvsFallbackHtml.html.includes("avs-fallback-shell")
+) {
+  throw new Error("Expected runtime HTML transform to preserve legacy avs fallback markup without duplicate injection")
+}
 vm.runInNewContext(
   hmrClientCode.replace("const hot = import.meta.hot;", "const hot = undefined;"),
   {
@@ -130,8 +162,15 @@ try {
   if (!app.includes("Vibe Show")) {
     throw new Error("Expected app HTML to include Vibe Show")
   }
+  if (!app.includes("Loading Show Page") || !app.includes("Ready to visualize") || !app.includes("avs-show-fallback-recovery-in 0.22s ease 5s forwards")) {
+    throw new Error("Expected app HTML to include runtime-injected delayed fallback recovery UI")
+  }
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
     throw new Error("Expected app HTML asset URLs to stay under /show/<session>/")
+  }
+  const generatedIndex = await readFile(join(root, "smoke", "index.html"), "utf8")
+  if (generatedIndex.includes("Ready to visualize") || generatedIndex.includes("Loading Show Page") || generatedIndex.includes("avs-fallback-shell")) {
+    throw new Error("Expected generated index.html to stay a clean app shell")
   }
   const generatedMain = await readFile(join(root, "smoke", "src", "main.tsx"), "utf8")
   if (!generatedMain.includes('import "./show-runtime-config"') || generatedMain.indexOf('import "./show-runtime-config"') > generatedMain.indexOf('import App from "./App"')) {
