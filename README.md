@@ -45,34 +45,41 @@ import { Button } from "@avibe/show-ui/button"
 import { ThemeProvider } from "@avibe/show-ui/theme"
 ```
 
-## Interaction SDK
+## Show Page Interaction Model
 
 `@avibe/show-sdk` owns the shared interaction contract between Show Pages,
 Vibe Remote, and agents. It includes typed Show events, mark attributes,
-anchor collection/resolution helpers, browser submit clients, and React
-components for live annotation.
+anchor collection/resolution helpers, browser submit clients, and low-level
+React primitives for product integrations.
+
+Agent-authored pages should stay normal Show Pages. Agents should add stable
+`mark-*` anchors to content that users or agents may need to reference, and use
+ordinary page controls when the question or workflow is already structured.
 
 ```tsx
-import { ShowSessionProvider, AnnotationOverlay, ShowAgentMark, ChoiceGroup } from "@avibe/show-sdk/react"
-
 export default function App() {
   return (
-    <ShowSessionProvider>
-      <ShowAgentMark id="summary">
-        <section>Quarterly summary</section>
-      </ShowAgentMark>
-      <ChoiceGroup
-        intent="choose"
-        options={[
-          { label: "Approve", value: "approved" },
-          { label: "Revise", value: "revise" }
-        ]}
-      />
-      <AnnotationOverlay defaultEnabled />
-    </ShowSessionProvider>
+    <main>
+      <section mark-default="summary.conclusion">
+        Quarterly conclusion
+      </section>
+
+      <form>
+        <button name="decision" value="approve">Approve</button>
+        <button name="decision" value="revise">Revise</button>
+      </form>
+    </main>
   )
 }
 ```
+
+The target product model is for the Vibe Remote Web UI shell around Show
+Runtime to mount the live interaction layer, rather than asking every
+agent-authored page to hand-wire it. That layer turns structured controls,
+selections, area comments, annotations, and agent marks into the same session
+event pipeline. The React exports under
+`@avibe/show-sdk/react` are implementation primitives and escape hatches for
+product code, not the default authoring style for agents.
 
 Supported event families include `human.intent.submitted`,
 `human.annotation.*`, `assistant.mark.*`, `assistant.page.updated`, and
