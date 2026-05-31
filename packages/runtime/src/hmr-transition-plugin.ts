@@ -1,4 +1,5 @@
 import type { Plugin } from "vite"
+import { fallbackRecoveryCss, injectFallbackRecovery } from "./fallback-recovery.js"
 
 const clientModuleId = "virtual:avibe-show-hmr-transition-client"
 const resolvedClientModuleId = `\0${clientModuleId}`
@@ -15,11 +16,13 @@ export function showHmrTransitionPlugin(): Plugin {
       if (id === resolvedClientModuleId) return hmrTransitionScript()
       return null
     },
-    transformIndexHtml() {
-      return [
+    transformIndexHtml(html) {
+      return {
+        html: injectFallbackRecovery(html),
+        tags: [
         {
           tag: "style",
-          children: hmrTransitionCss(),
+          children: `${fallbackRecoveryCss()}\n${hmrTransitionCss()}`,
           injectTo: "head"
         },
         {
@@ -30,7 +33,8 @@ export function showHmrTransitionPlugin(): Plugin {
           },
           injectTo: "head"
         }
-      ]
+        ]
+      }
     }
   }
 }
