@@ -1,6 +1,8 @@
 import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import vm from "node:vm"
+import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
 import {
   assistantMarkEvent,
@@ -86,6 +88,22 @@ const pageUpdateMessage = formatShowEventMessage(normalizeShowEvent({
 if (pageUpdateMessage !== "Page custom transcript.") {
   throw new Error(`Expected page updates to preserve supplied transcript message, got ${pageUpdateMessage}`)
 }
+
+const hmrPlugin = showHmrTransitionPlugin()
+const hmrClientCode = hmrPlugin.load?.("\0virtual:avibe-show-hmr-transition-client")
+if (typeof hmrClientCode !== "string") {
+  throw new Error("Expected HMR transition plugin to return client code")
+}
+vm.runInNewContext(
+  hmrClientCode.replace("const hot = import.meta.hot;", "const hot = undefined;"),
+  {
+    URLSearchParams,
+    window: undefined,
+    document: undefined,
+    setTimeout,
+    clearTimeout
+  }
+)
 
 const root = await mkdtemp(join(tmpdir(), "avibe-show-runtime-"))
 const runtime = await startShowRuntimeServer({ workspaceRoot: root })
