@@ -74,12 +74,16 @@ html.avs-hmr-debug.avs-hmr-updated body {
 function hmrTransitionScript() {
   return `
 const hot = import.meta.hot;
+let overlayTimer;
+const debugEnabled =
+  typeof window !== "undefined" &&
+  (new URLSearchParams(window.location.search).has("avibe_hmr_debug") ||
+    window.localStorage.getItem("avibe:hmr-debug") === "1");
+
 if (hot && typeof window !== "undefined" && typeof document !== "undefined" && !window.__avibeShowHmrTransitionsInstalled) {
   window.__avibeShowHmrTransitionsInstalled = true;
   let beforeTimer;
   let afterTimer;
-  let overlayTimer;
-  const debugEnabled = new URLSearchParams(window.location.search).has("avibe_hmr_debug") || window.localStorage.getItem("avibe:hmr-debug") === "1";
   if (debugEnabled) document.documentElement.classList.add("avs-hmr-debug");
 
   showDebug("HMR ready");
