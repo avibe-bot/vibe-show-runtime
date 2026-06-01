@@ -139,6 +139,25 @@ Recommended subpath exports:
 The root export should stay usable outside React. React-specific code belongs
 under `@avibe/show-sdk/react`.
 
+### Agent-Facing Authoring Model
+
+Agents should not be asked to manually assemble the live collaboration layer on
+every page. The default authoring model is:
+
+- build a normal Show Page with HTML, React, and `@avibe/show-ui` primitives
+- add stable `mark-*` anchors to content that may need feedback or reverse
+  marks
+- use ordinary page controls for structured questions, choices, forms, and
+  actions
+- let the Vibe Remote Web UI shell around Show Runtime mount the interaction
+  layer that captures annotations, submits intents, listens to SSE, and renders
+  assistant marks
+
+The React exports under `@avibe/show-sdk/react` are product primitives and
+escape hatches. They are useful for building the injected interaction layer,
+custom host shells, tests, and unusual pages, but they should not be presented
+as the recommended baseline for agent-authored Show Pages.
+
 ## Event Pipeline
 
 The unifying abstraction is a session event, not a chat message and not an
@@ -358,8 +377,11 @@ type AnchorResolution = {
 
 ## SDK Components
 
-The SDK should provide headless interaction primitives first. Visual styling
-should come from `@avibe/show-ui`.
+The SDK should provide headless interaction primitives for the product runtime
+and advanced integrations. Visual styling should come from `@avibe/show-ui`.
+These primitives are not the primary user-facing authoring contract for agents;
+the primary contract is stable page markup, `mark-*` anchors, structured
+controls, and the session event pipeline.
 
 Core providers and hooks:
 

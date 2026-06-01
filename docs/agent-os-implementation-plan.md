@@ -6,7 +6,8 @@ Implementation plan derived from `docs/agent-os-interaction.md`.
 
 This plan is intentionally split into small mergeable slices. The goal is to
 land the durable protocol and session event pipeline first, then add UI
-capabilities in layers. Do not begin with a large annotation toolbar.
+capabilities in layers. Do not begin with a large annotation toolbar, and do
+not make every agent-authored page hand-wire the interaction layer.
 
 ## Repositories
 
@@ -281,6 +282,16 @@ Vibe Remote behavior:
 - Optionally dispatch selected intent events to the agent.
 - Show history projection for meaningful form submissions.
 
+Boundary:
+
+- These React components are SDK primitives, not the default Agent-facing
+  authoring style.
+- The recommended Agent-facing style is ordinary Show Page UI plus a stable
+  session-event convention for forms and controls.
+- A later Vibe Remote Web UI shell around Show Runtime should be able to
+  recognize or wrap common controls so agents are not required to import SDK
+  components for simple choices, approvals, and forms.
+
 Validation:
 
 - SDK component tests.
@@ -323,6 +334,9 @@ Interaction rules:
 - Annotation mode has a visible on/off state.
 - Overlay clicks must not trigger page controls underneath.
 - Popover focus must not be stolen by host page focus traps.
+- The overlay is mounted by the Vibe Remote Web UI shell around Show Runtime by
+  default. Agent-authored pages should only need stable `mark-*` anchors unless
+  they are intentionally building a custom interaction host.
 
 Validation:
 
