@@ -153,6 +153,8 @@ export type ScreenshotAnnotationPayload = {
   height: number
   capturedRegion: MarkAnchorRect
   viewport?: AnchorViewport
+  captured?: boolean
+  captureError?: string
   dataUrl?: string
   items: ScreenshotAnnotationItem[]
 }
@@ -350,6 +352,8 @@ export type ScreenshotCaptureResult = {
   height: number
   capturedRegion: MarkAnchorRect
   viewport?: AnchorViewport
+  captured: boolean
+  captureError?: string
   dataUrl?: string
 }
 
@@ -918,15 +922,95 @@ export async function captureScreenshotRegion(region: MarkAnchorRect): Promise<S
   const capturedRegion = normalizeAnchorRect(region)
   const width = Math.max(1, Math.round(capturedRegion.width))
   const height = Math.max(1, Math.round(capturedRegion.height))
-  return {
+  const result: ScreenshotCaptureResult = {
     attachmentId: randomId("screenshot"),
     mimeType: "image/png",
     width,
     height,
     capturedRegion,
     viewport: viewport(),
-    dataUrl: await screenshotRegionPlaceholderDataUrl(width, height, capturedRegion)
+    captured: false
   }
+  try {
+    const dataUrl = await captureDisplayRegionDataUrl(capturedRegion, width, height)
+    return {
+      ...result,
+      captured: true,
+      dataUrl
+    }
+  } catch (error) {
+    return {
+      ...result,
+      captureError: error instanceof Error ? error.message : "Screenshot capture unavailable"
+    }
+  }
+}
+
+async function captureDisplayRegionDataUrl(region: MarkAnchorRect, width: number, height: number) {
+  const mediaDevices = globalThis.navigator?.mediaDevices as (MediaDevices & {
+    getDisplayMedia?: (constraints?: DisplayMediaStreamOptions) => Promise<MediaStream>
+  }) | undefined
+  if (!mediaDevices?.getDisplayMedia) {
+    throw new Error("Display capture is not available in this browser")
+  }
+  if (typeof document === "undefined") {
+    throw new Error("Display capture requires a browser document")
+  }
+  const stream = await mediaDevices.getDisplayMedia({ video: true, audio: false })
+  try {
+    const video = document.createElement("video")
+    video.muted = true
+    video.playsInline = true
+    video.srcObject = stream
+    await video.play()
+    await waitForVideoFrame(video)
+    const sourceWidth = video.videoWidth || width
+    const sourceHeight = video.videoHeight || height
+    const scaleX = sourceWidth / Math.max(1, window.innerWidth)
+    const scaleY = sourceHeight / Math.max(1, window.innerHeight)
+    const canvas = document.createElement("canvas")
+    canvas.width = width
+    canvas.height = height
+    const context = canvas.getContext("2d")
+    if (!context) {
+      throw new Error("Canvas capture context is unavailable")
+    }
+    context.drawImage(
+      video,
+      Math.round(region.x * scaleX),
+      Math.round(region.y * scaleY),
+      Math.round(region.width * scaleX),
+      Math.round(region.height * scaleY),
+      0,
+      0,
+      width,
+      height
+    )
+    return canvas.toDataURL("image/png")
+  } finally {
+    for (const track of stream.getTracks()) {
+      track.stop()
+    }
+  }
+}
+
+function waitForVideoFrame(video: HTMLVideoElement) {
+  return new Promise<void>((resolve, reject) => {
+    const timeout = window.setTimeout(() => reject(new Error("Display capture timed out")), 3000)
+    const done = () => {
+      window.clearTimeout(timeout)
+      resolve()
+    }
+    if (video.requestVideoFrameCallback) {
+      video.requestVideoFrameCallback(() => done())
+      return
+    }
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+      done()
+      return
+    }
+    video.addEventListener("loadeddata", done, { once: true })
+  })
 }
 
 export function screenshotPointFromViewport(point: { x: number; y: number }, capturedRegion: MarkAnchorRect) {
@@ -1128,24 +1212,6 @@ function rectIntersectionRatio(container: MarkAnchorRect, rect: MarkAnchorRect) 
 function isStructuralContainer(element: Element) {
   const tagName = element.tagName.toLowerCase()
   return ["html", "body", "head", "script", "style", "template", "noscript", "svg", "path"].includes(tagName)
-}
-
-async function screenshotRegionPlaceholderDataUrl(width: number, height: number, region: MarkAnchorRect) {
-  if (typeof document === "undefined") return undefined
-  const canvas = document.createElement("canvas")
-  canvas.width = width
-  canvas.height = height
-  const context = canvas.getContext("2d")
-  if (!context) return undefined
-  context.fillStyle = "#f8fafc"
-  context.fillRect(0, 0, width, height)
-  context.strokeStyle = "#2563eb"
-  context.lineWidth = 2
-  context.strokeRect(1, 1, Math.max(1, width - 2), Math.max(1, height - 2))
-  context.fillStyle = "#0f172a"
-  context.font = "12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif"
-  context.fillText(`Screenshot region ${Math.round(region.width)}x${Math.round(region.height)}`, 12, 24)
-  return canvas.toDataURL("image/png")
 }
 
 function targetToAnchor(target: string, scope: string): ShowAnchor | undefined {

@@ -631,17 +631,32 @@ export function AnnotationOverlay({
   const smartDragStartRef = React.useRef<{ x: number; y: number; allowArea: boolean } | null>(null)
   const suppressNextClickRef = React.useRef(false)
   const screenshotItemSequenceRef = React.useRef(0)
+  const activeRef = React.useRef(active)
+  const wasActiveRef = React.useRef(active)
+  activeRef.current = active
 
   React.useEffect(() => {
     dragRef.current = drag
   }, [drag])
 
   React.useEffect(() => {
-    if (active && mode === "idle") {
+    const wasActive = wasActiveRef.current
+    wasActiveRef.current = active
+    if (active && !wasActive && mode === "idle") {
       setMode(defaultMode)
     }
-    if (!active && mode !== "idle") {
+    if (!active && wasActive) {
       setMode("idle")
+      setDraft(null)
+      setScreenshotDraft(null)
+      screenshotItemSequenceRef.current = 0
+      setComment("")
+      setScreenshotComment("")
+      setDrag(null)
+      setHover(null)
+      setError(null)
+      smartDragStartRef.current = null
+      suppressNextClickRef.current = false
     }
   }, [active, defaultMode, mode])
 
@@ -809,7 +824,7 @@ export function AnnotationOverlay({
   }
 
   async function submitScreenshotDraft() {
-    if (!screenshotDraft?.capture || screenshotDraft.items.length === 0) return
+    if (!active || !screenshotDraft?.capture || screenshotDraft.items.length === 0) return
     const annotation = screenshotAnnotationFromDraft({
       scope,
       intent,
@@ -889,8 +904,16 @@ export function AnnotationOverlay({
     if (drag.purpose === "screenshot-region") {
       if (rect.width > 8 && rect.height > 8) {
         void captureScreenshotRegion(rect)
-          .then((capture) => setScreenshotDraft({ region: rect, capture, items: [] }))
-          .catch((captureError) => setError(captureError instanceof Error ? captureError.message : "Failed to capture screenshot region"))
+          .then((capture) => {
+            if (activeRef.current) {
+              setScreenshotDraft({ region: rect, capture, items: [] })
+            }
+          })
+          .catch((captureError) => {
+            if (activeRef.current) {
+              setError(captureError instanceof Error ? captureError.message : "Failed to capture screenshot region")
+            }
+          })
       }
       setDrag(null)
       return
@@ -921,7 +944,7 @@ export function AnnotationOverlay({
   }
 
   function addScreenshotComment() {
-    if (!screenshotDraft?.capture || !screenshotComment.trim()) return
+    if (!active || !screenshotDraft?.capture || !screenshotComment.trim()) return
     const label = ++screenshotItemSequenceRef.current
     const id = `shot_item_${label}`
     const capturedRegion = screenshotDraft.capture.capturedRegion
@@ -971,7 +994,7 @@ export function AnnotationOverlay({
         </div>
       ) : null}
       {hover && active && mode === "smart" && !draft ? <AnnotationMarker rect={hover.rect} tone="human" label={hover.label} /> : null}
-      {drag ? <AnnotationMarker rect={normalizeVisualRect(drag.rect)} tone="human" /> : null}
+      {active && drag ? <AnnotationMarker rect={normalizeVisualRect(drag.rect)} tone="human" /> : null}
       {active && mode === "screenshot" ? (
         <div
           data-show-annotation-capture=""
@@ -981,7 +1004,7 @@ export function AnnotationOverlay({
           onPointerUp={onCapturePointerUp}
         />
       ) : null}
-      {draft ? (
+      {active && draft ? (
         <>
           <AnnotationMarker rect={draft.rect} tone="human" label={draft.label} />
           <CommentPopover rect={draft.rect} onClose={() => setDraft(null)}>
@@ -1022,7 +1045,7 @@ export function AnnotationOverlay({
           </CommentPopover>
         </>
       ) : null}
-      {screenshotDraft ? (
+      {active && screenshotDraft ? (
         <>
           <AnnotationMarker rect={screenshotDraft.region} tone="assistant" label="Screenshot 1" />
           {screenshotDraft.items.map((item) =>
@@ -1032,8 +1055,8 @@ export function AnnotationOverlay({
               <AnnotationMarker key={item.id} rect={{ x: item.viewportPoint.x - 6, y: item.viewportPoint.y - 6, width: 12, height: 12 }} tone="assistant" label={String(item.label)} />
             ) : null
           )}
-          {screenshotDraft.pendingRect ? <AnnotationMarker rect={screenshotDraft.pendingRect} tone="human" label={String(screenshotDraft.items.length + 1)} /> : null}
-          {screenshotDraft.pendingPoint ? <AnnotationMarker rect={{ x: screenshotDraft.pendingPoint.x - 6, y: screenshotDraft.pendingPoint.y - 6, width: 12, height: 12 }} tone="human" label={String(screenshotDraft.items.length + 1)} /> : null}
+          {screenshotDraft.pendingRect ? <AnnotationMarker rect={screenshotDraft.pendingRect} tone="human" label={String(screenshotItemSequenceRef.current + 1)} /> : null}
+          {screenshotDraft.pendingPoint ? <AnnotationMarker rect={{ x: screenshotDraft.pendingPoint.x - 6, y: screenshotDraft.pendingPoint.y - 6, width: 12, height: 12 }} tone="human" label={String(screenshotItemSequenceRef.current + 1)} /> : null}
           <CommentPopover rect={screenshotDraft.pendingRect ?? pointRect(screenshotDraft.pendingPoint) ?? screenshotDraft.region} onClose={() => setScreenshotDraft(null)}>
             <div style={{ fontWeight: 600 }}>Screenshot 1</div>
             {screenshotDraft.capture?.dataUrl ? <img src={screenshotDraft.capture.dataUrl} alt="" style={screenshotPreviewStyle} /> : null}

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   areaAnnotation,
+  captureScreenshotRegion,
   classifyAreaSelection,
   collectElementsInArea,
   formatShowEventMessage,
@@ -100,6 +101,14 @@ describe("show annotation event contract", () => {
       width: 80,
       height: 40
     })
+  })
+
+  it("does not fake screenshot pixels when display capture is unavailable", async () => {
+    const capture = await captureScreenshotRegion({ x: 10, y: 20, width: 160, height: 90 })
+
+    expect(capture.captured).toBe(false)
+    expect(capture.dataUrl).toBeUndefined()
+    expect(capture.captureError).toMatch(/Display capture|browser document|Screenshot capture/)
   })
 
   it("formats one screenshot with multiple numbered comments as a single annotation", () => {
