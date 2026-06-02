@@ -618,7 +618,7 @@ export function AnnotationOverlay({
   const context = React.useContext(ShowSessionContext)
   const [internalEnabled, setInternalEnabled] = React.useState(defaultEnabled)
   const active = enabled ?? internalEnabled
-  const [mode, setMode] = React.useState<AnnotationOverlayMode>(defaultEnabled ? defaultMode : "idle")
+  const [mode, setMode] = React.useState<AnnotationOverlayMode>((enabled ?? defaultEnabled) ? defaultMode : "idle")
   const [hover, setHover] = React.useState<{ rect: MarkAnchorRect; label?: string } | null>(null)
   const [draft, setDraft] = React.useState<AnnotationDraft | null>(null)
   const [screenshotDraft, setScreenshotDraft] = React.useState<ScreenshotDraft | null>(null)
@@ -630,10 +630,20 @@ export function AnnotationOverlay({
   const dragRef = React.useRef(drag)
   const smartDragStartRef = React.useRef<{ x: number; y: number; allowArea: boolean } | null>(null)
   const suppressNextClickRef = React.useRef(false)
+  const screenshotItemSequenceRef = React.useRef(0)
 
   React.useEffect(() => {
     dragRef.current = drag
   }, [drag])
+
+  React.useEffect(() => {
+    if (active && mode === "idle") {
+      setMode(defaultMode)
+    }
+    if (!active && mode !== "idle") {
+      setMode("idle")
+    }
+  }, [active, defaultMode, mode])
 
   React.useEffect(() => {
     if (!active || mode !== "smart" || draft) {
@@ -805,7 +815,6 @@ export function AnnotationOverlay({
       intent,
       severity,
       status: "pending",
-      comment: screenshotDraft.items.map((item) => `${item.label}. ${item.comment}`).join("\n"),
       dispatch: true,
       screenshot: {
         ...screenshotDraft.capture,
@@ -817,6 +826,7 @@ export function AnnotationOverlay({
     try {
       const result = context ? await context.submitAnnotation(annotation) : await submitAnnotation(annotation)
       setScreenshotDraft(null)
+      screenshotItemSequenceRef.current = 0
       setScreenshotComment("")
       onSubmitted?.(annotation, result)
     } catch (submitError) {
@@ -830,6 +840,7 @@ export function AnnotationOverlay({
     setMode(nextMode)
     setDraft(null)
     setScreenshotDraft(null)
+    screenshotItemSequenceRef.current = 0
     setDrag(null)
     setHover(null)
     setError(null)
@@ -911,18 +922,19 @@ export function AnnotationOverlay({
 
   function addScreenshotComment() {
     if (!screenshotDraft?.capture || !screenshotComment.trim()) return
-    const label = screenshotDraft.items.length + 1
+    const label = ++screenshotItemSequenceRef.current
+    const id = `shot_item_${label}`
     const capturedRegion = screenshotDraft.capture.capturedRegion
     const item: ScreenshotCommentDraft = screenshotDraft.pendingRect
       ? {
-          id: `shot_item_${label}`,
+          id,
           label,
           comment: screenshotComment.trim(),
           rect: screenshotRectFromViewport(screenshotDraft.pendingRect, capturedRegion),
           viewportRect: screenshotDraft.pendingRect
         }
       : {
-          id: `shot_item_${label}`,
+          id,
           label,
           comment: screenshotComment.trim(),
           point: screenshotPointFromViewport(screenshotDraft.pendingPoint ?? centerPoint(screenshotDraft.region), capturedRegion),
