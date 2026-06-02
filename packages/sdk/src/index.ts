@@ -33,7 +33,7 @@ export const SHOW_EVENT_TYPES = [
   "system.runtime.error"
 ] as const satisfies readonly ShowEventType[]
 
-export type AnchorKind = "mark" | "element" | "text-range" | "area" | "group"
+export type AnchorKind = "mark" | "element" | "text-range" | "area" | "element-group" | "group" | "screenshot"
 
 export type MarkAnchorRect = {
   x: number
@@ -130,6 +130,31 @@ export type HumanIntentPayload = {
 export type ShowAnnotationIntent = "fix" | "change" | "question" | "approve" | "comment"
 export type ShowAnnotationSeverity = "blocking" | "important" | "suggestion"
 export type ShowAnnotationStatus = "pending" | "acknowledged" | "resolved" | "dismissed"
+export type ShowAnnotationPrimaryAnchor = "mark" | "element" | "text-range" | "element-group" | "area" | "screenshot"
+
+export type AreaSelectionClassification = {
+  confidence: number
+  reason: string
+  ambiguous?: boolean
+}
+
+export type ScreenshotAnnotationItem = {
+  id?: string
+  label: number
+  comment: string
+  point?: { x: number; y: number }
+  rect?: MarkAnchorRect
+}
+
+export type ScreenshotAnnotationPayload = {
+  attachmentId: string
+  mimeType: "image/png" | "image/webp"
+  width: number
+  height: number
+  capturedRegion: MarkAnchorRect
+  viewport?: AnchorViewport
+  items: ScreenshotAnnotationItem[]
+}
 
 export type ShowAnnotation = {
   id?: string
@@ -139,13 +164,27 @@ export type ShowAnnotation = {
   status?: ShowAnnotationStatus | string
   comment?: string
   text?: string
+  primaryAnchor?: ShowAnnotationPrimaryAnchor
   anchor?: ShowAnchor
+  anchors?: ShowAnchor[]
+  userRegion?: MarkAnchorRect
+  matchedElements?: ShowAnchor[]
+  classification?: AreaSelectionClassification
+  screenshot?: ScreenshotAnnotationPayload
   authorId?: string
   createdAt?: string
   updatedAt?: string
   resolvedAt?: string
   resolvedBy?: string
   [key: string]: unknown
+}
+
+export type AreaAnnotationInput = ShowAnnotation & {
+  primaryAnchor?: "area" | "element-group"
+}
+
+export type ScreenshotAnnotationInput = ShowAnnotation & {
+  screenshot: ScreenshotAnnotationPayload
 }
 
 export type AssistantMarkEvent = {
@@ -339,6 +378,32 @@ export async function submitAnnotation(annotation: ShowAnnotation, options: Anno
   return submitShowEvent(humanAnnotationEvent("human.annotation.created", annotation, options.anchor, options.sessionId), options)
 }
 
+export function areaAnnotation(annotation: AreaAnnotationInput): ShowAnnotation {
+  const primaryAnchor = annotation.primaryAnchor ?? (annotation.matchedElements?.length ? "element-group" : "area")
+  return {
+    ...annotation,
+    primaryAnchor,
+    anchor: annotation.anchor ?? annotation.anchors?.[0],
+    userRegion: annotation.userRegion ?? annotation.anchor?.rect,
+    matchedElements: annotation.matchedElements ?? (primaryAnchor === "element-group" ? annotation.anchors : undefined)
+  }
+}
+
+export function screenshotAnnotation(annotation: ScreenshotAnnotationInput): ShowAnnotation {
+  return {
+    ...annotation,
+    primaryAnchor: "screenshot",
+    screenshot: {
+      ...annotation.screenshot,
+      items: annotation.screenshot.items.map((item, index) => ({
+        ...item,
+        id: item.id || randomId("shot_item"),
+        label: item.label || index + 1
+      }))
+    }
+  }
+}
+
 export async function updateAnnotation(annotation: ShowAnnotation, options: AnnotationSubmitOptions = {}) {
   return submitShowEvent(humanAnnotationEvent("human.annotation.updated", annotation, options.anchor, options.sessionId), options)
 }
@@ -524,8 +589,9 @@ export function humanAnnotationEvent(
     ...annotation,
     id: annotation.id || randomId("annotation"),
     scope: normalizeScope(annotation.scope),
+    primaryAnchor: annotation.primaryAnchor ?? inferAnnotationPrimaryAnchor(annotation, anchor),
     status,
-    anchor: anchor ?? annotation.anchor,
+    anchor: anchor ?? annotation.anchor ?? annotation.anchors?.[0],
     createdAt,
     updatedAt: type === "human.annotation.created" ? annotation.updatedAt || createdAt : occurredAt,
     resolvedAt: type === "human.annotation.resolved" ? occurredAt : annotation.resolvedAt
@@ -596,10 +662,24 @@ export function formatHumanIntentMessage(payload: HumanIntentPayload, anchor?: S
 export function formatHumanAnnotationMessage(type: HumanAnnotationEvent["type"], annotation: ShowAnnotation, anchor?: ShowAnchor) {
   const scope = normalizeScope(annotation.scope)
   const action = type.split(".").at(-1) || "created"
+  const primaryAnchor = annotation.primaryAnchor ?? inferAnnotationPrimaryAnchor(annotation, anchor)
   const lines = [`[show-annotation:${scope}:${action}] ${annotation.intent || "comment"}`]
   const comment = (annotation.comment || annotation.text || "").trim()
   if (comment) {
     lines.push("", comment)
+  }
+  lines.push("", `Anchor kind: ${primaryAnchor}`)
+  if (annotation.screenshot?.items.length) {
+    lines.push("", `Screenshot: ${annotation.screenshot.attachmentId}`)
+    for (const item of annotation.screenshot.items) {
+      lines.push(`${item.label}. ${item.comment}`)
+    }
+  }
+  if (annotation.userRegion) {
+    lines.push("", `Region: ${formatRect(annotation.userRegion)}`)
+  }
+  if (annotation.matchedElements?.length) {
+    lines.push(`Matched elements: ${annotation.matchedElements.length}`)
   }
   const quote = anchor?.textQuote ?? anchor?.text
   if (quote) {
@@ -724,7 +804,7 @@ export function collectAreaAnchor(rect: MarkAnchorRect, options: CollectElementC
 }
 
 export function resolveAnchor(anchor: ShowAnchor, root?: ParentNode): AnchorResolveResult {
-  if (anchor.kind === "area" && anchor.rect) {
+  if ((anchor.kind === "area" || anchor.kind === "element-group" || anchor.kind === "group" || anchor.kind === "screenshot") && anchor.rect) {
     return { anchor, rect: anchor.rect, confidence: "area" }
   }
   const resolvedRoot = root ?? (typeof document !== "undefined" ? document : undefined)
@@ -837,6 +917,23 @@ function annotationFromPayload(event: ShowEventInput): ShowAnnotation {
     return payload as ShowAnnotation
   }
   return {}
+}
+
+function inferAnnotationPrimaryAnchor(annotation: ShowAnnotation, anchor?: ShowAnchor): ShowAnnotationPrimaryAnchor {
+  if (annotation.primaryAnchor) return annotation.primaryAnchor
+  if (annotation.screenshot) return "screenshot"
+  if (annotation.matchedElements?.length || annotation.anchors?.length) return "element-group"
+  const anchorKind = anchor?.kind ?? annotation.anchor?.kind
+  if (anchorKind === "group") return "element-group"
+  if (anchorKind === "mark" || anchorKind === "element" || anchorKind === "text-range" || anchorKind === "area" || anchorKind === "element-group" || anchorKind === "screenshot") {
+    return anchorKind
+  }
+  if (annotation.userRegion) return "area"
+  return "element"
+}
+
+function formatRect(rect: MarkAnchorRect) {
+  return `x:${Math.round(rect.x)}, y:${Math.round(rect.y)}, ${Math.round(rect.width)}x${Math.round(rect.height)}`
 }
 
 function targetToAnchor(target: string, scope: string): ShowAnchor | undefined {

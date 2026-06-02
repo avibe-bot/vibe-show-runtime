@@ -20,6 +20,7 @@
     "build": "npm run build -w @avibe/show-sdk && npm run build -w @avibe/show-ui && npm run build -w @avibe/show-runtime && npm run build -w @avibe/show-example-animation-showcase && npm run build -w @avibe/show-example-service-handler && npm run build -w @avibe/show-example-shadcn-alias",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
     "check": "npm run build && npm run typecheck",
     "bundle:vibe-remote": "node scripts/bundle-vibe-remote.mjs",
     "smoke": "node scripts/smoke-runtime.mjs"
