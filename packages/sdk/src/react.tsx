@@ -631,9 +631,12 @@ export function AnnotationOverlay({
   const smartDragStartRef = React.useRef<{ x: number; y: number; allowArea: boolean } | null>(null)
   const suppressNextClickRef = React.useRef(false)
   const screenshotItemSequenceRef = React.useRef(0)
+  const screenshotCaptureTokenRef = React.useRef(0)
   const activeRef = React.useRef(active)
+  const modeRef = React.useRef(mode)
   const wasActiveRef = React.useRef(active)
   activeRef.current = active
+  modeRef.current = mode
 
   React.useEffect(() => {
     dragRef.current = drag
@@ -648,13 +651,10 @@ export function AnnotationOverlay({
     if (!active && wasActive) {
       setMode("idle")
       setDraft(null)
-      setScreenshotDraft(null)
-      screenshotItemSequenceRef.current = 0
+      resetScreenshotState()
       setComment("")
-      setScreenshotComment("")
       setDrag(null)
       setHover(null)
-      setError(null)
       smartDragStartRef.current = null
       suppressNextClickRef.current = false
     }
@@ -785,7 +785,7 @@ export function AnnotationOverlay({
       if (event.key === "Escape") {
         setMode("idle")
         setDraft(null)
-        setScreenshotDraft(null)
+        resetScreenshotState()
         setDrag(null)
         setHover(null)
       }
@@ -840,9 +840,7 @@ export function AnnotationOverlay({
     setError(null)
     try {
       const result = context ? await context.submitAnnotation(annotation) : await submitAnnotation(annotation)
-      setScreenshotDraft(null)
-      screenshotItemSequenceRef.current = 0
-      setScreenshotComment("")
+      resetScreenshotState()
       onSubmitted?.(annotation, result)
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to submit screenshot annotation")
@@ -854,10 +852,17 @@ export function AnnotationOverlay({
   function setSmartMode(nextMode: Exclude<AnnotationOverlayMode, "idle">) {
     setMode(nextMode)
     setDraft(null)
-    setScreenshotDraft(null)
-    screenshotItemSequenceRef.current = 0
+    resetScreenshotState()
     setDrag(null)
     setHover(null)
+    setError(null)
+  }
+
+  function resetScreenshotState() {
+    screenshotCaptureTokenRef.current += 1
+    setScreenshotDraft(null)
+    screenshotItemSequenceRef.current = 0
+    setScreenshotComment("")
     setError(null)
   }
 
@@ -903,14 +908,25 @@ export function AnnotationOverlay({
     }
     if (drag.purpose === "screenshot-region") {
       if (rect.width > 8 && rect.height > 8) {
+        const captureToken = ++screenshotCaptureTokenRef.current
         void captureScreenshotRegion(rect)
           .then((capture) => {
+            if (screenshotCaptureTokenRef.current !== captureToken || !activeRef.current || modeRef.current !== "screenshot") {
+              return
+            }
+            if (!capture.captured) {
+              setError(capture.captureError || "Screenshot capture failed")
+              return
+            }
+            screenshotItemSequenceRef.current = 0
+            setScreenshotComment("")
+            setError(null)
             if (activeRef.current) {
               setScreenshotDraft({ region: rect, capture, items: [] })
             }
           })
           .catch((captureError) => {
-            if (activeRef.current) {
+            if (screenshotCaptureTokenRef.current === captureToken && activeRef.current && modeRef.current === "screenshot") {
               setError(captureError instanceof Error ? captureError.message : "Failed to capture screenshot region")
             }
           })
@@ -1067,7 +1083,7 @@ export function AnnotationOverlay({
               style={textareaStyle}
             />
             <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-              <button type="button" onClick={() => setScreenshotDraft(null)} style={secondaryButtonStyle}>Retake</button>
+              <button type="button" onClick={resetScreenshotState} style={secondaryButtonStyle}>Retake</button>
               <button type="button" disabled={!screenshotComment.trim()} onClick={addScreenshotComment} style={secondaryButtonStyle}>Add comment</button>
               <button type="button" disabled={submitting || screenshotDraft.items.length === 0} onClick={() => void submitScreenshotDraft()} style={buttonStyle}>
                 {submitting ? "Sending..." : "Send batch"}
@@ -1086,6 +1102,9 @@ export function AnnotationOverlay({
             {error ? <p role="alert" style={errorStyle}>{error}</p> : null}
           </CommentPopover>
         </>
+      ) : null}
+      {error && active && !draft && !screenshotDraft ? (
+        <div data-show-annotation-ui="" role="alert" style={floatingErrorStyle}>{error}</div>
       ) : null}
       <AgentMarkLayer scope={scope} />
     </>,
@@ -1328,6 +1347,21 @@ const errorStyle: React.CSSProperties = {
   margin: 0,
   color: "#b91c1c",
   fontSize: 12
+}
+
+const floatingErrorStyle: React.CSSProperties = {
+  position: "fixed",
+  right: 16,
+  bottom: 64,
+  zIndex: 2147483300,
+  maxWidth: 320,
+  border: "1px solid rgba(185, 28, 28, 0.24)",
+  borderRadius: 8,
+  padding: "8px 10px",
+  color: "#991b1b",
+  background: "rgba(254, 242, 242, 0.96)",
+  boxShadow: "0 12px 36px rgba(15, 23, 42, 0.16)",
+  font: "12px/18px system-ui, -apple-system, BlinkMacSystemFont, sans-serif"
 }
 
 const choiceGroupStyle: React.CSSProperties = {
