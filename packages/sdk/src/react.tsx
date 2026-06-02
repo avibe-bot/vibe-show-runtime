@@ -1,18 +1,24 @@
 import * as React from "react"
 import { createPortal } from "react-dom"
 import {
-  collectAreaAnchor,
+  annotationFromAreaSelection,
+  captureScreenshotRegion,
+  collectAreaSelection,
   collectElementContext,
   collectTextSelectionAnchor,
   deepElementFromPoint,
   markAttributes,
   markAttributeName,
   normalizeShowEvent,
+  screenshotAnnotationFromDraft,
+  screenshotPointFromViewport,
+  screenshotRectFromViewport,
   resolveAnchor,
   submitAgentMark,
   submitAnnotation,
   submitIntent,
   submitShowEvent,
+  type AreaSelectionResult,
   type AgentMark,
   type AgentMarkSubmitOptions,
   type AnnotationSubmitOptions,
@@ -23,6 +29,7 @@ import {
   type ShowAnchor,
   type SubmitShowEventOptions,
   type ShowAnnotation,
+  type ScreenshotAnnotationItem,
   type ShowClientOptions,
   type ShowEvent,
   type ShowEventInput
@@ -114,7 +121,7 @@ export type ActionButtonProps = IntentSubmitOptions & {
   onSubmitted?: (payload: HumanIntentPayload, result: unknown) => void
 } & Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, "value" | "onSubmit">
 
-export type AnnotationOverlayMode = "idle" | "element" | "text" | "area"
+export type AnnotationOverlayMode = "idle" | "smart" | "screenshot"
 
 export type AnnotationOverlayProps = {
   enabled?: boolean
@@ -125,6 +132,7 @@ export type AnnotationOverlayProps = {
   submitLabel?: string
   placeholder?: string
   showToolbar?: boolean
+  defaultMode?: Exclude<AnnotationOverlayMode, "idle">
   onSubmitted?: (annotation: ShowAnnotation, result: unknown) => void
 }
 
@@ -142,6 +150,28 @@ export type AnnotationMarkerProps = {
   tone?: "human" | "assistant"
   label?: string
   children?: React.ReactNode
+}
+
+type AnnotationDraft = {
+  kind: "smart"
+  anchor: ShowAnchor
+  rect: MarkAnchorRect
+  label?: string
+  selection?: AreaSelectionResult
+  commentPoint?: { x: number; y: number }
+}
+
+type ScreenshotCommentDraft = ScreenshotAnnotationItem & {
+  viewportPoint?: { x: number; y: number }
+  viewportRect?: MarkAnchorRect
+}
+
+type ScreenshotDraft = {
+  region: MarkAnchorRect
+  capture?: Awaited<ReturnType<typeof captureScreenshotRegion>>
+  items: ScreenshotCommentDraft[]
+  pendingPoint?: { x: number; y: number }
+  pendingRect?: MarkAnchorRect
 }
 
 const ShowSessionContext = React.createContext<ShowSessionContextValue | null>(null)
@@ -581,43 +611,139 @@ export function AnnotationOverlay({
   submitLabel = "Annotate",
   placeholder = "Write a comment...",
   showToolbar = true,
+  defaultMode = "smart",
   onSubmitted
 }: AnnotationOverlayProps) {
   const context = React.useContext(ShowSessionContext)
   const [internalEnabled, setInternalEnabled] = React.useState(defaultEnabled)
   const active = enabled ?? internalEnabled
-  const [mode, setMode] = React.useState<AnnotationOverlayMode>("idle")
-  const [draft, setDraft] = React.useState<{ anchor: ShowAnchor; rect: MarkAnchorRect; label?: string } | null>(null)
+  const [mode, setMode] = React.useState<AnnotationOverlayMode>(defaultEnabled ? defaultMode : "idle")
+  const [hover, setHover] = React.useState<{ rect: MarkAnchorRect; label?: string } | null>(null)
+  const [draft, setDraft] = React.useState<AnnotationDraft | null>(null)
+  const [screenshotDraft, setScreenshotDraft] = React.useState<ScreenshotDraft | null>(null)
   const [comment, setComment] = React.useState("")
-  const [drag, setDrag] = React.useState<{ startX: number; startY: number; rect: MarkAnchorRect } | null>(null)
+  const [screenshotComment, setScreenshotComment] = React.useState("")
+  const [drag, setDrag] = React.useState<{ purpose: "smart-area" | "screenshot-region" | "screenshot-item"; startX: number; startY: number; rect: MarkAnchorRect } | null>(null)
   const [submitting, setSubmitting] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
+  const dragRef = React.useRef(drag)
+  const smartDragStartRef = React.useRef<{ x: number; y: number; allowArea: boolean } | null>(null)
+  const suppressNextClickRef = React.useRef(false)
 
   React.useEffect(() => {
-    if (!active || mode !== "element") return
-    function capture(event: MouseEvent) {
+    dragRef.current = drag
+  }, [drag])
+
+  React.useEffect(() => {
+    if (!active || mode !== "smart" || draft) {
+      setHover(null)
+      return
+    }
+    function hoverElement(event: MouseEvent) {
       if (isOverlayTarget(event.target)) return
+      const selection = globalThis.getSelection?.()
+      if (selection && !selection.isCollapsed) return
+      const element = deepElementFromPoint(event.clientX, event.clientY)
+      if (!element) {
+        setHover(null)
+        return
+      }
+      const anchor = collectElementContext(element, { scope, includeNearby: true })
+      setHover(anchor.rect ? { rect: anchor.rect, label: anchor.label } : null)
+    }
+    function captureElement(event: MouseEvent) {
+      if (suppressNextClickRef.current) {
+        suppressNextClickRef.current = false
+        event.preventDefault()
+        event.stopPropagation()
+        return
+      }
+      if (isOverlayTarget(event.target)) return
+      const selection = globalThis.getSelection?.()
+      if (selection && !selection.isCollapsed) return
       const element = deepElementFromPoint(event.clientX, event.clientY)
       if (!element) return
       event.preventDefault()
       event.stopPropagation()
       const anchor = collectElementContext(element, { scope, includeNearby: true })
       if (anchor.rect) {
-        setDraft({ anchor, rect: anchor.rect, label: anchor.label })
-        setMode("idle")
+        setDraft({ kind: "smart", anchor, rect: anchor.rect, label: anchor.label, commentPoint: { x: event.clientX, y: event.clientY } })
       }
     }
-    document.addEventListener("click", capture, true)
-    return () => document.removeEventListener("click", capture, true)
-  }, [active, mode, scope])
+    document.addEventListener("mousemove", hoverElement, true)
+    document.addEventListener("click", captureElement, true)
+    return () => {
+      document.removeEventListener("mousemove", hoverElement, true)
+      document.removeEventListener("click", captureElement, true)
+    }
+  }, [active, draft, mode, scope])
 
   React.useEffect(() => {
-    if (!active || mode !== "text") return
+    if (!active || mode !== "smart" || draft) return
+    function pointerDown(event: PointerEvent) {
+      if (isOverlayTarget(event.target)) return
+      smartDragStartRef.current = { x: event.clientX, y: event.clientY, allowArea: !isLikelyTextSelectionTarget(event.target) }
+    }
+    function pointerMove(event: PointerEvent) {
+      const start = smartDragStartRef.current
+      if (!start) return
+      if (!start.allowArea) return
+      const selection = globalThis.getSelection?.()
+      if (selection && !selection.isCollapsed) return
+      const distance = Math.hypot(event.clientX - start.x, event.clientY - start.y)
+      if (distance < 8) return
+      const nextDrag = {
+        purpose: "smart-area" as const,
+        startX: start.x,
+        startY: start.y,
+        rect: {
+          x: start.x,
+          y: start.y,
+          width: event.clientX - start.x,
+          height: event.clientY - start.y
+        }
+      }
+      setDrag(nextDrag)
+      event.preventDefault()
+      event.stopPropagation()
+    }
+    function pointerUp(event: PointerEvent) {
+      smartDragStartRef.current = null
+      const currentDrag = dragRef.current
+      if (currentDrag?.purpose !== "smart-area") return
+      const rect = normalizeVisualRect(currentDrag.rect)
+      if (rect.width > 4 && rect.height > 4) {
+        const selection = collectAreaSelection(rect, { scope, includeNearby: true })
+        setDraft({
+          kind: "smart",
+          anchor: selection.anchor,
+          rect: selection.userRegion,
+          label: selection.primaryAnchor === "element-group" ? `${selection.matchedElements.length} elements` : "Selected area",
+          selection
+        })
+        suppressNextClickRef.current = true
+        event.preventDefault()
+        event.stopPropagation()
+      }
+      setDrag(null)
+    }
+    document.addEventListener("pointerdown", pointerDown, true)
+    document.addEventListener("pointermove", pointerMove, true)
+    document.addEventListener("pointerup", pointerUp, true)
+    return () => {
+      document.removeEventListener("pointerdown", pointerDown, true)
+      document.removeEventListener("pointermove", pointerMove, true)
+      document.removeEventListener("pointerup", pointerUp, true)
+    }
+  }, [active, draft, mode, scope])
+
+  React.useEffect(() => {
+    if (!active || mode !== "smart") return
     function capture() {
       const anchor = collectTextSelectionAnchor(globalThis.getSelection?.() ?? null, { scope, includeNearby: true })
       if (anchor?.rect) {
-        setDraft({ anchor, rect: anchor.rect, label: anchor.textQuote || anchor.label })
-        setMode("idle")
+        setDraft({ kind: "smart", anchor, rect: anchor.rect, label: anchor.textQuote || anchor.label })
+        setHover(null)
       }
     }
     document.addEventListener("mouseup", capture, true)
@@ -633,7 +759,9 @@ export function AnnotationOverlay({
       if (event.key === "Escape") {
         setMode("idle")
         setDraft(null)
+        setScreenshotDraft(null)
         setDrag(null)
+        setHover(null)
       }
     }
     document.addEventListener("keydown", escape)
@@ -642,7 +770,7 @@ export function AnnotationOverlay({
 
   async function submit() {
     if (!draft || !comment.trim()) return
-    const annotation: ShowAnnotation = {
+    const baseAnnotation: ShowAnnotation = {
       scope,
       intent,
       severity,
@@ -651,6 +779,10 @@ export function AnnotationOverlay({
       dispatch: true,
       anchor: draft.anchor
     }
+    const annotation = draft.selection ? annotationFromAreaSelection({
+      ...baseAnnotation,
+      primaryAnchor: draft.selection.primaryAnchor
+    }, draft.selection) : baseAnnotation
     setSubmitting(true)
     setError(null)
     try {
@@ -665,64 +797,191 @@ export function AnnotationOverlay({
     }
   }
 
+  async function submitScreenshotDraft() {
+    if (!screenshotDraft?.capture || screenshotDraft.items.length === 0) return
+    const annotation = screenshotAnnotationFromDraft({
+      scope,
+      intent,
+      severity,
+      status: "pending",
+      comment: screenshotDraft.items.map((item) => `${item.label}. ${item.comment}`).join("\n"),
+      dispatch: true,
+      screenshot: {
+        ...screenshotDraft.capture,
+        items: screenshotDraft.items.map(({ viewportPoint, viewportRect, ...item }) => item)
+      }
+    })
+    setSubmitting(true)
+    setError(null)
+    try {
+      const result = context ? await context.submitAnnotation(annotation) : await submitAnnotation(annotation)
+      setScreenshotDraft(null)
+      setScreenshotComment("")
+      onSubmitted?.(annotation, result)
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to submit screenshot annotation")
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  function setSmartMode(nextMode: Exclude<AnnotationOverlayMode, "idle">) {
+    setMode(nextMode)
+    setDraft(null)
+    setScreenshotDraft(null)
+    setDrag(null)
+    setHover(null)
+    setError(null)
+  }
+
+  function onCapturePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (isOverlayTarget(event.target)) return
+    event.currentTarget.setPointerCapture(event.pointerId)
+    const purpose = screenshotDraft?.capture ? "screenshot-item" : "screenshot-region"
+    setDrag({ purpose, startX: event.clientX, startY: event.clientY, rect: { x: event.clientX, y: event.clientY, width: 0, height: 0 } })
+  }
+
+  function onCapturePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (!drag) return
+    setDrag({
+      ...drag,
+      rect: {
+        x: drag.startX,
+        y: drag.startY,
+        width: event.clientX - drag.startX,
+        height: event.clientY - drag.startY
+      }
+    })
+  }
+
+  function onCapturePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    if (!drag) return
+    const rect = normalizeVisualRect(drag.rect)
+    if (drag.purpose === "smart-area") {
+      if (rect.width > 4 && rect.height > 4) {
+        const selection = collectAreaSelection(rect, { scope, includeNearby: true })
+        setDraft({
+          kind: "smart",
+          anchor: selection.anchor,
+          rect: selection.userRegion,
+          label: selection.primaryAnchor === "element-group" ? `${selection.matchedElements.length} elements` : "Selected area",
+          selection
+        })
+      }
+      setDrag(null)
+      return
+    }
+    if (drag.purpose === "screenshot-region") {
+      if (rect.width > 8 && rect.height > 8) {
+        void captureScreenshotRegion(rect)
+          .then((capture) => setScreenshotDraft({ region: rect, capture, items: [] }))
+          .catch((captureError) => setError(captureError instanceof Error ? captureError.message : "Failed to capture screenshot region"))
+      }
+      setDrag(null)
+      return
+    }
+    if (drag.purpose === "screenshot-item" && screenshotDraft?.capture) {
+      if (rect.width > 8 && rect.height > 8) {
+        setScreenshotDraft({
+          ...screenshotDraft,
+          pendingRect: rect,
+          pendingPoint: undefined
+        })
+      } else {
+        setScreenshotDraft({
+          ...screenshotDraft,
+          pendingPoint: { x: event.clientX, y: event.clientY },
+          pendingRect: undefined
+        })
+      }
+      setDrag(null)
+    }
+  }
+
+  function addScreenshotComment() {
+    if (!screenshotDraft?.capture || !screenshotComment.trim()) return
+    const label = screenshotDraft.items.length + 1
+    const capturedRegion = screenshotDraft.capture.capturedRegion
+    const item: ScreenshotCommentDraft = screenshotDraft.pendingRect
+      ? {
+          id: `shot_item_${label}`,
+          label,
+          comment: screenshotComment.trim(),
+          rect: screenshotRectFromViewport(screenshotDraft.pendingRect, capturedRegion),
+          viewportRect: screenshotDraft.pendingRect
+        }
+      : {
+          id: `shot_item_${label}`,
+          label,
+          comment: screenshotComment.trim(),
+          point: screenshotPointFromViewport(screenshotDraft.pendingPoint ?? centerPoint(screenshotDraft.region), capturedRegion),
+          viewportPoint: screenshotDraft.pendingPoint ?? centerPoint(screenshotDraft.region)
+        }
+    setScreenshotDraft({
+      ...screenshotDraft,
+      items: [...screenshotDraft.items, item],
+      pendingPoint: undefined,
+      pendingRect: undefined
+    })
+    setScreenshotComment("")
+  }
+
   if (typeof document === "undefined") return null
 
   return createPortal(
     <>
       {showToolbar ? (
         <div data-show-annotation-ui="" style={toolbarStyle} onClick={(event) => event.stopPropagation()}>
-          <button type="button" aria-pressed={active} onClick={() => setInternalEnabled((value) => !value)} style={toolbarButtonStyle}>{active ? "On" : "Off"}</button>
-          <button type="button" disabled={!active} aria-pressed={mode === "element"} onClick={() => setMode(mode === "element" ? "idle" : "element")} style={toolbarButtonStyle}>Element</button>
-          <button type="button" disabled={!active} aria-pressed={mode === "text"} onClick={() => setMode(mode === "text" ? "idle" : "text")} style={toolbarButtonStyle}>Text</button>
-          <button type="button" disabled={!active} aria-pressed={mode === "area"} onClick={() => setMode(mode === "area" ? "idle" : "area")} style={toolbarButtonStyle}>Area</button>
+          <button type="button" aria-pressed={active} onClick={() => {
+            const next = !active
+            setInternalEnabled(next)
+            setMode(next ? defaultMode : "idle")
+            if (!next) {
+              setDraft(null)
+              setScreenshotDraft(null)
+              setDrag(null)
+              setHover(null)
+            }
+          }} style={toolbarButtonStyle}>{active ? "On" : "Off"}</button>
+          <button type="button" disabled={!active} aria-pressed={mode === "smart"} onClick={() => setSmartMode("smart")} style={toolbarButtonStyle}>Smart</button>
+          <button type="button" disabled={!active} aria-pressed={mode === "screenshot"} onClick={() => setSmartMode("screenshot")} style={toolbarButtonStyle}>Screenshot</button>
         </div>
       ) : null}
-      {active && mode === "area" ? (
+      {hover && active && mode === "smart" && !draft ? <AnnotationMarker rect={hover.rect} tone="human" label={hover.label} /> : null}
+      {drag ? <AnnotationMarker rect={normalizeVisualRect(drag.rect)} tone="human" /> : null}
+      {active && mode === "screenshot" ? (
         <div
           data-show-annotation-capture=""
           style={areaCaptureStyle}
-          onPointerDown={(event) => {
-            if (isOverlayTarget(event.target)) return
-            event.currentTarget.setPointerCapture(event.pointerId)
-            setDrag({ startX: event.clientX, startY: event.clientY, rect: { x: event.clientX, y: event.clientY, width: 0, height: 0 } })
-          }}
-          onPointerMove={(event) => {
-            if (!drag) return
-            setDrag({
-              ...drag,
-              rect: {
-                x: drag.startX,
-                y: drag.startY,
-                width: event.clientX - drag.startX,
-                height: event.clientY - drag.startY
-              }
-            })
-          }}
-          onPointerUp={(event) => {
-            if (!drag) return
-            const captureLayer = event.currentTarget
-            const previousPointerEvents = captureLayer.style.pointerEvents
-            let anchor: ShowAnchor
-            try {
-              captureLayer.style.pointerEvents = "none"
-              anchor = collectAreaAnchor(drag.rect, { scope, includeNearby: true })
-            } finally {
-              captureLayer.style.pointerEvents = previousPointerEvents
-            }
-            if (anchor.rect && anchor.rect.width > 4 && anchor.rect.height > 4) {
-              setDraft({ anchor, rect: anchor.rect, label: "Selected area" })
-            }
-            setDrag(null)
-            setMode("idle")
-          }}
-        >
-          {drag ? <AnnotationMarker rect={normalizeVisualRect(drag.rect)} tone="human" /> : null}
-        </div>
+          onPointerDown={onCapturePointerDown}
+          onPointerMove={onCapturePointerMove}
+          onPointerUp={onCapturePointerUp}
+        />
       ) : null}
       {draft ? (
         <>
           <AnnotationMarker rect={draft.rect} tone="human" label={draft.label} />
           <CommentPopover rect={draft.rect} onClose={() => setDraft(null)}>
+            {draft.selection?.classification.ambiguous ? (
+              <div style={toggleRowStyle}>
+                <button type="button" style={draft.selection.primaryAnchor === "element-group" ? toggleActiveStyle : toggleButtonStyle} onClick={() => {
+                  const nextSelection = {
+                    ...draft.selection!,
+                    primaryAnchor: "element-group" as const,
+                    anchor: { ...draft.selection!.anchor, kind: "element-group" as const }
+                  }
+                  setDraft({ ...draft, selection: nextSelection, anchor: nextSelection.anchor, label: `${nextSelection.matchedElements.length} elements` })
+                }}>By elements</button>
+                <button type="button" style={draft.selection.primaryAnchor === "area" ? toggleActiveStyle : toggleButtonStyle} onClick={() => {
+                  const nextSelection = {
+                    ...draft.selection!,
+                    primaryAnchor: "area" as const,
+                    anchor: { ...draft.selection!.anchor, kind: "area" as const }
+                  }
+                  setDraft({ ...draft, selection: nextSelection, anchor: nextSelection.anchor, label: "Selected area" })
+                }}>By area</button>
+              </div>
+            ) : null}
             <textarea
               autoFocus
               placeholder={placeholder}
@@ -736,6 +995,48 @@ export function AnnotationOverlay({
                 {submitting ? "Sending..." : submitLabel}
               </button>
             </div>
+            {error ? <p role="alert" style={errorStyle}>{error}</p> : null}
+          </CommentPopover>
+        </>
+      ) : null}
+      {screenshotDraft ? (
+        <>
+          <AnnotationMarker rect={screenshotDraft.region} tone="assistant" label="Screenshot 1" />
+          {screenshotDraft.items.map((item) =>
+            item.viewportRect ? (
+              <AnnotationMarker key={item.id} rect={item.viewportRect} tone="assistant" label={String(item.label)} />
+            ) : item.viewportPoint ? (
+              <AnnotationMarker key={item.id} rect={{ x: item.viewportPoint.x - 6, y: item.viewportPoint.y - 6, width: 12, height: 12 }} tone="assistant" label={String(item.label)} />
+            ) : null
+          )}
+          {screenshotDraft.pendingRect ? <AnnotationMarker rect={screenshotDraft.pendingRect} tone="human" label={String(screenshotDraft.items.length + 1)} /> : null}
+          {screenshotDraft.pendingPoint ? <AnnotationMarker rect={{ x: screenshotDraft.pendingPoint.x - 6, y: screenshotDraft.pendingPoint.y - 6, width: 12, height: 12 }} tone="human" label={String(screenshotDraft.items.length + 1)} /> : null}
+          <CommentPopover rect={screenshotDraft.pendingRect ?? pointRect(screenshotDraft.pendingPoint) ?? screenshotDraft.region} onClose={() => setScreenshotDraft(null)}>
+            <div style={{ fontWeight: 600 }}>Screenshot 1</div>
+            {screenshotDraft.capture?.dataUrl ? <img src={screenshotDraft.capture.dataUrl} alt="" style={screenshotPreviewStyle} /> : null}
+            <textarea
+              placeholder="Comment on this screenshot..."
+              value={screenshotComment}
+              onChange={(event) => setScreenshotComment(event.target.value)}
+              style={textareaStyle}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+              <button type="button" onClick={() => setScreenshotDraft(null)} style={secondaryButtonStyle}>Retake</button>
+              <button type="button" disabled={!screenshotComment.trim()} onClick={addScreenshotComment} style={secondaryButtonStyle}>Add comment</button>
+              <button type="button" disabled={submitting || screenshotDraft.items.length === 0} onClick={() => void submitScreenshotDraft()} style={buttonStyle}>
+                {submitting ? "Sending..." : "Send batch"}
+              </button>
+            </div>
+            {screenshotDraft.items.length ? (
+              <ol style={screenshotListStyle}>
+                {screenshotDraft.items.map((item) => (
+                  <li key={item.id}>
+                    <span>{item.comment}</span>
+                    <button type="button" style={inlineDeleteStyle} onClick={() => setScreenshotDraft({ ...screenshotDraft, items: screenshotDraft.items.filter((current) => current.id !== item.id) })}>Remove</button>
+                  </li>
+                ))}
+              </ol>
+            ) : null}
             {error ? <p role="alert" style={errorStyle}>{error}</p> : null}
           </CommentPopover>
         </>
@@ -873,10 +1174,29 @@ function isOverlayTarget(target: EventTarget | null) {
   return target instanceof Element && Boolean(target.closest("[data-show-annotation-ui]"))
 }
 
+function isLikelyTextSelectionTarget(target: EventTarget | null) {
+  if (!(target instanceof Element)) return false
+  const tagName = target.tagName.toLowerCase()
+  if (["input", "textarea"].includes(tagName) || target.getAttribute("contenteditable") === "true") return true
+  const text = target.textContent?.trim()
+  if (!text || text.length < 8) return false
+  const childElementCount = target.children.length
+  return childElementCount <= 2
+}
+
 function normalizeVisualRect(rect: MarkAnchorRect): MarkAnchorRect {
   const x = Math.min(rect.x, rect.x + rect.width)
   const y = Math.min(rect.y, rect.y + rect.height)
   return { x, y, width: Math.abs(rect.width), height: Math.abs(rect.height) }
+}
+
+function centerPoint(rect: MarkAnchorRect) {
+  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }
+}
+
+function pointRect(point?: { x: number; y: number }): MarkAnchorRect | undefined {
+  if (!point) return undefined
+  return { x: point.x - 6, y: point.y - 6, width: 12, height: 12 }
 }
 
 function markAttributeSelector(scope: string) {
@@ -1025,4 +1345,52 @@ const closeButtonStyle: React.CSSProperties = {
   borderRadius: 999,
   background: "#f3f4f6",
   cursor: "pointer"
+}
+
+const toggleRowStyle: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "1fr 1fr",
+  gap: 6
+}
+
+const toggleButtonStyle: React.CSSProperties = {
+  border: "1px solid rgba(148, 163, 184, 0.7)",
+  borderRadius: 8,
+  padding: "6px 8px",
+  background: "#fff",
+  color: "#111827",
+  font: "12px/18px system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
+  cursor: "pointer"
+}
+
+const toggleActiveStyle: React.CSSProperties = {
+  ...toggleButtonStyle,
+  borderColor: "#111827",
+  background: "#111827",
+  color: "#fff"
+}
+
+const screenshotPreviewStyle: React.CSSProperties = {
+  width: "100%",
+  maxHeight: 140,
+  objectFit: "cover",
+  border: "1px solid rgba(148, 163, 184, 0.7)",
+  borderRadius: 8
+}
+
+const screenshotListStyle: React.CSSProperties = {
+  margin: 0,
+  paddingInlineStart: 22,
+  display: "grid",
+  gap: 6,
+  fontSize: 12
+}
+
+const inlineDeleteStyle: React.CSSProperties = {
+  marginInlineStart: 8,
+  border: 0,
+  background: "transparent",
+  color: "#b91c1c",
+  cursor: "pointer",
+  font: "inherit"
 }

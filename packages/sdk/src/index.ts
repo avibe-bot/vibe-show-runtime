@@ -153,6 +153,7 @@ export type ScreenshotAnnotationPayload = {
   height: number
   capturedRegion: MarkAnchorRect
   viewport?: AnchorViewport
+  dataUrl?: string
   items: ScreenshotAnnotationItem[]
 }
 
@@ -329,6 +330,29 @@ export type CollectElementContextOptions = {
   source?: string
 }
 
+export type AreaSelectionResult = {
+  anchor: ShowAnchor
+  primaryAnchor: "area" | "element-group"
+  userRegion: MarkAnchorRect
+  matchedElements: ShowAnchor[]
+  classification: AreaSelectionClassification
+}
+
+export type CollectAreaSelectionOptions = CollectElementContextOptions & {
+  maxElements?: number
+  root?: ParentNode
+}
+
+export type ScreenshotCaptureResult = {
+  attachmentId: string
+  mimeType: "image/png"
+  width: number
+  height: number
+  capturedRegion: MarkAnchorRect
+  viewport?: AnchorViewport
+  dataUrl?: string
+}
+
 declare global {
   var __AVIBE_SHOW__: RuntimeConfig | undefined
 }
@@ -402,6 +426,24 @@ export function screenshotAnnotation(annotation: ScreenshotAnnotationInput): Sho
       }))
     }
   }
+}
+
+export function annotationFromAreaSelection(annotation: AreaAnnotationInput, selection: AreaSelectionResult): ShowAnnotation {
+  return areaAnnotation({
+    ...annotation,
+    primaryAnchor: annotation.primaryAnchor ?? selection.primaryAnchor,
+    anchor: annotation.anchor ?? selection.anchor,
+    anchors: annotation.anchors ?? selection.matchedElements,
+    userRegion: annotation.userRegion ?? selection.userRegion,
+    matchedElements: annotation.matchedElements ?? selection.matchedElements,
+    classification: annotation.classification ?? selection.classification
+  })
+}
+
+export function screenshotAnnotationFromDraft(annotation: Omit<ScreenshotAnnotationInput, "screenshot"> & {
+  screenshot: ScreenshotCaptureResult & { items: ScreenshotAnnotationItem[] }
+}): ShowAnnotation {
+  return screenshotAnnotation(annotation)
 }
 
 export async function updateAnnotation(annotation: ShowAnnotation, options: AnnotationSubmitOptions = {}) {
@@ -803,6 +845,112 @@ export function collectAreaAnchor(rect: MarkAnchorRect, options: CollectElementC
   }
 }
 
+export function collectAreaSelection(rect: MarkAnchorRect, options: CollectAreaSelectionOptions = {}): AreaSelectionResult {
+  const userRegion = normalizeAnchorRect(rect)
+  const matchedElements = collectElementsInArea(userRegion, options)
+  const classification = classifyAreaSelection(userRegion, matchedElements)
+  const primaryAnchor = classification.reason === "selection contains multiple meaningful elements" ? "element-group" : "area"
+  const baseAnchor = collectAreaAnchor(userRegion, options)
+  const anchor: ShowAnchor = {
+    ...baseAnchor,
+    kind: primaryAnchor,
+    id: primaryAnchor === "element-group" ? randomId("element_group") : baseAnchor.id,
+    rect: userRegion,
+    source: primaryAnchor === "element-group" ? "area-selection" : "area",
+    elements: matchedElements.length ? matchedElements : undefined
+  }
+  return {
+    anchor,
+    primaryAnchor,
+    userRegion,
+    matchedElements,
+    classification
+  }
+}
+
+export function classifyAreaSelection(userRegion: MarkAnchorRect, matchedElements: ShowAnchor[]): AreaSelectionClassification {
+  if (matchedElements.length >= 2) {
+    return {
+      confidence: Math.min(0.96, 0.68 + matchedElements.length * 0.08),
+      reason: "selection contains multiple meaningful elements",
+      ambiguous: matchedElements.length <= 2
+    }
+  }
+  if (matchedElements.length === 1) {
+    const elementRect = matchedElements[0].rect
+    const coverage = elementRect ? rectIntersectionRatio(userRegion, elementRect) : 0
+    return {
+      confidence: coverage > 0.72 ? 0.58 : 0.42,
+      reason: "selection contains one meaningful element",
+      ambiguous: true
+    }
+  }
+  return {
+    confidence: 0.82,
+    reason: "selection is best represented as a visual area",
+    ambiguous: false
+  }
+}
+
+export function collectElementsInArea(rect: MarkAnchorRect, options: CollectAreaSelectionOptions = {}): ShowAnchor[] {
+  const root = options.root ?? (typeof document !== "undefined" ? document : undefined)
+  if (!root || typeof Element === "undefined") return []
+  const ownerDocument = ownerDocumentForRoot(root)
+  const source = ownerDocument?.body ?? (root instanceof Element ? root : undefined)
+  if (!source) return []
+  const maxElements = Math.max(1, options.maxElements ?? 8)
+  const elements = Array.from(source.querySelectorAll("*"))
+    .filter((element) => isAreaSelectionCandidate(element, rect))
+    .sort((left, right) => areaSelectionScore(right, rect) - areaSelectionScore(left, rect))
+
+  const selected: Element[] = []
+  for (const element of elements) {
+    if (selected.some((existing) => existing.contains(element) || element.contains(existing))) {
+      continue
+    }
+    selected.push(element)
+    if (selected.length >= maxElements) break
+  }
+
+  return selected.map((element) => collectElementContext(element, { ...options, source: "area-selection" }))
+}
+
+export async function captureScreenshotRegion(region: MarkAnchorRect): Promise<ScreenshotCaptureResult> {
+  const capturedRegion = normalizeAnchorRect(region)
+  const width = Math.max(1, Math.round(capturedRegion.width))
+  const height = Math.max(1, Math.round(capturedRegion.height))
+  return {
+    attachmentId: randomId("screenshot"),
+    mimeType: "image/png",
+    width,
+    height,
+    capturedRegion,
+    viewport: viewport(),
+    dataUrl: await screenshotRegionPlaceholderDataUrl(width, height, capturedRegion)
+  }
+}
+
+export function screenshotPointFromViewport(point: { x: number; y: number }, capturedRegion: MarkAnchorRect) {
+  return {
+    x: Math.round(point.x - capturedRegion.x),
+    y: Math.round(point.y - capturedRegion.y)
+  }
+}
+
+export function screenshotRectFromViewport(rect: MarkAnchorRect, capturedRegion: MarkAnchorRect): MarkAnchorRect {
+  const normalized = normalizeAnchorRect(rect)
+  return normalizeAnchorRect({
+    x: normalized.x - capturedRegion.x,
+    y: normalized.y - capturedRegion.y,
+    width: normalized.width,
+    height: normalized.height
+  })
+}
+
+export function normalizeAnchorRect(rect: MarkAnchorRect): MarkAnchorRect {
+  return normalizeRect(rect)
+}
+
 export function resolveAnchor(anchor: ShowAnchor, root?: ParentNode): AnchorResolveResult {
   if ((anchor.kind === "area" || anchor.kind === "element-group" || anchor.kind === "group" || anchor.kind === "screenshot") && anchor.rect) {
     return { anchor, rect: anchor.rect, confidence: "area" }
@@ -934,6 +1082,71 @@ function inferAnnotationPrimaryAnchor(annotation: ShowAnnotation, anchor?: ShowA
 
 function formatRect(rect: MarkAnchorRect) {
   return `x:${Math.round(rect.x)}, y:${Math.round(rect.y)}, ${Math.round(rect.width)}x${Math.round(rect.height)}`
+}
+
+function isAreaSelectionCandidate(element: Element, userRegion: MarkAnchorRect) {
+  if (isTextAnchorContainer(element) || isStructuralContainer(element)) return false
+  const rect = rectFromElement(element)
+  if (rect.width < 8 || rect.height < 8) return false
+  if (!rectsIntersect(userRegion, rect)) return false
+  if (rect.width > userRegion.width * 1.35 && rect.height > userRegion.height * 1.35) return false
+  const visibleRatio = rectIntersectionRatio(userRegion, rect)
+  if (visibleRatio < 0.45) return false
+  return areaSelectionScore(element, userRegion) > 0
+}
+
+function areaSelectionScore(element: Element, userRegion: MarkAnchorRect) {
+  const rect = rectFromElement(element)
+  const visibleRatio = rectIntersectionRatio(userRegion, rect)
+  let score = visibleRatio * 4
+  if (readElementMark(element)) score += 5
+  const tagName = element.tagName.toLowerCase()
+  if (["button", "a", "input", "select", "textarea", "li", "tr", "article", "section"].includes(tagName)) score += 2
+  if (element.getAttribute("role") || element.getAttribute("aria-label")) score += 1.5
+  if (element.getAttribute("data-testid") || element.getAttribute("data-test-id") || element.getAttribute("data-cy")) score += 1.5
+  const className = element instanceof HTMLElement ? element.className : ""
+  if (typeof className === "string" && /card|item|row|tile|panel|cell|option/i.test(className)) score += 1.25
+  if (elementText(element)) score += 0.75
+  return score
+}
+
+function rectsIntersect(left: MarkAnchorRect, right: MarkAnchorRect) {
+  return !(right.x + right.width < left.x || right.x > left.x + left.width || right.y + right.height < left.y || right.y > left.y + left.height)
+}
+
+function rectIntersectionRatio(container: MarkAnchorRect, rect: MarkAnchorRect) {
+  const x = Math.max(container.x, rect.x)
+  const y = Math.max(container.y, rect.y)
+  const right = Math.min(container.x + container.width, rect.x + rect.width)
+  const bottom = Math.min(container.y + container.height, rect.y + rect.height)
+  const width = Math.max(0, right - x)
+  const height = Math.max(0, bottom - y)
+  const intersection = width * height
+  const area = Math.max(1, rect.width * rect.height)
+  return intersection / area
+}
+
+function isStructuralContainer(element: Element) {
+  const tagName = element.tagName.toLowerCase()
+  return ["html", "body", "head", "script", "style", "template", "noscript", "svg", "path"].includes(tagName)
+}
+
+async function screenshotRegionPlaceholderDataUrl(width: number, height: number, region: MarkAnchorRect) {
+  if (typeof document === "undefined") return undefined
+  const canvas = document.createElement("canvas")
+  canvas.width = width
+  canvas.height = height
+  const context = canvas.getContext("2d")
+  if (!context) return undefined
+  context.fillStyle = "#f8fafc"
+  context.fillRect(0, 0, width, height)
+  context.strokeStyle = "#2563eb"
+  context.lineWidth = 2
+  context.strokeRect(1, 1, Math.max(1, width - 2), Math.max(1, height - 2))
+  context.fillStyle = "#0f172a"
+  context.font = "12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif"
+  context.fillText(`Screenshot region ${Math.round(region.width)}x${Math.round(region.height)}`, 12, 24)
+  return canvas.toDataURL("image/png")
 }
 
 function targetToAnchor(target: string, scope: string): ShowAnchor | undefined {
