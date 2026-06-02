@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import {
   areaAnnotation,
   classifyAreaSelection,
+  collectElementsInArea,
   formatShowEventMessage,
   humanAnnotationEvent,
   screenshotPointFromViewport,
@@ -51,6 +52,44 @@ describe("show annotation event contract", () => {
     expect(classification.ambiguous).toBe(true)
   })
 
+  it("collects area elements only inside the caller-provided root", () => {
+    const previousElement = globalThis.Element
+    const previousHTMLElement = globalThis.HTMLElement
+    const previousDocument = globalThis.Document
+    const previousDocumentGlobal = globalThis.document
+    const previousNode = globalThis.Node
+    const root = new FakeElement("div", "Root", { x: 0, y: 0, width: 220, height: 120 })
+    const inside = new FakeElement("button", "Inside", { x: 20, y: 20, width: 80, height: 40 })
+    const outside = new FakeElement("button", "Outside", { x: 30, y: 30, width: 80, height: 40 })
+    root.append(inside)
+    const fakeDocument = {
+      body: new FakeElement("body", "", { x: 0, y: 0, width: 1000, height: 800 })
+    }
+    fakeDocument.body.append(root, outside)
+
+    try {
+      Object.assign(globalThis, {
+        Element: FakeElement,
+        HTMLElement: FakeElement,
+        Node: { ELEMENT_NODE: 1 },
+        Document: FakeDocument,
+        document: fakeDocument
+      })
+      const anchors = collectElementsInArea({ x: 0, y: 0, width: 180, height: 100 }, { root, maxElements: 4 })
+
+      expect(anchors).toHaveLength(1)
+      expect(anchors[0].label).toBe("Inside")
+    } finally {
+      Object.assign(globalThis, {
+        Element: previousElement,
+        HTMLElement: previousHTMLElement,
+        Document: previousDocument,
+        Node: previousNode,
+        document: previousDocumentGlobal
+      })
+    }
+  })
+
   it("converts screenshot comment geometry into screenshot-local coordinates", () => {
     const capturedRegion = { x: 100, y: 200, width: 640, height: 360 }
 
@@ -93,3 +132,58 @@ describe("show annotation event contract", () => {
     expect(message).toContain("2. This empty area looks accidental.")
   })
 })
+
+class FakeDocument {}
+
+class FakeElement {
+  attributes: { name: string; value: string }[] = []
+  children: FakeElement[] = []
+  className = ""
+  id = ""
+  nodeType = 1
+  ownerDocument?: unknown
+  parent?: FakeElement
+  parentElement?: FakeElement
+
+  constructor(
+    readonly tagName: string,
+    readonly textContent: string,
+    private rect: { x: number; y: number; width: number; height: number }
+  ) {}
+
+  append(...children: FakeElement[]) {
+    for (const child of children) {
+      child.parent = this
+      child.parentElement = this
+      child.ownerDocument = this.ownerDocument
+      this.children.push(child)
+    }
+  }
+
+  querySelectorAll() {
+    return this.children.flatMap((child) => [child, ...child.querySelectorAll()])
+  }
+
+  contains(element: FakeElement) {
+    return element === this || this.children.some((child) => child.contains(element))
+  }
+
+  closest() {
+    return null
+  }
+
+  getAttribute() {
+    return null
+  }
+
+  getBoundingClientRect() {
+    return {
+      ...this.rect,
+      left: this.rect.x,
+      top: this.rect.y,
+      right: this.rect.x + this.rect.width,
+      bottom: this.rect.y + this.rect.height,
+      toJSON: () => this.rect
+    } as DOMRect
+  }
+}

@@ -1,5 +1,6 @@
 import * as React from "react"
 import { createPortal } from "react-dom"
+import { flushSync } from "react-dom"
 import {
   annotationFromAreaSelection,
   captureScreenshotRegion,
@@ -712,6 +713,7 @@ export function AnnotationOverlay({
       const currentDrag = dragRef.current
       if (currentDrag?.purpose !== "smart-area") return
       const rect = normalizeVisualRect(currentDrag.rect)
+      flushSync(() => setDrag(null))
       if (rect.width > 4 && rect.height > 4) {
         const selection = collectAreaSelection(rect, { scope, includeNearby: true })
         setDraft({
@@ -725,7 +727,6 @@ export function AnnotationOverlay({
         event.preventDefault()
         event.stopPropagation()
       }
-      setDrag(null)
     }
     document.addEventListener("pointerdown", pointerDown, true)
     document.addEventListener("pointermove", pointerMove, true)
@@ -738,7 +739,7 @@ export function AnnotationOverlay({
   }, [active, draft, mode, scope])
 
   React.useEffect(() => {
-    if (!active || mode !== "smart") return
+    if (!active || mode !== "smart" || draft) return
     function capture() {
       const anchor = collectTextSelectionAnchor(globalThis.getSelection?.() ?? null, { scope, includeNearby: true })
       if (anchor?.rect) {
@@ -752,7 +753,7 @@ export function AnnotationOverlay({
       document.removeEventListener("mouseup", capture, true)
       document.removeEventListener("keyup", capture, true)
     }
-  }, [active, mode, scope])
+  }, [active, draft, mode, scope])
 
   React.useEffect(() => {
     function escape(event: KeyboardEvent) {
@@ -836,6 +837,9 @@ export function AnnotationOverlay({
 
   function onCapturePointerDown(event: React.PointerEvent<HTMLDivElement>) {
     if (isOverlayTarget(event.target)) return
+    if (screenshotDraft?.capture && !pointInsideRect({ x: event.clientX, y: event.clientY }, screenshotDraft.capture.capturedRegion)) {
+      return
+    }
     event.currentTarget.setPointerCapture(event.pointerId)
     const purpose = screenshotDraft?.capture ? "screenshot-item" : "screenshot-region"
     setDrag({ purpose, startX: event.clientX, startY: event.clientY, rect: { x: event.clientX, y: event.clientY, width: 0, height: 0 } })
@@ -881,16 +885,23 @@ export function AnnotationOverlay({
       return
     }
     if (drag.purpose === "screenshot-item" && screenshotDraft?.capture) {
+      const capturedRegion = screenshotDraft.capture.capturedRegion
+      const constrainedRect = constrainRectToRegion(rect, capturedRegion)
+      const point = clampPointToRect({ x: event.clientX, y: event.clientY }, capturedRegion)
       if (rect.width > 8 && rect.height > 8) {
+        if (!constrainedRect || constrainedRect.width <= 0 || constrainedRect.height <= 0) {
+          setDrag(null)
+          return
+        }
         setScreenshotDraft({
           ...screenshotDraft,
-          pendingRect: rect,
+          pendingRect: constrainedRect,
           pendingPoint: undefined
         })
       } else {
         setScreenshotDraft({
           ...screenshotDraft,
-          pendingPoint: { x: event.clientX, y: event.clientY },
+          pendingPoint: point,
           pendingRect: undefined
         })
       }
@@ -1197,6 +1208,26 @@ function centerPoint(rect: MarkAnchorRect) {
 function pointRect(point?: { x: number; y: number }): MarkAnchorRect | undefined {
   if (!point) return undefined
   return { x: point.x - 6, y: point.y - 6, width: 12, height: 12 }
+}
+
+function pointInsideRect(point: { x: number; y: number }, rect: MarkAnchorRect) {
+  return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height
+}
+
+function clampPointToRect(point: { x: number; y: number }, rect: MarkAnchorRect) {
+  return {
+    x: Math.min(rect.x + rect.width, Math.max(rect.x, point.x)),
+    y: Math.min(rect.y + rect.height, Math.max(rect.y, point.y))
+  }
+}
+
+function constrainRectToRegion(rect: MarkAnchorRect, region: MarkAnchorRect): MarkAnchorRect | null {
+  const x = Math.max(rect.x, region.x)
+  const y = Math.max(rect.y, region.y)
+  const right = Math.min(rect.x + rect.width, region.x + region.width)
+  const bottom = Math.min(rect.y + rect.height, region.y + region.height)
+  if (right <= x || bottom <= y) return null
+  return { x, y, width: right - x, height: bottom - y }
 }
 
 function markAttributeSelector(scope: string) {

@@ -895,11 +895,10 @@ export function classifyAreaSelection(userRegion: MarkAnchorRect, matchedElement
 export function collectElementsInArea(rect: MarkAnchorRect, options: CollectAreaSelectionOptions = {}): ShowAnchor[] {
   const root = options.root ?? (typeof document !== "undefined" ? document : undefined)
   if (!root || typeof Element === "undefined") return []
-  const ownerDocument = ownerDocumentForRoot(root)
-  const source = ownerDocument?.body ?? (root instanceof Element ? root : undefined)
+  const source = areaSelectionSource(root)
   if (!source) return []
   const maxElements = Math.max(1, options.maxElements ?? 8)
-  const elements = Array.from(source.querySelectorAll("*"))
+  const elements = elementsFromAreaSource(source)
     .filter((element) => isAreaSelectionCandidate(element, rect))
     .sort((left, right) => areaSelectionScore(right, rect) - areaSelectionScore(left, rect))
 
@@ -1085,7 +1084,7 @@ function formatRect(rect: MarkAnchorRect) {
 }
 
 function isAreaSelectionCandidate(element: Element, userRegion: MarkAnchorRect) {
-  if (isTextAnchorContainer(element) || isStructuralContainer(element)) return false
+  if (isTextAnchorContainer(element) || isStructuralContainer(element) || isShowOverlayElement(element)) return false
   const rect = rectFromElement(element)
   if (rect.width < 8 || rect.height < 8) return false
   if (!rectsIntersect(userRegion, rect)) return false
@@ -1397,6 +1396,27 @@ function ownerDocumentForRoot(root: ParentNode) {
   return (root as Node).ownerDocument ?? (typeof document !== "undefined" ? document : undefined)
 }
 
+function areaSelectionSource(root: ParentNode): ParentNode | undefined {
+  if (typeof Document !== "undefined" && root instanceof Document) {
+    return root.body
+  }
+  if (typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot) {
+    return root
+  }
+  if (typeof Element !== "undefined" && root instanceof Element) {
+    return root
+  }
+  return undefined
+}
+
+function elementsFromAreaSource(source: ParentNode): Element[] {
+  const descendants = Array.from(source.querySelectorAll("*"))
+  if (typeof Element !== "undefined" && source instanceof Element) {
+    return [source, ...descendants]
+  }
+  return descendants
+}
+
 function isTextAnchorCandidate(element: Element, needle: string) {
   return !isTextAnchorContainer(element) && normalizeTextContent(element.textContent || "").includes(needle)
 }
@@ -1406,6 +1426,10 @@ function isTextAnchorContainer(element: Element) {
   if (["html", "body", "head", "script", "style", "template", "noscript"].includes(tagName)) {
     return true
   }
+  return isShowOverlayElement(element)
+}
+
+function isShowOverlayElement(element: Element) {
   return Boolean(element.closest("[data-show-annotation-ui], [data-show-annotation-capture], [data-show-agent-mark-layer]"))
 }
 
