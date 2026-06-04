@@ -104,7 +104,7 @@ Policy:
 Suggested defaults:
 
 ```text
-idleTtlMs = 15 minutes
+idleTtlMs = 24 hours
 maxActiveContexts = 10
 startupTimeoutMs = 10 seconds
 ```
