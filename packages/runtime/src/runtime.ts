@@ -17,9 +17,11 @@ import { createShadcnAlias } from "./aliases.js"
 import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
 import { ensureSessionTemplate } from "./templates.js"
 
+const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000
+
 export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
-  const idleTtlMs = options.idleTtlMs ?? 15 * 60 * 1000
+  const idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS
 
   async function ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus> {
     const existing = getOrCreateSession(sessionId)
