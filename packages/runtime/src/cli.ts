@@ -4,12 +4,14 @@ import { resolve } from "node:path"
 import { startShowRuntimeServer } from "./server.js"
 
 const workspaceRoot = resolve(getArg("--workspace-root") ?? ".show")
+const cacheRoot = getArg("--cache-root")
 const port = Number(getArg("--port") ?? "0")
 const host = getArg("--host") ?? "127.0.0.1"
 const fallbackDelaySeconds = numberArg("--fallback-delay-seconds")
 
 const runtime = await startShowRuntimeServer({
   workspaceRoot,
+  cacheRoot: cacheRoot ? resolve(cacheRoot) : undefined,
   host,
   port,
   fallbackDelaySeconds
@@ -17,6 +19,9 @@ const runtime = await startShowRuntimeServer({
 
 console.log(`Vibe Show Runtime listening at ${runtime.url}`)
 console.log(`Workspace root: ${workspaceRoot}`)
+if (cacheRoot) {
+  console.log(`Cache root: ${resolve(cacheRoot)}`)
+}
 
 process.on("SIGINT", () => {
   void runtime.close().then(() => process.exit(0))

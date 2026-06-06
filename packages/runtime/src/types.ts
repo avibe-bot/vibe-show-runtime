@@ -6,6 +6,7 @@ export type ShowRuntimeOptions = {
   workspaceRoot: string
   server?: Server
   dependencyRoot?: string
+  cacheRoot?: string
   host?: string
   port?: number
   idleTtlMs?: number

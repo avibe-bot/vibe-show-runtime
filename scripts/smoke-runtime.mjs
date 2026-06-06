@@ -1,6 +1,6 @@
-import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises"
+import { access, mkdtemp, mkdir, readFile, readdir, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, relative } from "node:path"
 import vm from "node:vm"
 import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
@@ -147,7 +147,8 @@ vm.runInNewContext(
 )
 
 const root = await mkdtemp(join(tmpdir(), "avibe-show-runtime-"))
-const runtime = await startShowRuntimeServer({ workspaceRoot: root, fallbackDelaySeconds: 10 })
+const cacheRoot = join(root, "runtime-cache")
+const runtime = await startShowRuntimeServer({ workspaceRoot: root, cacheRoot, fallbackDelaySeconds: 10 })
 
 try {
   const apiDir = join(root, "smoke", "api")
@@ -176,6 +177,25 @@ try {
   }
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
     throw new Error("Expected app HTML asset URLs to stay under /show/<session>/")
+  }
+  await fetch(`${runtime.url}/sessions/smoke/app/src/main.tsx`).then((res) => {
+    if (!res.ok) {
+      throw new Error(`Expected session source module to load, got ${res.status}`)
+    }
+  })
+  await access(cacheRoot)
+  const cacheDigestDirs = await readdir(cacheRoot)
+  if (cacheDigestDirs.length !== 1) {
+    throw new Error(`Expected one dependency cache namespace, got ${cacheDigestDirs.join(", ")}`)
+  }
+  await access(join(cacheRoot, cacheDigestDirs[0], "smoke"))
+  try {
+    await access(join(root, "smoke", "node_modules", ".vite"))
+    throw new Error("Expected Vite optimized dependency cache to stay out of the session workspace")
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error
+    }
   }
   const generatedIndex = await readFile(join(root, "smoke", "index.html"), "utf8")
   if (generatedIndex.includes("Ready to visualize") || generatedIndex.includes("Loading Show Page") || generatedIndex.includes("avs-fallback-shell")) {
@@ -369,6 +389,42 @@ try {
 } finally {
   await runtime.close()
   await rm(root, { recursive: true, force: true })
+}
+
+const relativeCacheRoot = await mkdtemp(join(tmpdir(), "avibe-show-runtime-relative-cache-"))
+const relativeRoot = await mkdtemp(join(tmpdir(), "avibe-show-runtime-relative-root-"))
+const relativeRuntime = await startShowRuntimeServer({
+  workspaceRoot: relativeRoot,
+  cacheRoot: relative(process.cwd(), relativeCacheRoot)
+})
+try {
+  const ensure = await fetch(`${relativeRuntime.url}/sessions/relative/ensure`, { method: "POST" }).then((res) => res.json())
+  if (ensure.state !== "active") {
+    throw new Error(`Expected relative cache session to be active, got ${ensure.state}`)
+  }
+  await fetch(`${relativeRuntime.url}/sessions/relative/app/src/main.tsx`).then((res) => {
+    if (!res.ok) {
+      throw new Error(`Expected relative cache session source module to load, got ${res.status}`)
+    }
+  })
+  const cacheDigestDirs = await readdir(relativeCacheRoot)
+  if (cacheDigestDirs.length !== 1) {
+    throw new Error(`Expected relative cache root to contain one namespace, got ${cacheDigestDirs.join(", ")}`)
+  }
+  await access(join(relativeCacheRoot, cacheDigestDirs[0], "relative"))
+  try {
+    await access(join(relativeRoot, "relative", ".vite"))
+    throw new Error("Expected relative cacheRoot to resolve outside the session workspace")
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error
+    }
+  }
+  await new Promise((resolve) => setTimeout(resolve, 250))
+} finally {
+  await relativeRuntime.close()
+  await rm(relativeRoot, { recursive: true, force: true })
+  await rm(relativeCacheRoot, { recursive: true, force: true })
 }
 
 async function readUntil(reader, needle) {
