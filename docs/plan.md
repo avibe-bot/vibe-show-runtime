@@ -132,6 +132,27 @@ Avoid for v1:
 The global graph can be revisited later if active-session memory becomes a real
 bottleneck, but it should not be the first design.
 
+## Remote HMR Performance Model
+
+The runtime must preserve hot updates for local, remote, private, and public
+Show Pages. Remote performance should improve by separating immutable runtime
+assets from session source, not by replacing live pages with static snapshots.
+
+The optimization boundary should be:
+
+- immutable runtime/vendor assets: stable URL, long cache, keyed by runtime
+  version or manifest digest
+- session source modules: session URL, no-store or short cache, HMR-controlled
+- HMR WebSocket and event streams: never cached
+- HTML shell with injected session config: no-store
+
+The first implementation keeps one Vite context and one mutable Vite cache
+directory per active session, but moves those cache directories outside the
+session workspace. This preserves Vite's per-context cache safety while giving
+Vibe Remote one runtime-owned cache root to manage. A later immutable prebundle
+or runtime asset namespace can make browser-visible URLs stable across session
+and share paths.
+
 ## Session Workspace
 
 Default generated files:
@@ -448,8 +469,9 @@ Limits:
 - status API
 - lifecycle tests
 
-### M4: Publish Snapshot
+### M4: Live Public Sharing And Runtime Cache
 
-- build service app to static output
-- let Vibe Remote serve public `/p/<share-id>/` from snapshot
-- keep live service private by default
+- serve public `/p/<share-id>/` through the same live runtime and HMR model
+- keep public write/event/handler capabilities behind explicit policy checks
+- move immutable runtime/vendor assets to versioned, cacheable paths
+- keep session source modules and HMR channels session-scoped and fresh

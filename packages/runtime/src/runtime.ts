@@ -1,6 +1,7 @@
 import { access, mkdir, symlink } from "node:fs/promises"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+import { createHash } from "node:crypto"
 import react from "@vitejs/plugin-react"
 import { createServer as createViteServer } from "vite"
 import type { InlineConfig } from "vite"
@@ -78,11 +79,13 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
 
   async function warmSession(session: ShowSession, basePath: string): Promise<ShowSession> {
     await mkdir(session.workspace, { recursive: true })
-    await ensureSharedDependencyLink(session.workspace, options.dependencyRoot)
+    const dependencyRoot = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot)
     await ensureSessionTemplate(session.workspace)
+    const cacheDir = await viteCacheDir(dependencyRoot, session.id, options.cacheRoot)
     const viteConfig = {
       base: basePath,
       root: session.workspace,
+      cacheDir,
       server: {
         middlewareMode: options.server ? { server: options.server } : true,
         hmr: {
@@ -91,7 +94,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
         },
         fs: {
           strict: true,
-          allow: [session.workspace],
+          allow: [session.workspace, dependencyRoot],
           deny: []
         }
       },
@@ -174,11 +177,20 @@ async function ensureSharedDependencyLink(workspace: string, dependencyRoot?: st
   const linkPath = join(workspace, "node_modules")
   try {
     await access(linkPath)
-    return
+    return nodeModules
   } catch {
     // create link below
   }
   await symlink(nodeModules, linkPath, "junction")
+  return nodeModules
+}
+
+async function viteCacheDir(dependencyRoot: string, sessionId: string, cacheRoot?: string) {
+  const root = resolve(cacheRoot ?? join(dirname(dependencyRoot), ".vite-cache"))
+  const digest = createHash("sha256").update(dependencyRoot).digest("hex").slice(0, 16)
+  const cacheDir = join(root, digest, encodeURIComponent(sessionId))
+  await mkdir(cacheDir, { recursive: true })
+  return cacheDir
 }
 
 async function findNearestNodeModules() {
