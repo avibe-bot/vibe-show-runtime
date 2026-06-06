@@ -125,6 +125,9 @@ npm run build -w @avibe/show-example-shadcn-alias
 The `examples/shadcn-alias` app demonstrates the agent-facing alias model.
 The `examples/service-handler` package demonstrates the first handler type
 shape.
+The `examples/local-decisions` app demonstrates a front-end-only template that
+stores decisions in `localStorage` and copies the full decision JSON without
+posting to the runtime server.
 
 ## Runtime Server
 
