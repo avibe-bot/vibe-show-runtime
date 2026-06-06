@@ -10,6 +10,7 @@ export type ShowRuntimeOptions = {
   port?: number
   idleTtlMs?: number
   uiPackageName?: string
+  fallbackDelaySeconds?: number
 }
 
 export type ShowSessionState = "created" | "warming" | "active" | "idle" | "suspended"

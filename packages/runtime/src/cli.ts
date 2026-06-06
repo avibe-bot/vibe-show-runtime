@@ -6,11 +6,13 @@ import { startShowRuntimeServer } from "./server.js"
 const workspaceRoot = resolve(getArg("--workspace-root") ?? ".show")
 const port = Number(getArg("--port") ?? "0")
 const host = getArg("--host") ?? "127.0.0.1"
+const fallbackDelaySeconds = numberArg("--fallback-delay-seconds")
 
 const runtime = await startShowRuntimeServer({
   workspaceRoot,
   host,
-  port
+  port,
+  fallbackDelaySeconds
 })
 
 console.log(`Vibe Show Runtime listening at ${runtime.url}`)
@@ -28,4 +30,14 @@ function getArg(name: string) {
   const index = process.argv.indexOf(name)
   if (index === -1) return undefined
   return process.argv[index + 1]
+}
+
+function numberArg(name: string) {
+  const raw = getArg(name)
+  if (raw === undefined) return undefined
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative number`)
+  }
+  return parsed
 }

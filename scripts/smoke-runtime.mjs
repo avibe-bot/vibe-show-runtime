@@ -89,7 +89,16 @@ if (pageUpdateMessage !== "Page custom transcript.") {
   throw new Error(`Expected page updates to preserve supplied transcript message, got ${pageUpdateMessage}`)
 }
 
-const hmrPlugin = showHmrTransitionPlugin()
+const defaultHmrPlugin = showHmrTransitionPlugin()
+const defaultHmrIndexHtml = defaultHmrPlugin.transformIndexHtml?.('<div id="root"></div><script type="module" src="/src/main.tsx"></script>')
+const defaultHmrStyleTag = !Array.isArray(defaultHmrIndexHtml) && typeof defaultHmrIndexHtml === "object"
+  ? defaultHmrIndexHtml.tags.find((tag) => tag.tag === "style")
+  : undefined
+if (!defaultHmrStyleTag?.children?.includes("avs-show-fallback-recovery-in 0.22s ease 5s forwards")) {
+  throw new Error("Expected standalone runtime fallback recovery delay to default to 5 seconds")
+}
+
+const hmrPlugin = showHmrTransitionPlugin({ fallbackDelaySeconds: 10 })
 const hmrClientCode = hmrPlugin.load?.("\0virtual:avibe-show-hmr-transition-client")
 if (typeof hmrClientCode !== "string") {
   throw new Error("Expected HMR transition plugin to return client code")
@@ -107,8 +116,8 @@ if (
   !hmrIndexHtml.html.includes("Ready to visualize") ||
   !hmrStyleTag?.children?.includes("Loading Show Page") ||
   !hmrStyleTag.children.includes(".avs-fallback") ||
-  hmrStyleTag.children.includes(".fallback-shell") ||
-  !hmrStyleTag.children.includes("avs-show-fallback-recovery-in 0.22s ease 5s forwards")
+  hmrStyleTag.children.includes(".fallback-shell {") ||
+  !hmrStyleTag.children.includes("avs-show-fallback-recovery-in 0.22s ease 10s forwards")
 ) {
   throw new Error("Expected runtime HTML transform to inject and delay the fallback recovery screen")
 }
@@ -138,7 +147,7 @@ vm.runInNewContext(
 )
 
 const root = await mkdtemp(join(tmpdir(), "avibe-show-runtime-"))
-const runtime = await startShowRuntimeServer({ workspaceRoot: root })
+const runtime = await startShowRuntimeServer({ workspaceRoot: root, fallbackDelaySeconds: 10 })
 
 try {
   const apiDir = join(root, "smoke", "api")
@@ -162,7 +171,7 @@ try {
   if (!app.includes("Vibe Show")) {
     throw new Error("Expected app HTML to include Vibe Show")
   }
-  if (!app.includes("Loading Show Page") || !app.includes("Ready to visualize") || !app.includes("avs-show-fallback-recovery-in 0.22s ease 5s forwards")) {
+  if (!app.includes("Loading Show Page") || !app.includes("Ready to visualize") || !app.includes("avs-show-fallback-recovery-in 0.22s ease 10s forwards")) {
     throw new Error("Expected app HTML to include runtime-injected delayed fallback recovery UI")
   }
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {

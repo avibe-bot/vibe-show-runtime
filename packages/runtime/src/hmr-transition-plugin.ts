@@ -4,7 +4,8 @@ import { fallbackRecoveryCss, injectFallbackRecovery } from "./fallback-recovery
 const clientModuleId = "virtual:avibe-show-hmr-transition-client"
 const resolvedClientModuleId = `\0${clientModuleId}`
 
-export function showHmrTransitionPlugin(): Plugin {
+export function showHmrTransitionPlugin(options: { fallbackDelaySeconds?: number } = {}): Plugin {
+  const fallbackDelaySeconds = options.fallbackDelaySeconds
   return {
     name: "avibe-show-hmr-transition",
     apply: "serve",
@@ -22,7 +23,7 @@ export function showHmrTransitionPlugin(): Plugin {
         tags: [
         {
           tag: "style",
-          children: `${fallbackRecoveryCss()}\n${hmrTransitionCss()}`,
+          children: `${fallbackRecoveryCss(fallbackDelaySeconds)}\n${hmrTransitionCss()}`,
           injectTo: "head"
         },
         {
