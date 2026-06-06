@@ -1,8 +1,8 @@
-const FALLBACK_DELAY_SECONDS = 5
+export const DEFAULT_FALLBACK_DELAY_SECONDS = 5
 const ROOT_ELEMENT_PATTERN = /(<div\b(?=[^>]*\bid\s*=\s*(["'])root\2)[^>]*>\s*<\/div>)/i
 const AVS_FALLBACK_PATTERN = /\bclass\s*=\s*(["'])[^"']*\bavs-fallback(?=\s|["'])[^"']*\1/i
 
-export function fallbackRecoveryCss() {
+export function fallbackRecoveryCss(delaySeconds = DEFAULT_FALLBACK_DELAY_SECONDS) {
   return `
 #root:not(:empty) + .avs-fallback-shell {
   display: none;
@@ -31,7 +31,7 @@ export function fallbackRecoveryCss() {
   box-sizing: border-box;
   animation:
     avs-show-fallback-spinner 0.8s linear infinite,
-    avs-show-fallback-loading-out 0.18s ease ${FALLBACK_DELAY_SECONDS}s forwards;
+    avs-show-fallback-loading-out 0.18s ease ${delaySeconds}s forwards;
 }
 
 .avs-fallback-shell::after {
@@ -45,7 +45,7 @@ export function fallbackRecoveryCss() {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   white-space: nowrap;
-  animation: avs-show-fallback-loading-out 0.18s ease ${FALLBACK_DELAY_SECONDS}s forwards;
+  animation: avs-show-fallback-loading-out 0.18s ease ${delaySeconds}s forwards;
 }
 
 .avs-fallback {
@@ -59,7 +59,7 @@ export function fallbackRecoveryCss() {
   opacity: 0;
   visibility: hidden;
   transform: translateY(6px);
-  animation: avs-show-fallback-recovery-in 0.22s ease ${FALLBACK_DELAY_SECONDS}s forwards;
+  animation: avs-show-fallback-recovery-in 0.22s ease ${delaySeconds}s forwards;
 }
 
 .avs-fallback-eyebrow {
@@ -170,7 +170,7 @@ export function fallbackRecoveryCss() {
 
 @media (prefers-reduced-motion: reduce) {
   .avs-fallback-shell::before {
-    animation: avs-show-fallback-loading-out 0.18s ease ${FALLBACK_DELAY_SECONDS}s forwards;
+    animation: avs-show-fallback-loading-out 0.18s ease ${delaySeconds}s forwards;
   }
 
   .avs-fallback {

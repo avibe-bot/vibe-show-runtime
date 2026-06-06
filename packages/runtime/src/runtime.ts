@@ -95,7 +95,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
           deny: []
         }
       },
-      plugins: [showHmrTransitionPlugin(), react()] as InlineConfig["plugins"],
+      plugins: [showHmrTransitionPlugin({ fallbackDelaySeconds: options.fallbackDelaySeconds }), react()] as InlineConfig["plugins"],
       resolve: {
         alias: createShadcnAlias(options.uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never
       }
