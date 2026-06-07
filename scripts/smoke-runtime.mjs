@@ -98,7 +98,7 @@ if (!defaultHmrStyleTag?.children?.includes("avs-show-fallback-recovery-in 0.22s
   throw new Error("Expected standalone runtime fallback recovery delay to default to 5 seconds")
 }
 
-const hmrPlugin = showHmrTransitionPlugin({ fallbackDelaySeconds: 10 })
+const hmrPlugin = showHmrTransitionPlugin({ fallbackDelaySeconds: 30 })
 const hmrClientCode = hmrPlugin.load?.("\0virtual:avibe-show-hmr-transition-client")
 if (typeof hmrClientCode !== "string") {
   throw new Error("Expected HMR transition plugin to return client code")
@@ -117,7 +117,7 @@ if (
   !hmrStyleTag?.children?.includes("Loading Show Page") ||
   !hmrStyleTag.children.includes(".avs-fallback") ||
   hmrStyleTag.children.includes(".fallback-shell {") ||
-  !hmrStyleTag.children.includes("avs-show-fallback-recovery-in 0.22s ease 10s forwards")
+  !hmrStyleTag.children.includes("avs-show-fallback-recovery-in 0.22s ease 30s forwards")
 ) {
   throw new Error("Expected runtime HTML transform to inject and delay the fallback recovery screen")
 }
@@ -148,7 +148,7 @@ vm.runInNewContext(
 
 const root = await mkdtemp(join(tmpdir(), "avibe-show-runtime-"))
 const cacheRoot = join(root, "runtime-cache")
-const runtime = await startShowRuntimeServer({ workspaceRoot: root, cacheRoot, fallbackDelaySeconds: 10 })
+const runtime = await startShowRuntimeServer({ workspaceRoot: root, cacheRoot, fallbackDelaySeconds: 30 })
 
 try {
   const apiDir = join(root, "smoke", "api")
@@ -172,7 +172,7 @@ try {
   if (!app.includes("Vibe Show")) {
     throw new Error("Expected app HTML to include Vibe Show")
   }
-  if (!app.includes("Loading Show Page") || !app.includes("Ready to visualize") || !app.includes("avs-show-fallback-recovery-in 0.22s ease 10s forwards")) {
+  if (!app.includes("Loading Show Page") || !app.includes("Ready to visualize") || !app.includes("avs-show-fallback-recovery-in 0.22s ease 30s forwards")) {
     throw new Error("Expected app HTML to include runtime-injected delayed fallback recovery UI")
   }
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
@@ -299,6 +299,30 @@ try {
   const status = await fetch(`${runtime.url}/sessions/smoke/status`).then((res) => res.json())
   if (status.messageCount !== 3 || status.eventCount !== 3) {
     throw new Error(`Expected show event counters in status: ${JSON.stringify(status)}`)
+  }
+
+  const idleRoot = await mkdtemp(join(tmpdir(), "avibe-show-runtime-idle-"))
+  const idleRuntime = await startShowRuntimeServer({ workspaceRoot: idleRoot, idleTtlMs: 200, idlePruneIntervalMs: 0 })
+  try {
+    const active = await loadAppEntry(idleRuntime.url, "idle")
+    if (!active.includes("Vibe Show")) {
+      throw new Error("Expected idle test app HTML to load")
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    const idleStatus = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
+    if (idleStatus.state !== "idle") {
+      throw new Error(`Expected idle session to prune to idle, got ${JSON.stringify(idleStatus)}`)
+    }
+    const rewarmed = await loadAppEntry(idleRuntime.url, "idle")
+    if (!rewarmed.includes("Vibe Show")) {
+      throw new Error("Expected idle session to rewarm after prune")
+    }
+    const activeAgain = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
+    if (activeAgain.state !== "active") {
+      throw new Error(`Expected re-warmed idle session to be active, got ${JSON.stringify(activeAgain)}`)
+    }
+  } finally {
+    await idleRuntime.close()
   }
 
   const streamController = new AbortController()
@@ -442,4 +466,14 @@ async function readUntil(reader, needle) {
     body += decoder.decode(value, { stream: true })
   }
   return body
+}
+
+async function loadAppEntry(runtimeUrl, sessionId) {
+  const html = await fetch(`${runtimeUrl}/sessions/${sessionId}/app/`).then((res) => res.text())
+  const main = await fetch(`${runtimeUrl}/sessions/${sessionId}/app/src/main.tsx`)
+  if (!main.ok) {
+    throw new Error(`Expected ${sessionId} app entry module to load, got ${main.status}`)
+  }
+  await main.text()
+  return html
 }

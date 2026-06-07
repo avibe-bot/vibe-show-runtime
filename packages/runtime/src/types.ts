@@ -10,6 +10,7 @@ export type ShowRuntimeOptions = {
   host?: string
   port?: number
   idleTtlMs?: number
+  idlePruneIntervalMs?: number
   uiPackageName?: string
   fallbackDelaySeconds?: number
 }
@@ -41,7 +42,8 @@ export type ShowSession = {
 
 export type ShowRuntime = {
   ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus>
-  getSessionStatus(sessionId: string): ShowSessionStatus
+  getSessionStatus(sessionId: string): Promise<ShowSessionStatus>
+  pruneIdleSessions(): Promise<ShowSessionStatus[]>
   getSession(sessionId: string): ShowSession | undefined
   suspendSession(sessionId: string): Promise<ShowSessionStatus>
   recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor): ShowEvent

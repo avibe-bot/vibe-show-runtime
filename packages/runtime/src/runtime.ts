@@ -19,36 +19,63 @@ import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
 import { ensureSessionTemplate } from "./templates.js"
 
 const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000
+const DEFAULT_IDLE_PRUNE_INTERVAL_MS = 5 * 60 * 1000
+const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 
 export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
   const idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS
+  const idlePruneIntervalMs = options.idlePruneIntervalMs ?? DEFAULT_IDLE_PRUNE_INTERVAL_MS
+  let lastIdlePruneAt = 0
+  const idlePruneTimer = idlePruneIntervalMs > 0
+    ? setInterval(() => {
+      void pruneIdleSessions().catch((error) => {
+        console.error(JSON.stringify({
+          level: "warn",
+          source: "show-runtime",
+          event: "idle-prune-error",
+          message: error instanceof Error ? error.message : String(error)
+        }))
+      })
+    }, idlePruneIntervalMs)
+    : undefined
+  idlePruneTimer?.unref?.()
 
   async function ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus> {
+    const started = performance.now()
+    await pruneIdleSessionsIfDue()
     const existing = getOrCreateSession(sessionId)
     existing.lastAccessedAt = new Date()
     const normalizedBasePath = normalizeBasePath(basePath, sessionId)
     if (existing.state === "active" && existing.basePath === normalizedBasePath) {
       existing.updatedAt = new Date()
+      logTiming("ensureSession", sessionId, started, { state: "active", reused: true })
       return toStatus(existing)
     }
     if (existing.state === "active" && existing.basePath !== normalizedBasePath) {
+      const closeStarted = performance.now()
       await closeSession(existing)
+      logTiming("closeSessionForBasePathChange", sessionId, closeStarted, { from: existing.basePath, to: normalizedBasePath })
     }
     if (!existing.warming) {
+      if (existing.vite) {
+        const closeStarted = performance.now()
+        await closeSession(existing, existing.state)
+        logTiming("closeStaleSessionBeforeWarm", sessionId, closeStarted, { state: existing.state })
+      }
       existing.state = "warming"
       existing.updatedAt = new Date()
       existing.warming = warmSession(existing, normalizedBasePath)
     }
     const warmed = await existing.warming
+    warmed.lastAccessedAt = new Date()
+    logTiming("ensureSession", sessionId, started, { state: warmed.state, reused: false, basePath: warmed.basePath })
     return toStatus(warmed)
   }
 
-  function getSessionStatus(sessionId: string): ShowSessionStatus {
+  async function getSessionStatus(sessionId: string): Promise<ShowSessionStatus> {
+    await pruneIdleSessions()
     const session = getOrCreateSession(sessionId)
-    if (session.state === "active" && session.lastAccessedAt && Date.now() - session.lastAccessedAt.getTime() > idleTtlMs) {
-      session.state = "idle"
-    }
     return toStatus(session)
   }
 
@@ -59,7 +86,29 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   }
 
   async function close() {
+    if (idlePruneTimer) clearInterval(idlePruneTimer)
     await Promise.all([...sessions.values()].map((session) => closeSession(session)))
+  }
+
+  async function pruneIdleSessions(): Promise<ShowSessionStatus[]> {
+    const now = Date.now()
+    lastIdlePruneAt = now
+    const pruned: ShowSessionStatus[] = []
+    for (const session of sessions.values()) {
+      if (session.state !== "active" || !session.lastAccessedAt) continue
+      if (now - session.lastAccessedAt.getTime() <= idleTtlMs) continue
+      const started = performance.now()
+      await closeSession(session, "idle")
+      logTiming("pruneIdleSession", session.id, started, { idleTtlMs })
+      pruned.push(toStatus(session))
+    }
+    return pruned
+  }
+
+  async function pruneIdleSessionsIfDue(): Promise<ShowSessionStatus[]> {
+    if (idlePruneIntervalMs <= 0) return []
+    if (Date.now() - lastIdlePruneAt < idlePruneIntervalMs) return []
+    return pruneIdleSessions()
   }
 
   function getOrCreateSession(sessionId: string): ShowSession {
@@ -78,10 +127,19 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   }
 
   async function warmSession(session: ShowSession, basePath: string): Promise<ShowSession> {
+    const started = performance.now()
+    const mkdirStarted = performance.now()
     await mkdir(session.workspace, { recursive: true })
+    logTiming("warmSession.mkdir", session.id, mkdirStarted)
+    const linkStarted = performance.now()
     const dependencyRoot = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot)
+    logTiming("warmSession.dependencyLink", session.id, linkStarted, { dependencyRoot })
+    const templateStarted = performance.now()
     await ensureSessionTemplate(session.workspace)
+    logTiming("warmSession.template", session.id, templateStarted)
+    const cacheStarted = performance.now()
     const cacheDir = await viteCacheDir(dependencyRoot, session.id, options.cacheRoot)
+    logTiming("warmSession.cacheDir", session.id, cacheStarted, { cacheDir })
     const viteConfig = {
       base: basePath,
       root: session.workspace,
@@ -103,21 +161,24 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
         alias: createShadcnAlias(options.uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never
       }
     } satisfies InlineConfig
+    const viteStarted = performance.now()
     session.vite = await createViteServer(viteConfig)
+    logTiming("warmSession.createViteServer", session.id, viteStarted, { cacheDir, basePath })
     session.state = "active"
     session.basePath = basePath
     session.updatedAt = new Date()
     session.warming = undefined
+    logTiming("warmSession.total", session.id, started, { cacheDir, basePath })
     return session
   }
 
-  async function closeSession(session: ShowSession) {
+  async function closeSession(session: ShowSession, nextState: ShowSession["state"] = "suspended") {
     if (session.vite) {
       await session.vite.waitForRequestsIdle()
       await session.vite.close()
       session.vite = undefined
     }
-    session.state = "suspended"
+    session.state = nextState
     session.updatedAt = new Date()
     session.warming = undefined
   }
@@ -125,6 +186,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   return {
     ensureSession,
     getSessionStatus,
+    pruneIdleSessions,
     getSession: (sessionId: string) => sessions.get(sessionId),
     suspendSession,
     recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor) {
@@ -217,4 +279,18 @@ export function toStatus(session: ShowSession): ShowSessionStatus {
     eventCount: session.events.length,
     messageCount: session.messages.length
   }
+}
+
+function logTiming(label: string, sessionId: string, started: number, extra: Record<string, unknown> = {}) {
+  const durationMs = Math.round(performance.now() - started)
+  if (durationMs < SLOW_TIMING_MS && process.env.VIBE_SHOW_RUNTIME_TIMING !== "1") return
+  console.error(JSON.stringify({
+    level: durationMs >= SLOW_TIMING_MS ? "warn" : "info",
+    source: "show-runtime",
+    event: "timing",
+    label,
+    sessionId,
+    durationMs,
+    ...extra
+  }))
 }

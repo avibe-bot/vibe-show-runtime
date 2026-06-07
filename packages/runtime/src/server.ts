@@ -6,6 +6,8 @@ import type { ShowRuntimeOptions } from "./types.js"
 import { createShowRuntime } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
 
+const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
+
 export async function startShowRuntimeServer(options: ShowRuntimeOptions = { workspaceRoot: ".show" }) {
   const host = options.host ?? "127.0.0.1"
   const port = options.port ?? 0
@@ -58,7 +60,7 @@ async function routeRequest(
 
   const statusMatch = pathname.match(/^\/sessions\/([^/]+)\/status$/)
   if (request.method === "GET" && statusMatch) {
-    sendJson(response, 200, runtime.getSessionStatus(statusMatch[1]))
+    sendJson(response, 200, await runtime.getSessionStatus(statusMatch[1]))
     return
   }
 
@@ -104,7 +106,9 @@ async function routeRequest(
   if (appMatch) {
     const sessionId = appMatch[1]
     const appPath = `/${appMatch[2] || ""}`
+    const requestStarted = performance.now()
     const status = await runtime.ensureSession(sessionId, publicBasePath(request))
+    logRequestTiming("ensureSessionForAppRequest", sessionId, appPath, requestStarted, { state: status.state })
     const session = runtime.getSession(sessionId)
     if (!session) {
       sendJson(response, 503, { error: "Session not ready", status })
@@ -169,6 +173,16 @@ async function routeRequest(
     }
 
     request.url = appPath === "/" ? "/" : appPath
+    const middlewareStarted = performance.now()
+    response.once("finish", () => {
+      logRequestTiming("viteMiddlewareResponse", sessionId, appPath, middlewareStarted, {
+        statusCode: response.statusCode
+      })
+      logRequestTiming("appRequestTotal", sessionId, appPath, requestStarted, {
+        statusCode: response.statusCode,
+        state: session.state
+      })
+    })
     vite.middlewares(request, response, (error?: unknown) => {
       if (error) {
         response.statusCode = 500
@@ -305,6 +319,27 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown) {
   response.statusCode = statusCode
   response.setHeader("content-type", "application/json")
   response.end(JSON.stringify(body))
+}
+
+function logRequestTiming(
+  label: string,
+  sessionId: string,
+  path: string,
+  started: number,
+  extra: Record<string, unknown> = {}
+) {
+  const durationMs = Math.round(performance.now() - started)
+  if (durationMs < SLOW_TIMING_MS && process.env.VIBE_SHOW_RUNTIME_TIMING !== "1") return
+  console.error(JSON.stringify({
+    level: durationMs >= SLOW_TIMING_MS ? "warn" : "info",
+    source: "show-runtime",
+    event: "timing",
+    label,
+    sessionId,
+    path,
+    durationMs,
+    ...extra
+  }))
 }
 
 function sendEventStream(response: ServerResponse) {
