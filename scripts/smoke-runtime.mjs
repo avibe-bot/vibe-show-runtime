@@ -302,13 +302,20 @@ try {
   }
 
   const idleRoot = await mkdtemp(join(tmpdir(), "avibe-show-runtime-idle-"))
-  const idleRuntime = await startShowRuntimeServer({ workspaceRoot: idleRoot, idleTtlMs: 200, idlePruneIntervalMs: 0 })
+  const idleApiDir = join(idleRoot, "idle", "api")
+  await mkdir(idleApiDir, { recursive: true })
+  await writeFile(join(idleApiDir, "slow.ts"), `export async function GET() {
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    return Response.json({ ok: true })
+  }
+`)
+  const idleRuntime = await startShowRuntimeServer({ workspaceRoot: idleRoot, idleTtlMs: 100, idlePruneIntervalMs: 0 })
   try {
     const active = await loadAppEntry(idleRuntime.url, "idle")
     if (!active.includes("Vibe Show")) {
       throw new Error("Expected idle test app HTML to load")
     }
-    await new Promise((resolve) => setTimeout(resolve, 250))
+    await new Promise((resolve) => setTimeout(resolve, 150))
     const idleStatus = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
     if (idleStatus.state !== "idle") {
       throw new Error(`Expected idle session to prune to idle, got ${JSON.stringify(idleStatus)}`)
@@ -320,6 +327,20 @@ try {
     const activeAgain = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
     if (activeAgain.state !== "active") {
       throw new Error(`Expected re-warmed idle session to be active, got ${JSON.stringify(activeAgain)}`)
+    }
+
+    const slow = fetch(`${idleRuntime.url}/sessions/idle/app/api/slow`).then((res) => res.json())
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const pruning = fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    const concurrentApp = fetch(`${idleRuntime.url}/sessions/idle/app/`).then((res) => res.text())
+    const [slowResponse, , concurrentHtml] = await Promise.all([slow, pruning, concurrentApp])
+    if (!slowResponse.ok || !concurrentHtml.includes("Vibe Show")) {
+      throw new Error("Expected concurrent idle prune access to complete")
+    }
+    const concurrentStatus = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
+    if (concurrentStatus.state !== "active") {
+      throw new Error(`Expected concurrent access during prune to leave session active, got ${JSON.stringify(concurrentStatus)}`)
     }
   } finally {
     await idleRuntime.close()

@@ -15,7 +15,7 @@ export type ShowRuntimeOptions = {
   fallbackDelaySeconds?: number
 }
 
-export type ShowSessionState = "created" | "warming" | "active" | "idle" | "suspended"
+export type ShowSessionState = "created" | "warming" | "active" | "closing" | "idle" | "suspended"
 
 export type ShowSessionStatus = {
   sessionId: string
@@ -36,6 +36,7 @@ export type ShowSession = {
   lastAccessedAt?: Date
   vite?: ViteDevServer
   warming?: Promise<ShowSession>
+  closing?: Promise<void>
   events: ShowEvent[]
   messages: ShowMessage[]
 }

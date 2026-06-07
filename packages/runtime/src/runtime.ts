@@ -46,6 +46,10 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     await pruneIdleSessionsIfDue()
     const existing = getOrCreateSession(sessionId)
     existing.lastAccessedAt = new Date()
+    if (existing.closing) {
+      await existing.closing
+      existing.lastAccessedAt = new Date()
+    }
     const normalizedBasePath = normalizeBasePath(basePath, sessionId)
     if (existing.state === "active" && existing.basePath === normalizedBasePath) {
       existing.updatedAt = new Date()
@@ -60,7 +64,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     if (!existing.warming) {
       if (existing.vite) {
         const closeStarted = performance.now()
-        await closeSession(existing, existing.state)
+        await closeSession(existing, existing.state === "closing" ? "suspended" : existing.state)
         logTiming("closeStaleSessionBeforeWarm", sessionId, closeStarted, { state: existing.state })
       }
       existing.state = "warming"
@@ -99,7 +103,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       if (now - session.lastAccessedAt.getTime() <= idleTtlMs) continue
       const started = performance.now()
       await closeSession(session, "idle")
-      logTiming("pruneIdleSession", session.id, started, { idleTtlMs })
+      logTiming("pruneIdleSession", session.id, started, { idleTtlMs, state: session.state })
       pruned.push(toStatus(session))
     }
     return pruned
@@ -173,14 +177,34 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   }
 
   async function closeSession(session: ShowSession, nextState: ShowSession["state"] = "suspended") {
-    if (session.vite) {
-      await session.vite.waitForRequestsIdle()
-      await session.vite.close()
-      session.vite = undefined
+    if (session.closing) {
+      await session.closing
+      return
     }
-    session.state = nextState
+    const vite = session.vite
+    if (!vite) {
+      session.state = nextState
+      session.updatedAt = new Date()
+      session.warming = undefined
+      return
+    }
+    session.state = "closing"
     session.updatedAt = new Date()
     session.warming = undefined
+    session.closing = (async () => {
+      try {
+        await vite.waitForRequestsIdle()
+        await vite.close()
+      } finally {
+        if (session.vite === vite) {
+          session.vite = undefined
+        }
+        session.closing = undefined
+        session.state = nextState
+        session.updatedAt = new Date()
+      }
+    })()
+    await session.closing
   }
 
   return {
