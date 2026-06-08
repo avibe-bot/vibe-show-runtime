@@ -1,4 +1,4 @@
-import { access, mkdir, symlink } from "node:fs/promises"
+import { access, lstat, mkdir, readlink, rm, symlink } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
@@ -79,9 +79,9 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
 
   async function warmSession(session: ShowSession, basePath: string): Promise<ShowSession> {
     await mkdir(session.workspace, { recursive: true })
-    const dependencyRoot = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot)
+    const sharedDependencies = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot)
     await ensureSessionTemplate(session.workspace)
-    const cacheDir = await viteCacheDir(dependencyRoot, session.id, options.cacheRoot)
+    const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, session.id, options.cacheRoot)
     const viteConfig = {
       base: basePath,
       root: session.workspace,
@@ -94,7 +94,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
         },
         fs: {
           strict: true,
-          allow: [session.workspace, dependencyRoot],
+          allow: [session.workspace, sharedDependencies.allowRoot],
           deny: []
         }
       },
@@ -172,17 +172,31 @@ function normalizeBasePath(basePath: string | undefined, sessionId: string) {
   return withLeadingSlash.endsWith("/") ? withLeadingSlash : `${withLeadingSlash}/`
 }
 
-async function ensureSharedDependencyLink(workspace: string, dependencyRoot?: string) {
-  const nodeModules = dependencyRoot ? join(dependencyRoot, "node_modules") : await findNearestNodeModules()
+type SharedDependencies = {
+  nodeModules: string
+  allowRoot: string
+}
+
+async function ensureSharedDependencyLink(workspace: string, dependencyRoot?: string): Promise<SharedDependencies> {
+  const allowRoot = dependencyRoot ? resolve(dependencyRoot) : await findNearestDependencyRoot()
+  const nodeModules = join(allowRoot, "node_modules")
+  await access(nodeModules)
   const linkPath = join(workspace, "node_modules")
   try {
-    await access(linkPath)
-    return nodeModules
+    const stats = await lstat(linkPath)
+    if (stats.isSymbolicLink()) {
+      const currentTarget = resolve(dirname(linkPath), await readlink(linkPath))
+      if (currentTarget !== nodeModules) {
+        await rm(linkPath)
+        await symlink(nodeModules, linkPath, "junction")
+      }
+    }
+    return { nodeModules, allowRoot }
   } catch {
     // create link below
   }
   await symlink(nodeModules, linkPath, "junction")
-  return nodeModules
+  return { nodeModules, allowRoot }
 }
 
 async function viteCacheDir(dependencyRoot: string, sessionId: string, cacheRoot?: string) {
@@ -193,13 +207,13 @@ async function viteCacheDir(dependencyRoot: string, sessionId: string, cacheRoot
   return cacheDir
 }
 
-async function findNearestNodeModules() {
+async function findNearestDependencyRoot() {
   let current = dirname(fileURLToPath(import.meta.url))
   while (current !== dirname(current)) {
     const candidate = join(current, "node_modules")
     try {
       await access(candidate)
-      return candidate
+      return current
     } catch {
       current = dirname(current)
     }
