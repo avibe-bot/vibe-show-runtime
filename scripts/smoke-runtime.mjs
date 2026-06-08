@@ -205,6 +205,13 @@ try {
   if (animatedTextModule.status !== 200 || !animatedTextModule.body.includes("AnimatedText")) {
     throw new Error(`Expected @avibe/show-ui transitive workspace modules to load, got ${animatedTextModule.status}`)
   }
+  const projectRootModule = await fetch(`${runtime.url}/sessions/smoke/app/@fs/${process.cwd()}/package.json`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  if (projectRootModule.status !== 403 || !projectRootModule.body.includes("outside of Vite serving allow list")) {
+    throw new Error(`Expected project root files to stay outside Vite fs.allow, got ${projectRootModule.status}`)
+  }
   await access(cacheRoot)
   const cacheDigestDirs = await readdir(cacheRoot)
   if (cacheDigestDirs.length !== 1) {

@@ -1,4 +1,4 @@
-import { access, lstat, mkdir, readlink, rm, symlink } from "node:fs/promises"
+import { access, lstat, mkdir, readlink, realpath, rm, symlink } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
@@ -79,7 +79,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
 
   async function warmSession(session: ShowSession, basePath: string): Promise<ShowSession> {
     await mkdir(session.workspace, { recursive: true })
-    const sharedDependencies = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot)
+    const sharedDependencies = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot, options.uiPackageName)
     await ensureSessionTemplate(session.workspace)
     const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, session.id, options.cacheRoot)
     const viteConfig = {
@@ -94,7 +94,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
         },
         fs: {
           strict: true,
-          allow: [session.workspace, sharedDependencies.allowRoot],
+          allow: [session.workspace, sharedDependencies.nodeModules, ...sharedDependencies.packageRoots],
           deny: []
         }
       },
@@ -174,13 +174,14 @@ function normalizeBasePath(basePath: string | undefined, sessionId: string) {
 
 type SharedDependencies = {
   nodeModules: string
-  allowRoot: string
+  packageRoots: string[]
 }
 
-async function ensureSharedDependencyLink(workspace: string, dependencyRoot?: string): Promise<SharedDependencies> {
-  const allowRoot = dependencyRoot ? resolve(dependencyRoot) : await findNearestDependencyRoot()
-  const nodeModules = join(allowRoot, "node_modules")
+async function ensureSharedDependencyLink(workspace: string, dependencyRoot?: string, uiPackageName = "@avibe/show-ui"): Promise<SharedDependencies> {
+  const root = dependencyRoot ? resolve(dependencyRoot) : await findNearestDependencyRoot()
+  const nodeModules = join(root, "node_modules")
   await access(nodeModules)
+  const packageRoots = await resolveAllowedPackageRoots(nodeModules, [uiPackageName, "@avibe/show-sdk"])
   const linkPath = join(workspace, "node_modules")
   try {
     const stats = await lstat(linkPath)
@@ -191,12 +192,25 @@ async function ensureSharedDependencyLink(workspace: string, dependencyRoot?: st
         await symlink(nodeModules, linkPath, "junction")
       }
     }
-    return { nodeModules, allowRoot }
+    return { nodeModules, packageRoots }
   } catch {
     // create link below
   }
   await symlink(nodeModules, linkPath, "junction")
-  return { nodeModules, allowRoot }
+  return { nodeModules, packageRoots }
+}
+
+async function resolveAllowedPackageRoots(nodeModules: string, packageNames: string[]) {
+  const roots = new Set<string>()
+  for (const packageName of packageNames) {
+    const packageRoot = packageName.split("/").reduce((current, part) => join(current, part), nodeModules)
+    try {
+      roots.add(await realpath(packageRoot))
+    } catch {
+      // Optional package aliases may not exist in every runtime install.
+    }
+  }
+  return [...roots]
 }
 
 async function viteCacheDir(dependencyRoot: string, sessionId: string, cacheRoot?: string) {
