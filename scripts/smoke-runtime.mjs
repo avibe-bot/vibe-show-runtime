@@ -1,4 +1,4 @@
-import { access, mkdtemp, mkdir, readFile, readdir, writeFile, rm } from "node:fs/promises"
+import { access, mkdtemp, mkdir, readFile, readlink, readdir, symlink, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, relative } from "node:path"
 import vm from "node:vm"
@@ -148,6 +148,10 @@ vm.runInNewContext(
 
 const root = await mkdtemp(join(tmpdir(), "avibe-show-runtime-"))
 const cacheRoot = join(root, "runtime-cache")
+const staleDependencyRoot = await mkdtemp(join(tmpdir(), "avibe-show-stale-deps-"))
+await mkdir(join(staleDependencyRoot, "node_modules"), { recursive: true })
+await mkdir(join(root, "smoke"), { recursive: true })
+await symlink(join(staleDependencyRoot, "node_modules"), join(root, "smoke", "node_modules"), "junction")
 const runtime = await startShowRuntimeServer({ workspaceRoot: root, cacheRoot, fallbackDelaySeconds: 10 })
 
 try {
@@ -161,6 +165,10 @@ try {
   const ensure = await fetch(`${runtime.url}/sessions/smoke/ensure`, { method: "POST" }).then((res) => res.json())
   if (ensure.state !== "active") {
     throw new Error(`Expected active session, got ${ensure.state}`)
+  }
+  const linkedNodeModules = await readlink(join(root, "smoke", "node_modules"))
+  if (linkedNodeModules === join(staleDependencyRoot, "node_modules")) {
+    throw new Error("Expected runtime to refresh stale session node_modules symlink")
   }
 
   const handler = await fetch(`${runtime.url}/sessions/smoke/app/api/health`).then((res) => res.json())
@@ -183,6 +191,27 @@ try {
       throw new Error(`Expected session source module to load, got ${res.status}`)
     }
   })
+  const buttonModule = await fetch(`${runtime.url}/sessions/smoke/app/@fs/${process.cwd()}/packages/ui/dist/button.js`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  if (buttonModule.status !== 200 || !buttonModule.body.includes("animated-text.js")) {
+    throw new Error(`Expected @avibe/show-ui workspace modules to load, got ${buttonModule.status}`)
+  }
+  const animatedTextModule = await fetch(`${runtime.url}/sessions/smoke/app/@fs/${process.cwd()}/packages/ui/dist/animated-text.js`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  if (animatedTextModule.status !== 200 || !animatedTextModule.body.includes("AnimatedText")) {
+    throw new Error(`Expected @avibe/show-ui transitive workspace modules to load, got ${animatedTextModule.status}`)
+  }
+  const projectRootModule = await fetch(`${runtime.url}/sessions/smoke/app/@fs/${process.cwd()}/package.json`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  if (projectRootModule.status !== 403 || !projectRootModule.body.includes("outside of Vite serving allow list")) {
+    throw new Error(`Expected project root files to stay outside Vite fs.allow, got ${projectRootModule.status}`)
+  }
   await access(cacheRoot)
   const cacheDigestDirs = await readdir(cacheRoot)
   if (cacheDigestDirs.length !== 1) {
