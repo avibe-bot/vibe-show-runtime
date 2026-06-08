@@ -205,6 +205,7 @@ async function resolveAllowedPackageRoots(nodeModules: string, packageNames: str
   for (const packageName of packageNames) {
     const packageRoot = packageName.split("/").reduce((current, part) => join(current, part), nodeModules)
     try {
+      roots.add(resolve(packageRoot))
       roots.add(await realpath(packageRoot))
     } catch {
       // Optional package aliases may not exist in every runtime install.

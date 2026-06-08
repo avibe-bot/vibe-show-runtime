@@ -205,6 +205,13 @@ try {
   if (animatedTextModule.status !== 200 || !animatedTextModule.body.includes("AnimatedText")) {
     throw new Error(`Expected @avibe/show-ui transitive workspace modules to load, got ${animatedTextModule.status}`)
   }
+  const linkedButtonModule = await fetch(`${runtime.url}/sessions/smoke/app/@fs/${process.cwd()}/node_modules/@avibe/show-ui/dist/button.js`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  if (linkedButtonModule.status !== 200 || !linkedButtonModule.body.includes("animated-text.js")) {
+    throw new Error(`Expected @avibe/show-ui package symlink modules to load, got ${linkedButtonModule.status}`)
+  }
   const projectRootModule = await fetch(`${runtime.url}/sessions/smoke/app/@fs/${process.cwd()}/package.json`).then(async (res) => ({
     status: res.status,
     body: await res.text()
