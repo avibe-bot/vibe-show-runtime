@@ -5,6 +5,7 @@ import { isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type 
 import type { ShowRuntimeOptions } from "./types.js"
 import { createShowRuntime } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
+import { isVendorAssetPath, serveVendorAsset } from "./vendor-runtime.js"
 
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 
@@ -49,6 +50,20 @@ async function routeRequest(
 
   if (request.method === "GET" && pathname === "/health") {
     sendJson(response, 200, { ok: true })
+    return
+  }
+
+  // Shared, content-hashed vendor assets live at a session-independent path so every
+  // session's import map references one immutable copy. Served straight off disk (not
+  // through any session's Vite). The browser only requests these after a Show Page
+  // HTML — which warms the bundle — so it's available; guard defensively anyway.
+  if (isVendorAssetPath(pathname)) {
+    const bundle = runtime.getVendorBundle()
+    if (!bundle) {
+      sendJson(response, 503, { error: "Vendor bundle not ready" })
+      return
+    }
+    await serveVendorAsset(bundle, pathname, response)
     return
   }
 
