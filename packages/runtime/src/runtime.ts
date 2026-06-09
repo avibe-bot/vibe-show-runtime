@@ -103,8 +103,8 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   }
 
   async function getSessionStatus(sessionId: string): Promise<ShowSessionStatus> {
-    await pruneIdleSessions()
     const session = getOrCreateSession(sessionId)
+    await pruneSessionIfIdle(session)
     return toStatus(session)
   }
 
@@ -124,14 +124,19 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     lastIdlePruneAt = now
     const pruned: ShowSessionStatus[] = []
     for (const session of sessions.values()) {
-      if (session.state !== "active" || !session.lastAccessedAt) continue
-      if (now - session.lastAccessedAt.getTime() <= idleTtlMs) continue
-      const started = performance.now()
-      await closeSession(session, "idle")
-      logTiming("pruneIdleSession", session.id, started, { idleTtlMs, state: session.state })
-      pruned.push(toStatus(session))
+      const status = await pruneSessionIfIdle(session, now)
+      if (status) pruned.push(status)
     }
     return pruned
+  }
+
+  async function pruneSessionIfIdle(session: ShowSession, now = Date.now()): Promise<ShowSessionStatus | undefined> {
+    if (session.state !== "active" || !session.lastAccessedAt) return undefined
+    if (now - session.lastAccessedAt.getTime() <= idleTtlMs) return undefined
+    const started = performance.now()
+    await closeSession(session, "idle")
+    logTiming("pruneIdleSession", session.id, started, { idleTtlMs, state: session.state })
+    return toStatus(session)
   }
 
   async function pruneIdleSessionsIfDue(): Promise<ShowSessionStatus[]> {

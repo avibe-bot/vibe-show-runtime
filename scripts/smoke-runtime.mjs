@@ -473,17 +473,28 @@ export const demo = customAlphabet("abc")
 
   const idleRoot = await mkdtemp(join(tmpdir(), "avibe-show-runtime-idle-"))
   const idleApiDir = join(idleRoot, "idle", "api")
+  const unrelatedIdleApiDir = join(idleRoot, "unrelated-idle", "api")
   await mkdir(idleApiDir, { recursive: true })
+  await mkdir(unrelatedIdleApiDir, { recursive: true })
   await writeFile(join(idleApiDir, "slow.ts"), `export async function GET() {
     await new Promise((resolve) => setTimeout(resolve, 300))
+    return Response.json({ ok: true })
+  }
+`)
+  await writeFile(join(unrelatedIdleApiDir, "slow.ts"), `export async function GET() {
+    await new Promise((resolve) => setTimeout(resolve, 1200))
     return Response.json({ ok: true })
   }
 `)
   const idleRuntime = await startShowRuntimeServer({ workspaceRoot: idleRoot, idleTtlMs: 100, idlePruneIntervalMs: 0 })
   try {
     const active = await loadAppEntry(idleRuntime.url, "idle")
+    const unrelatedActive = await loadAppEntry(idleRuntime.url, "unrelated-idle")
     if (!active.includes("Vibe Show")) {
       throw new Error("Expected idle test app HTML to load")
+    }
+    if (!unrelatedActive.includes("Vibe Show")) {
+      throw new Error("Expected unrelated idle test app HTML to load")
     }
     await new Promise((resolve) => setTimeout(resolve, 150))
     const idleStatus = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
@@ -511,6 +522,27 @@ export const demo = customAlphabet("abc")
     const concurrentStatus = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
     if (concurrentStatus.state !== "active") {
       throw new Error(`Expected concurrent access during prune to leave session active, got ${JSON.stringify(concurrentStatus)}`)
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const unrelatedSlow = fetch(`${idleRuntime.url}/sessions/unrelated-idle/app/api/slow`).then((res) => res.json())
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const scopedStatusStarted = performance.now()
+    const scopedStatus = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
+    const scopedStatusDurationMs = performance.now() - scopedStatusStarted
+    if (scopedStatusDurationMs > 500) {
+      throw new Error(`Expected scoped idle status pruning not to wait on unrelated sessions, took ${Math.round(scopedStatusDurationMs)}ms`)
+    }
+    if (scopedStatus.state !== "idle") {
+      throw new Error(`Expected scoped idle status to prune the requested session only, got ${JSON.stringify(scopedStatus)}`)
+    }
+    const unrelatedAfterStatus = await fetch(`${idleRuntime.url}/sessions/unrelated-idle/status`).then((res) => res.json())
+    if (unrelatedAfterStatus.state !== "idle") {
+      throw new Error(`Expected unrelated session to stay independently prunable, got ${JSON.stringify(unrelatedAfterStatus)}`)
+    }
+    const unrelatedSlowResponse = await unrelatedSlow
+    if (!unrelatedSlowResponse.ok) {
+      throw new Error("Expected unrelated slow request to complete")
     }
   } finally {
     await idleRuntime.close()
