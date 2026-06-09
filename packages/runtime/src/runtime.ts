@@ -27,11 +27,36 @@ import {
   vendorImportMapPlugin,
   type VendorBundle
 } from "./vendor-runtime.js"
+import { createDependencyResolver, type DependencyResolver } from "./vendor.js"
 
 const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000
 const DEFAULT_IDLE_PRUNE_INTERVAL_MS = 5 * 60 * 1000
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 const viteCacheWarmLocks = new Map<string, Promise<void>>()
+// One shared-install resolver per `node_modules` dir, built lazily on the first extras
+// session that needs the fallback and reused across sessions. Anchored at the shared
+// install so it resolves `import`-only packages (e.g. `@avibe/show-sdk/*`) that CJS
+// `createRequire` cannot. Disposed in `close()`; a disposed entry is rebuilt on demand.
+const sharedInstallResolvers = new Map<string, Promise<DependencyResolver>>()
+
+function sharedInstallResolver(sharedNodeModules: string): Promise<DependencyResolver> {
+  const existing = sharedInstallResolvers.get(sharedNodeModules)
+  if (existing) return existing
+  const built = createDependencyResolver(dirname(sharedNodeModules)).catch((error) => {
+    if (sharedInstallResolvers.get(sharedNodeModules) === built) sharedInstallResolvers.delete(sharedNodeModules)
+    throw error
+  })
+  sharedInstallResolvers.set(sharedNodeModules, built)
+  return built
+}
+
+async function disposeSharedInstallResolvers() {
+  const resolvers = [...sharedInstallResolvers.values()]
+  sharedInstallResolvers.clear()
+  await Promise.all(resolvers.map(async (resolver) => {
+    await resolver.then((value) => value.cleanup()).catch(() => undefined)
+  }))
+}
 
 export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
@@ -109,6 +134,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   async function close() {
     if (idlePruneTimer) clearInterval(idlePruneTimer)
     await Promise.all([...sessions.values()].map((session) => closeSession(session)))
+    await disposeSharedInstallResolvers()
   }
 
   async function pruneIdleSessions(): Promise<ShowSessionStatus[]> {
@@ -427,29 +453,62 @@ async function ensureSharedSymlink(linkPath: string, sharedNodeModules: string) 
  * Used only for declared-extras sessions, whose `workspace/node_modules` holds ONLY the
  * declared extras (so a bare import of any other shared dep would otherwise fail). This
  * replaces the old parent symlink at `workspaceRoot/node_modules`, which could clobber a
- * host app's real `node_modules`. Provided deps are externalized before this runs, so the
- * fallback only ever serves non-provided shared deps; local/virtual ids are left to Vite.
+ * host app's real `node_modules`.
+ *
+ * It deliberately serves `@avibe/show-sdk` (+ subpaths): the SDK ships its values from
+ * the shared install but is NOT part of the vendor bundle/import map (it's filtered out
+ * of the per-session extras install as runtime-owned), so without this fallback a page
+ * importing an SDK value in an extras session would have no resolver. The PROVIDED set
+ * (react, react-dom, `@avibe/show-ui/*`, and the `@/` shadcn alias onto it) is left
+ * alone — it's externalized before this runs and resolved by the import map, never
+ * forked here. Local/virtual ids are left to Vite.
+ *
+ * Resolution goes through an `import.meta.resolve` resolver anchored at the shared
+ * install (not CJS `createRequire`, which throws `ERR_PACKAGE_PATH_NOT_EXPORTED` on the
+ * `import`-only `@avibe/show-sdk/*` subpaths).
  */
 function sharedResolveFallbackPlugin(sharedNodeModules: string, uiPackageName: string): Plugin {
-  const sharedRequire = createRequire(join(dirname(sharedNodeModules), "__avibe-show-shared-resolver.js"))
   return {
     name: "avibe-show-shared-resolve-fallback",
     enforce: "post",
     apply: "serve",
     async resolveId(source, importer, options) {
-      if (!isBareImport(source) || isRuntimeManagedImport(source, uiPackageName)) {
+      if (!isBareImport(source) || isProvidedFamilyImport(source, uiPackageName)) {
         return null
       }
       // Only act as a fallback: defer to the session's own resolution first.
       const own = await this.resolve(source, importer, { ...options, skipSelf: true })
       if (own) return null
       try {
-        return sharedRequire.resolve(source)
+        return (await sharedInstallResolver(sharedNodeModules)).resolveToPath(source)
       } catch {
         return null
       }
     }
   }
+}
+
+/**
+ * Whether the shared-install fallback must leave a bare specifier alone because it is
+ * handled elsewhere: the React family + the whole `@avibe/show-ui` package + the `@/`
+ * shadcn alias onto it (all externalized → resolved by the import map, never forked
+ * here).
+ *
+ * This is `isRuntimeManagedImport`'s bare-specifier coverage MINUS `@avibe/show-sdk`:
+ * the SDK is runtime-owned but NOT provided via the bundle/import map, so in an extras
+ * session the fallback is precisely its resolver. (Specifiers actually in the vendor
+ * import map, e.g. `motion/react` or `lucide-react`, are already short-circuited by the
+ * `enforce: "pre"` externalize plugin before this `post` fallback runs, so they need no
+ * guard here; a non-provided bare dep like `motion` is still served from the shared
+ * install, unchanged from before.)
+ */
+function isProvidedFamilyImport(specifier: string, uiPackageName: string): boolean {
+  return specifier === "react" ||
+    specifier === "react-dom/client" ||
+    specifier.startsWith("react/") ||
+    specifier === uiPackageName ||
+    specifier.startsWith(`${uiPackageName}/`) ||
+    specifier.startsWith("@/")
 }
 
 async function resolveAllowedPackageRoots(nodeModules: string, packageNames: string[]) {

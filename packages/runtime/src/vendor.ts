@@ -1,13 +1,15 @@
-import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join, relative, resolve, sep } from "node:path"
-import { pathToFileURL } from "node:url"
+import { dirname, join, relative, resolve, sep } from "node:path"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { createHash, randomUUID } from "node:crypto"
 import { build, type BuildOptions, type Metafile } from "esbuild"
 
 const DEFAULT_UI_PACKAGE_NAME = "@avibe/show-ui"
 export const VENDOR_MANIFEST_FILENAME = "vendor-manifest.json"
-const VENDOR_MANIFEST_VERSION = 1
+// v2 records `outputFiles` so a pre-existing bundle can be validated + reused without
+// a destructive rescan of `outDir` (which a concurrent process may be publishing into).
+const VENDOR_MANIFEST_VERSION = 2
 
 /**
  * Session-independent, absolute URL prefix the shared vendor bundle is served under.
@@ -28,7 +30,12 @@ export function vendorBaseUrl(hash: string): string {
 export interface BuildVendorOptions {
   /** Directory whose `node_modules` holds the shared, pinned runtime install. */
   dependencyRoot: string
-  /** Directory the vendor bundle and manifest are written to. Cleared before each build. */
+  /**
+   * Directory the vendor bundle and manifest are published to. A pre-existing valid
+   * bundle here is reused as-is; otherwise the build is staged in a temp dir and
+   * published additively (content-hashed files are added, never deleted) so a
+   * concurrent process still serving this dir keeps its files.
+   */
   outDir: string
   /** Override the UI package name (defaults to `@avibe/show-ui`). */
   uiPackageName?: string
@@ -45,6 +52,13 @@ export interface VendorManifest {
   specifiers: string[]
   /** Specifier -> output file path relative to `outDir`. */
   imports: Record<string, string>
+  /**
+   * Every emitted output file (entries + chunks + assets) for THIS bundle, relative
+   * to `outDir`, sorted (excludes the manifest). Lets a restart validate + reuse the
+   * bundle by name even when `outDir` also holds another process's content-hashed
+   * files from a different build.
+   */
+  outputFiles: string[]
 }
 
 export interface BuildVendorResult {
@@ -239,12 +253,29 @@ export function providedVendorCssSpecifiers(uiPackageName: string = DEFAULT_UI_P
  *
  * Deterministic and idempotent: identical inputs produce identical hashes, so the
  * outputs are safe to serve as immutable.
+ *
+ * Publishing is concurrency-safe. `outDir` is keyed by `(dependencyRoot, uiPackageName)`
+ * — not by content hash — so two runtime processes that share a vendor cache (rolling
+ * restart, multiple workers) target the SAME `outDir`. This never clears it:
+ *  - A pre-existing, self-consistent bundle for the same inputs is REUSED as-is (the
+ *    build is deterministic, so a rebuild would only reproduce it).
+ *  - Otherwise the build is staged in a temp dir and published ADDITIVELY — its
+ *    content-hashed files are moved in without removing any existing ones, and the
+ *    manifest is swapped in atomically last. A concurrent process still serving the
+ *    old bundle keeps its (differently hashed) files, so its import map never 404s.
  */
 export async function buildVendor(options: BuildVendorOptions): Promise<BuildVendorResult> {
   const uiPackageName = options.uiPackageName ?? DEFAULT_UI_PACKAGE_NAME
   const dependencyRoot = resolve(options.dependencyRoot)
   const nodeModules = join(dependencyRoot, "node_modules")
   const outDir = resolve(options.outDir)
+
+  // Fast path: an intact bundle for the same inputs is already published — reuse it
+  // without rebuilding or touching `outDir` (which another process may be serving).
+  const reusable = await readReusableManifest(outDir, uiPackageName)
+  if (reusable) {
+    return { outDir, manifestPath: join(outDir, VENDOR_MANIFEST_FILENAME), manifest: reusable, outputFiles: reusable.outputFiles }
+  }
 
   // Enumerate provided UI subpaths from the resolved package's `exports`, so EVERY
   // built JS subpath lands in the bundle + import map + externalize set — not a
@@ -255,9 +286,11 @@ export async function buildVendor(options: BuildVendorOptions): Promise<BuildVen
   const jsSpecifiers = providedVendorSpecifiers(uiPackageName, uiSubpaths)
   const cssSpecifiers = providedVendorCssSpecifiers(uiPackageName)
 
-  await rm(outDir, { recursive: true, force: true })
-  await mkdir(outDir, { recursive: true })
-
+  // Stage the build beside `outDir` (under the same vendor cache root), so publishing it
+  // is a same-filesystem `rename` (no cross-device `EXDEV`); never clear `outDir` itself.
+  const cacheRoot = dirname(outDir)
+  await mkdir(cacheRoot, { recursive: true })
+  const buildDir = await mkdtemp(join(cacheRoot, ".avibe-vendor-build-"))
   const stubRoot = await mkdtemp(join(tmpdir(), "avibe-vendor-stub-"))
   try {
     const imports: Record<string, string> = {}
@@ -271,7 +304,7 @@ export async function buildVendor(options: BuildVendorOptions): Promise<BuildVen
       stubRoot,
       dependencyRoot,
       nodeModules,
-      outDir
+      outDir: buildDir
     }))
 
     // CSS specifiers are bundled separately: esbuild treats a `.css` file as its
@@ -283,26 +316,92 @@ export async function buildVendor(options: BuildVendorOptions): Promise<BuildVen
         stubRoot,
         dependencyRoot,
         nodeModules,
-        outDir
+        outDir: buildDir
       }))
     }
 
-    const outputFiles = await listEmittedFiles(outDir)
-    const hash = await hashOutputs(outDir, outputFiles)
+    const outputFiles = await listEmittedFiles(buildDir)
+    const hash = await hashOutputs(buildDir, outputFiles)
     const manifest: VendorManifest = {
       version: VENDOR_MANIFEST_VERSION,
       uiPackageName,
       hash,
       specifiers: [...jsSpecifiers, ...cssSpecifiers].sort(compareStrings),
-      imports: sortRecord(imports)
+      imports: sortRecord(imports),
+      outputFiles
     }
-    const manifestPath = join(outDir, VENDOR_MANIFEST_FILENAME)
-    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8")
-
+    const manifestPath = await publishVendorBuild(buildDir, outDir, manifest, outputFiles)
     return { outDir, manifestPath, manifest, outputFiles }
   } finally {
+    await rm(buildDir, { recursive: true, force: true })
     await rm(stubRoot, { recursive: true, force: true })
   }
+}
+
+/**
+ * Return the already-published manifest at `outDir` IFF it is a complete, self-consistent
+ * bundle for `uiPackageName` that can be reused as-is — else `undefined` (rebuild).
+ *
+ * "Reusable" means: it parses, its schema version + UI package match, every file it
+ * lists is present on disk, AND re-hashing exactly those files reproduces its recorded
+ * `hash`. Because the build is deterministic, such a bundle is byte-identical to what a
+ * rebuild for the same inputs would emit, so serving it is equivalent — and skipping the
+ * rebuild avoids clearing a dir a concurrent process may still be serving from.
+ */
+async function readReusableManifest(outDir: string, uiPackageName: string): Promise<VendorManifest | undefined> {
+  let manifest: VendorManifest
+  try {
+    manifest = JSON.parse(await readFile(join(outDir, VENDOR_MANIFEST_FILENAME), "utf8")) as VendorManifest
+  } catch {
+    return undefined
+  }
+  if (
+    manifest.version !== VENDOR_MANIFEST_VERSION ||
+    manifest.uiPackageName !== uiPackageName ||
+    !Array.isArray(manifest.outputFiles) ||
+    manifest.outputFiles.length === 0
+  ) {
+    return undefined
+  }
+  for (const file of manifest.outputFiles) {
+    if (!(await fileExists(join(outDir, ...file.split("/"))))) return undefined
+  }
+  const rehashed = await hashOutputs(outDir, manifest.outputFiles).catch(() => undefined)
+  return rehashed === manifest.hash ? manifest : undefined
+}
+
+/**
+ * Publish a staged vendor build from `buildDir` into the shared `outDir` WITHOUT
+ * clearing it. Content-hashed files are moved in additively (an existing file with the
+ * same hashed name is byte-identical, so it's left in place), then the manifest is
+ * swapped in atomically (write-temp + rename) as the last step. Files belonging to a
+ * concurrent process's older bundle keep different hashed names, so they survive and
+ * that process's import map keeps resolving. Returns the published manifest path.
+ */
+async function publishVendorBuild(
+  buildDir: string,
+  outDir: string,
+  manifest: VendorManifest,
+  outputFiles: string[]
+): Promise<string> {
+  await mkdir(outDir, { recursive: true })
+  for (const file of outputFiles) {
+    const target = join(outDir, ...file.split("/"))
+    if (await fileExists(target)) continue
+    await mkdir(dirname(target), { recursive: true })
+    // `buildDir` is a sibling of `outDir` (same vendor cache root), so this rename stays
+    // on one filesystem. Tolerate a lost race: if another process created the (byte-
+    // identical, content-hashed) file between the check and the rename, accept it.
+    await rename(join(buildDir, ...file.split("/")), target).catch(async (error) => {
+      if (await fileExists(target)) return
+      throw error
+    })
+  }
+  const manifestPath = join(outDir, VENDOR_MANIFEST_FILENAME)
+  const manifestTmp = join(outDir, `.${VENDOR_MANIFEST_FILENAME}.${randomUUID()}.tmp`)
+  await writeFile(manifestTmp, `${JSON.stringify(manifest, null, 2)}\n`, "utf8")
+  await rename(manifestTmp, manifestPath)
+  return manifestPath
 }
 
 /**
@@ -336,8 +435,9 @@ interface BundleSpecifiersArgs {
 async function bundleSpecifiers(args: BundleSpecifiersArgs): Promise<Record<string, string>> {
   const { specifiers, kind, stubRoot, dependencyRoot, nodeModules, outDir } = args
   // Export discovery must resolve from the dependency root (not the runtime's own
-  // install). A resolver helper physically located there anchors `import.meta.resolve`
-  // to that root while still honoring `import`/`exports` conditions (see resolver doc).
+  // install), so a resolver anchored at the dependency root's `node_modules` honors its
+  // `import`/`exports` conditions. The resolver keeps its writes out of `dependencyRoot`
+  // (which can be a read-only installed app); see `createDependencyResolver`.
   const resolver = kind === "js" ? await createDependencyResolver(dependencyRoot) : undefined
   const stubs = new Map<string, string>()
   const entryPoints: Array<{ in: string; out: string }> = []
@@ -440,39 +540,54 @@ async function discoverNamedExports(specifier: string, resolver: DependencyResol
     .sort(compareStrings)
 }
 
-interface DependencyResolver {
+export interface DependencyResolver {
   /** Resolve `specifier` to a file URL anchored at the dependency root. */
   resolve(specifier: string): string
-  /** Remove the on-disk resolver helper. Safe to call once after the build. */
+  /** Resolve `specifier` to an absolute filesystem path anchored at the dependency root. */
+  resolveToPath(specifier: string): string
+  /** Remove the on-disk resolver scratch dir. Safe to call once after use. */
   cleanup(): Promise<void>
 }
 
 /**
- * Build a resolver anchored at the dependency root so export discovery (and the
- * generated facades) match the *shared install*, never the runtime's own
- * `node_modules`.
+ * Build a resolver anchored at the dependency root so resolution (export discovery,
+ * the generated facades, the dev shared-install fallback) matches the *shared
+ * install*, never the runtime's own `node_modules`.
  *
- * `import.meta.resolve(specifier, parentUrl)` ignores its 2nd argument for module
- * resolution unless the calling module physically lives at that location, so a
- * synthetic parent URL silently resolves from the runtime's install instead. CJS
- * `createRequire(...).resolve(...)` would anchor correctly but throws
- * `ERR_PACKAGE_PATH_NOT_EXPORTED` for the `import`-only `@avibe/show-ui/*` subpaths
- * (no `require`/`default` export condition). So we write a tiny ESM helper file
- * INTO the dependency root and import it: its `import.meta.resolve` is anchored at
- * the root *and* honors the `import`/`browser` export conditions.
+ * `import.meta.resolve` anchors module resolution at the calling module's physical
+ * location — its optional `parent` argument is ignored for resolution, so a synthetic
+ * parent URL silently resolves from the runtime's install instead. CJS
+ * `createRequire(...).resolve(...)` would anchor by path string but throws
+ * `ERR_PACKAGE_PATH_NOT_EXPORTED` for the `import`-only `@avibe/show-ui/*` and
+ * `@avibe/show-sdk/*` subpaths (no `require`/`default` export condition).
+ *
+ * So we anchor an ESM helper at the dependency root WITHOUT writing into it (the
+ * dependency root can be a read-only installed app): a throwaway scratch dir gets a
+ * `node_modules` junction to `<dependencyRoot>/node_modules`, and the helper imported
+ * from that scratch dir resolves every specifier through that junction — i.e. exactly
+ * the dependency root's install, honoring `import`/`browser` export conditions —
+ * while all generated artifacts live in the (always writable) scratch dir.
  */
-async function createDependencyResolver(dependencyRoot: string): Promise<DependencyResolver> {
-  const helperPath = join(dependencyRoot, `.avibe-vendor-resolver-${randomUUID()}.mjs`)
-  await writeFile(helperPath, "export const resolve = (specifier) => import.meta.resolve(specifier)\n", "utf8")
+export async function createDependencyResolver(dependencyRoot: string): Promise<DependencyResolver> {
+  const scratchDir = await mkdtemp(join(tmpdir(), "avibe-vendor-resolver-"))
   let cleaned = false
   const cleanup = async () => {
     if (cleaned) return
     cleaned = true
-    await rm(helperPath, { force: true })
+    await rm(scratchDir, { recursive: true, force: true })
   }
   try {
+    // Anchor resolution at the dependency root's install via a junction, so the helper
+    // (and its writes) stay in the scratch dir even when `dependencyRoot` is read-only.
+    await symlink(join(resolve(dependencyRoot), "node_modules"), join(scratchDir, "node_modules"), "junction")
+    const helperPath = join(scratchDir, `resolver-${randomUUID()}.mjs`)
+    await writeFile(helperPath, "export const resolve = (specifier) => import.meta.resolve(specifier)\n", "utf8")
     const helper: { resolve(specifier: string): string } = await import(pathToFileURL(helperPath).href)
-    return { resolve: (specifier) => helper.resolve(specifier), cleanup }
+    return {
+      resolve: (specifier) => helper.resolve(specifier),
+      resolveToPath: (specifier) => fileURLToPath(helper.resolve(specifier)),
+      cleanup
+    }
   } catch (error) {
     await cleanup()
     throw error
