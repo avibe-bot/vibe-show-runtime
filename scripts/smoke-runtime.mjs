@@ -192,9 +192,49 @@ try {
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
     throw new Error("Expected app HTML asset URLs to stay under /show/<session>/")
   }
-  await fetch(`${runtime.url}/sessions/smoke/app/src/main.tsx`).then((res) => {
+  // Shared vendor: the served HTML must inject a JS import map (BEFORE the app module
+  // script) mapping the provided specifiers to the session-independent vendor path,
+  // plus a <link> for the hashed vendor stylesheet. CSS must NOT be a JS import-map
+  // target (it maps to an empty module instead).
+  if (!/<script type="importmap">/.test(app)) {
+    throw new Error("Expected served HTML to inject a JS import map for the shared vendor bundle")
+  }
+  if (!/"react"\s*:\s*"\/_show-runtime\/vendor\//.test(app) || !/"@avibe\/show-ui\/button"\s*:\s*"\/_show-runtime\/vendor\//.test(app)) {
+    throw new Error(`Expected import map to resolve provided specifiers to /_show-runtime/vendor/, got: ${app.slice(app.indexOf("importmap"), app.indexOf("importmap") + 600)}`)
+  }
+  if (/"@avibe\/show-ui\/styles\.css"\s*:\s*"\/_show-runtime\/vendor\/[^"]*\.css"/.test(app) || !/"@avibe\/show-ui\/styles\.css"\s*:\s*"[^"]*__empty\.js"/.test(app)) {
+    throw new Error("Expected the CSS specifier to map to the empty module, never to a .css URL in the JS import map")
+  }
+  if (!/<link[^>]+rel="stylesheet"[^>]+href="\/_show-runtime\/vendor\/[^"]+\.css"/.test(app) && !/<link[^>]+href="\/_show-runtime\/vendor\/[^"]+\.css"[^>]+rel="stylesheet"/.test(app)) {
+    throw new Error("Expected served HTML to inject a <link rel=stylesheet> for the hashed vendor CSS")
+  }
+  if (app.indexOf('type="importmap"') > app.indexOf('src="/show/smoke/src/main.tsx"')) {
+    throw new Error("Expected the import map to be injected before the app module script")
+  }
+  // The vendor assets are served at a session-independent, absolute path and are
+  // byte-identical for a different session (one shared, cacheable copy).
+  const vendorReactUrl = app.match(/"react"\s*:\s*"(\/_show-runtime\/vendor\/[^"]+)"/)[1]
+  const vendorReact = await fetch(`${runtime.url}${vendorReactUrl}`)
+  if (vendorReact.status !== 200 || !(vendorReact.headers.get("content-type") || "").includes("javascript")) {
+    throw new Error(`Expected vendor react asset served as JS, got ${vendorReact.status} ${vendorReact.headers.get("content-type")}`)
+  }
+  if (!(vendorReact.headers.get("cache-control") || "").includes("immutable")) {
+    throw new Error("Expected content-hashed vendor asset to be served with an immutable cache-control")
+  }
+  const secondVendorApp = await fetch(`${runtime.url}/sessions/smoke-two/app/`).then((res) => res.text())
+  if (secondVendorApp.match(/"react"\s*:\s*"(\/_show-runtime\/vendor\/[^"]+)"/)?.[1] !== vendorReactUrl) {
+    throw new Error("Expected two sessions to reference the same session-independent vendor react URL")
+  }
+  await fetch(`${runtime.url}/sessions/smoke/app/src/main.tsx`).then(async (res) => {
     if (!res.ok) {
       throw new Error(`Expected session source module to load, got ${res.status}`)
+    }
+    const body = await res.text()
+    if (!/from\s*"react"/.test(body) || !/from\s*"react-dom\/client"/.test(body)) {
+      throw new Error("Expected the externalized session module to keep react / react-dom/client bare for the import map")
+    }
+    if (!/import\s*"@avibe\/show-ui\/styles\.css"/.test(body) || /styles\.css\?import/.test(body) || /show-ui\.css/.test(body)) {
+      throw new Error("Expected the CSS import to stay bare (resolved to the empty module), never fetched as JS")
     }
   })
   const buttonModule = await fetch(`${runtime.url}/sessions/smoke/app/@fs/${process.cwd()}/packages/ui/dist/button.js`).then(async (res) => ({

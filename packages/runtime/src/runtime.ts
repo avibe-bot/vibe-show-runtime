@@ -1,4 +1,4 @@
-import { access, lstat, mkdir, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises"
+import { access, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { dirname, extname, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
@@ -20,6 +20,12 @@ import { createShadcnAlias } from "./aliases.js"
 import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
 import { ensureSessionTemplate } from "./templates.js"
 import { createVendorExternalizePlugins, isProvidedVendorSpecifier } from "./vendor-externalize-plugin.js"
+import {
+  defaultVendorCacheRoot,
+  ensureVendorBundle,
+  vendorImportMapPlugin,
+  type VendorBundle
+} from "./vendor-runtime.js"
 
 const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000
 const DEFAULT_IDLE_PRUNE_INTERVAL_MS = 5 * 60 * 1000
@@ -28,6 +34,10 @@ const viteCacheWarmLocks = new Map<string, Promise<void>>()
 
 export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
+  // The most recently warmed shared vendor bundle. The server serves its assets at a
+  // session-independent path; it's set the first time any session warms (the build is
+  // cached per dependency root in `ensureVendorBundle`).
+  let vendorBundle: VendorBundle | undefined
   const idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS
   const idlePruneIntervalMs = options.idlePruneIntervalMs ?? DEFAULT_IDLE_PRUNE_INTERVAL_MS
   const idlePruneTimer = idlePruneIntervalMs > 0
@@ -143,11 +153,20 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     await ensureSessionTemplate(session.workspace)
     logTiming("warmSession.template", session.id, templateStarted)
     const uiPackageName = options.uiPackageName ?? "@avibe/show-ui"
+    const dependencyRoot = await resolveDependencyRoot(options.dependencyRoot)
+    const vendorStarted = performance.now()
+    const bundle = await ensureVendorBundle({
+      dependencyRoot,
+      vendorCacheRoot: defaultVendorCacheRoot(dependencyRoot, options.cacheRoot),
+      uiPackageName
+    })
+    vendorBundle = bundle
+    logTiming("warmSession.vendorBundle", session.id, vendorStarted, { hash: bundle.result.manifest.hash, baseUrl: bundle.baseUrl })
     const dependencyStarted = performance.now()
     const sourceDependencies = await sourceDependenciesForWorkspace(session.workspace, uiPackageName)
     logTiming("warmSession.sourceDependencies", session.id, dependencyStarted, { signature: sourceDependencies.signature, extraBareImports: sourceDependencies.extraBareImports.length, declaredExtras: sourceDependencies.declaredExtras.entries.length })
     const linkStarted = performance.now()
-    const sharedDependencies = await ensureSessionDependencies(session.workspace, sourceDependencies.declaredExtras, options.dependencyRoot, uiPackageName)
+    const sharedDependencies = await ensureSessionDependencies(session.workspace, sourceDependencies.declaredExtras, dependencyRoot, uiPackageName)
     logTiming("warmSession.dependencyLink", session.id, linkStarted, { nodeModules: sharedDependencies.nodeModules, extrasSignature: sharedDependencies.extrasSignature })
     const cacheStarted = performance.now()
     const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot, sourceDependencies.signature)
@@ -169,6 +188,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
         }
       },
       plugins: [
+        vendorImportMapPlugin(bundle),
         ...createVendorExternalizePlugins(uiPackageName),
         showHmrTransitionPlugin({ fallbackDelaySeconds: options.fallbackDelaySeconds }),
         react()
@@ -248,6 +268,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     getSessionStatus,
     pruneIdleSessions,
     getSession: (sessionId: string) => sessions.get(sessionId),
+    getVendorBundle: () => vendorBundle,
     suspendSession,
     recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor) {
       return recordShowEvent(sessionId, { type: "assistant.mark.created", mark, anchor })
@@ -321,10 +342,10 @@ type SharedDependencies = {
 async function ensureSessionDependencies(
   workspace: string,
   declaredExtras: DeclaredExtras,
-  dependencyRoot?: string,
+  dependencyRoot: string,
   uiPackageName = "@avibe/show-ui"
 ): Promise<SharedDependencies> {
-  const root = dependencyRoot ? resolve(dependencyRoot) : await findNearestDependencyRoot()
+  const root = dependencyRoot
   const sharedNodeModules = join(root, "node_modules")
   await access(sharedNodeModules)
   const packageRoots = await resolveAllowedPackageRoots(sharedNodeModules, [uiPackageName, "@avibe/show-sdk"])
@@ -422,32 +443,77 @@ async function readDeclaredExtras(workspace: string, uiPackageName: string): Pro
 /**
  * Install the declared extras into `workspace/node_modules` (a real, session-private
  * dir) and return that dir. Idempotent: a sidecar lockfile records the signature the
- * dir was installed for, so `npm install` only re-runs when the declared extras
- * change. Installs exactly the declared `dependencies` (+ their transitive,
- * non-provided deps) — the provided vendor set is left to the shared bundle.
+ * dir was installed for, so the install only re-runs when the declared extras change.
+ *
+ * Installs EXACTLY the declared extras (+ their transitive, non-provided deps). npm
+ * resolves into a temp staging dir whose manifest has no dependencies, so the
+ * workspace `package.json` is never read during install — even when each extra is
+ * named explicitly, an in-place `npm install <extra>` would still ALSO pull the
+ * workspace manifest's (provided/dev) deps. The staged `node_modules` then replaces
+ * the session one, so the provided vendor set is never installed per session and the
+ * workspace `package.json` (the source of truth for declared extras) is untouched.
  */
 async function ensureSessionExtrasInstall(workspace: string, declaredExtras: DeclaredExtras): Promise<string> {
   const extrasDir = join(workspace, "node_modules")
   const lockfile = join(workspace, SESSION_EXTRAS_LOCKFILE)
   const installed = await readInstalledExtrasSignature(lockfile)
-  if (installed === declaredExtras.signature) {
+  // The lock signature alone is not enough: if extras were added → removed (which
+  // reverts node_modules to the shared symlink) → re-added the same, the signature
+  // matches but node_modules is the symlink, so the extras aren't actually present.
+  // Only trust the lock when node_modules is a real (non-symlink) extras dir.
+  if (installed === declaredExtras.signature && await isRealDirectory(extrasDir)) {
     return extrasDir
   }
-  // `workspace/node_modules` may currently be the shared symlink (first time this
-  // session declares extras). Replace it with a real, private dir before installing
-  // so npm never writes into the shared install.
-  await replaceSharedSymlinkWithDir(extrasDir)
+  const staged = await installExtrasToStagingDir(workspace, declaredExtras)
+  try {
+    // Swap the staged extras install in for the session node_modules (replacing the
+    // shared symlink or a stale extras dir from a prior signature).
+    await rm(extrasDir, { recursive: true, force: true })
+    await rename(staged, extrasDir)
+  } finally {
+    await rm(dirname(staged), { recursive: true, force: true })
+  }
+  await writeFile(lockfile, `${JSON.stringify({ signature: declaredExtras.signature, entries: declaredExtras.entries }, null, 2)}\n`, "utf8")
+  return extrasDir
+}
+
+/**
+ * Run `npm install <extra@range> ...` in a throwaway staging dir whose manifest has
+ * no dependencies, and return the resulting `node_modules` path. Isolating the
+ * install keeps npm from also resolving the session `package.json` deps (which
+ * include the provided vendor set). The caller moves the result into the session.
+ *
+ * Staged next to `workspace` (not in the OS temp dir) so the follow-up `rename` into
+ * the session stays on the same filesystem (avoids cross-device `EXDEV`).
+ */
+async function installExtrasToStagingDir(workspace: string, declaredExtras: DeclaredExtras): Promise<string> {
+  const stagingDir = await mkdtemp(join(dirname(workspace), ".avibe-show-extras-"))
+  await writeFile(
+    join(stagingDir, "package.json"),
+    `${JSON.stringify({ name: "avibe-show-session-extras", private: true }, null, 2)}\n`,
+    "utf8"
+  )
   await execFileAsync(npmExecutable(), [
     "install",
+    ...declaredExtras.entries,
     "--no-save",
     "--no-package-lock",
     "--no-audit",
     "--no-fund",
     "--prefix",
-    workspace
-  ], { cwd: workspace, env: process.env })
-  await writeFile(lockfile, `${JSON.stringify({ signature: declaredExtras.signature, entries: declaredExtras.entries }, null, 2)}\n`, "utf8")
-  return extrasDir
+    stagingDir
+  ], { cwd: stagingDir, env: process.env })
+  return join(stagingDir, "node_modules")
+}
+
+/** Whether `path` is a real directory on disk (a symlink, file, or missing entry is not). */
+async function isRealDirectory(path: string): Promise<boolean> {
+  try {
+    const stats = await lstat(path)
+    return stats.isDirectory()
+  } catch {
+    return false
+  }
 }
 
 async function readInstalledExtrasSignature(lockfile: string): Promise<string | undefined> {
@@ -457,19 +523,6 @@ async function readInstalledExtrasSignature(lockfile: string): Promise<string | 
   } catch {
     return undefined
   }
-}
-
-/** Ensure `nodeModules` is a real directory (not the shared symlink) so npm installs locally. */
-async function replaceSharedSymlinkWithDir(nodeModules: string) {
-  try {
-    const stats = await lstat(nodeModules)
-    if (stats.isSymbolicLink()) {
-      await rm(nodeModules)
-    }
-  } catch {
-    // Missing entirely; npm creates it.
-  }
-  await mkdir(nodeModules, { recursive: true })
 }
 
 function npmExecutable() {
@@ -953,6 +1006,11 @@ async function withViteCacheWarmLock<T>(cacheDir: string, callback: () => Promis
       viteCacheWarmLocks.delete(cacheDir)
     }
   }
+}
+
+/** Resolve the dependency root whose `node_modules` is the shared, pinned install. */
+async function resolveDependencyRoot(dependencyRoot?: string): Promise<string> {
+  return dependencyRoot ? resolve(dependencyRoot) : await findNearestDependencyRoot()
 }
 
 async function findNearestDependencyRoot() {

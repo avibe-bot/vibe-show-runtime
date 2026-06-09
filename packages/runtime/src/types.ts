@@ -1,6 +1,7 @@
 import type { Server } from "node:http"
 import type { ViteDevServer } from "vite"
 import type { AgentMark, MarkAnchor, ShowEvent, ShowEventInput } from "@avibe/show-sdk"
+import type { VendorBundle } from "./vendor-runtime.js"
 
 export type ShowRuntimeOptions = {
   workspaceRoot: string
@@ -47,6 +48,8 @@ export type ShowRuntime = {
   getSessionStatus(sessionId: string): Promise<ShowSessionStatus>
   pruneIdleSessions(): Promise<ShowSessionStatus[]>
   getSession(sessionId: string): ShowSession | undefined
+  /** The shared vendor bundle warmed for this runtime, or `undefined` before the first warm. */
+  getVendorBundle(): VendorBundle | undefined
   suspendSession(sessionId: string): Promise<ShowSessionStatus>
   recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor): ShowEvent
   recordShowEvent(sessionId: string, payload: ShowEventInput | ShowEvent): ShowEvent

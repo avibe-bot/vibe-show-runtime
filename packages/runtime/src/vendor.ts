@@ -2,12 +2,28 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node
 import { tmpdir } from "node:os"
 import { join, relative, resolve, sep } from "node:path"
 import { pathToFileURL } from "node:url"
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { build, type BuildOptions, type Metafile } from "esbuild"
 
 const DEFAULT_UI_PACKAGE_NAME = "@avibe/show-ui"
 export const VENDOR_MANIFEST_FILENAME = "vendor-manifest.json"
 const VENDOR_MANIFEST_VERSION = 1
+
+/**
+ * Session-independent, absolute URL prefix the shared vendor bundle is served under.
+ * Assets live at `${VENDOR_URL_PREFIX}/<hash>/<file>` so they're shared across every
+ * session and cacheable as immutable (the content hash is in the path). The avibe
+ * proxy must expose this same prefix unprefixed by the per-session base.
+ */
+export const VENDOR_URL_PREFIX = "/_show-runtime/vendor"
+
+/** Filename of the shared empty JS module that neutralizes bare CSS imports. */
+export const VENDOR_EMPTY_MODULE_FILENAME = "__empty.js"
+
+/** The hash-scoped base URL the vendor assets for `hash` are served under. */
+export function vendorBaseUrl(hash: string): string {
+  return `${VENDOR_URL_PREFIX}/${hash}`
+}
 
 export interface BuildVendorOptions {
   /** Directory whose `node_modules` holds the shared, pinned runtime install. */
@@ -37,6 +53,56 @@ export interface BuildVendorResult {
   manifest: VendorManifest
   /** Emitted output files relative to `outDir`, sorted (excludes the manifest). */
   outputFiles: string[]
+}
+
+/** The browser-facing wiring a served Show Page needs to resolve the vendor bundle. */
+export interface VendorBrowserAssets {
+  /** Specifier -> absolute vendor URL, for the `<script type="importmap">` block. */
+  importMap: Record<string, string>
+  /** Absolute vendor URLs for the hashed stylesheets, injected as `<link rel="stylesheet">`. */
+  styleHrefs: string[]
+}
+
+export interface VendorBrowserAssetsOptions {
+  /**
+   * Session-independent, hash-scoped path the bundle files are served under
+   * (e.g. `/_show-runtime/vendor/<hash>`). The manifest output paths are joined onto it.
+   */
+  baseUrl: string
+  /**
+   * Absolute URL of a harmless empty JS module (served with a JS MIME type). The
+   * provided CSS specifiers are mapped to it so a bare `import "<pkg>/styles.css"`
+   * resolves to a no-op instead of fetching the `.css` as JS (a MIME error). The
+   * real stylesheet is delivered via `styleHrefs` as a `<link>`.
+   */
+  emptyModuleUrl: string
+}
+
+/**
+ * Split a vendor manifest into the browser wiring: the import map and the stylesheet
+ * hrefs.
+ *
+ * A `.css` URL must never be an import-map target the browser fetches as JS — that
+ * fails the module MIME check. So CSS specifiers map to a shared empty JS module
+ * (their bare `import` still resolves, to a no-op), while the real hashed stylesheet
+ * is returned in `styleHrefs` for a `<link rel="stylesheet">`. JS specifiers map to
+ * their hashed bundle output. `providedVendorCssSpecifiers` stays the single source
+ * of truth for which manifest entries are stylesheets.
+ */
+export function vendorBrowserAssets(manifest: VendorManifest, options: VendorBrowserAssetsOptions): VendorBrowserAssets {
+  const cssSpecifiers = new Set(providedVendorCssSpecifiers(manifest.uiPackageName))
+  const prefix = options.baseUrl.endsWith("/") ? options.baseUrl.slice(0, -1) : options.baseUrl
+  const importMap: Record<string, string> = {}
+  const styleHrefs: string[] = []
+  for (const [specifier, file] of Object.entries(manifest.imports)) {
+    if (cssSpecifiers.has(specifier)) {
+      styleHrefs.push(`${prefix}/${file}`)
+      importMap[specifier] = options.emptyModuleUrl
+    } else {
+      importMap[specifier] = `${prefix}/${file}`
+    }
+  }
+  return { importMap, styleHrefs }
 }
 
 /**
@@ -128,6 +194,7 @@ export async function buildVendor(options: BuildVendorOptions): Promise<BuildVen
       specifiers: jsSpecifiers,
       kind: "js",
       stubRoot,
+      dependencyRoot,
       nodeModules,
       outDir
     }))
@@ -139,6 +206,7 @@ export async function buildVendor(options: BuildVendorOptions): Promise<BuildVen
         specifiers: cssSpecifiers,
         kind: "css",
         stubRoot,
+        dependencyRoot,
         nodeModules,
         outDir
       }))
@@ -166,6 +234,7 @@ interface BundleSpecifiersArgs {
   specifiers: string[]
   kind: "js" | "css"
   stubRoot: string
+  dependencyRoot: string
   nodeModules: string
   outDir: string
 }
@@ -176,12 +245,16 @@ interface BundleSpecifiersArgs {
  * specifier -> output-file (relative to outDir) map derived from the metafile.
  */
 async function bundleSpecifiers(args: BundleSpecifiersArgs): Promise<Record<string, string>> {
-  const { specifiers, kind, stubRoot, nodeModules, outDir } = args
+  const { specifiers, kind, stubRoot, dependencyRoot, nodeModules, outDir } = args
+  // Export discovery must resolve from the dependency root (not the runtime's own
+  // install). A resolver helper physically located there anchors `import.meta.resolve`
+  // to that root while still honoring `import`/`exports` conditions (see resolver doc).
+  const resolver = kind === "js" ? await createDependencyResolver(dependencyRoot) : undefined
   const stubs = new Map<string, string>()
   const entryPoints: Array<{ in: string; out: string }> = []
   for (const specifier of specifiers) {
     const stubPath = join(stubRoot, `${entryName(specifier)}.${kind === "css" ? "css" : "mjs"}`)
-    const source = kind === "css" ? cssStubSource(specifier) : await jsStubSource(specifier, nodeModules)
+    const source = kind === "css" ? cssStubSource(specifier) : await jsStubSource(specifier, resolver!)
     await writeFile(stubPath, source, "utf8")
     stubs.set(specifier, stubPath)
     entryPoints.push({ in: stubPath, out: entryName(specifier) })
@@ -217,11 +290,15 @@ async function bundleSpecifiers(args: BundleSpecifiersArgs): Promise<Record<stri
     loader: { ".css": "css" }
   }
 
-  const result = await build(buildOptions)
-  if (!result.metafile) {
-    throw new Error("esbuild did not produce a metafile for the vendor bundle")
+  try {
+    const result = await build(buildOptions)
+    if (!result.metafile) {
+      throw new Error("esbuild did not produce a metafile for the vendor bundle")
+    }
+    return await mapSpecifierOutputs(specifiers, stubs, result.metafile, stubRoot, outDir)
+  } finally {
+    await resolver?.cleanup()
   }
-  return mapSpecifierOutputs(specifiers, stubs, result.metafile, stubRoot, outDir)
 }
 
 function cssStubSource(specifier: string): string {
@@ -245,8 +322,8 @@ function cssStubSource(specifier: string): string {
  * a default *binding* would hard-fail. The value form mirrors how bundlers expose
  * `import X from "pkg"` — the real default for CJS, the namespace otherwise.
  */
-async function jsStubSource(specifier: string, nodeModules: string): Promise<string> {
-  const named = await discoverNamedExports(specifier, nodeModules)
+async function jsStubSource(specifier: string, resolver: DependencyResolver): Promise<string> {
+  const named = await discoverNamedExports(specifier, resolver)
   const ref = JSON.stringify(specifier)
   const lines: string[] = []
   if (named.length > 0) {
@@ -258,7 +335,7 @@ async function jsStubSource(specifier: string, nodeModules: string): Promise<str
 }
 
 /**
- * Import a specifier from the shared install and read its named exports. Names are
+ * Import a specifier from the dependency root and read its named exports. Names are
  * sorted so the generated facade — and therefore the content hash — is
  * deterministic across runs and machines. Node's ESM interop (cjs-module-lexer)
  * enumerates CJS named exports; for the few dual-package libs whose CJS/ESM
@@ -266,12 +343,51 @@ async function jsStubSource(specifier: string, nodeModules: string): Promise<str
  * bundles, and any name it cannot find is reported as a hard error (so drift is
  * never silently shipped).
  */
-async function discoverNamedExports(specifier: string, nodeModules: string): Promise<string[]> {
-  const moduleUrl = import.meta.resolve(specifier, pathToFileURL(join(nodeModules, "__vendor_resolver__.mjs")).href)
+async function discoverNamedExports(specifier: string, resolver: DependencyResolver): Promise<string[]> {
+  const moduleUrl = resolver.resolve(specifier)
   const namespace: Record<string, unknown> = await import(moduleUrl)
   return Object.keys(namespace)
     .filter((key) => key !== "default" && isValidIdentifier(key))
     .sort(compareStrings)
+}
+
+interface DependencyResolver {
+  /** Resolve `specifier` to a file URL anchored at the dependency root. */
+  resolve(specifier: string): string
+  /** Remove the on-disk resolver helper. Safe to call once after the build. */
+  cleanup(): Promise<void>
+}
+
+/**
+ * Build a resolver anchored at the dependency root so export discovery (and the
+ * generated facades) match the *shared install*, never the runtime's own
+ * `node_modules`.
+ *
+ * `import.meta.resolve(specifier, parentUrl)` ignores its 2nd argument for module
+ * resolution unless the calling module physically lives at that location, so a
+ * synthetic parent URL silently resolves from the runtime's install instead. CJS
+ * `createRequire(...).resolve(...)` would anchor correctly but throws
+ * `ERR_PACKAGE_PATH_NOT_EXPORTED` for the `import`-only `@avibe/show-ui/*` subpaths
+ * (no `require`/`default` export condition). So we write a tiny ESM helper file
+ * INTO the dependency root and import it: its `import.meta.resolve` is anchored at
+ * the root *and* honors the `import`/`browser` export conditions.
+ */
+async function createDependencyResolver(dependencyRoot: string): Promise<DependencyResolver> {
+  const helperPath = join(dependencyRoot, `.avibe-vendor-resolver-${randomUUID()}.mjs`)
+  await writeFile(helperPath, "export const resolve = (specifier) => import.meta.resolve(specifier)\n", "utf8")
+  let cleaned = false
+  const cleanup = async () => {
+    if (cleaned) return
+    cleaned = true
+    await rm(helperPath, { force: true })
+  }
+  try {
+    const helper: { resolve(specifier: string): string } = await import(pathToFileURL(helperPath).href)
+    return { resolve: (specifier) => helper.resolve(specifier), cleanup }
+  } catch (error) {
+    await cleanup()
+    throw error
+  }
 }
 
 const RESERVED_WORDS = new Set([
