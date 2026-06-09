@@ -31,6 +31,7 @@ export type ShowSession = {
   id: string
   workspace: string
   basePath?: string
+  dependencySignature?: string
   state: ShowSessionState
   updatedAt: Date
   lastAccessedAt?: Date

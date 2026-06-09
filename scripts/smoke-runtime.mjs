@@ -1,4 +1,4 @@
-import { access, mkdtemp, mkdir, readFile, readdir, writeFile, rm } from "node:fs/promises"
+import { access, mkdtemp, mkdir, readFile, readlink, readdir, symlink, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, relative } from "node:path"
 import vm from "node:vm"
@@ -148,6 +148,10 @@ vm.runInNewContext(
 
 const root = await mkdtemp(join(tmpdir(), "avibe-show-runtime-"))
 const cacheRoot = join(root, "runtime-cache")
+const staleDependencyRoot = await mkdtemp(join(tmpdir(), "avibe-show-stale-deps-"))
+await mkdir(join(staleDependencyRoot, "node_modules"), { recursive: true })
+await mkdir(join(root, "smoke"), { recursive: true })
+await symlink(join(staleDependencyRoot, "node_modules"), join(root, "smoke", "node_modules"), "junction")
 const runtime = await startShowRuntimeServer({ workspaceRoot: root, cacheRoot, fallbackDelaySeconds: 30 })
 
 try {
@@ -158,9 +162,19 @@ try {
 }
 `)
 
-  const ensure = await fetch(`${runtime.url}/sessions/smoke/ensure`, { method: "POST" }).then((res) => res.json())
+  const [ensure, secondEnsure] = await Promise.all([
+    fetch(`${runtime.url}/sessions/smoke/ensure`, { method: "POST" }).then((res) => res.json()),
+    fetch(`${runtime.url}/sessions/smoke-two/ensure`, { method: "POST" }).then((res) => res.json())
+  ])
   if (ensure.state !== "active") {
     throw new Error(`Expected active session, got ${ensure.state}`)
+  }
+  if (secondEnsure.state !== "active") {
+    throw new Error(`Expected second active session, got ${secondEnsure.state}`)
+  }
+  const linkedNodeModules = await readlink(join(root, "smoke", "node_modules"))
+  if (linkedNodeModules === join(staleDependencyRoot, "node_modules")) {
+    throw new Error("Expected runtime to refresh stale session node_modules symlink")
   }
 
   const handler = await fetch(`${runtime.url}/sessions/smoke/app/api/health`).then((res) => res.json())
@@ -183,12 +197,45 @@ try {
       throw new Error(`Expected session source module to load, got ${res.status}`)
     }
   })
+  const buttonModule = await fetch(`${runtime.url}/sessions/smoke/app/@fs/${process.cwd()}/packages/ui/dist/button.js`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  if (buttonModule.status !== 200 || !buttonModule.body.includes("animated-text.js")) {
+    throw new Error(`Expected @avibe/show-ui workspace modules to load, got ${buttonModule.status}`)
+  }
+  const animatedTextModule = await fetch(`${runtime.url}/sessions/smoke/app/@fs/${process.cwd()}/packages/ui/dist/animated-text.js`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  if (animatedTextModule.status !== 200 || !animatedTextModule.body.includes("AnimatedText")) {
+    throw new Error(`Expected @avibe/show-ui transitive workspace modules to load, got ${animatedTextModule.status}`)
+  }
+  const linkedButtonModule = await fetch(`${runtime.url}/sessions/smoke/app/@fs/${process.cwd()}/node_modules/@avibe/show-ui/dist/button.js`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  if (linkedButtonModule.status !== 200 || !linkedButtonModule.body.includes("animated-text.js")) {
+    throw new Error(`Expected @avibe/show-ui package symlink modules to load, got ${linkedButtonModule.status}`)
+  }
+  const projectRootModule = await fetch(`${runtime.url}/sessions/smoke/app/@fs/${process.cwd()}/package.json`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  if (projectRootModule.status !== 403 || !projectRootModule.body.includes("outside of Vite serving allow list")) {
+    throw new Error(`Expected project root files to stay outside Vite fs.allow, got ${projectRootModule.status}`)
+  }
   await access(cacheRoot)
   const cacheDigestDirs = await readdir(cacheRoot)
   if (cacheDigestDirs.length !== 1) {
     throw new Error(`Expected one dependency cache namespace, got ${cacheDigestDirs.join(", ")}`)
   }
-  await access(join(cacheRoot, cacheDigestDirs[0], "smoke"))
+  const sharedCacheDir = join(cacheRoot, cacheDigestDirs[0])
+  await access(join(sharedCacheDir, "deps"))
+  const cacheEntries = await readdir(sharedCacheDir)
+  if (cacheEntries.includes("smoke") || cacheEntries.includes("smoke-two")) {
+    throw new Error(`Expected Vite optimized dependency cache to be shared across sessions, got ${cacheEntries.join(", ")}`)
+  }
   try {
     await access(join(root, "smoke", "node_modules", ".vite"))
     throw new Error("Expected Vite optimized dependency cache to stay out of the session workspace")
@@ -211,6 +258,129 @@ try {
   }
   if (!generatedConfig.includes("writeToken: injected.writeToken")) {
     throw new Error("Expected generated client shell to preserve injected write tokens")
+  }
+
+  await writeFile(join(root, "smoke", "src", "draft.ts"), `import "missing-draft-only-package"
+export const draft = true
+`)
+  await writeFile(join(root, "smoke", "src", "types.ts"), `import type { MissingType } from "missing-type-only-package"
+export type SmokeType = MissingType
+`)
+  await writeFile(join(root, "smoke", "src", "extra-dep.ts"), `import type { SmokeType } from "./types"
+import stackback from "stackback"
+import formatStack from "stackback/formatstack"
+import { workerDep } from "./worker.ts?worker"
+import { absoluteDep } from "/src/root-absolute.ts"
+import rawExample from "./raw-example.ts?raw"
+import type {} from "missing-export-type-package"
+import { type InlineMissingType } from "missing-inline-type-only-package"
+export { type InlineMissingExportType } from "missing-inline-export-type-only-package"
+const eagerPages = import.meta.glob("./pages/*.tsx", { eager: true })
+// import "missing-commented-only-package"
+/* import "missing-block-comment-only-package" */
+const snippet = 'import "missing-string-only-package"'
+const templateSnippet = \`require("missing-template-only-package")\`
+export const stackDepth = stackback().length
+export const formattedStack = formatStack([])
+export const workerDependency = workerDep
+export const rootAbsoluteDependency = absoluteDep
+export const snippets = [snippet, templateSnippet, rawExample, eagerPages]
+export type { SmokeType }
+`)
+  await writeFile(join(root, "smoke", "src", "worker.ts"), `import { nanoid } from "nanoid/non-secure"
+
+export const workerDep = nanoid
+`)
+  await writeFile(join(root, "smoke", "src", "root-absolute.ts"), `import pc from "picocolors"
+
+export const absoluteDep = pc.green
+`)
+  await mkdir(join(root, "smoke", "src", "pages"), { recursive: true })
+  await writeFile(join(root, "smoke", "src", "pages", "globbed.tsx"), `import MagicString from "magic-string"
+
+export const globbedDependency = MagicString
+`)
+  await writeFile(join(root, "smoke", "src", "raw-example.ts"), `import "missing-raw-only-package"
+
+export const rawOnly = true
+`)
+  await writeFile(join(root, "smoke", "src", "App.tsx"), `import { stackDepth } from "./extra-dep"
+
+export default function App() {
+  return <main>Stack depth: {stackDepth}</main>
+}
+`)
+  const extraDepModule = await fetch(`${runtime.url}/sessions/smoke/app/src/extra-dep.ts?t=1`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  if (extraDepModule.status !== 200 || !extraDepModule.body.includes("/deps/stackback.js")) {
+    throw new Error(`Expected extra page dependency to be optimized, got ${extraDepModule.status}: ${extraDepModule.body.slice(0, 200)}`)
+  }
+  if (!extraDepModule.body.includes("/deps/stackback_formatstack.js")) {
+    throw new Error(`Expected deep bare imports to stay optimized by full specifier, got: ${extraDepModule.body.slice(0, 300)}`)
+  }
+  if (
+    extraDepModule.body.includes("missing-type-only-package") ||
+    extraDepModule.body.includes("missing-draft-only-package") ||
+    extraDepModule.body.includes("missing-commented-only-package") ||
+    extraDepModule.body.includes("missing-block-comment-only-package") ||
+    extraDepModule.body.includes("missing-inline-type-only-package") ||
+    extraDepModule.body.includes("missing-inline-export-type-only-package")
+  ) {
+    throw new Error(`Expected unreachable, type-only, and commented imports to stay out of optimizer output: ${extraDepModule.body.slice(0, 300)}`)
+  }
+  const updatedCacheDigestDirs = await readdir(cacheRoot)
+  if (updatedCacheDigestDirs.length < 2) {
+    throw new Error(`Expected extra page dependencies to use a dedicated cache namespace, got ${updatedCacheDigestDirs.join(", ")}`)
+  }
+  const extraCacheDigestDir = updatedCacheDigestDirs.find((dir) => dir !== cacheDigestDirs[0])
+  const extraCacheDeps = extraCacheDigestDir ? await readdir(join(cacheRoot, extraCacheDigestDir, "deps")) : []
+  if (!extraCacheDeps.some((entry) => entry.startsWith("nanoid_non-secure"))) {
+    throw new Error(`Expected Vite query imports to scan reachable worker dependencies, got cache deps: ${extraCacheDeps.join(", ")}`)
+  }
+  if (!extraCacheDeps.some((entry) => entry.startsWith("picocolors"))) {
+    throw new Error(`Expected root-absolute imports to scan reachable source dependencies, got cache deps: ${extraCacheDeps.join(", ")}`)
+  }
+  if (!extraCacheDeps.some((entry) => entry.startsWith("magic-string"))) {
+    throw new Error(`Expected Vite glob imports to scan reachable source dependencies, got cache deps: ${extraCacheDeps.join(", ")}`)
+  }
+  if (
+    extraCacheDeps.some((entry) =>
+      entry.startsWith("missing-string-only-package") ||
+      entry.startsWith("missing-template-only-package") ||
+      entry.startsWith("missing-raw-only-package")
+    )
+  ) {
+    throw new Error(`Expected import-like string literals and raw imports to stay out of optimized deps, got cache deps: ${extraCacheDeps.join(", ")}`)
+  }
+
+  await writeFile(join(root, "smoke", "index.html"), `<div id="root"></div><!-- <script type="module" src="/src/commented-demo.tsx"></script> --><script type="module" src="/src/demo.tsx"></script>`)
+  await writeFile(join(root, "smoke", "src", "main.tsx"), `import "missing-unused-main-package"
+`)
+  await writeFile(join(root, "smoke", "src", "demo.tsx"), `import { customAlphabet } from "nanoid"
+
+export const demo = customAlphabet("abc")
+`)
+  await writeFile(join(root, "smoke", "src", "commented-demo.tsx"), `import "missing-commented-html-entry-package"
+`)
+  const customEntryEnsure = await fetch(`${runtime.url}/sessions/smoke/ensure`, { method: "POST" }).then((res) => res.json())
+  if (customEntryEnsure.state !== "active") {
+    throw new Error(`Expected custom HTML entry session to stay active, got ${JSON.stringify(customEntryEnsure)}`)
+  }
+  const customEntryCacheDigestDirs = await readdir(cacheRoot)
+  const customEntryCacheDir = customEntryCacheDigestDirs.find((dir) => !updatedCacheDigestDirs.includes(dir))
+  const customEntryCacheDeps = customEntryCacheDir ? await readdir(join(cacheRoot, customEntryCacheDir, "deps")) : []
+  if (!customEntryCacheDeps.some((entry) => entry.startsWith("nanoid"))) {
+    throw new Error(`Expected customized HTML entries to scan their dependencies, got cache deps: ${customEntryCacheDeps.join(", ")}`)
+  }
+  if (
+    customEntryCacheDeps.some((entry) =>
+      entry.startsWith("missing-unused-main-package") ||
+      entry.startsWith("missing-commented-html-entry-package")
+    )
+  ) {
+    throw new Error(`Expected custom HTML warmup to ignore unused and commented entries, got cache deps: ${customEntryCacheDeps.join(", ")}`)
   }
 
   const eventResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {
@@ -456,7 +626,11 @@ try {
   if (cacheDigestDirs.length !== 1) {
     throw new Error(`Expected relative cache root to contain one namespace, got ${cacheDigestDirs.join(", ")}`)
   }
-  await access(join(relativeCacheRoot, cacheDigestDirs[0], "relative"))
+  const sharedRelativeCacheDir = join(relativeCacheRoot, cacheDigestDirs[0])
+  const relativeCacheEntries = await readdir(sharedRelativeCacheDir)
+  if (relativeCacheEntries.includes("relative")) {
+    throw new Error(`Expected relative cacheRoot to share optimized deps across sessions, got ${relativeCacheEntries.join(", ")}`)
+  }
   try {
     await access(join(relativeRoot, "relative", ".vite"))
     throw new Error("Expected relative cacheRoot to resolve outside the session workspace")
