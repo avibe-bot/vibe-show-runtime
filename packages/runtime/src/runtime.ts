@@ -39,7 +39,10 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     if (!existing.warming) {
       existing.state = "warming"
       existing.updatedAt = new Date()
-      existing.warming = warmSession(existing, normalizedBasePath)
+      existing.warming = warmSession(existing, normalizedBasePath).catch(async (error) => {
+        await closeSession(existing)
+        throw error
+      })
     }
     const warmed = await existing.warming
     return toStatus(warmed)
@@ -105,16 +108,22 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
         alias: createShadcnAlias(uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never
       },
       optimizeDeps: {
+        noDiscovery: true,
         include: [
           "react",
           "react/jsx-runtime",
           "react/jsx-dev-runtime",
           "react-dom/client",
-          "motion/react",
+          `${uiPackageName}/animated-text > motion/react`,
+          `${uiPackageName}/card > motion/react`,
           `${uiPackageName}/button`,
           `${uiPackageName}/card`,
           `${uiPackageName}/badge`,
+          `${uiPackageName}/dialog`,
+          `${uiPackageName}/input`,
+          `${uiPackageName}/metric-card`,
           `${uiPackageName}/progress`,
+          `${uiPackageName}/switch`,
           `${uiPackageName}/theme`
         ]
       }
