@@ -5,3 +5,5 @@ dist
 *.tsbuildinfo
 coverage
 examples/*/dist
+.vite-cache
+.show-vendor

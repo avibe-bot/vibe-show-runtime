@@ -32,8 +32,13 @@ export interface VendorBundle {
 
 const EMPTY_MODULE_SOURCE = "export default {}\n"
 
-// One shared bundle per resolved dependency root (cached so it builds once, not per
-// session). The promise is cached so concurrent warms await a single build.
+const DEFAULT_UI_PACKAGE_NAME = "@avibe/show-ui"
+
+// One shared bundle per distinct build input set (cached so it builds once, not per
+// session). Keyed by every input that affects the manifest/output — dependency root,
+// UI package, AND vendor cache root (the on-disk location) — so a second runtime with
+// the same root but a different UI package or cache dir doesn't reuse the wrong bundle.
+// The promise is cached so concurrent warms await a single build.
 const vendorBundles = new Map<string, Promise<VendorBundle>>()
 
 export interface EnsureVendorBundleOptions {
@@ -52,21 +57,26 @@ export interface EnsureVendorBundleOptions {
  */
 export function ensureVendorBundle(options: EnsureVendorBundleOptions): Promise<VendorBundle> {
   const dependencyRoot = resolve(options.dependencyRoot)
-  const cached = vendorBundles.get(dependencyRoot)
+  const uiPackageName = options.uiPackageName ?? DEFAULT_UI_PACKAGE_NAME
+  const vendorCacheRoot = resolve(options.vendorCacheRoot)
+  const cacheKey = `${dependencyRoot}\0${uiPackageName}\0${vendorCacheRoot}`
+  const cached = vendorBundles.get(cacheKey)
   if (cached) return cached
-  const built = buildVendorBundle(dependencyRoot, options).catch((error) => {
+  const built = buildVendorBundle(dependencyRoot, uiPackageName, vendorCacheRoot).catch((error) => {
     // Don't cache a failed build — let the next warm retry.
-    if (vendorBundles.get(dependencyRoot) === built) vendorBundles.delete(dependencyRoot)
+    if (vendorBundles.get(cacheKey) === built) vendorBundles.delete(cacheKey)
     throw error
   })
-  vendorBundles.set(dependencyRoot, built)
+  vendorBundles.set(cacheKey, built)
   return built
 }
 
-async function buildVendorBundle(dependencyRoot: string, options: EnsureVendorBundleOptions): Promise<VendorBundle> {
-  const digest = createHash("sha256").update(dependencyRoot).digest("hex").slice(0, 16)
-  const outDir = join(resolve(options.vendorCacheRoot), digest)
-  const result = await buildVendor({ dependencyRoot, outDir, uiPackageName: options.uiPackageName })
+async function buildVendorBundle(dependencyRoot: string, uiPackageName: string, vendorCacheRoot: string): Promise<VendorBundle> {
+  // Namespace the on-disk output by dependency root AND UI package so two UI packages
+  // under the same root never share an out dir (their manifests differ).
+  const digest = createHash("sha256").update(`${dependencyRoot}\0${uiPackageName}`).digest("hex").slice(0, 16)
+  const outDir = join(vendorCacheRoot, digest)
+  const result = await buildVendor({ dependencyRoot, outDir, uiPackageName })
   const baseUrl = vendorBaseUrl(result.manifest.hash)
   const emptyModuleUrl = `${baseUrl}/${VENDOR_EMPTY_MODULE_FILENAME}`
   const assets = vendorBrowserAssets(result.manifest, { baseUrl, emptyModuleUrl })
@@ -157,12 +167,21 @@ export function vendorImportMapPlugin(bundle: VendorBundle): Plugin {
 }
 
 /**
- * Default vendor cache root for a dependency root: a SIBLING of the Vite optimize
- * cache, never inside it. The runtime serves the Vite cache root straight to Vibe
- * Remote and that dir is expected to hold only per-dependency Vite namespaces, so the
- * immutable vendor output must live alongside it (`<cacheRoot-parent>/.show-vendor`).
+ * Default vendor cache root for a dependency root.
+ *
+ * It must mirror where `viteCacheDir` puts the Vite optimize cache:
+ *  - **No `cacheRoot`** (default): the Vite cache defaults to `<dependencyRoot>/.vite-cache`
+ *    (INSIDE the app root, where the install lives). So the vendor output is its sibling
+ *    `<dependencyRoot>/.show-vendor` — also inside the app root, which is writable in
+ *    non-root / read-only-parent containers (e.g. an app installed at `/app`). The old
+ *    derivation produced `/.show-vendor`, outside the app, which failed there.
+ *  - **Explicit `cacheRoot`**: the runtime serves that dir straight to Vibe Remote and it
+ *    must hold only per-dependency Vite namespaces, so the immutable vendor output lives
+ *    as its sibling (`<cacheRoot-parent>/.show-vendor`), never inside it.
  */
 export function defaultVendorCacheRoot(dependencyRoot: string, cacheRoot?: string): string {
-  const viteCacheRoot = cacheRoot ? resolve(cacheRoot) : join(dirname(resolve(dependencyRoot)), ".vite-cache")
-  return join(dirname(viteCacheRoot), ".show-vendor")
+  if (cacheRoot) {
+    return join(dirname(resolve(cacheRoot)), ".show-vendor")
+  }
+  return join(resolve(dependencyRoot), ".show-vendor")
 }

@@ -1,6 +1,5 @@
 import type { Plugin } from "vite"
 import type { Plugin as EsbuildPlugin } from "esbuild"
-import { providedVendorCssSpecifiers, providedVendorSpecifiers } from "./vendor.js"
 
 /**
  * Leave the shared "provided" vendor specifiers as **bare** specifiers in every
@@ -25,50 +24,41 @@ import { providedVendorCssSpecifiers, providedVendorSpecifiers } from "./vendor.
  *      import-analysis emits back to the original bare `<spec>` in the served
  *      code, so the browser sees `import ... from "react"`.
  *
- * The set is the single source of truth in `vendor.ts`: JS specifiers match
- * exactly (React core + both JSX runtimes + `react-dom` subpaths are enumerated),
- * and the UI package is matched by prefix so deep imports like
- * `@avibe/show-ui/button` and any nested subpath are externalized too. CSS
- * specifiers (`@avibe/show-ui/styles.css`) are included so the shared stylesheet
- * import stays bare for the import map as well.
+ * The provided set is **exact-matched**: it's exactly the specifiers the bundle +
+ * import map cover (the `vendor-manifest.json` `specifiers`, passed in by the
+ * runtime). Exact match is essential — prefix-matching `@avibe/show-ui/` would
+ * externalize a deep subpath the import map does NOT cover (e.g. a non-enumerated
+ * `@avibe/show-ui/...`), leaving a bare import the browser can't resolve. A subpath
+ * outside the provided set instead optimizes per-session normally (safe).
  */
-export function createVendorExternalizePlugins(uiPackageName: string): Plugin[] {
-  const matcher = createProvidedMatcher(uiPackageName)
-  return [externalizePlugin(matcher)]
+export function createVendorExternalizePlugins(providedSpecifiers: string[]): Plugin[] {
+  return [externalizePlugin(createProvidedMatcher(providedSpecifiers))]
 }
 
 /**
- * Whether a specifier belongs to the provided vendor set and must be left bare
- * for the import map. Exact-match the JS/CSS specifiers; prefix-match the UI
- * package subpaths (deep imports). Exported so callers (e.g. `optimizeDeps`
- * config) filter the provided set out of the optimizer with the same logic.
+ * Whether a specifier belongs to the provided vendor set and must be left bare for
+ * the import map. Exact match against the provided specifiers (the bundle's manifest
+ * list). Exported so callers (e.g. `optimizeDeps` config, declared-extras filtering)
+ * filter the provided set out with the same logic.
  */
-export function isProvidedVendorSpecifier(specifier: string, uiPackageName: string): boolean {
-  return createProvidedMatcher(uiPackageName).matches(specifier)
+export function isProvidedVendorSpecifier(specifier: string, providedSpecifiers: string[]): boolean {
+  return createProvidedMatcher(providedSpecifiers).matches(specifier)
 }
 
-/** Exact-match the provided JS/CSS specifiers; prefix-match the UI subpaths. */
+/** Exact-match the provided JS/CSS specifiers (the manifest's authoritative set). */
 export interface ProvidedMatcher {
   /** Every provided specifier (JS + CSS), used for `optimizeDeps.exclude`. */
   readonly specifiers: string[]
-  /** The UI package name, whose `<pkg>/...` subpaths are all provided. */
-  readonly uiPackageName: string
   matches(specifier: string): boolean
 }
 
-function createProvidedMatcher(uiPackageName: string): ProvidedMatcher {
-  const specifiers = [...providedVendorSpecifiers(uiPackageName), ...providedVendorCssSpecifiers(uiPackageName)]
+function createProvidedMatcher(providedSpecifiers: string[]): ProvidedMatcher {
+  const specifiers = [...providedSpecifiers]
   const exact = new Set(specifiers)
-  const uiSubpathPrefix = `${uiPackageName}/`
   return {
     specifiers,
-    uiPackageName,
     matches(specifier: string) {
-      const clean = cleanSpecifier(specifier)
-      if (exact.has(clean)) return true
-      // Deep imports into the shared UI package (e.g. a nested subpath beyond the
-      // enumerated set) resolve onto the same bundle, so keep them bare too.
-      return clean === uiPackageName || clean.startsWith(uiSubpathPrefix)
+      return exact.has(cleanSpecifier(specifier))
     }
   }
 }

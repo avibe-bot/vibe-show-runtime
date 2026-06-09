@@ -2,11 +2,12 @@ import { access, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, r
 import { dirname, extname, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
+import { createRequire } from "node:module"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import react from "@vitejs/plugin-react"
 import { createServer as createViteServer } from "vite"
-import type { InlineConfig, ViteDevServer } from "vite"
+import type { InlineConfig, Plugin, ViteDevServer } from "vite"
 import {
   formatShowEventMessage,
   normalizeShowEvent,
@@ -161,6 +162,10 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       uiPackageName
     })
     vendorBundle = bundle
+    // The bundle's manifest IS the authoritative provided set (exactly what the
+    // bundle + import map cover). Externalize + optimize filtering key off it so the
+    // browser never sees a bare specifier the import map can't resolve.
+    const providedSpecifiers = bundle.result.manifest.specifiers
     logTiming("warmSession.vendorBundle", session.id, vendorStarted, { hash: bundle.result.manifest.hash, baseUrl: bundle.baseUrl })
     const dependencyStarted = performance.now()
     const sourceDependencies = await sourceDependenciesForWorkspace(session.workspace, uiPackageName)
@@ -183,13 +188,19 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
         },
         fs: {
           strict: true,
-          allow: [session.workspace, sharedDependencies.nodeModules, ...sharedDependencies.packageRoots],
+          allow: [session.workspace, sharedDependencies.nodeModules, sharedDependencies.sharedNodeModules, ...sharedDependencies.packageRoots],
           deny: []
         }
       },
       plugins: [
         vendorImportMapPlugin(bundle),
-        ...createVendorExternalizePlugins(uiPackageName),
+        ...createVendorExternalizePlugins(providedSpecifiers),
+        // Extras sessions resolve their own declared extras from workspace/node_modules;
+        // any other non-provided shared dep falls back to the shared install here (no
+        // parent symlink). Skipped when node_modules already IS the shared install.
+        ...(sharedDependencies.nodeModules === sharedDependencies.sharedNodeModules
+          ? []
+          : [sharedResolveFallbackPlugin(sharedDependencies.sharedNodeModules, uiPackageName)]),
         showHmrTransitionPlugin({ fallbackDelaySeconds: options.fallbackDelaySeconds }),
         react()
       ] as InlineConfig["plugins"],
@@ -205,7 +216,17 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
         // so the optimizer only handles the app's OWN non-provided bare imports.
         // `exclude` for the provided set is added by the externalize plugin's
         // `config` hook (single source of truth in vendor-externalize-plugin).
-        include: sourceDependencies.extraBareImports.filter((specifier) => !isProvidedVendorSpecifier(specifier, uiPackageName))
+        //
+        // For extras sessions, a non-provided bare import that does NOT resolve from
+        // the session's own node_modules (it lives only in the shared install) is left
+        // OUT of `include`: Vite's optimizer can't pre-bundle it from the session root,
+        // and the shared resolve fallback serves it on demand instead. Keeping it in
+        // `include` would only emit a misleading "Failed to resolve dependency" warning.
+        include: await optimizableBareImports(
+          sourceDependencies.extraBareImports.filter((specifier) => !isProvidedVendorSpecifier(specifier, providedSpecifiers)),
+          sharedDependencies.nodeModules,
+          sharedDependencies.sharedNodeModules
+        )
       }
     } satisfies InlineConfig
     await withViteCacheWarmLock(cacheDir, async () => {
@@ -318,6 +339,8 @@ function normalizeBasePath(basePath: string | undefined, sessionId: string) {
 type SharedDependencies = {
   /** node_modules Vite resolves from (the shared symlink, or the session extras dir). */
   nodeModules: string
+  /** The shared, pinned install dir (`<dependencyRoot>/node_modules`). */
+  sharedNodeModules: string
   /** Extra dirs to add to `server.fs.allow` beyond the shared install + package roots. */
   packageRoots: string[]
   /** Signature of the declared extras the workspace was installed against. */
@@ -327,16 +350,18 @@ type SharedDependencies = {
 /**
  * Resolve a session's dependency layering and (re)install per-session extras.
  *
- * Layering (Node walk-up resolution does the work; no per-package aliasing):
+ * The shared install is reached two different ways depending on the layer, but the
+ * runtime NEVER mutates anything outside the session's own `workspace/node_modules`
+ * (a host app could be configured with `workspaceRoot` pointing at its own root):
  *  - **No declared extras** (today's behavior, unchanged): `workspace/node_modules`
  *    is a symlink to the shared, pinned install — that single dir resolves every
  *    non-provided dep the app uses, and the session shares the global optimize cache.
  *  - **Declared extras**: install ONLY the declared extras (+ their transitive,
- *    non-provided deps) into `workspace/node_modules` as a real, session-private dir,
- *    and symlink the shared install one level up at `workspaceRoot/node_modules`.
- *    Walk-up from the session sources hits the extras dir first, then the shared
- *    install as a fallback for non-provided shared deps. The provided vendor set
- *    (react, `@avibe/show-ui/*`, ...) is never installed per session — it stays
+ *    non-provided deps) into `workspace/node_modules` as a real, session-private dir.
+ *    Vite resolves the extras from there first; any OTHER non-provided shared dep the
+ *    app imports is served by the shared-install resolve fallback (`sharedResolveFallbackPlugin`,
+ *    wired in `warmSession`), NOT by a symlink into a parent dir. The provided vendor
+ *    set (react, `@avibe/show-ui/*`, ...) is never installed per session — it stays
  *    externalized to the shared bundle (Stage R-B), so a session can't fork React.
  */
 async function ensureSessionDependencies(
@@ -354,21 +379,29 @@ async function ensureSessionDependencies(
     // Shared-only: workspace/node_modules -> shared install. Drop any stale extras
     // real dir from a previous warm so reverting to no-extras restores the symlink.
     await ensureSharedSymlink(join(workspace, "node_modules"), sharedNodeModules)
-    return { nodeModules: sharedNodeModules, packageRoots, extrasSignature: "shared" }
+    return { nodeModules: sharedNodeModules, sharedNodeModules, packageRoots, extrasSignature: "shared" }
   }
 
-  // Extras: shared stays reachable as the walk-up fallback one level up; the session
-  // node_modules becomes the private extras install.
-  await ensureSharedSymlink(join(dirname(workspace), "node_modules"), sharedNodeModules)
+  // Extras: the session node_modules becomes the private extras install. Non-provided
+  // shared deps stay reachable via the resolve fallback (see warmSession), so we never
+  // touch a parent/shared `node_modules` that may be a real host directory.
   const extrasDir = await ensureSessionExtrasInstall(workspace, declaredExtras)
   return {
     nodeModules: extrasDir,
+    sharedNodeModules,
     packageRoots: [...packageRoots, extrasDir, sharedNodeModules],
     extrasSignature: declaredExtras.signature
   }
 }
 
-/** Point `linkPath` at the shared install, replacing any stale symlink target or real dir. */
+/**
+ * Point the session-owned `linkPath` (`workspace/node_modules`) at the shared install,
+ * replacing any stale symlink target or a session-private extras dir from a prior warm.
+ *
+ * Only ever called for the session's OWN `workspace/node_modules` — never a parent or
+ * shared dir — so removing a real directory here is safe (it can only be this session's
+ * earlier extras install). It refuses to delete anything else as a guardrail.
+ */
 async function ensureSharedSymlink(linkPath: string, sharedNodeModules: string) {
   try {
     const stats = await lstat(linkPath)
@@ -377,13 +410,46 @@ async function ensureSharedSymlink(linkPath: string, sharedNodeModules: string) 
       if (currentTarget === sharedNodeModules) return
       await rm(linkPath)
     } else {
-      // A previous extras warm left a real node_modules here; clear it before linking.
+      // A previous extras warm left this session's real node_modules here; clear it
+      // before linking. (Guarded: `linkPath` is always the session-owned dir.)
       await rm(linkPath, { recursive: true, force: true })
     }
   } catch {
     // Nothing to replace; create the link below.
   }
   await symlink(sharedNodeModules, linkPath, "junction")
+}
+
+/**
+ * A Vite resolve FALLBACK that serves a session's non-provided bare imports from the
+ * shared, pinned install when the session's own `node_modules` can't resolve them.
+ *
+ * Used only for declared-extras sessions, whose `workspace/node_modules` holds ONLY the
+ * declared extras (so a bare import of any other shared dep would otherwise fail). This
+ * replaces the old parent symlink at `workspaceRoot/node_modules`, which could clobber a
+ * host app's real `node_modules`. Provided deps are externalized before this runs, so the
+ * fallback only ever serves non-provided shared deps; local/virtual ids are left to Vite.
+ */
+function sharedResolveFallbackPlugin(sharedNodeModules: string, uiPackageName: string): Plugin {
+  const sharedRequire = createRequire(join(dirname(sharedNodeModules), "__avibe-show-shared-resolver.js"))
+  return {
+    name: "avibe-show-shared-resolve-fallback",
+    enforce: "post",
+    apply: "serve",
+    async resolveId(source, importer, options) {
+      if (!isBareImport(source) || isRuntimeManagedImport(source, uiPackageName)) {
+        return null
+      }
+      // Only act as a fallback: defer to the session's own resolution first.
+      const own = await this.resolve(source, importer, { ...options, skipSelf: true })
+      if (own) return null
+      try {
+        return sharedRequire.resolve(source)
+      } catch {
+        return null
+      }
+    }
+  }
 }
 
 async function resolveAllowedPackageRoots(nodeModules: string, packageNames: string[]) {
@@ -413,11 +479,16 @@ type DeclaredExtras = {
 /**
  * Read the OPTIONAL per-session `package.json` and return its declared extra deps.
  *
- * Only `dependencies` are honored (the install surface). The provided vendor set is
- * never installed per session, so any provided specifier a session lists is dropped
- * here — it's served by the shared bundle regardless and must not fork React.
- * Sessions that ship no `package.json` (or an empty `dependencies`) report no extras
- * and keep the shared-install fast path untouched.
+ * Only `dependencies` are honored (the install surface). The runtime-owned deps (the
+ * React family + the whole `@avibe/show-ui` / `@avibe/show-sdk` packages) are never
+ * installed per session — any a session lists is dropped here; they're served by the
+ * shared bundle / shared install regardless and must not fork React. Sessions that
+ * ship no `package.json` (or an empty `dependencies`) report no extras and keep the
+ * shared-install fast path untouched.
+ *
+ * This uses a build-independent ownership predicate (not the import-map externalize
+ * set) so the declared-extras signature is stable on the hot reuse path, which has no
+ * built bundle to read the manifest from.
  */
 async function readDeclaredExtras(workspace: string, uiPackageName: string): Promise<DeclaredExtras> {
   let manifest: { dependencies?: Record<string, string> }
@@ -431,13 +502,34 @@ async function readDeclaredExtras(workspace: string, uiPackageName: string): Pro
     return { entries: [], signature: "none" }
   }
   const entries = Object.entries(dependencies)
-    .filter(([name]) => !isProvidedVendorSpecifier(name, uiPackageName))
+    .filter(([name]) => !isRuntimeOwnedDependency(name, uiPackageName))
     .map(([name, range]) => `${name}@${range}`)
     .sort()
   return {
     entries,
     signature: entries.length ? createHash("sha256").update(entries.join("\n")).digest("hex").slice(0, 16) : "none"
   }
+}
+
+/**
+ * Whether a declared dependency NAME is owned by the runtime and must never be
+ * installed per session. Prefix-matches the whole `@avibe/show-ui` / `@avibe/show-sdk`
+ * packages (every subpath shares the shared install) plus the React family, `motion`,
+ * and `lucide-react`. Distinct from the import-map externalize set (exact-match):
+ * ownership is broader than what the bundle enumerates.
+ */
+function isRuntimeOwnedDependency(name: string, uiPackageName: string): boolean {
+  return name === "react" ||
+    name === "react-dom" ||
+    name.startsWith("react/") ||
+    name.startsWith("react-dom/") ||
+    name === "motion" ||
+    name.startsWith("motion/") ||
+    name === "lucide-react" ||
+    name === uiPackageName ||
+    name.startsWith(`${uiPackageName}/`) ||
+    name === "@avibe/show-sdk" ||
+    name.startsWith("@avibe/show-sdk/")
 }
 
 /**
@@ -979,6 +1071,30 @@ function isBareImport(specifier: string) {
     !specifier.startsWith("/") &&
     !specifier.startsWith("virtual:") &&
     !specifier.startsWith("\0")
+}
+
+/**
+ * Filter `optimizeDeps.include` to specifiers Vite's dep optimizer can actually resolve
+ * from the session's own `node_modules`.
+ *
+ * Shared-only sessions resolve everything from the single shared dir, so the list is
+ * returned unchanged. For extras sessions, a specifier that resolves ONLY from the
+ * shared install (not the session's extras-only dir) is dropped: the optimizer (rooted
+ * at the session) can't pre-bundle it, and the shared resolve fallback serves it on
+ * demand. Keeping it would just emit a misleading "Failed to resolve dependency" warning.
+ */
+async function optimizableBareImports(specifiers: string[], nodeModules: string, sharedNodeModules: string): Promise<string[]> {
+  if (nodeModules === sharedNodeModules) return specifiers
+  // Anchor a resolver at the session workspace (the parent of its extras node_modules).
+  const sessionRequire = createRequire(join(dirname(nodeModules), "__avibe-show-session-resolver.js"))
+  return specifiers.filter((specifier) => {
+    try {
+      sessionRequire.resolve(specifier)
+      return true
+    } catch {
+      return false
+    }
+  })
 }
 
 async function viteCacheDir(dependencyRoot: string, cacheRoot?: string, dependencySignature = "shared") {

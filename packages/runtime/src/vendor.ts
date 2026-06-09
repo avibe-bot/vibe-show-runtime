@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, relative, resolve, sep } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -124,21 +124,18 @@ export function vendorBrowserAssets(manifest: VendorManifest, options: VendorBro
  *
  * Keep this as the single source of truth so externalization (leaving these
  * specifiers bare for the import map) and this pre-build agree exactly.
+ *
+ * `uiSubpaths` are the JS-exporting `@avibe/show-ui` subpath names the bundle was
+ * built for (enumerated from the package's `exports` by `buildVendor`). When omitted,
+ * the historical default set is used (e.g. callers without a resolved install). The
+ * built `vendor-manifest.json` `specifiers` is the authoritative runtime copy, so
+ * externalization keys off the manifest, never a re-derived list — this stays the
+ * single declaration site for the core (non-UI-subpath) provided deps.
  */
-export function providedVendorSpecifiers(uiPackageName: string = DEFAULT_UI_PACKAGE_NAME): string[] {
-  const uiSubpaths = [
-    "animated-text",
-    "badge",
-    "button",
-    "card",
-    "dialog",
-    "input",
-    "metric-card",
-    "progress",
-    "switch",
-    "theme",
-    "utils"
-  ]
+export function providedVendorSpecifiers(
+  uiPackageName: string = DEFAULT_UI_PACKAGE_NAME,
+  uiSubpaths: string[] = DEFAULT_UI_SUBPATHS
+): string[] {
   return [
     "react",
     "react-dom",
@@ -150,6 +147,78 @@ export function providedVendorSpecifiers(uiPackageName: string = DEFAULT_UI_PACK
     uiPackageName,
     ...uiSubpaths.map((subpath) => `${uiPackageName}/${subpath}`)
   ]
+}
+
+/**
+ * Fallback UI subpath set used only when the package's `exports` cannot be read. The
+ * authoritative list at build time comes from `uiPackageJsSubpaths(<exports>)`.
+ */
+const DEFAULT_UI_SUBPATHS = [
+  "animated-text",
+  "badge",
+  "button",
+  "card",
+  "dialog",
+  "input",
+  "metric-card",
+  "progress",
+  "switch",
+  "theme",
+  "utils"
+]
+
+/**
+ * Enumerate the JS-exporting subpath names from a UI package's `exports` map (so the
+ * provided set covers EVERY shippable subpath, e.g. a newly added one, not just a
+ * hand-maintained list). Skips the bare `.` entry (handled separately) and CSS/asset
+ * exports.
+ *
+ * A subpath is included only if its JS target FILE actually exists under `packageDir`.
+ * Some packages declare an `exports` entry whose JS artifact isn't built (e.g. a
+ * types-only or runtime-injected subpath like `@avibe/show-ui/hmr-transition`);
+ * bundling those would hard-fail, and externalizing them would leave a bare import the
+ * browser can't resolve. Skipping them lets such a subpath optimize per-session
+ * normally (safe) instead. Falls back to the historical default set when `exports` is
+ * absent/unreadable or yields nothing.
+ */
+export async function uiPackageJsSubpaths(exportsMap: unknown, packageDir: string): Promise<string[]> {
+  if (!exportsMap || typeof exportsMap !== "object") return [...DEFAULT_UI_SUBPATHS]
+  const subpaths: string[] = []
+  for (const [key, target] of Object.entries(exportsMap as Record<string, unknown>)) {
+    if (!key.startsWith("./") || key === ".") continue
+    const subpath = key.slice(2)
+    if (!subpath) continue
+    const jsTarget = jsExportTargetPath(target)
+    if (jsTarget && await fileExists(join(packageDir, ...jsTarget.replace(/^\.\//, "").split("/")))) {
+      subpaths.push(subpath)
+    }
+  }
+  return subpaths.length ? subpaths.sort(compareStrings) : [...DEFAULT_UI_SUBPATHS]
+}
+
+/**
+ * The JS target path of an `exports` entry (`import`/`module`/`default` condition or a
+ * bare string), or `undefined` for a CSS/asset-only export.
+ */
+function jsExportTargetPath(target: unknown): string | undefined {
+  if (typeof target === "string") return target.endsWith(".css") ? undefined : target
+  if (target && typeof target === "object") {
+    const conditions = target as Record<string, unknown>
+    for (const condition of ["import", "module", "default"]) {
+      const resolved = jsExportTargetPath(conditions[condition])
+      if (resolved) return resolved
+    }
+  }
+  return undefined
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -177,7 +246,13 @@ export async function buildVendor(options: BuildVendorOptions): Promise<BuildVen
   const nodeModules = join(dependencyRoot, "node_modules")
   const outDir = resolve(options.outDir)
 
-  const jsSpecifiers = providedVendorSpecifiers(uiPackageName)
+  // Enumerate provided UI subpaths from the resolved package's `exports`, so EVERY
+  // built JS subpath lands in the bundle + import map + externalize set — not a
+  // hand-maintained list that silently misses one (and not a subpath whose JS isn't
+  // built, which would leave a bare import the browser can't resolve).
+  const uiPackageDir = join(nodeModules, ...uiPackageName.split("/"))
+  const uiSubpaths = await uiPackageJsSubpaths(await readUiPackageExports(uiPackageDir), uiPackageDir)
+  const jsSpecifiers = providedVendorSpecifiers(uiPackageName, uiSubpaths)
   const cssSpecifiers = providedVendorCssSpecifiers(uiPackageName)
 
   await rm(outDir, { recursive: true, force: true })
@@ -227,6 +302,20 @@ export async function buildVendor(options: BuildVendorOptions): Promise<BuildVen
     return { outDir, manifestPath, manifest, outputFiles }
   } finally {
     await rm(stubRoot, { recursive: true, force: true })
+  }
+}
+
+/**
+ * Read a UI package's `exports` map from its resolved install dir. Returns `undefined`
+ * if the `package.json` is missing/unreadable, so the caller falls back to the
+ * historical default subpath set.
+ */
+async function readUiPackageExports(packageDir: string): Promise<unknown> {
+  try {
+    const manifest = JSON.parse(await readFile(join(packageDir, "package.json"), "utf8")) as { exports?: unknown }
+    return manifest.exports
+  } catch {
+    return undefined
   }
 }
 
