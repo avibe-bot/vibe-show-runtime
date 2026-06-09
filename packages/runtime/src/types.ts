@@ -10,11 +10,12 @@ export type ShowRuntimeOptions = {
   host?: string
   port?: number
   idleTtlMs?: number
+  idlePruneIntervalMs?: number
   uiPackageName?: string
   fallbackDelaySeconds?: number
 }
 
-export type ShowSessionState = "created" | "warming" | "active" | "idle" | "suspended"
+export type ShowSessionState = "created" | "warming" | "active" | "closing" | "idle" | "suspended"
 
 export type ShowSessionStatus = {
   sessionId: string
@@ -36,13 +37,15 @@ export type ShowSession = {
   lastAccessedAt?: Date
   vite?: ViteDevServer
   warming?: Promise<ShowSession>
+  closing?: Promise<void>
   events: ShowEvent[]
   messages: ShowMessage[]
 }
 
 export type ShowRuntime = {
   ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus>
-  getSessionStatus(sessionId: string): ShowSessionStatus
+  getSessionStatus(sessionId: string): Promise<ShowSessionStatus>
+  pruneIdleSessions(): Promise<ShowSessionStatus[]>
   getSession(sessionId: string): ShowSession | undefined
   suspendSession(sessionId: string): Promise<ShowSessionStatus>
   recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor): ShowEvent

@@ -98,7 +98,7 @@ if (!defaultHmrStyleTag?.children?.includes("avs-show-fallback-recovery-in 0.22s
   throw new Error("Expected standalone runtime fallback recovery delay to default to 5 seconds")
 }
 
-const hmrPlugin = showHmrTransitionPlugin({ fallbackDelaySeconds: 10 })
+const hmrPlugin = showHmrTransitionPlugin({ fallbackDelaySeconds: 30 })
 const hmrClientCode = hmrPlugin.load?.("\0virtual:avibe-show-hmr-transition-client")
 if (typeof hmrClientCode !== "string") {
   throw new Error("Expected HMR transition plugin to return client code")
@@ -117,7 +117,7 @@ if (
   !hmrStyleTag?.children?.includes("Loading Show Page") ||
   !hmrStyleTag.children.includes(".avs-fallback") ||
   hmrStyleTag.children.includes(".fallback-shell {") ||
-  !hmrStyleTag.children.includes("avs-show-fallback-recovery-in 0.22s ease 10s forwards")
+  !hmrStyleTag.children.includes("avs-show-fallback-recovery-in 0.22s ease 30s forwards")
 ) {
   throw new Error("Expected runtime HTML transform to inject and delay the fallback recovery screen")
 }
@@ -152,7 +152,7 @@ const staleDependencyRoot = await mkdtemp(join(tmpdir(), "avibe-show-stale-deps-
 await mkdir(join(staleDependencyRoot, "node_modules"), { recursive: true })
 await mkdir(join(root, "smoke"), { recursive: true })
 await symlink(join(staleDependencyRoot, "node_modules"), join(root, "smoke", "node_modules"), "junction")
-const runtime = await startShowRuntimeServer({ workspaceRoot: root, cacheRoot, fallbackDelaySeconds: 10 })
+const runtime = await startShowRuntimeServer({ workspaceRoot: root, cacheRoot, fallbackDelaySeconds: 30 })
 
 try {
   const apiDir = join(root, "smoke", "api")
@@ -186,7 +186,7 @@ try {
   if (!app.includes("Vibe Show")) {
     throw new Error("Expected app HTML to include Vibe Show")
   }
-  if (!app.includes("Loading Show Page") || !app.includes("Ready to visualize") || !app.includes("avs-show-fallback-recovery-in 0.22s ease 10s forwards")) {
+  if (!app.includes("Loading Show Page") || !app.includes("Ready to visualize") || !app.includes("avs-show-fallback-recovery-in 0.22s ease 30s forwards")) {
     throw new Error("Expected app HTML to include runtime-injected delayed fallback recovery UI")
   }
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
@@ -471,6 +471,99 @@ export const demo = customAlphabet("abc")
     throw new Error(`Expected show event counters in status: ${JSON.stringify(status)}`)
   }
 
+  const idleRoot = await mkdtemp(join(tmpdir(), "avibe-show-runtime-idle-"))
+  const idleApiDir = join(idleRoot, "idle", "api")
+  const unrelatedIdleApiDir = join(idleRoot, "unrelated-idle", "api")
+  await mkdir(idleApiDir, { recursive: true })
+  await mkdir(unrelatedIdleApiDir, { recursive: true })
+  await writeFile(join(idleApiDir, "slow.ts"), `export async function GET() {
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    return Response.json({ ok: true })
+  }
+`)
+  await writeFile(join(unrelatedIdleApiDir, "slow.ts"), `export async function GET() {
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    return Response.json({ ok: true })
+  }
+`)
+  const idleRuntime = await startShowRuntimeServer({ workspaceRoot: idleRoot, idleTtlMs: 100, idlePruneIntervalMs: 0 })
+  try {
+    const active = await loadAppEntry(idleRuntime.url, "idle")
+    const unrelatedActive = await loadAppEntry(idleRuntime.url, "unrelated-idle")
+    if (!active.includes("Vibe Show")) {
+      throw new Error("Expected idle test app HTML to load")
+    }
+    if (!unrelatedActive.includes("Vibe Show")) {
+      throw new Error("Expected unrelated idle test app HTML to load")
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const idleStatus = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
+    if (idleStatus.state !== "idle") {
+      throw new Error(`Expected idle session to prune to idle, got ${JSON.stringify(idleStatus)}`)
+    }
+    const rewarmed = await loadAppEntry(idleRuntime.url, "idle")
+    if (!rewarmed.includes("Vibe Show")) {
+      throw new Error("Expected idle session to rewarm after prune")
+    }
+    const activeAgain = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
+    if (activeAgain.state !== "active") {
+      throw new Error(`Expected re-warmed idle session to be active, got ${JSON.stringify(activeAgain)}`)
+    }
+
+    const slow = fetch(`${idleRuntime.url}/sessions/idle/app/api/slow`).then((res) => res.json())
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const pruning = fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    const concurrentApp = fetch(`${idleRuntime.url}/sessions/idle/app/`).then((res) => res.text())
+    const [slowResponse, , concurrentHtml] = await Promise.all([slow, pruning, concurrentApp])
+    if (!slowResponse.ok || !concurrentHtml.includes("Vibe Show")) {
+      throw new Error("Expected concurrent idle prune access to complete")
+    }
+    const concurrentStatus = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
+    if (concurrentStatus.state !== "active") {
+      throw new Error(`Expected concurrent access during prune to leave session active, got ${JSON.stringify(concurrentStatus)}`)
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const unrelatedSlow = fetch(`${idleRuntime.url}/sessions/unrelated-idle/app/api/slow`).then((res) => res.json())
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const scopedStatusStarted = performance.now()
+    const scopedStatus = await fetch(`${idleRuntime.url}/sessions/idle/status`).then((res) => res.json())
+    const scopedStatusDurationMs = performance.now() - scopedStatusStarted
+    if (scopedStatusDurationMs > 500) {
+      throw new Error(`Expected scoped idle status pruning not to wait on unrelated sessions, took ${Math.round(scopedStatusDurationMs)}ms`)
+    }
+    if (scopedStatus.state !== "idle") {
+      throw new Error(`Expected scoped idle status to prune the requested session only, got ${JSON.stringify(scopedStatus)}`)
+    }
+    const unrelatedAfterStatus = await fetch(`${idleRuntime.url}/sessions/unrelated-idle/status`).then((res) => res.json())
+    if (unrelatedAfterStatus.state !== "idle") {
+      throw new Error(`Expected unrelated session to stay independently prunable, got ${JSON.stringify(unrelatedAfterStatus)}`)
+    }
+    const unrelatedSlowResponse = await unrelatedSlow
+    if (!unrelatedSlowResponse.ok) {
+      throw new Error("Expected unrelated slow request to complete")
+    }
+
+    const unrelatedSlowForAppRequest = fetch(`${idleRuntime.url}/sessions/unrelated-idle/app/api/slow`).then((res) => res.json())
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const scopedAppStarted = performance.now()
+    const scopedAppHtml = await fetch(`${idleRuntime.url}/sessions/idle/app/`).then((res) => res.text())
+    const scopedAppDurationMs = performance.now() - scopedAppStarted
+    if (scopedAppDurationMs > 500) {
+      throw new Error(`Expected app requests not to wait on unrelated idle pruning, took ${Math.round(scopedAppDurationMs)}ms`)
+    }
+    if (!scopedAppHtml.includes("Vibe Show")) {
+      throw new Error("Expected scoped app request to complete while unrelated slow request is active")
+    }
+    const unrelatedSlowForAppResponse = await unrelatedSlowForAppRequest
+    if (!unrelatedSlowForAppResponse.ok) {
+      throw new Error("Expected unrelated slow request during app request to complete")
+    }
+  } finally {
+    await idleRuntime.close()
+  }
+
   const streamController = new AbortController()
   const stream = await fetch(`${runtime.url}/sessions/smoke/app/__show/events?stream=1`, {
     signal: streamController.signal
@@ -616,4 +709,14 @@ async function readUntil(reader, needle) {
     body += decoder.decode(value, { stream: true })
   }
   return body
+}
+
+async function loadAppEntry(runtimeUrl, sessionId) {
+  const html = await fetch(`${runtimeUrl}/sessions/${sessionId}/app/`).then((res) => res.text())
+  const main = await fetch(`${runtimeUrl}/sessions/${sessionId}/app/src/main.tsx`)
+  if (!main.ok) {
+    throw new Error(`Expected ${sessionId} app entry module to load, got ${main.status}`)
+  }
+  await main.text()
+  return html
 }
