@@ -269,10 +269,18 @@ export type SmokeType = MissingType
   await writeFile(join(root, "smoke", "src", "extra-dep.ts"), `import type { SmokeType } from "./types"
 import stackback from "stackback"
 import formatStack from "stackback/formatstack"
+import { workerDep } from "./worker.ts?worker"
 import type {} from "missing-export-type-package"
+// import "missing-commented-only-package"
+/* import "missing-block-comment-only-package" */
 export const stackDepth = stackback().length
 export const formattedStack = formatStack([])
+export const workerDependency = workerDep
 export type { SmokeType }
+`)
+  await writeFile(join(root, "smoke", "src", "worker.ts"), `import { nanoid } from "nanoid/non-secure"
+
+export const workerDep = nanoid
 `)
   await writeFile(join(root, "smoke", "src", "App.tsx"), `import { stackDepth } from "./extra-dep"
 
@@ -290,12 +298,22 @@ export default function App() {
   if (!extraDepModule.body.includes("/deps/stackback_formatstack.js")) {
     throw new Error(`Expected deep bare imports to stay optimized by full specifier, got: ${extraDepModule.body.slice(0, 300)}`)
   }
-  if (extraDepModule.body.includes("missing-type-only-package") || extraDepModule.body.includes("missing-draft-only-package")) {
-    throw new Error(`Expected unreachable and type-only imports to stay out of optimizer output: ${extraDepModule.body.slice(0, 300)}`)
+  if (
+    extraDepModule.body.includes("missing-type-only-package") ||
+    extraDepModule.body.includes("missing-draft-only-package") ||
+    extraDepModule.body.includes("missing-commented-only-package") ||
+    extraDepModule.body.includes("missing-block-comment-only-package")
+  ) {
+    throw new Error(`Expected unreachable, type-only, and commented imports to stay out of optimizer output: ${extraDepModule.body.slice(0, 300)}`)
   }
   const updatedCacheDigestDirs = await readdir(cacheRoot)
   if (updatedCacheDigestDirs.length < 2) {
     throw new Error(`Expected extra page dependencies to use a dedicated cache namespace, got ${updatedCacheDigestDirs.join(", ")}`)
+  }
+  const extraCacheDigestDir = updatedCacheDigestDirs.find((dir) => dir !== cacheDigestDirs[0])
+  const extraCacheDeps = extraCacheDigestDir ? await readdir(join(cacheRoot, extraCacheDigestDir, "deps")) : []
+  if (!extraCacheDeps.some((entry) => entry.startsWith("nanoid_non-secure"))) {
+    throw new Error(`Expected Vite query imports to scan reachable worker dependencies, got cache deps: ${extraCacheDeps.join(", ")}`)
   }
 
   const eventResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {

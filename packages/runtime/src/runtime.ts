@@ -303,7 +303,7 @@ async function reachableSourceFiles(entry: string): Promise<string[]> {
     }
     for (const { specifier } of importSpecifiers(source)) {
       if (specifier.startsWith("./") || specifier.startsWith("../")) {
-        queue.push(resolve(dirname(file), specifier))
+        queue.push(resolve(dirname(file), stripViteImportSuffix(specifier)))
       }
     }
   }
@@ -339,7 +339,7 @@ async function isFile(path: string) {
 
 function importSpecifiers(source: string) {
   const specifiers: Array<{ specifier: string }> = []
-  for (const match of source.matchAll(IMPORT_RE)) {
+  for (const match of stripJavaScriptComments(source).matchAll(IMPORT_RE)) {
     const staticImportClause = match[1]?.trim()
     const staticImportSpecifier = match[2]
     const staticExportClause = match[3]?.trim()
@@ -356,6 +356,73 @@ function importSpecifiers(source: string) {
     }
   }
   return specifiers
+}
+
+function stripJavaScriptComments(source: string) {
+  let output = ""
+  let index = 0
+  let quote: "\"" | "'" | "`" | undefined
+  let escaped = false
+  while (index < source.length) {
+    const char = source[index]
+    const next = source[index + 1]
+
+    if (quote) {
+      output += char
+      if (escaped) {
+        escaped = false
+      } else if (char === "\\") {
+        escaped = true
+      } else if (char === quote) {
+        quote = undefined
+      }
+      index += 1
+      continue
+    }
+
+    if (char === "\"" || char === "'" || char === "`") {
+      quote = char
+      output += char
+      index += 1
+      continue
+    }
+
+    if (char === "/" && next === "/") {
+      output += "  "
+      index += 2
+      while (index < source.length && source[index] !== "\n") {
+        output += " "
+        index += 1
+      }
+      continue
+    }
+
+    if (char === "/" && next === "*") {
+      output += "  "
+      index += 2
+      while (index < source.length) {
+        const current = source[index]
+        const following = source[index + 1]
+        if (current === "*" && following === "/") {
+          output += "  "
+          index += 2
+          break
+        }
+        output += current === "\n" ? "\n" : " "
+        index += 1
+      }
+      continue
+    }
+
+    output += char
+    index += 1
+  }
+  return output
+}
+
+function stripViteImportSuffix(specifier: string) {
+  const queryIndex = specifier.search(/[?#]/)
+  return queryIndex === -1 ? specifier : specifier.slice(0, queryIndex)
 }
 
 function isRuntimeManagedImport(specifier: string, uiPackageName: string) {
