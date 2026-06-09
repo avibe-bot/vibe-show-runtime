@@ -29,6 +29,7 @@
     "@avibe/show-sdk": "0.0.0",
     "@avibe/show-ui": "0.0.0",
     "@vitejs/plugin-react": "^5.1.1",
+    "esbuild": "^0.27.0",
     "vite": "^7.2.4"
   },
   "devDependencies": {
