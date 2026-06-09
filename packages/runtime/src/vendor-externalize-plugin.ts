@@ -58,15 +58,37 @@ function createProvidedMatcher(providedSpecifiers: string[]): ProvidedMatcher {
   return {
     specifiers,
     matches(specifier: string) {
-      return exact.has(cleanSpecifier(specifier))
+      const bare = cleanSpecifier(specifier)
+      return bare !== undefined && exact.has(bare)
     }
   }
 }
 
-/** Strip Vite's query/hash suffix (`?v=...`, `?import`, `#...`) before matching. */
-function cleanSpecifier(specifier: string): string {
-  const queryIndex = specifier.search(/[?#]/)
-  return queryIndex === -1 ? specifier : specifier.slice(0, queryIndex)
+/**
+ * The bare specifier to match the provided set against, with only Vite's
+ * RUNTIME-GENERATED suffixes stripped — or `undefined` when the specifier carries a
+ * USER-AUTHORED query, which must NOT be externalized.
+ *
+ * A user query (`?inline` / `?url` / `?raw` / `?worker` / ...) selects a Vite asset/query
+ * transform: externalizing `@avibe/show-ui/styles.css?inline` like the plain side-effect
+ * import would drop the query and bypass that transform (CSS-as-string/URL would break).
+ * So such a specifier must fall through to Vite. Only Vite's own markers are stripped:
+ *  - `?v=<hash>` — the dep-optimizer cache-bust,
+ *  - `?import` — the flag import-analysis appends to a bare import it processes,
+ *  - the `#…` fragment.
+ * If, after dropping exactly those, any query parameter remains, the import is user-keyed
+ * and not a provided match.
+ */
+function cleanSpecifier(specifier: string): string | undefined {
+  const fragmentless = specifier.replace(/#.*$/, "")
+  const queryIndex = fragmentless.indexOf("?")
+  if (queryIndex === -1) return fragmentless
+  const path = fragmentless.slice(0, queryIndex)
+  const params = new URLSearchParams(fragmentless.slice(queryIndex + 1))
+  params.delete("v")
+  params.delete("import")
+  // Any leftover param is a user-authored query (`?inline`, `?url`, ...): let Vite own it.
+  return [...params].length === 0 ? path : undefined
 }
 
 function externalizePlugin(matcher: ProvidedMatcher): Plugin {
@@ -155,14 +177,26 @@ function bareRewritePlugin(matcher: ProvidedMatcher, base: string): Plugin {
       pattern.lastIndex = 0
       let mutated = false
       const next = code.replace(pattern, (match, _quote: string, specifier: string) => {
-        const decoded = decodeIdSpecifier(specifier)
-        if (!matcher.matches(decoded)) return match
+        const bare = providedBareSpecifier(decodeIdSpecifier(specifier), matcher)
+        if (bare === undefined) return match
         mutated = true
-        return JSON.stringify(decoded)
+        return JSON.stringify(bare)
       })
       return mutated ? { code: next, map: null } : null
     }
   }
+}
+
+/**
+ * The bare specifier to rewrite a `/@id/<spec>` URL back to — i.e. the provided specifier
+ * with Vite's runtime suffixes stripped — or `undefined` when `decoded` is not a provided
+ * match (a user-keyed query, or simply not in the set), so the URL is left as Vite emitted
+ * it. A user-keyed provided specifier is never externalized in the first place (so this
+ * form shouldn't appear for it), but keying the rewrite off the same matcher keeps the two
+ * in lockstep.
+ */
+function providedBareSpecifier(decoded: string, matcher: ProvidedMatcher): string | undefined {
+  return matcher.matches(decoded) ? cleanSpecifier(decoded) : undefined
 }
 
 /**
@@ -179,8 +213,9 @@ function buildBareRewritePattern(base: string): RegExp {
 
 function decodeIdSpecifier(raw: string): string {
   // Vite encodes a leading null byte (virtual modules) as `__x00__`; provided
-  // specifiers never contain one, but decode defensively before cleaning.
-  return cleanSpecifier(raw.replace(/^__x00__/, "\0"))
+  // specifiers never contain one, but decode defensively. The query/fragment is left
+  // intact here — `matches` / `cleanSpecifier` decide membership and strip suffixes.
+  return raw.replace(/^__x00__/, "\0")
 }
 
 function includesProvided(entry: string, matcher: ProvidedMatcher): boolean {

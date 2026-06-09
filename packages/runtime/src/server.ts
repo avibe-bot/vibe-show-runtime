@@ -187,7 +187,12 @@ async function routeRequest(
       return
     }
 
-    request.url = appPath === "/" ? "/" : appPath
+    // Preserve the query string when forwarding to Vite: a user-authored import query
+    // (`?inline`, `?url`, `?raw`, `?worker`, ...) selects a Vite transform, so dropping it
+    // here would make Vite fall back to the default handling (e.g. CSS injected as a style
+    // tag instead of returned as an inline string). `parsed.search` keeps the leading `?`.
+    const appSearch = parsed.search ?? ""
+    request.url = appPath === "/" ? `/${appSearch}` : `${appPath}${appSearch}`
     const middlewareStarted = performance.now()
     response.once("finish", () => {
       logRequestTiming("viteMiddlewareResponse", sessionId, appPath, middlewareStarted, {

@@ -7,6 +7,8 @@ import {
   VENDOR_EMPTY_MODULE_FILENAME,
   VENDOR_URL_PREFIX,
   buildVendor,
+  dependencyFingerprint,
+  providedVendorPackageNames,
   vendorBaseUrl,
   vendorBrowserAssets,
   type BuildVendorResult,
@@ -72,9 +74,12 @@ export function ensureVendorBundle(options: EnsureVendorBundleOptions): Promise<
 }
 
 async function buildVendorBundle(dependencyRoot: string, uiPackageName: string, vendorCacheRoot: string): Promise<VendorBundle> {
-  // Namespace the on-disk output by dependency root AND UI package so two UI packages
-  // under the same root never share an out dir (their manifests differ).
-  const digest = createHash("sha256").update(`${dependencyRoot}\0${uiPackageName}`).digest("hex").slice(0, 16)
+  // Namespace the on-disk output by dependency root, UI package, AND the installed
+  // provided-package versions so two UI packages under the same root never share an out
+  // dir (their manifests differ), and an in-place dep change lands in a fresh out dir
+  // instead of overwriting a bundle a concurrent (rolling-restart) process still serves.
+  const fingerprint = await dependencyFingerprint(join(dependencyRoot, "node_modules"), providedVendorPackageNames(uiPackageName))
+  const digest = createHash("sha256").update(`${dependencyRoot}\0${uiPackageName}\0${fingerprint}`).digest("hex").slice(0, 16)
   const outDir = join(vendorCacheRoot, digest)
   const result = await buildVendor({ dependencyRoot, outDir, uiPackageName })
   const baseUrl = vendorBaseUrl(result.manifest.hash)

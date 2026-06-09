@@ -9,7 +9,13 @@ const DEFAULT_UI_PACKAGE_NAME = "@avibe/show-ui"
 export const VENDOR_MANIFEST_FILENAME = "vendor-manifest.json"
 // v2 records `outputFiles` so a pre-existing bundle can be validated + reused without
 // a destructive rescan of `outDir` (which a concurrent process may be publishing into).
-const VENDOR_MANIFEST_VERSION = 2
+// v3 records `depFingerprint` so a reused bundle is invalidated when the installed
+// versions of the provided packages change in place at the same `dependencyRoot`
+// (a shared cache volume + an in-place dep update would otherwise serve a stale bundle).
+const VENDOR_MANIFEST_VERSION = 3
+
+/** Marker recorded in the dependency fingerprint when a provided package isn't installed. */
+const ABSENT_PACKAGE_VERSION = "<absent>"
 
 /**
  * Session-independent, absolute URL prefix the shared vendor bundle is served under.
@@ -48,6 +54,13 @@ export interface VendorManifest {
   uiPackageName: string
   /** Content hash spanning every emitted output file (stable for identical inputs). */
   hash: string
+  /**
+   * Hash of the installed `version` of every provided package (react, react-dom, the UI
+   * package, motion, lucide-react) read from `<dependencyRoot>/node_modules/<pkg>/package.json`.
+   * Folded into the cache identity so an in-place dep change at the same `dependencyRoot`
+   * invalidates a reused bundle even though `outDir` and the output hash are unchanged.
+   */
+  depFingerprint: string
   /** Every provided specifier, sorted, that the import map must resolve. */
   specifiers: string[]
   /** Specifier -> output file path relative to `outDir`. */
@@ -245,6 +258,56 @@ export function providedVendorCssSpecifiers(uiPackageName: string = DEFAULT_UI_P
 }
 
 /**
+ * The distinct npm package NAMES the vendor bundle pulls — derived from the provided
+ * specifiers so it stays the single source of truth (a new provided specifier carries
+ * its package automatically). Subpaths collapse to their root package (e.g.
+ * `react/jsx-runtime` -> `react`, `@avibe/show-ui/button` -> `@avibe/show-ui`) because
+ * a subpath shares its package's single installed version.
+ */
+export function providedVendorPackageNames(uiPackageName: string = DEFAULT_UI_PACKAGE_NAME): string[] {
+  const names = new Set<string>()
+  for (const specifier of [...providedVendorSpecifiers(uiPackageName, []), ...providedVendorCssSpecifiers(uiPackageName)]) {
+    names.add(rootPackageName(specifier))
+  }
+  return [...names].sort(compareStrings)
+}
+
+/** Root package name of a specifier (`@scope/name/sub` -> `@scope/name`, `name/sub` -> `name`). */
+function rootPackageName(specifier: string): string {
+  const parts = specifier.split("/")
+  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0]
+}
+
+/**
+ * A cheap, deterministic fingerprint of the installed versions of the provided packages
+ * at `nodeModules`. Reads each package's `version` from
+ * `<nodeModules>/<pkg>/package.json` and hashes the sorted `name@version` list (a missing
+ * package contributes `name@<absent>`, so an install/uninstall also moves the fingerprint).
+ *
+ * Folded into the vendor cache identity (the `outDir` digest in `vendor-runtime` and the
+ * manifest-reuse check in `buildVendor`) so a dep change at the same `dependencyRoot`
+ * forces a rebuild instead of serving a stale, content-hash-identical bundle.
+ */
+export async function dependencyFingerprint(nodeModules: string, packageNames: string[]): Promise<string> {
+  const entries = await Promise.all(
+    [...packageNames].sort(compareStrings).map(async (name) => `${name}@${await installedPackageVersion(nodeModules, name)}`)
+  )
+  return createHash("sha256").update(entries.join("\n")).digest("hex").slice(0, 16)
+}
+
+/** Installed `version` of `<nodeModules>/<pkg>/package.json`, or `ABSENT_PACKAGE_VERSION`. */
+async function installedPackageVersion(nodeModules: string, packageName: string): Promise<string> {
+  try {
+    const manifest = JSON.parse(
+      await readFile(join(nodeModules, ...packageName.split("/"), "package.json"), "utf8")
+    ) as { version?: unknown }
+    return typeof manifest.version === "string" ? manifest.version : ABSENT_PACKAGE_VERSION
+  } catch {
+    return ABSENT_PACKAGE_VERSION
+  }
+}
+
+/**
  * Pre-build the shared vendor bundle: bundle every provided specifier as an ESM
  * entry, splitting shared code (React, the JSX runtime, motion, ...) into common
  * chunks so React resolves to a single instance across every entry. Writes
@@ -270,9 +333,14 @@ export async function buildVendor(options: BuildVendorOptions): Promise<BuildVen
   const nodeModules = join(dependencyRoot, "node_modules")
   const outDir = resolve(options.outDir)
 
+  // Fingerprint the installed provided-package versions so an in-place dep change at the
+  // same `dependencyRoot` invalidates a reused bundle (its outputs would otherwise re-hash
+  // to the recorded value and be wrongly reused).
+  const depFingerprint = await dependencyFingerprint(nodeModules, providedVendorPackageNames(uiPackageName))
+
   // Fast path: an intact bundle for the same inputs is already published — reuse it
   // without rebuilding or touching `outDir` (which another process may be serving).
-  const reusable = await readReusableManifest(outDir, uiPackageName)
+  const reusable = await readReusableManifest(outDir, uiPackageName, depFingerprint)
   if (reusable) {
     return { outDir, manifestPath: join(outDir, VENDOR_MANIFEST_FILENAME), manifest: reusable, outputFiles: reusable.outputFiles }
   }
@@ -326,6 +394,7 @@ export async function buildVendor(options: BuildVendorOptions): Promise<BuildVen
       version: VENDOR_MANIFEST_VERSION,
       uiPackageName,
       hash,
+      depFingerprint,
       specifiers: [...jsSpecifiers, ...cssSpecifiers].sort(compareStrings),
       imports: sortRecord(imports),
       outputFiles
@@ -340,15 +409,20 @@ export async function buildVendor(options: BuildVendorOptions): Promise<BuildVen
 
 /**
  * Return the already-published manifest at `outDir` IFF it is a complete, self-consistent
- * bundle for `uiPackageName` that can be reused as-is — else `undefined` (rebuild).
+ * bundle for `uiPackageName` + the current `depFingerprint` that can be reused as-is —
+ * else `undefined` (rebuild).
  *
- * "Reusable" means: it parses, its schema version + UI package match, every file it
- * lists is present on disk, AND re-hashing exactly those files reproduces its recorded
- * `hash`. Because the build is deterministic, such a bundle is byte-identical to what a
- * rebuild for the same inputs would emit, so serving it is equivalent — and skipping the
- * rebuild avoids clearing a dir a concurrent process may still be serving from.
+ * "Reusable" means: it parses, its schema version + UI package + dependency fingerprint
+ * match, every file it lists is present on disk, AND re-hashing exactly those files
+ * reproduces its recorded `hash`. The dependency fingerprint guard is what catches an
+ * in-place dep change at the same `dependencyRoot`: the bundle on disk re-hashes to its
+ * recorded value (it's unchanged), so without comparing the installed versions a stale
+ * bundle would be served. Because the build is deterministic, a bundle that passes every
+ * check is byte-identical to what a rebuild for the same inputs would emit, so serving it
+ * is equivalent — and skipping the rebuild avoids clearing a dir a concurrent process may
+ * still be serving from.
  */
-async function readReusableManifest(outDir: string, uiPackageName: string): Promise<VendorManifest | undefined> {
+async function readReusableManifest(outDir: string, uiPackageName: string, depFingerprint: string): Promise<VendorManifest | undefined> {
   let manifest: VendorManifest
   try {
     manifest = JSON.parse(await readFile(join(outDir, VENDOR_MANIFEST_FILENAME), "utf8")) as VendorManifest
@@ -358,6 +432,7 @@ async function readReusableManifest(outDir: string, uiPackageName: string): Prom
   if (
     manifest.version !== VENDOR_MANIFEST_VERSION ||
     manifest.uiPackageName !== uiPackageName ||
+    manifest.depFingerprint !== depFingerprint ||
     !Array.isArray(manifest.outputFiles) ||
     manifest.outputFiles.length === 0
   ) {

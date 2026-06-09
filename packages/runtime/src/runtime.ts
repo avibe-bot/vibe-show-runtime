@@ -1,5 +1,5 @@
 import { access, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises"
-import { dirname, extname, join, relative, resolve, sep } from "node:path"
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
 import { createRequire } from "node:module"
@@ -576,12 +576,32 @@ async function readDeclaredExtras(workspace: string, uiPackageName: string): Pro
   }
   const entries = Object.entries(dependencies)
     .filter(([name]) => !isRuntimeOwnedDependency(name, uiPackageName))
-    .map(([name, range]) => `${name}@${range}`)
+    .map(([name, range]) => `${name}@${anchorLocalRange(range, workspace)}`)
     .sort()
   return {
     entries,
     signature: entries.length ? createHash("sha256").update(entries.join("\n")).digest("hex").slice(0, 16) : "none"
   }
+}
+
+/**
+ * Rewrite a relative `file:`/`link:` dependency range so it is anchored at the session
+ * `workspace`, not the throwaway staging dir the extras are installed from.
+ *
+ * The per-session extras install runs npm with cwd/`--prefix` = a staging dir (so the
+ * workspace `package.json`'s provided/dev deps are never pulled in). A relative local
+ * spec like `file:../local` (or `link:`) would therefore resolve against the staging dir,
+ * not the workspace that declared it — pointing at the wrong directory (or nowhere). We
+ * make it absolute up front. Absolute local specs and every registry/git/url range are
+ * left untouched, and the absolute path is folded into the extras signature so a moved
+ * target re-installs.
+ */
+function anchorLocalRange(range: string, workspace: string): string {
+  const match = /^(file|link):(.*)$/.exec(range)
+  if (!match) return range
+  const [, scheme, target] = match
+  if (isAbsolute(target)) return range
+  return `${scheme}:${resolve(workspace, target)}`
 }
 
 /**
