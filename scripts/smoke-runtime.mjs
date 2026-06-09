@@ -260,8 +260,19 @@ try {
     throw new Error("Expected generated client shell to preserve injected write tokens")
   }
 
-  await writeFile(join(root, "smoke", "src", "extra-dep.ts"), `import stackback from "stackback"
+  await writeFile(join(root, "smoke", "src", "draft.ts"), `import "missing-draft-only-package"
+export const draft = true
+`)
+  await writeFile(join(root, "smoke", "src", "types.ts"), `import type { MissingType } from "missing-type-only-package"
+export type SmokeType = MissingType
+`)
+  await writeFile(join(root, "smoke", "src", "extra-dep.ts"), `import type { SmokeType } from "./types"
+import stackback from "stackback"
+import formatStack from "stackback/formatstack"
+import type {} from "missing-export-type-package"
 export const stackDepth = stackback().length
+export const formattedStack = formatStack([])
+export type { SmokeType }
 `)
   await writeFile(join(root, "smoke", "src", "App.tsx"), `import { stackDepth } from "./extra-dep"
 
@@ -275,6 +286,12 @@ export default function App() {
   }))
   if (extraDepModule.status !== 200 || !extraDepModule.body.includes("/deps/stackback.js")) {
     throw new Error(`Expected extra page dependency to be optimized, got ${extraDepModule.status}: ${extraDepModule.body.slice(0, 200)}`)
+  }
+  if (!extraDepModule.body.includes("/deps/stackback_formatstack.js")) {
+    throw new Error(`Expected deep bare imports to stay optimized by full specifier, got: ${extraDepModule.body.slice(0, 300)}`)
+  }
+  if (extraDepModule.body.includes("missing-type-only-package") || extraDepModule.body.includes("missing-draft-only-package")) {
+    throw new Error(`Expected unreachable and type-only imports to stay out of optimizer output: ${extraDepModule.body.slice(0, 300)}`)
   }
   const updatedCacheDigestDirs = await readdir(cacheRoot)
   if (updatedCacheDigestDirs.length < 2) {

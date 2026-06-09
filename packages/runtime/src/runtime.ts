@@ -1,5 +1,5 @@
-import { access, lstat, mkdir, readFile, readdir, readlink, realpath, rm, symlink } from "node:fs/promises"
-import { dirname, join, resolve } from "node:path"
+import { access, lstat, mkdir, readFile, readlink, realpath, rm, symlink } from "node:fs/promises"
+import { dirname, extname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
 import react from "@vitejs/plugin-react"
@@ -260,19 +260,18 @@ type SourceDependencies = {
 }
 
 const SOURCE_DEPENDENCY_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts"])
-const STATIC_IMPORT_RE = /\bimport\s+(?:[^'"]*?\s+from\s+)?["']([^"']+)["']|\bexport\s+[^'"]*?\s+from\s+["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)|\brequire\s*\(\s*["']([^"']+)["']\s*\)/g
+const IMPORT_RE = /\bimport\s+([^'"]*?\s+from\s+)?["']([^"']+)["']|\bexport\s+([^'"]*?\s+from\s+)?["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)|\brequire\s*\(\s*["']([^"']+)["']\s*\)/g
 
 async function sourceDependenciesForWorkspace(workspace: string, uiPackageName: string): Promise<SourceDependencies> {
   const extraBareImports = new Set<string>()
-  for (const sourceFile of await sourceFiles(join(workspace, "src"))) {
+  for (const sourceFile of await reachableSourceFiles(join(workspace, "src", "main.tsx"))) {
     const source = await readFile(sourceFile, "utf8")
-    for (const specifier of importSpecifiers(source)) {
+    for (const { specifier } of importSpecifiers(source)) {
       if (isRuntimeManagedImport(specifier, uiPackageName)) {
         continue
       }
-      const barePackage = barePackageName(specifier)
-      if (barePackage) {
-        extraBareImports.add(barePackage)
+      if (isBareImport(specifier)) {
+        extraBareImports.add(specifier)
       }
     }
   }
@@ -287,31 +286,73 @@ async function sourceDependencySignature(workspace: string, uiPackageName: strin
   return (await sourceDependenciesForWorkspace(workspace, uiPackageName)).signature
 }
 
-async function sourceFiles(root: string): Promise<string[]> {
+async function reachableSourceFiles(entry: string): Promise<string[]> {
+  const seen = new Set<string>()
+  const queue = [entry]
+  for (let index = 0; index < queue.length; index += 1) {
+    const file = await resolveSourceFile(queue[index])
+    if (!file || seen.has(file)) {
+      continue
+    }
+    seen.add(file)
+    let source = ""
+    try {
+      source = await readFile(file, "utf8")
+    } catch {
+      continue
+    }
+    for (const { specifier } of importSpecifiers(source)) {
+      if (specifier.startsWith("./") || specifier.startsWith("../")) {
+        queue.push(resolve(dirname(file), specifier))
+      }
+    }
+  }
+  return [...seen]
+}
+
+async function resolveSourceFile(path: string): Promise<string | undefined> {
+  if (SOURCE_DEPENDENCY_EXTENSIONS.has(extname(path)) && await isFile(path)) {
+    return path
+  }
+  for (const extension of SOURCE_DEPENDENCY_EXTENSIONS) {
+    const candidate = `${path}${extension}`
+    if (await isFile(candidate)) {
+      return candidate
+    }
+  }
+  for (const extension of SOURCE_DEPENDENCY_EXTENSIONS) {
+    const candidate = join(path, `index${extension}`)
+    if (await isFile(candidate)) {
+      return candidate
+    }
+  }
+  return undefined
+}
+
+async function isFile(path: string) {
   try {
-    const entries = await readdir(root, { withFileTypes: true })
-    const files = await Promise.all(entries.map(async (entry) => {
-      const path = join(root, entry.name)
-      if (entry.isDirectory()) {
-        return sourceFiles(path)
-      }
-      if (entry.isFile() && SOURCE_DEPENDENCY_EXTENSIONS.has(extension(entry.name))) {
-        return [path]
-      }
-      return []
-    }))
-    return files.flat()
+    return (await lstat(path)).isFile()
   } catch {
-    return []
+    return false
   }
 }
 
 function importSpecifiers(source: string) {
-  const specifiers: string[] = []
-  for (const match of source.matchAll(STATIC_IMPORT_RE)) {
-    const specifier = match[1] ?? match[2] ?? match[3] ?? match[4]
+  const specifiers: Array<{ specifier: string }> = []
+  for (const match of source.matchAll(IMPORT_RE)) {
+    const staticImportClause = match[1]?.trim()
+    const staticImportSpecifier = match[2]
+    const staticExportClause = match[3]?.trim()
+    const staticExportSpecifier = match[4]
+    const specifier = staticImportSpecifier ?? staticExportSpecifier ?? match[5] ?? match[6]
     if (specifier) {
-      specifiers.push(specifier)
+      if (staticImportSpecifier && (staticImportClause === "type" || staticImportClause?.startsWith("type "))) {
+        continue
+      }
+      if (staticExportSpecifier && (staticExportClause === undefined || staticExportClause === "type from" || staticExportClause?.startsWith("type "))) {
+        continue
+      }
+      specifiers.push({ specifier })
     }
   }
   return specifiers
@@ -333,18 +374,12 @@ function isRuntimeManagedImport(specifier: string, uiPackageName: string) {
     specifier.startsWith("\0")
 }
 
-function barePackageName(specifier: string) {
-  if (specifier.startsWith("@")) {
-    const [scope, name] = specifier.split("/")
-    return scope && name ? `${scope}/${name}` : undefined
-  }
-  const [name] = specifier.split("/")
-  return name || undefined
-}
-
-function extension(path: string) {
-  const dot = path.lastIndexOf(".")
-  return dot >= 0 ? path.slice(dot) : ""
+function isBareImport(specifier: string) {
+  return !specifier.startsWith("./") &&
+    !specifier.startsWith("../") &&
+    !specifier.startsWith("/") &&
+    !specifier.startsWith("virtual:") &&
+    !specifier.startsWith("\0")
 }
 
 async function viteCacheDir(dependencyRoot: string, cacheRoot?: string, dependencySignature = "shared") {
