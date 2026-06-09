@@ -47,7 +47,6 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
   const idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS
   const idlePruneIntervalMs = options.idlePruneIntervalMs ?? DEFAULT_IDLE_PRUNE_INTERVAL_MS
-  let lastIdlePruneAt = 0
   const idlePruneTimer = idlePruneIntervalMs > 0
     ? setInterval(() => {
       void pruneIdleSessions().catch((error) => {
@@ -64,7 +63,6 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
 
   async function ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus> {
     const started = performance.now()
-    await pruneIdleSessionsIfDue()
     const existing = getOrCreateSession(sessionId)
     existing.lastAccessedAt = new Date()
     if (existing.closing) {
@@ -121,7 +119,6 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
 
   async function pruneIdleSessions(): Promise<ShowSessionStatus[]> {
     const now = Date.now()
-    lastIdlePruneAt = now
     const pruned: ShowSessionStatus[] = []
     for (const session of sessions.values()) {
       const status = await pruneSessionIfIdle(session, now)
@@ -137,12 +134,6 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     await closeSession(session, "idle")
     logTiming("pruneIdleSession", session.id, started, { idleTtlMs, state: session.state })
     return toStatus(session)
-  }
-
-  async function pruneIdleSessionsIfDue(): Promise<ShowSessionStatus[]> {
-    if (idlePruneIntervalMs <= 0) return []
-    if (Date.now() - lastIdlePruneAt < idlePruneIntervalMs) return []
-    return pruneIdleSessions()
   }
 
   function getOrCreateSession(sessionId: string): ShowSession {

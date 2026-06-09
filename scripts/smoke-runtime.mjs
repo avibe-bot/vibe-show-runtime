@@ -544,6 +544,22 @@ export const demo = customAlphabet("abc")
     if (!unrelatedSlowResponse.ok) {
       throw new Error("Expected unrelated slow request to complete")
     }
+
+    const unrelatedSlowForAppRequest = fetch(`${idleRuntime.url}/sessions/unrelated-idle/app/api/slow`).then((res) => res.json())
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const scopedAppStarted = performance.now()
+    const scopedAppHtml = await fetch(`${idleRuntime.url}/sessions/idle/app/`).then((res) => res.text())
+    const scopedAppDurationMs = performance.now() - scopedAppStarted
+    if (scopedAppDurationMs > 500) {
+      throw new Error(`Expected app requests not to wait on unrelated idle pruning, took ${Math.round(scopedAppDurationMs)}ms`)
+    }
+    if (!scopedAppHtml.includes("Vibe Show")) {
+      throw new Error("Expected scoped app request to complete while unrelated slow request is active")
+    }
+    const unrelatedSlowForAppResponse = await unrelatedSlowForAppRequest
+    if (!unrelatedSlowForAppResponse.ok) {
+      throw new Error("Expected unrelated slow request during app request to complete")
+    }
   } finally {
     await idleRuntime.close()
   }
