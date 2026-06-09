@@ -1,10 +1,10 @@
-import { access, lstat, mkdir, readlink, realpath, rm, symlink } from "node:fs/promises"
-import { dirname, join, resolve } from "node:path"
+import { access, lstat, mkdir, readFile, readdir, readlink, realpath, rm, symlink } from "node:fs/promises"
+import { dirname, extname, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
 import react from "@vitejs/plugin-react"
 import { createServer as createViteServer } from "vite"
-import type { InlineConfig } from "vite"
+import type { InlineConfig, ViteDevServer } from "vite"
 import {
   formatShowEventMessage,
   normalizeShowEvent,
@@ -19,6 +19,27 @@ import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
 import { ensureSessionTemplate } from "./templates.js"
 
 const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000
+const viteCacheWarmLocks = new Map<string, Promise<void>>()
+
+function defaultOptimizeDepsInclude(uiPackageName: string) {
+  return [
+    "react",
+    "react/jsx-runtime",
+    "react/jsx-dev-runtime",
+    "react-dom/client",
+    `${uiPackageName}/animated-text > motion/react`,
+    `${uiPackageName}/card > motion/react`,
+    `${uiPackageName}/button`,
+    `${uiPackageName}/card`,
+    `${uiPackageName}/badge`,
+    `${uiPackageName}/dialog`,
+    `${uiPackageName}/input`,
+    `${uiPackageName}/metric-card`,
+    `${uiPackageName}/progress`,
+    `${uiPackageName}/switch`,
+    `${uiPackageName}/theme`
+  ]
+}
 
 export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
@@ -28,17 +49,21 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     const existing = getOrCreateSession(sessionId)
     existing.lastAccessedAt = new Date()
     const normalizedBasePath = normalizeBasePath(basePath, sessionId)
-    if (existing.state === "active" && existing.basePath === normalizedBasePath) {
+    const dependencySignature = existing.state === "active" ? await sourceDependencySignature(existing.workspace, options.uiPackageName ?? "@avibe/show-ui") : undefined
+    if (existing.state === "active" && existing.basePath === normalizedBasePath && existing.dependencySignature === dependencySignature) {
       existing.updatedAt = new Date()
       return toStatus(existing)
     }
-    if (existing.state === "active" && existing.basePath !== normalizedBasePath) {
+    if (existing.state === "active" && (existing.basePath !== normalizedBasePath || existing.dependencySignature !== dependencySignature)) {
       await closeSession(existing)
     }
     if (!existing.warming) {
       existing.state = "warming"
       existing.updatedAt = new Date()
-      existing.warming = warmSession(existing, normalizedBasePath)
+      existing.warming = warmSession(existing, normalizedBasePath).catch(async (error) => {
+        await closeSession(existing)
+        throw error
+      })
     }
     const warmed = await existing.warming
     return toStatus(warmed)
@@ -79,9 +104,11 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
 
   async function warmSession(session: ShowSession, basePath: string): Promise<ShowSession> {
     await mkdir(session.workspace, { recursive: true })
-    const sharedDependencies = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot, options.uiPackageName)
     await ensureSessionTemplate(session.workspace)
-    const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, session.id, options.cacheRoot)
+    const uiPackageName = options.uiPackageName ?? "@avibe/show-ui"
+    const sharedDependencies = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot, uiPackageName)
+    const sourceDependencies = await sourceDependenciesForWorkspace(session.workspace, uiPackageName)
+    const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot, sourceDependencies.signature)
     const viteConfig = {
       base: basePath,
       root: session.workspace,
@@ -100,15 +127,30 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       },
       plugins: [showHmrTransitionPlugin({ fallbackDelaySeconds: options.fallbackDelaySeconds }), react()] as InlineConfig["plugins"],
       resolve: {
-        alias: createShadcnAlias(options.uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never
+        alias: createShadcnAlias(uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never
+      },
+      optimizeDeps: {
+        noDiscovery: true,
+        include: [...defaultOptimizeDepsInclude(uiPackageName), ...sourceDependencies.extraBareImports]
       }
     } satisfies InlineConfig
-    session.vite = await createViteServer(viteConfig)
+    await withViteCacheWarmLock(cacheDir, async () => {
+      session.vite = await createViteServer(viteConfig)
+      await warmEntryModuleGraph(session.vite, sourceDependencies.entryRequests)
+    })
     session.state = "active"
     session.basePath = basePath
+    session.dependencySignature = sourceDependencies.signature
     session.updatedAt = new Date()
     session.warming = undefined
     return session
+  }
+
+  async function warmEntryModuleGraph(vite: ViteDevServer, entryRequests: string[]) {
+    for (const entryRequest of entryRequests) {
+      await vite.warmupRequest(entryRequest)
+    }
+    await vite.waitForRequestsIdle()
   }
 
   async function closeSession(session: ShowSession) {
@@ -214,12 +256,473 @@ async function resolveAllowedPackageRoots(nodeModules: string, packageNames: str
   return [...roots]
 }
 
-async function viteCacheDir(dependencyRoot: string, sessionId: string, cacheRoot?: string) {
+type SourceDependencies = {
+  entryRequests: string[]
+  extraBareImports: string[]
+  signature: string
+}
+
+const SOURCE_DEPENDENCY_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts"])
+const HTML_MODULE_SCRIPT_RE = /<script\b(?=[^>]*\btype\s*=\s*["']module["'])(?=[^>]*\bsrc\s*=\s*["']([^"']+)["'])[^>]*>/gi
+
+async function sourceDependenciesForWorkspace(workspace: string, uiPackageName: string): Promise<SourceDependencies> {
+  const extraBareImports = new Set<string>()
+  const entries = await workspaceEntryFiles(workspace)
+  for (const sourceFile of await reachableSourceFiles(entries.map((entry) => entry.file), workspace)) {
+    const source = await readFile(sourceFile, "utf8")
+    for (const { specifier } of importSpecifiers(source)) {
+      if (isRuntimeManagedImport(specifier, uiPackageName)) {
+        continue
+      }
+      if (isBareImport(specifier)) {
+        extraBareImports.add(specifier)
+      }
+    }
+  }
+  const sorted = [...extraBareImports].sort()
+  return {
+    entryRequests: entries.map((entry) => entry.request),
+    extraBareImports: sorted,
+    signature: sorted.length ? createHash("sha256").update(sorted.join("\n")).digest("hex").slice(0, 16) : "shared"
+  }
+}
+
+async function sourceDependencySignature(workspace: string, uiPackageName: string) {
+  return (await sourceDependenciesForWorkspace(workspace, uiPackageName)).signature
+}
+
+async function workspaceEntryFiles(workspace: string): Promise<Array<{ file: string; request: string }>> {
+  const entries = new Map<string, { file: string; request: string }>()
+  try {
+    const html = stripHtmlComments(await readFile(join(workspace, "index.html"), "utf8"))
+    for (const match of html.matchAll(HTML_MODULE_SCRIPT_RE)) {
+      const sourcePath = workspaceLocalImportPath(workspace, workspace, match[1])
+      if (sourcePath) {
+        entries.set(sourcePath, { file: sourcePath, request: normalizeViteRequestPath(match[1]) })
+      }
+    }
+  } catch {
+    // Fall back to the runtime-owned client shell when index.html is absent.
+  }
+  if (!entries.size) {
+    const fallback = join(workspace, "src", "main.tsx")
+    entries.set(fallback, { file: fallback, request: "/src/main.tsx" })
+  }
+  return [...entries.values()]
+}
+
+async function reachableSourceFiles(entries: string[], workspace: string): Promise<string[]> {
+  const seen = new Set<string>()
+  const queue = [...entries]
+  for (let index = 0; index < queue.length; index += 1) {
+    const file = await resolveSourceFile(queue[index])
+    if (!file || seen.has(file)) {
+      continue
+    }
+    seen.add(file)
+    let source = ""
+    try {
+      source = await readFile(file, "utf8")
+    } catch {
+      continue
+    }
+    for (const { specifier } of importSpecifiers(source)) {
+      const localPath = workspaceLocalImportPath(workspace, dirname(file), specifier)
+      if (localPath) {
+        queue.push(localPath)
+      }
+    }
+    for (const localPath of await globSourceFiles(workspace, dirname(file), importGlobSpecifiers(source))) {
+      queue.push(localPath)
+    }
+  }
+  return [...seen]
+}
+
+async function resolveSourceFile(path: string): Promise<string | undefined> {
+  if (SOURCE_DEPENDENCY_EXTENSIONS.has(extname(path)) && await isFile(path)) {
+    return path
+  }
+  for (const extension of SOURCE_DEPENDENCY_EXTENSIONS) {
+    const candidate = `${path}${extension}`
+    if (await isFile(candidate)) {
+      return candidate
+    }
+  }
+  for (const extension of SOURCE_DEPENDENCY_EXTENSIONS) {
+    const candidate = join(path, `index${extension}`)
+    if (await isFile(candidate)) {
+      return candidate
+    }
+  }
+  return undefined
+}
+
+async function isFile(path: string) {
+  try {
+    return (await lstat(path)).isFile()
+  } catch {
+    return false
+  }
+}
+
+function importSpecifiers(source: string) {
+  const specifiers: Array<{ specifier: string }> = []
+  const tokens = javascriptTokens(source)
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]
+    if (token.value === "import") {
+      const nextToken = tokens[index + 1]
+      if (nextToken?.value === "(") {
+        const specifierToken = tokens[index + 2]
+        if (specifierToken?.kind === "string") {
+          specifiers.push({ specifier: specifierToken.value })
+        }
+        continue
+      }
+      if (nextToken?.kind === "string") {
+        specifiers.push({ specifier: nextToken.value })
+        continue
+      }
+      const fromIndex = findNextKeyword(tokens, index + 1, "from")
+      const specifierToken = fromIndex === undefined ? undefined : tokens[fromIndex + 1]
+      if (specifierToken?.kind === "string" && !isTypeOnlyImportClause(tokens.slice(index + 1, fromIndex))) {
+        specifiers.push({ specifier: specifierToken.value })
+      }
+      continue
+    }
+    if (token.value === "export") {
+      const fromIndex = findNextKeyword(tokens, index + 1, "from")
+      const specifierToken = fromIndex === undefined ? undefined : tokens[fromIndex + 1]
+      if (specifierToken?.kind === "string" && !isTypeOnlyImportClause(tokens.slice(index + 1, fromIndex))) {
+        specifiers.push({ specifier: specifierToken.value })
+      }
+      continue
+    }
+    if (token.value === "require" && tokens[index + 1]?.value === "(") {
+      const specifierToken = tokens[index + 2]
+      if (specifierToken?.kind === "string") {
+        specifiers.push({ specifier: specifierToken.value })
+      }
+    }
+  }
+  return specifiers
+}
+
+function importGlobSpecifiers(source: string) {
+  const specifiers: string[] = []
+  const tokens = javascriptTokens(source)
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (
+      tokens[index].value === "import" &&
+      tokens[index + 1]?.value === "." &&
+      tokens[index + 2]?.value === "meta" &&
+      tokens[index + 3]?.value === "." &&
+      tokens[index + 4]?.value === "glob" &&
+      tokens[index + 5]?.value === "(" &&
+      tokens[index + 6]?.kind === "string"
+    ) {
+      specifiers.push(tokens[index + 6].value)
+    }
+  }
+  return specifiers
+}
+
+type JavaScriptToken = {
+  kind: "identifier" | "string" | "punctuation"
+  value: string
+}
+
+function javascriptTokens(source: string) {
+  const tokens: JavaScriptToken[] = []
+  let index = 0
+  while (index < source.length) {
+    const char = source[index]
+    const next = source[index + 1]
+
+    if (/\s/.test(char)) {
+      index += 1
+      continue
+    }
+
+    if (char === "/" && next === "/") {
+      index += 2
+      while (index < source.length && source[index] !== "\n") {
+        index += 1
+      }
+      continue
+    }
+
+    if (char === "/" && next === "*") {
+      index += 2
+      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/")) {
+        index += 1
+      }
+      index = Math.min(index + 2, source.length)
+      continue
+    }
+
+    if (char === "\"" || char === "'") {
+      const result = readQuotedString(source, index, char)
+      tokens.push({ kind: "string", value: result.value })
+      index = result.nextIndex
+      continue
+    }
+
+    if (char === "`") {
+      index = skipTemplateLiteral(source, index)
+      continue
+    }
+
+    if (isIdentifierStart(char)) {
+      const start = index
+      index += 1
+      while (index < source.length && isIdentifierPart(source[index])) {
+        index += 1
+      }
+      tokens.push({ kind: "identifier", value: source.slice(start, index) })
+      continue
+    }
+
+    tokens.push({ kind: "punctuation", value: char })
+    index += 1
+  }
+  return tokens
+}
+
+function readQuotedString(source: string, start: number, quote: "\"" | "'") {
+  let value = ""
+  let index = start + 1
+  let escaped = false
+  while (index < source.length) {
+    const char = source[index]
+    if (escaped) {
+      value += char
+      escaped = false
+    } else if (char === "\\") {
+      escaped = true
+    } else if (char === quote) {
+      return { value, nextIndex: index + 1 }
+    } else {
+      value += char
+    }
+    index += 1
+  }
+  return { value, nextIndex: index }
+}
+
+function skipTemplateLiteral(source: string, start: number) {
+  let index = start + 1
+  let escaped = false
+  while (index < source.length) {
+    const char = source[index]
+    if (escaped) {
+      escaped = false
+    } else if (char === "\\") {
+      escaped = true
+    } else if (char === "`") {
+      return index + 1
+    }
+    index += 1
+  }
+  return index
+}
+
+function findNextKeyword(tokens: JavaScriptToken[], start: number, keyword: string) {
+  for (let index = start; index < tokens.length; index += 1) {
+    if (tokens[index].value === keyword) {
+      return index
+    }
+    if (tokens[index].value === ";" || tokens[index].value === "\n") {
+      return undefined
+    }
+  }
+  return undefined
+}
+
+function isTypeOnlyImportClause(tokens: JavaScriptToken[]) {
+  const meaningful = tokens.filter((token) => token.value !== "\n")
+  if (!meaningful.length) {
+    return false
+  }
+  if (meaningful[0].value === "type") {
+    return true
+  }
+  if (meaningful[0].value !== "{" || meaningful[meaningful.length - 1].value !== "}") {
+    return false
+  }
+  const body = meaningful.slice(1, -1)
+  if (!body.length) {
+    return false
+  }
+  let segment: JavaScriptToken[] = []
+  for (const token of [...body, { kind: "punctuation" as const, value: "," }]) {
+    if (token.value !== ",") {
+      segment.push(token)
+      continue
+    }
+    if (segment.length && (segment.length < 2 || segment[0].value !== "type")) {
+      return false
+    }
+    segment = []
+  }
+  return true
+}
+
+function workspaceLocalImportPath(workspace: string, importerDir: string, specifier: string) {
+  if (!isExecutableSourceSpecifier(specifier)) {
+    return undefined
+  }
+  const path = stripViteImportSuffix(specifier)
+  if (path.startsWith("./") || path.startsWith("../")) {
+    return resolve(importerDir, path)
+  }
+  if (path.startsWith("/src/")) {
+    return resolve(workspace, path.slice(1))
+  }
+  return undefined
+}
+
+async function globSourceFiles(workspace: string, importerDir: string, specifiers: string[]) {
+  const files = new Set<string>()
+  for (const specifier of specifiers) {
+    const basePath = workspaceLocalImportPath(workspace, importerDir, specifier)
+    if (!basePath) {
+      continue
+    }
+    const pattern = normalizePath(relative(workspace, basePath))
+    for (const file of await sourceFilesUnder(workspace)) {
+      const relativeFile = normalizePath(relative(workspace, file))
+      if (globMatches(pattern, relativeFile)) {
+        files.add(file)
+      }
+    }
+  }
+  return [...files]
+}
+
+async function sourceFilesUnder(root: string) {
+  const files: string[] = []
+  async function visit(directory: string) {
+    let entries = []
+    try {
+      entries = await readdir(directory, { encoding: "utf8", withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (entry.name === "node_modules" || entry.name === ".git" || entry.name === "dist") {
+        continue
+      }
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) {
+        await visit(path)
+      } else if (entry.isFile() && SOURCE_DEPENDENCY_EXTENSIONS.has(extname(path))) {
+        files.push(path)
+      }
+    }
+  }
+  await visit(root)
+  return files
+}
+
+function globMatches(pattern: string, value: string) {
+  const regex = new RegExp(`^${pattern.split(/(\*\*)|(\*)/g).filter(Boolean).map((part) => {
+    if (part === "**") return ".*"
+    if (part === "*") return "[^/]*"
+    return escapeRegExp(part)
+  }).join("")}$`)
+  return regex.test(value)
+}
+
+function stripHtmlComments(source: string) {
+  return source.replace(/<!--[\s\S]*?-->/g, "")
+}
+
+function stripViteImportSuffix(specifier: string) {
+  const queryIndex = specifier.search(/[?#]/)
+  return queryIndex === -1 ? specifier : specifier.slice(0, queryIndex)
+}
+
+function isExecutableSourceSpecifier(specifier: string) {
+  const suffix = specifier.match(/[?#](.*)$/)?.[1]
+  if (!suffix) {
+    return true
+  }
+  const params = new URLSearchParams(suffix.replace(/^#/, ""))
+  return params.has("worker") || params.has("sharedworker")
+}
+
+function normalizeViteRequestPath(path: string) {
+  const normalized = stripViteImportSuffix(path)
+  return normalized.startsWith("/") ? normalized : `/${normalized}`
+}
+
+function normalizePath(path: string) {
+  return path.split(sep).join("/")
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function isIdentifierStart(char: string) {
+  return /[A-Za-z_$]/.test(char)
+}
+
+function isIdentifierPart(char: string) {
+  return /[A-Za-z0-9_$]/.test(char)
+}
+
+function isRuntimeManagedImport(specifier: string, uiPackageName: string) {
+  return specifier === "react" ||
+    specifier === "react-dom/client" ||
+    specifier.startsWith("react/") ||
+    specifier === uiPackageName ||
+    specifier.startsWith(`${uiPackageName}/`) ||
+    specifier === "@avibe/show-sdk" ||
+    specifier.startsWith("@avibe/show-sdk/") ||
+    specifier.startsWith("@/") ||
+    specifier.startsWith("./") ||
+    specifier.startsWith("../") ||
+    specifier.startsWith("/") ||
+    specifier.startsWith("virtual:") ||
+    specifier.startsWith("\0")
+}
+
+function isBareImport(specifier: string) {
+  return !specifier.startsWith("./") &&
+    !specifier.startsWith("../") &&
+    !specifier.startsWith("/") &&
+    !specifier.startsWith("virtual:") &&
+    !specifier.startsWith("\0")
+}
+
+async function viteCacheDir(dependencyRoot: string, cacheRoot?: string, dependencySignature = "shared") {
   const root = resolve(cacheRoot ?? join(dirname(dependencyRoot), ".vite-cache"))
-  const digest = createHash("sha256").update(dependencyRoot).digest("hex").slice(0, 16)
-  const cacheDir = join(root, digest, encodeURIComponent(sessionId))
+  const digest = createHash("sha256").update(`${dependencyRoot}\0${dependencySignature}`).digest("hex").slice(0, 16)
+  const cacheDir = join(root, digest)
   await mkdir(cacheDir, { recursive: true })
   return cacheDir
+}
+
+async function withViteCacheWarmLock<T>(cacheDir: string, callback: () => Promise<T>): Promise<T> {
+  const previous = viteCacheWarmLocks.get(cacheDir) ?? Promise.resolve()
+  let release!: () => void
+  const current = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const tail = previous.catch(() => undefined).then(() => current)
+  viteCacheWarmLocks.set(cacheDir, tail)
+  await previous.catch(() => undefined)
+  try {
+    return await callback()
+  } finally {
+    release()
+    if (viteCacheWarmLocks.get(cacheDir) === tail) {
+      viteCacheWarmLocks.delete(cacheDir)
+    }
+  }
 }
 
 async function findNearestDependencyRoot() {
