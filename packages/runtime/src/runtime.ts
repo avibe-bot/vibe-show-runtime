@@ -1,7 +1,9 @@
-import { access, lstat, mkdir, readFile, readdir, readlink, realpath, rm, symlink } from "node:fs/promises"
+import { access, lstat, mkdir, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { dirname, extname, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
 import react from "@vitejs/plugin-react"
 import { createServer as createViteServer } from "vite"
 import type { InlineConfig, ViteDevServer } from "vite"
@@ -141,12 +143,12 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     await ensureSessionTemplate(session.workspace)
     logTiming("warmSession.template", session.id, templateStarted)
     const uiPackageName = options.uiPackageName ?? "@avibe/show-ui"
-    const linkStarted = performance.now()
-    const sharedDependencies = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot, uiPackageName)
-    logTiming("warmSession.dependencyLink", session.id, linkStarted, { nodeModules: sharedDependencies.nodeModules })
     const dependencyStarted = performance.now()
     const sourceDependencies = await sourceDependenciesForWorkspace(session.workspace, uiPackageName)
-    logTiming("warmSession.sourceDependencies", session.id, dependencyStarted, { signature: sourceDependencies.signature, extraBareImports: sourceDependencies.extraBareImports.length })
+    logTiming("warmSession.sourceDependencies", session.id, dependencyStarted, { signature: sourceDependencies.signature, extraBareImports: sourceDependencies.extraBareImports.length, declaredExtras: sourceDependencies.declaredExtras.entries.length })
+    const linkStarted = performance.now()
+    const sharedDependencies = await ensureSessionDependencies(session.workspace, sourceDependencies.declaredExtras, options.dependencyRoot, uiPackageName)
+    logTiming("warmSession.dependencyLink", session.id, linkStarted, { nodeModules: sharedDependencies.nodeModules, extrasSignature: sharedDependencies.extrasSignature })
     const cacheStarted = performance.now()
     const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot, sourceDependencies.signature)
     logTiming("warmSession.cacheDir", session.id, cacheStarted, { cacheDir })
@@ -293,31 +295,74 @@ function normalizeBasePath(basePath: string | undefined, sessionId: string) {
 }
 
 type SharedDependencies = {
+  /** node_modules Vite resolves from (the shared symlink, or the session extras dir). */
   nodeModules: string
+  /** Extra dirs to add to `server.fs.allow` beyond the shared install + package roots. */
   packageRoots: string[]
+  /** Signature of the declared extras the workspace was installed against. */
+  extrasSignature: string
 }
 
-async function ensureSharedDependencyLink(workspace: string, dependencyRoot?: string, uiPackageName = "@avibe/show-ui"): Promise<SharedDependencies> {
+/**
+ * Resolve a session's dependency layering and (re)install per-session extras.
+ *
+ * Layering (Node walk-up resolution does the work; no per-package aliasing):
+ *  - **No declared extras** (today's behavior, unchanged): `workspace/node_modules`
+ *    is a symlink to the shared, pinned install — that single dir resolves every
+ *    non-provided dep the app uses, and the session shares the global optimize cache.
+ *  - **Declared extras**: install ONLY the declared extras (+ their transitive,
+ *    non-provided deps) into `workspace/node_modules` as a real, session-private dir,
+ *    and symlink the shared install one level up at `workspaceRoot/node_modules`.
+ *    Walk-up from the session sources hits the extras dir first, then the shared
+ *    install as a fallback for non-provided shared deps. The provided vendor set
+ *    (react, `@avibe/show-ui/*`, ...) is never installed per session — it stays
+ *    externalized to the shared bundle (Stage R-B), so a session can't fork React.
+ */
+async function ensureSessionDependencies(
+  workspace: string,
+  declaredExtras: DeclaredExtras,
+  dependencyRoot?: string,
+  uiPackageName = "@avibe/show-ui"
+): Promise<SharedDependencies> {
   const root = dependencyRoot ? resolve(dependencyRoot) : await findNearestDependencyRoot()
-  const nodeModules = join(root, "node_modules")
-  await access(nodeModules)
-  const packageRoots = await resolveAllowedPackageRoots(nodeModules, [uiPackageName, "@avibe/show-sdk"])
-  const linkPath = join(workspace, "node_modules")
+  const sharedNodeModules = join(root, "node_modules")
+  await access(sharedNodeModules)
+  const packageRoots = await resolveAllowedPackageRoots(sharedNodeModules, [uiPackageName, "@avibe/show-sdk"])
+
+  if (declaredExtras.entries.length === 0) {
+    // Shared-only: workspace/node_modules -> shared install. Drop any stale extras
+    // real dir from a previous warm so reverting to no-extras restores the symlink.
+    await ensureSharedSymlink(join(workspace, "node_modules"), sharedNodeModules)
+    return { nodeModules: sharedNodeModules, packageRoots, extrasSignature: "shared" }
+  }
+
+  // Extras: shared stays reachable as the walk-up fallback one level up; the session
+  // node_modules becomes the private extras install.
+  await ensureSharedSymlink(join(dirname(workspace), "node_modules"), sharedNodeModules)
+  const extrasDir = await ensureSessionExtrasInstall(workspace, declaredExtras)
+  return {
+    nodeModules: extrasDir,
+    packageRoots: [...packageRoots, extrasDir, sharedNodeModules],
+    extrasSignature: declaredExtras.signature
+  }
+}
+
+/** Point `linkPath` at the shared install, replacing any stale symlink target or real dir. */
+async function ensureSharedSymlink(linkPath: string, sharedNodeModules: string) {
   try {
     const stats = await lstat(linkPath)
     if (stats.isSymbolicLink()) {
       const currentTarget = resolve(dirname(linkPath), await readlink(linkPath))
-      if (currentTarget !== nodeModules) {
-        await rm(linkPath)
-        await symlink(nodeModules, linkPath, "junction")
-      }
+      if (currentTarget === sharedNodeModules) return
+      await rm(linkPath)
+    } else {
+      // A previous extras warm left a real node_modules here; clear it before linking.
+      await rm(linkPath, { recursive: true, force: true })
     }
-    return { nodeModules, packageRoots }
   } catch {
-    // create link below
+    // Nothing to replace; create the link below.
   }
-  await symlink(nodeModules, linkPath, "junction")
-  return { nodeModules, packageRoots }
+  await symlink(sharedNodeModules, linkPath, "junction")
 }
 
 async function resolveAllowedPackageRoots(nodeModules: string, packageNames: string[]) {
@@ -334,9 +379,108 @@ async function resolveAllowedPackageRoots(nodeModules: string, packageNames: str
   return [...roots]
 }
 
+const execFileAsync = promisify(execFile)
+const SESSION_EXTRAS_LOCKFILE = ".show-extras.json"
+
+type DeclaredExtras = {
+  /** Declared extra packages as `name@range`, sorted for a stable signature. */
+  entries: string[]
+  /** Stable digest of the declared extras (`"none"` when nothing is declared). */
+  signature: string
+}
+
+/**
+ * Read the OPTIONAL per-session `package.json` and return its declared extra deps.
+ *
+ * Only `dependencies` are honored (the install surface). The provided vendor set is
+ * never installed per session, so any provided specifier a session lists is dropped
+ * here — it's served by the shared bundle regardless and must not fork React.
+ * Sessions that ship no `package.json` (or an empty `dependencies`) report no extras
+ * and keep the shared-install fast path untouched.
+ */
+async function readDeclaredExtras(workspace: string, uiPackageName: string): Promise<DeclaredExtras> {
+  let manifest: { dependencies?: Record<string, string> }
+  try {
+    manifest = JSON.parse(await readFile(join(workspace, "package.json"), "utf8"))
+  } catch {
+    return { entries: [], signature: "none" }
+  }
+  const dependencies = manifest.dependencies
+  if (!dependencies || typeof dependencies !== "object") {
+    return { entries: [], signature: "none" }
+  }
+  const entries = Object.entries(dependencies)
+    .filter(([name]) => !isProvidedVendorSpecifier(name, uiPackageName))
+    .map(([name, range]) => `${name}@${range}`)
+    .sort()
+  return {
+    entries,
+    signature: entries.length ? createHash("sha256").update(entries.join("\n")).digest("hex").slice(0, 16) : "none"
+  }
+}
+
+/**
+ * Install the declared extras into `workspace/node_modules` (a real, session-private
+ * dir) and return that dir. Idempotent: a sidecar lockfile records the signature the
+ * dir was installed for, so `npm install` only re-runs when the declared extras
+ * change. Installs exactly the declared `dependencies` (+ their transitive,
+ * non-provided deps) — the provided vendor set is left to the shared bundle.
+ */
+async function ensureSessionExtrasInstall(workspace: string, declaredExtras: DeclaredExtras): Promise<string> {
+  const extrasDir = join(workspace, "node_modules")
+  const lockfile = join(workspace, SESSION_EXTRAS_LOCKFILE)
+  const installed = await readInstalledExtrasSignature(lockfile)
+  if (installed === declaredExtras.signature) {
+    return extrasDir
+  }
+  // `workspace/node_modules` may currently be the shared symlink (first time this
+  // session declares extras). Replace it with a real, private dir before installing
+  // so npm never writes into the shared install.
+  await replaceSharedSymlinkWithDir(extrasDir)
+  await execFileAsync(npmExecutable(), [
+    "install",
+    "--no-save",
+    "--no-package-lock",
+    "--no-audit",
+    "--no-fund",
+    "--prefix",
+    workspace
+  ], { cwd: workspace, env: process.env })
+  await writeFile(lockfile, `${JSON.stringify({ signature: declaredExtras.signature, entries: declaredExtras.entries }, null, 2)}\n`, "utf8")
+  return extrasDir
+}
+
+async function readInstalledExtrasSignature(lockfile: string): Promise<string | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(lockfile, "utf8")) as { signature?: string }
+    return typeof parsed.signature === "string" ? parsed.signature : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Ensure `nodeModules` is a real directory (not the shared symlink) so npm installs locally. */
+async function replaceSharedSymlinkWithDir(nodeModules: string) {
+  try {
+    const stats = await lstat(nodeModules)
+    if (stats.isSymbolicLink()) {
+      await rm(nodeModules)
+    }
+  } catch {
+    // Missing entirely; npm creates it.
+  }
+  await mkdir(nodeModules, { recursive: true })
+}
+
+function npmExecutable() {
+  return process.platform === "win32" ? "npm.cmd" : "npm"
+}
+
 type SourceDependencies = {
   entryRequests: string[]
   extraBareImports: string[]
+  /** Per-session extras declared in the workspace `package.json` (`name@range`, sorted). */
+  declaredExtras: DeclaredExtras
   signature: string
 }
 
@@ -358,10 +502,18 @@ async function sourceDependenciesForWorkspace(workspace: string, uiPackageName: 
     }
   }
   const sorted = [...extraBareImports].sort()
+  const declaredExtras = await readDeclaredExtras(workspace, uiPackageName)
+  // The signature keys both warm-change detection and the Vite optimize cache, so
+  // it must move when EITHER the scanned bare imports OR the declared extras change
+  // (a `package.json` version bump alone must still re-install + re-optimize).
+  const signatureSource = `${sorted.join("\n")}\0${declaredExtras.signature}`
   return {
     entryRequests: entries.map((entry) => entry.request),
     extraBareImports: sorted,
-    signature: sorted.length ? createHash("sha256").update(sorted.join("\n")).digest("hex").slice(0, 16) : "shared"
+    declaredExtras,
+    signature: sorted.length || declaredExtras.entries.length
+      ? createHash("sha256").update(signatureSource).digest("hex").slice(0, 16)
+      : "shared"
   }
 }
 
