@@ -226,7 +226,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
         // parent symlink). Skipped when node_modules already IS the shared install.
         ...(sharedDependencies.nodeModules === sharedDependencies.sharedNodeModules
           ? []
-          : [sharedResolveFallbackPlugin(sharedDependencies.sharedNodeModules, uiPackageName)]),
+          : [sharedResolveFallbackPlugin(sharedDependencies.sharedNodeModules, providedSpecifiers)]),
         showHmrTransitionPlugin({ fallbackDelaySeconds: options.fallbackDelaySeconds }),
         react()
       ] as InlineConfig["plugins"],
@@ -458,22 +458,26 @@ async function ensureSharedSymlink(linkPath: string, sharedNodeModules: string) 
  * It deliberately serves `@avibe/show-sdk` (+ subpaths): the SDK ships its values from
  * the shared install but is NOT part of the vendor bundle/import map (it's filtered out
  * of the per-session extras install as runtime-owned), so without this fallback a page
- * importing an SDK value in an extras session would have no resolver. The PROVIDED set
- * (react, react-dom, `@avibe/show-ui/*`, and the `@/` shadcn alias onto it) is left
- * alone — it's externalized before this runs and resolved by the import map, never
- * forked here. Local/virtual ids are left to Vite.
+ * importing an SDK value in an extras session would have no resolver. The skip-set is
+ * aligned with what is ACTUALLY externalized — the React family + the EXACT members of
+ * the vendor manifest's provided set (`isProvidedVendorSpecifier`, the same source of
+ * truth `createVendorExternalizePlugins` uses). A `@avibe/show-ui` subpath NOT in the
+ * manifest (e.g. a custom UI package whose wildcard `exports` couldn't be enumerated)
+ * is therefore neither externalized here nor skipped — it falls through to the shared
+ * resolver below, matching the shared-only session (where the symlink would resolve it).
+ * Local/virtual ids are left to Vite.
  *
  * Resolution goes through an `import.meta.resolve` resolver anchored at the shared
  * install (not CJS `createRequire`, which throws `ERR_PACKAGE_PATH_NOT_EXPORTED` on the
  * `import`-only `@avibe/show-sdk/*` subpaths).
  */
-function sharedResolveFallbackPlugin(sharedNodeModules: string, uiPackageName: string): Plugin {
+function sharedResolveFallbackPlugin(sharedNodeModules: string, providedSpecifiers: string[]): Plugin {
   return {
     name: "avibe-show-shared-resolve-fallback",
     enforce: "post",
     apply: "serve",
     async resolveId(source, importer, options) {
-      if (!isBareImport(source) || isProvidedFamilyImport(source, uiPackageName)) {
+      if (!isBareImport(source) || isExternalizedImport(source, providedSpecifiers)) {
         return null
       }
       // Only act as a fallback: defer to the session's own resolution first.
@@ -490,25 +494,35 @@ function sharedResolveFallbackPlugin(sharedNodeModules: string, uiPackageName: s
 
 /**
  * Whether the shared-install fallback must leave a bare specifier alone because it is
- * handled elsewhere: the React family + the whole `@avibe/show-ui` package + the `@/`
- * shadcn alias onto it (all externalized → resolved by the import map, never forked
- * here).
+ * already externalized for the import map (resolved there, never forked here). This is
+ * the EXACT externalized set, so the fallback's skip-list and the externalizer stay in
+ * lockstep:
+ *  - the React family (singletons that must collapse to the one shared copy), and
+ *  - the exact members of the vendor manifest's provided specifiers
+ *    (`isProvidedVendorSpecifier` — the same source of truth the externalize plugins
+ *    use).
  *
- * This is `isRuntimeManagedImport`'s bare-specifier coverage MINUS `@avibe/show-sdk`:
- * the SDK is runtime-owned but NOT provided via the bundle/import map, so in an extras
- * session the fallback is precisely its resolver. (Specifiers actually in the vendor
- * import map, e.g. `motion/react` or `lucide-react`, are already short-circuited by the
- * `enforce: "pre"` externalize plugin before this `post` fallback runs, so they need no
- * guard here; a non-provided bare dep like `motion` is still served from the shared
- * install, unchanged from before.)
+ * Everything else falls through to `this.resolve` → the shared resolver, INCLUDING a
+ * `@avibe/show-ui` subpath that is NOT in the manifest (e.g. a custom UI package whose
+ * wildcard `exports` couldn't be enumerated): the externalizer leaves such a subpath
+ * bare-unresolved, so the fallback must serve it from the shared install — exactly as
+ * the symlink would in a shared-only session. `@avibe/show-sdk` (runtime-owned but NOT
+ * in the bundle/import map) likewise falls through, so the fallback is its resolver.
+ * Specifiers actually in the vendor import map (e.g. `motion/react`, `lucide-react`)
+ * are short-circuited by the `enforce: "pre"` externalize plugin before this `post`
+ * fallback runs; a non-provided bare dep like `motion` is still served from the shared
+ * install, unchanged.
  */
-function isProvidedFamilyImport(specifier: string, uiPackageName: string): boolean {
+function isExternalizedImport(specifier: string, providedSpecifiers: string[]): boolean {
+  return isReactFamilyImport(specifier) || isProvidedVendorSpecifier(specifier, providedSpecifiers)
+}
+
+/** The React singletons that must always collapse to the one shared, externalized copy. */
+function isReactFamilyImport(specifier: string): boolean {
   return specifier === "react" ||
+    specifier === "react-dom" ||
     specifier === "react-dom/client" ||
-    specifier.startsWith("react/") ||
-    specifier === uiPackageName ||
-    specifier.startsWith(`${uiPackageName}/`) ||
-    specifier.startsWith("@/")
+    specifier.startsWith("react/")
 }
 
 async function resolveAllowedPackageRoots(nodeModules: string, packageNames: string[]) {
@@ -629,10 +643,12 @@ async function ensureSessionExtrasInstall(workspace: string, declaredExtras: Dec
 }
 
 /**
- * Run `npm install <extra@range> ...` in a throwaway staging dir whose manifest has
- * no dependencies, and return the resulting `node_modules` path. Isolating the
- * install keeps npm from also resolving the session `package.json` deps (which
- * include the provided vendor set). The caller moves the result into the session.
+ * Run `npm install <extra@range> ... --ignore-scripts` in a throwaway staging dir
+ * whose manifest has no dependencies, and return the resulting `node_modules` path.
+ * Isolating the install keeps npm from also resolving the session `package.json` deps
+ * (which include the provided vendor set); `--ignore-scripts` keeps agent/user-authored
+ * declared or transitive lifecycle scripts from running on the runtime host. The caller
+ * moves the result into the session.
  *
  * Staged next to `workspace` (not in the OS temp dir) so the follow-up `rename` into
  * the session stays on the same filesystem (avoids cross-device `EXDEV`).
@@ -651,6 +667,10 @@ async function installExtrasToStagingDir(workspace: string, declaredExtras: Decl
     "--no-package-lock",
     "--no-audit",
     "--no-fund",
+    // Session `package.json` deps are agent/user-authored, so a declared or transitive
+    // package's lifecycle scripts (postinstall/prepare/...) would run arbitrary code on
+    // the runtime host during warm. Never execute them for per-session extras.
+    "--ignore-scripts",
     "--prefix",
     stagingDir
   ], { cwd: stagingDir, env: process.env })
