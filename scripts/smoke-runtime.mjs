@@ -260,6 +260,27 @@ try {
     throw new Error("Expected generated client shell to preserve injected write tokens")
   }
 
+  await writeFile(join(root, "smoke", "src", "extra-dep.ts"), `import stackback from "stackback"
+export const stackDepth = stackback().length
+`)
+  await writeFile(join(root, "smoke", "src", "App.tsx"), `import { stackDepth } from "./extra-dep"
+
+export default function App() {
+  return <main>Stack depth: {stackDepth}</main>
+}
+`)
+  const extraDepModule = await fetch(`${runtime.url}/sessions/smoke/app/src/extra-dep.ts?t=1`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  if (extraDepModule.status !== 200 || !extraDepModule.body.includes("/deps/stackback.js")) {
+    throw new Error(`Expected extra page dependency to be optimized, got ${extraDepModule.status}: ${extraDepModule.body.slice(0, 200)}`)
+  }
+  const updatedCacheDigestDirs = await readdir(cacheRoot)
+  if (updatedCacheDigestDirs.length < 2) {
+    throw new Error(`Expected extra page dependencies to use a dedicated cache namespace, got ${updatedCacheDigestDirs.join(", ")}`)
+  }
+
   const eventResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {
     method: "POST",
     headers: { "content-type": "application/json" },

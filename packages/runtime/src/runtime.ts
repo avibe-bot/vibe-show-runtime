@@ -1,4 +1,4 @@
-import { access, lstat, mkdir, readlink, realpath, rm, symlink } from "node:fs/promises"
+import { access, lstat, mkdir, readFile, readdir, readlink, realpath, rm, symlink } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
@@ -21,6 +21,26 @@ import { ensureSessionTemplate } from "./templates.js"
 const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000
 const viteCacheWarmLocks = new Map<string, Promise<void>>()
 
+function defaultOptimizeDepsInclude(uiPackageName: string) {
+  return [
+    "react",
+    "react/jsx-runtime",
+    "react/jsx-dev-runtime",
+    "react-dom/client",
+    `${uiPackageName}/animated-text > motion/react`,
+    `${uiPackageName}/card > motion/react`,
+    `${uiPackageName}/button`,
+    `${uiPackageName}/card`,
+    `${uiPackageName}/badge`,
+    `${uiPackageName}/dialog`,
+    `${uiPackageName}/input`,
+    `${uiPackageName}/metric-card`,
+    `${uiPackageName}/progress`,
+    `${uiPackageName}/switch`,
+    `${uiPackageName}/theme`
+  ]
+}
+
 export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
   const idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS
@@ -29,11 +49,12 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     const existing = getOrCreateSession(sessionId)
     existing.lastAccessedAt = new Date()
     const normalizedBasePath = normalizeBasePath(basePath, sessionId)
-    if (existing.state === "active" && existing.basePath === normalizedBasePath) {
+    const dependencySignature = existing.state === "active" ? await sourceDependencySignature(existing.workspace, options.uiPackageName ?? "@avibe/show-ui") : undefined
+    if (existing.state === "active" && existing.basePath === normalizedBasePath && existing.dependencySignature === dependencySignature) {
       existing.updatedAt = new Date()
       return toStatus(existing)
     }
-    if (existing.state === "active" && existing.basePath !== normalizedBasePath) {
+    if (existing.state === "active" && (existing.basePath !== normalizedBasePath || existing.dependencySignature !== dependencySignature)) {
       await closeSession(existing)
     }
     if (!existing.warming) {
@@ -83,10 +104,11 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
 
   async function warmSession(session: ShowSession, basePath: string): Promise<ShowSession> {
     await mkdir(session.workspace, { recursive: true })
+    await ensureSessionTemplate(session.workspace)
     const uiPackageName = options.uiPackageName ?? "@avibe/show-ui"
     const sharedDependencies = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot, uiPackageName)
-    await ensureSessionTemplate(session.workspace)
-    const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot)
+    const sourceDependencies = await sourceDependenciesForWorkspace(session.workspace, uiPackageName)
+    const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot, sourceDependencies.signature)
     const viteConfig = {
       base: basePath,
       root: session.workspace,
@@ -109,23 +131,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       },
       optimizeDeps: {
         noDiscovery: true,
-        include: [
-          "react",
-          "react/jsx-runtime",
-          "react/jsx-dev-runtime",
-          "react-dom/client",
-          `${uiPackageName}/animated-text > motion/react`,
-          `${uiPackageName}/card > motion/react`,
-          `${uiPackageName}/button`,
-          `${uiPackageName}/card`,
-          `${uiPackageName}/badge`,
-          `${uiPackageName}/dialog`,
-          `${uiPackageName}/input`,
-          `${uiPackageName}/metric-card`,
-          `${uiPackageName}/progress`,
-          `${uiPackageName}/switch`,
-          `${uiPackageName}/theme`
-        ]
+        include: [...defaultOptimizeDepsInclude(uiPackageName), ...sourceDependencies.extraBareImports]
       }
     } satisfies InlineConfig
     await withViteCacheWarmLock(cacheDir, async () => {
@@ -134,6 +140,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     })
     session.state = "active"
     session.basePath = basePath
+    session.dependencySignature = sourceDependencies.signature
     session.updatedAt = new Date()
     session.warming = undefined
     return session
@@ -247,9 +254,102 @@ async function resolveAllowedPackageRoots(nodeModules: string, packageNames: str
   return [...roots]
 }
 
-async function viteCacheDir(dependencyRoot: string, cacheRoot?: string) {
+type SourceDependencies = {
+  extraBareImports: string[]
+  signature: string
+}
+
+const SOURCE_DEPENDENCY_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts"])
+const STATIC_IMPORT_RE = /\bimport\s+(?:[^'"]*?\s+from\s+)?["']([^"']+)["']|\bexport\s+[^'"]*?\s+from\s+["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)|\brequire\s*\(\s*["']([^"']+)["']\s*\)/g
+
+async function sourceDependenciesForWorkspace(workspace: string, uiPackageName: string): Promise<SourceDependencies> {
+  const extraBareImports = new Set<string>()
+  for (const sourceFile of await sourceFiles(join(workspace, "src"))) {
+    const source = await readFile(sourceFile, "utf8")
+    for (const specifier of importSpecifiers(source)) {
+      if (isRuntimeManagedImport(specifier, uiPackageName)) {
+        continue
+      }
+      const barePackage = barePackageName(specifier)
+      if (barePackage) {
+        extraBareImports.add(barePackage)
+      }
+    }
+  }
+  const sorted = [...extraBareImports].sort()
+  return {
+    extraBareImports: sorted,
+    signature: sorted.length ? createHash("sha256").update(sorted.join("\n")).digest("hex").slice(0, 16) : "shared"
+  }
+}
+
+async function sourceDependencySignature(workspace: string, uiPackageName: string) {
+  return (await sourceDependenciesForWorkspace(workspace, uiPackageName)).signature
+}
+
+async function sourceFiles(root: string): Promise<string[]> {
+  try {
+    const entries = await readdir(root, { withFileTypes: true })
+    const files = await Promise.all(entries.map(async (entry) => {
+      const path = join(root, entry.name)
+      if (entry.isDirectory()) {
+        return sourceFiles(path)
+      }
+      if (entry.isFile() && SOURCE_DEPENDENCY_EXTENSIONS.has(extension(entry.name))) {
+        return [path]
+      }
+      return []
+    }))
+    return files.flat()
+  } catch {
+    return []
+  }
+}
+
+function importSpecifiers(source: string) {
+  const specifiers: string[] = []
+  for (const match of source.matchAll(STATIC_IMPORT_RE)) {
+    const specifier = match[1] ?? match[2] ?? match[3] ?? match[4]
+    if (specifier) {
+      specifiers.push(specifier)
+    }
+  }
+  return specifiers
+}
+
+function isRuntimeManagedImport(specifier: string, uiPackageName: string) {
+  return specifier === "react" ||
+    specifier === "react-dom/client" ||
+    specifier.startsWith("react/") ||
+    specifier === uiPackageName ||
+    specifier.startsWith(`${uiPackageName}/`) ||
+    specifier === "@avibe/show-sdk" ||
+    specifier.startsWith("@avibe/show-sdk/") ||
+    specifier.startsWith("@/") ||
+    specifier.startsWith("./") ||
+    specifier.startsWith("../") ||
+    specifier.startsWith("/") ||
+    specifier.startsWith("virtual:") ||
+    specifier.startsWith("\0")
+}
+
+function barePackageName(specifier: string) {
+  if (specifier.startsWith("@")) {
+    const [scope, name] = specifier.split("/")
+    return scope && name ? `${scope}/${name}` : undefined
+  }
+  const [name] = specifier.split("/")
+  return name || undefined
+}
+
+function extension(path: string) {
+  const dot = path.lastIndexOf(".")
+  return dot >= 0 ? path.slice(dot) : ""
+}
+
+async function viteCacheDir(dependencyRoot: string, cacheRoot?: string, dependencySignature = "shared") {
   const root = resolve(cacheRoot ?? join(dirname(dependencyRoot), ".vite-cache"))
-  const digest = createHash("sha256").update(dependencyRoot).digest("hex").slice(0, 16)
+  const digest = createHash("sha256").update(`${dependencyRoot}\0${dependencySignature}`).digest("hex").slice(0, 16)
   const cacheDir = join(root, digest)
   await mkdir(cacheDir, { recursive: true })
   return cacheDir
