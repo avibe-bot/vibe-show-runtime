@@ -17,31 +17,12 @@ import type { ShowRuntime, ShowRuntimeOptions, ShowSession, ShowSessionStatus } 
 import { createShadcnAlias } from "./aliases.js"
 import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
 import { ensureSessionTemplate } from "./templates.js"
+import { createVendorExternalizePlugins, isProvidedVendorSpecifier } from "./vendor-externalize-plugin.js"
 
 const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000
 const DEFAULT_IDLE_PRUNE_INTERVAL_MS = 5 * 60 * 1000
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 const viteCacheWarmLocks = new Map<string, Promise<void>>()
-
-function defaultOptimizeDepsInclude(uiPackageName: string) {
-  return [
-    "react",
-    "react/jsx-runtime",
-    "react/jsx-dev-runtime",
-    "react-dom/client",
-    `${uiPackageName}/animated-text > motion/react`,
-    `${uiPackageName}/card > motion/react`,
-    `${uiPackageName}/button`,
-    `${uiPackageName}/card`,
-    `${uiPackageName}/badge`,
-    `${uiPackageName}/dialog`,
-    `${uiPackageName}/input`,
-    `${uiPackageName}/metric-card`,
-    `${uiPackageName}/progress`,
-    `${uiPackageName}/switch`,
-    `${uiPackageName}/theme`
-  ]
-}
 
 export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
@@ -185,13 +166,24 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
           deny: []
         }
       },
-      plugins: [showHmrTransitionPlugin({ fallbackDelaySeconds: options.fallbackDelaySeconds }), react()] as InlineConfig["plugins"],
+      plugins: [
+        ...createVendorExternalizePlugins(uiPackageName),
+        showHmrTransitionPlugin({ fallbackDelaySeconds: options.fallbackDelaySeconds }),
+        react()
+      ] as InlineConfig["plugins"],
       resolve: {
-        alias: createShadcnAlias(uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never
+        alias: createShadcnAlias(uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never,
+        // Singleton guard: even though React is served bare via the import map,
+        // dedupe keeps any stray local resolution collapsed to one copy.
+        dedupe: ["react", "react-dom"]
       },
       optimizeDeps: {
         noDiscovery: true,
-        include: [...defaultOptimizeDepsInclude(uiPackageName), ...sourceDependencies.extraBareImports]
+        // The provided vendor set is externalized (left bare for the import map),
+        // so the optimizer only handles the app's OWN non-provided bare imports.
+        // `exclude` for the provided set is added by the externalize plugin's
+        // `config` hook (single source of truth in vendor-externalize-plugin).
+        include: sourceDependencies.extraBareImports.filter((specifier) => !isProvidedVendorSpecifier(specifier, uiPackageName))
       }
     } satisfies InlineConfig
     await withViteCacheWarmLock(cacheDir, async () => {

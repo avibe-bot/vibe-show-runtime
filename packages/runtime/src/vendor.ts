@@ -44,8 +44,10 @@ export interface BuildVendorResult {
  * content-hashed vendor bundle so every Show Page session references the same
  * immutable copy (one React instance) through a browser import map.
  *
- * This mirrors `defaultOptimizeDepsInclude` in `runtime.ts`, normalized to the
- * actual specifiers a Show Page app (or `@avibe/show-ui`) can import:
+ * This is the single source of truth shared with dev externalization
+ * (`vendor-externalize-plugin.ts` leaves exactly this set bare for the import
+ * map), normalized to the actual specifiers a Show Page app (or `@avibe/show-ui`)
+ * can import:
  *   - React core + both JSX runtimes + `react-dom` / `react-dom/client`.
  *   - Every `@avibe/show-ui` subpath that ships a JS build (the shadcn
  *     `@/components/ui/*` and `@/lib/utils` aliases resolve onto these), plus the
