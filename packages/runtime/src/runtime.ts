@@ -260,11 +260,11 @@ type SourceDependencies = {
 }
 
 const SOURCE_DEPENDENCY_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts"])
-const IMPORT_RE = /\bimport\s+([^'"]*?\s+from\s+)?["']([^"']+)["']|\bexport\s+([^'"]*?\s+from\s+)?["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)|\brequire\s*\(\s*["']([^"']+)["']\s*\)/g
+const HTML_MODULE_SCRIPT_RE = /<script\b(?=[^>]*\btype\s*=\s*["']module["'])(?=[^>]*\bsrc\s*=\s*["']([^"']+)["'])[^>]*>/gi
 
 async function sourceDependenciesForWorkspace(workspace: string, uiPackageName: string): Promise<SourceDependencies> {
   const extraBareImports = new Set<string>()
-  for (const sourceFile of await reachableSourceFiles(join(workspace, "src", "main.tsx"))) {
+  for (const sourceFile of await reachableSourceFiles(await workspaceEntryFiles(workspace), workspace)) {
     const source = await readFile(sourceFile, "utf8")
     for (const { specifier } of importSpecifiers(source)) {
       if (isRuntimeManagedImport(specifier, uiPackageName)) {
@@ -286,9 +286,28 @@ async function sourceDependencySignature(workspace: string, uiPackageName: strin
   return (await sourceDependenciesForWorkspace(workspace, uiPackageName)).signature
 }
 
-async function reachableSourceFiles(entry: string): Promise<string[]> {
+async function workspaceEntryFiles(workspace: string): Promise<string[]> {
+  const entries = new Set<string>()
+  try {
+    const html = await readFile(join(workspace, "index.html"), "utf8")
+    for (const match of html.matchAll(HTML_MODULE_SCRIPT_RE)) {
+      const sourcePath = workspaceLocalImportPath(workspace, workspace, match[1])
+      if (sourcePath) {
+        entries.add(sourcePath)
+      }
+    }
+  } catch {
+    // Fall back to the runtime-owned client shell when index.html is absent.
+  }
+  if (!entries.size) {
+    entries.add(join(workspace, "src", "main.tsx"))
+  }
+  return [...entries]
+}
+
+async function reachableSourceFiles(entries: string[], workspace: string): Promise<string[]> {
   const seen = new Set<string>()
-  const queue = [entry]
+  const queue = [...entries]
   for (let index = 0; index < queue.length; index += 1) {
     const file = await resolveSourceFile(queue[index])
     if (!file || seen.has(file)) {
@@ -302,8 +321,9 @@ async function reachableSourceFiles(entry: string): Promise<string[]> {
       continue
     }
     for (const { specifier } of importSpecifiers(source)) {
-      if (specifier.startsWith("./") || specifier.startsWith("../")) {
-        queue.push(resolve(dirname(file), stripViteImportSuffix(specifier)))
+      const localPath = workspaceLocalImportPath(workspace, dirname(file), specifier)
+      if (localPath) {
+        queue.push(localPath)
       }
     }
   }
@@ -339,90 +359,210 @@ async function isFile(path: string) {
 
 function importSpecifiers(source: string) {
   const specifiers: Array<{ specifier: string }> = []
-  for (const match of stripJavaScriptComments(source).matchAll(IMPORT_RE)) {
-    const staticImportClause = match[1]?.trim()
-    const staticImportSpecifier = match[2]
-    const staticExportClause = match[3]?.trim()
-    const staticExportSpecifier = match[4]
-    const specifier = staticImportSpecifier ?? staticExportSpecifier ?? match[5] ?? match[6]
-    if (specifier) {
-      if (staticImportSpecifier && (staticImportClause === "type" || staticImportClause?.startsWith("type "))) {
+  const tokens = javascriptTokens(source)
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]
+    if (token.value === "import") {
+      const nextToken = tokens[index + 1]
+      if (nextToken?.value === "(") {
+        const specifierToken = tokens[index + 2]
+        if (specifierToken?.kind === "string") {
+          specifiers.push({ specifier: specifierToken.value })
+        }
         continue
       }
-      if (staticExportSpecifier && (staticExportClause === undefined || staticExportClause === "type from" || staticExportClause?.startsWith("type "))) {
+      if (nextToken?.kind === "string") {
+        specifiers.push({ specifier: nextToken.value })
         continue
       }
-      specifiers.push({ specifier })
+      const fromIndex = findNextKeyword(tokens, index + 1, "from")
+      const specifierToken = fromIndex === undefined ? undefined : tokens[fromIndex + 1]
+      if (specifierToken?.kind === "string" && !isTypeOnlyImportClause(tokens.slice(index + 1, fromIndex))) {
+        specifiers.push({ specifier: specifierToken.value })
+      }
+      continue
+    }
+    if (token.value === "export") {
+      const fromIndex = findNextKeyword(tokens, index + 1, "from")
+      const specifierToken = fromIndex === undefined ? undefined : tokens[fromIndex + 1]
+      if (specifierToken?.kind === "string" && !isTypeOnlyImportClause(tokens.slice(index + 1, fromIndex))) {
+        specifiers.push({ specifier: specifierToken.value })
+      }
+      continue
+    }
+    if (token.value === "require" && tokens[index + 1]?.value === "(") {
+      const specifierToken = tokens[index + 2]
+      if (specifierToken?.kind === "string") {
+        specifiers.push({ specifier: specifierToken.value })
+      }
     }
   }
   return specifiers
 }
 
-function stripJavaScriptComments(source: string) {
-  let output = ""
+type JavaScriptToken = {
+  kind: "identifier" | "string" | "punctuation"
+  value: string
+}
+
+function javascriptTokens(source: string) {
+  const tokens: JavaScriptToken[] = []
   let index = 0
-  let quote: "\"" | "'" | "`" | undefined
-  let escaped = false
   while (index < source.length) {
     const char = source[index]
     const next = source[index + 1]
 
-    if (quote) {
-      output += char
-      if (escaped) {
-        escaped = false
-      } else if (char === "\\") {
-        escaped = true
-      } else if (char === quote) {
-        quote = undefined
-      }
-      index += 1
-      continue
-    }
-
-    if (char === "\"" || char === "'" || char === "`") {
-      quote = char
-      output += char
+    if (/\s/.test(char)) {
       index += 1
       continue
     }
 
     if (char === "/" && next === "/") {
-      output += "  "
       index += 2
       while (index < source.length && source[index] !== "\n") {
-        output += " "
         index += 1
       }
       continue
     }
 
     if (char === "/" && next === "*") {
-      output += "  "
       index += 2
-      while (index < source.length) {
-        const current = source[index]
-        const following = source[index + 1]
-        if (current === "*" && following === "/") {
-          output += "  "
-          index += 2
-          break
-        }
-        output += current === "\n" ? "\n" : " "
+      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/")) {
         index += 1
       }
+      index = Math.min(index + 2, source.length)
       continue
     }
 
-    output += char
+    if (char === "\"" || char === "'") {
+      const result = readQuotedString(source, index, char)
+      tokens.push({ kind: "string", value: result.value })
+      index = result.nextIndex
+      continue
+    }
+
+    if (char === "`") {
+      index = skipTemplateLiteral(source, index)
+      continue
+    }
+
+    if (isIdentifierStart(char)) {
+      const start = index
+      index += 1
+      while (index < source.length && isIdentifierPart(source[index])) {
+        index += 1
+      }
+      tokens.push({ kind: "identifier", value: source.slice(start, index) })
+      continue
+    }
+
+    tokens.push({ kind: "punctuation", value: char })
     index += 1
   }
-  return output
+  return tokens
+}
+
+function readQuotedString(source: string, start: number, quote: "\"" | "'") {
+  let value = ""
+  let index = start + 1
+  let escaped = false
+  while (index < source.length) {
+    const char = source[index]
+    if (escaped) {
+      value += char
+      escaped = false
+    } else if (char === "\\") {
+      escaped = true
+    } else if (char === quote) {
+      return { value, nextIndex: index + 1 }
+    } else {
+      value += char
+    }
+    index += 1
+  }
+  return { value, nextIndex: index }
+}
+
+function skipTemplateLiteral(source: string, start: number) {
+  let index = start + 1
+  let escaped = false
+  while (index < source.length) {
+    const char = source[index]
+    if (escaped) {
+      escaped = false
+    } else if (char === "\\") {
+      escaped = true
+    } else if (char === "`") {
+      return index + 1
+    }
+    index += 1
+  }
+  return index
+}
+
+function findNextKeyword(tokens: JavaScriptToken[], start: number, keyword: string) {
+  for (let index = start; index < tokens.length; index += 1) {
+    if (tokens[index].value === keyword) {
+      return index
+    }
+    if (tokens[index].value === ";" || tokens[index].value === "\n") {
+      return undefined
+    }
+  }
+  return undefined
+}
+
+function isTypeOnlyImportClause(tokens: JavaScriptToken[]) {
+  const meaningful = tokens.filter((token) => token.value !== "\n")
+  if (!meaningful.length) {
+    return false
+  }
+  if (meaningful[0].value === "type") {
+    return true
+  }
+  if (meaningful[0].value !== "{" || meaningful[meaningful.length - 1].value !== "}") {
+    return false
+  }
+  const body = meaningful.slice(1, -1)
+  if (!body.length) {
+    return false
+  }
+  let segment: JavaScriptToken[] = []
+  for (const token of [...body, { kind: "punctuation" as const, value: "," }]) {
+    if (token.value !== ",") {
+      segment.push(token)
+      continue
+    }
+    if (segment.length && (segment.length < 2 || segment[0].value !== "type")) {
+      return false
+    }
+    segment = []
+  }
+  return true
+}
+
+function workspaceLocalImportPath(workspace: string, importerDir: string, specifier: string) {
+  const path = stripViteImportSuffix(specifier)
+  if (path.startsWith("./") || path.startsWith("../")) {
+    return resolve(importerDir, path)
+  }
+  if (path.startsWith("/src/")) {
+    return resolve(workspace, path.slice(1))
+  }
+  return undefined
 }
 
 function stripViteImportSuffix(specifier: string) {
   const queryIndex = specifier.search(/[?#]/)
   return queryIndex === -1 ? specifier : specifier.slice(0, queryIndex)
+}
+
+function isIdentifierStart(char: string) {
+  return /[A-Za-z_$]/.test(char)
+}
+
+function isIdentifierPart(char: string) {
+  return /[A-Za-z0-9_$]/.test(char)
 }
 
 function isRuntimeManagedImport(specifier: string, uiPackageName: string) {

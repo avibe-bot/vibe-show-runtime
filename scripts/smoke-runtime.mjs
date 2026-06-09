@@ -270,17 +270,28 @@ export type SmokeType = MissingType
 import stackback from "stackback"
 import formatStack from "stackback/formatstack"
 import { workerDep } from "./worker.ts?worker"
+import { absoluteDep } from "/src/root-absolute.ts"
 import type {} from "missing-export-type-package"
+import { type InlineMissingType } from "missing-inline-type-only-package"
+export { type InlineMissingExportType } from "missing-inline-export-type-only-package"
 // import "missing-commented-only-package"
 /* import "missing-block-comment-only-package" */
+const snippet = 'import "missing-string-only-package"'
+const templateSnippet = \`require("missing-template-only-package")\`
 export const stackDepth = stackback().length
 export const formattedStack = formatStack([])
 export const workerDependency = workerDep
+export const rootAbsoluteDependency = absoluteDep
+export const snippets = [snippet, templateSnippet]
 export type { SmokeType }
 `)
   await writeFile(join(root, "smoke", "src", "worker.ts"), `import { nanoid } from "nanoid/non-secure"
 
 export const workerDep = nanoid
+`)
+  await writeFile(join(root, "smoke", "src", "root-absolute.ts"), `import pc from "picocolors"
+
+export const absoluteDep = pc.green
 `)
   await writeFile(join(root, "smoke", "src", "App.tsx"), `import { stackDepth } from "./extra-dep"
 
@@ -302,7 +313,9 @@ export default function App() {
     extraDepModule.body.includes("missing-type-only-package") ||
     extraDepModule.body.includes("missing-draft-only-package") ||
     extraDepModule.body.includes("missing-commented-only-package") ||
-    extraDepModule.body.includes("missing-block-comment-only-package")
+    extraDepModule.body.includes("missing-block-comment-only-package") ||
+    extraDepModule.body.includes("missing-inline-type-only-package") ||
+    extraDepModule.body.includes("missing-inline-export-type-only-package")
   ) {
     throw new Error(`Expected unreachable, type-only, and commented imports to stay out of optimizer output: ${extraDepModule.body.slice(0, 300)}`)
   }
@@ -314,6 +327,28 @@ export default function App() {
   const extraCacheDeps = extraCacheDigestDir ? await readdir(join(cacheRoot, extraCacheDigestDir, "deps")) : []
   if (!extraCacheDeps.some((entry) => entry.startsWith("nanoid_non-secure"))) {
     throw new Error(`Expected Vite query imports to scan reachable worker dependencies, got cache deps: ${extraCacheDeps.join(", ")}`)
+  }
+  if (!extraCacheDeps.some((entry) => entry.startsWith("picocolors"))) {
+    throw new Error(`Expected root-absolute imports to scan reachable source dependencies, got cache deps: ${extraCacheDeps.join(", ")}`)
+  }
+  if (extraCacheDeps.some((entry) => entry.startsWith("missing-string-only-package") || entry.startsWith("missing-template-only-package"))) {
+    throw new Error(`Expected import-like string literals to stay out of optimized deps, got cache deps: ${extraCacheDeps.join(", ")}`)
+  }
+
+  await writeFile(join(root, "smoke", "index.html"), `<div id="root"></div><script type="module" src="/src/demo.tsx"></script>`)
+  await writeFile(join(root, "smoke", "src", "demo.tsx"), `import ms from "magic-string"
+
+export const demo = new ms("").toString()
+`)
+  const customEntryEnsure = await fetch(`${runtime.url}/sessions/smoke/ensure`, { method: "POST" }).then((res) => res.json())
+  if (customEntryEnsure.state !== "active") {
+    throw new Error(`Expected custom HTML entry session to stay active, got ${JSON.stringify(customEntryEnsure)}`)
+  }
+  const customEntryCacheDigestDirs = await readdir(cacheRoot)
+  const customEntryCacheDir = customEntryCacheDigestDirs.find((dir) => !updatedCacheDigestDirs.includes(dir))
+  const customEntryCacheDeps = customEntryCacheDir ? await readdir(join(cacheRoot, customEntryCacheDir, "deps")) : []
+  if (!customEntryCacheDeps.some((entry) => entry.startsWith("magic-string"))) {
+    throw new Error(`Expected customized HTML entries to scan their dependencies, got cache deps: ${customEntryCacheDeps.join(", ")}`)
   }
 
   const eventResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {
