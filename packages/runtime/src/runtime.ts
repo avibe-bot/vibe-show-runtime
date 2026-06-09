@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
 import react from "@vitejs/plugin-react"
 import { createServer as createViteServer } from "vite"
-import type { InlineConfig } from "vite"
+import type { InlineConfig, ViteDevServer } from "vite"
 import {
   formatShowEventMessage,
   normalizeShowEvent,
@@ -19,6 +19,7 @@ import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
 import { ensureSessionTemplate } from "./templates.js"
 
 const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000
+const viteCacheWarmLocks = new Map<string, Promise<void>>()
 
 export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
@@ -79,9 +80,10 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
 
   async function warmSession(session: ShowSession, basePath: string): Promise<ShowSession> {
     await mkdir(session.workspace, { recursive: true })
-    const sharedDependencies = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot, options.uiPackageName)
+    const uiPackageName = options.uiPackageName ?? "@avibe/show-ui"
+    const sharedDependencies = await ensureSharedDependencyLink(session.workspace, options.dependencyRoot, uiPackageName)
     await ensureSessionTemplate(session.workspace)
-    const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, session.id, options.cacheRoot)
+    const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot)
     const viteConfig = {
       base: basePath,
       root: session.workspace,
@@ -100,15 +102,37 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       },
       plugins: [showHmrTransitionPlugin({ fallbackDelaySeconds: options.fallbackDelaySeconds }), react()] as InlineConfig["plugins"],
       resolve: {
-        alias: createShadcnAlias(options.uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never
+        alias: createShadcnAlias(uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never
+      },
+      optimizeDeps: {
+        include: [
+          "react",
+          "react/jsx-runtime",
+          "react/jsx-dev-runtime",
+          "react-dom/client",
+          "motion/react",
+          `${uiPackageName}/button`,
+          `${uiPackageName}/card`,
+          `${uiPackageName}/badge`,
+          `${uiPackageName}/progress`,
+          `${uiPackageName}/theme`
+        ]
       }
     } satisfies InlineConfig
-    session.vite = await createViteServer(viteConfig)
+    await withViteCacheWarmLock(cacheDir, async () => {
+      session.vite = await createViteServer(viteConfig)
+      await warmEntryModuleGraph(session.vite)
+    })
     session.state = "active"
     session.basePath = basePath
     session.updatedAt = new Date()
     session.warming = undefined
     return session
+  }
+
+  async function warmEntryModuleGraph(vite: ViteDevServer) {
+    await vite.warmupRequest("/src/main.tsx")
+    await vite.waitForRequestsIdle()
   }
 
   async function closeSession(session: ShowSession) {
@@ -214,12 +238,31 @@ async function resolveAllowedPackageRoots(nodeModules: string, packageNames: str
   return [...roots]
 }
 
-async function viteCacheDir(dependencyRoot: string, sessionId: string, cacheRoot?: string) {
+async function viteCacheDir(dependencyRoot: string, cacheRoot?: string) {
   const root = resolve(cacheRoot ?? join(dirname(dependencyRoot), ".vite-cache"))
   const digest = createHash("sha256").update(dependencyRoot).digest("hex").slice(0, 16)
-  const cacheDir = join(root, digest, encodeURIComponent(sessionId))
+  const cacheDir = join(root, digest)
   await mkdir(cacheDir, { recursive: true })
   return cacheDir
+}
+
+async function withViteCacheWarmLock<T>(cacheDir: string, callback: () => Promise<T>): Promise<T> {
+  const previous = viteCacheWarmLocks.get(cacheDir) ?? Promise.resolve()
+  let release!: () => void
+  const current = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const tail = previous.catch(() => undefined).then(() => current)
+  viteCacheWarmLocks.set(cacheDir, tail)
+  await previous.catch(() => undefined)
+  try {
+    return await callback()
+  } finally {
+    release()
+    if (viteCacheWarmLocks.get(cacheDir) === tail) {
+      viteCacheWarmLocks.delete(cacheDir)
+    }
+  }
 }
 
 async function findNearestDependencyRoot() {

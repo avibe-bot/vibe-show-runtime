@@ -162,9 +162,15 @@ try {
 }
 `)
 
-  const ensure = await fetch(`${runtime.url}/sessions/smoke/ensure`, { method: "POST" }).then((res) => res.json())
+  const [ensure, secondEnsure] = await Promise.all([
+    fetch(`${runtime.url}/sessions/smoke/ensure`, { method: "POST" }).then((res) => res.json()),
+    fetch(`${runtime.url}/sessions/smoke-two/ensure`, { method: "POST" }).then((res) => res.json())
+  ])
   if (ensure.state !== "active") {
     throw new Error(`Expected active session, got ${ensure.state}`)
+  }
+  if (secondEnsure.state !== "active") {
+    throw new Error(`Expected second active session, got ${secondEnsure.state}`)
   }
   const linkedNodeModules = await readlink(join(root, "smoke", "node_modules"))
   if (linkedNodeModules === join(staleDependencyRoot, "node_modules")) {
@@ -224,7 +230,12 @@ try {
   if (cacheDigestDirs.length !== 1) {
     throw new Error(`Expected one dependency cache namespace, got ${cacheDigestDirs.join(", ")}`)
   }
-  await access(join(cacheRoot, cacheDigestDirs[0], "smoke"))
+  const sharedCacheDir = join(cacheRoot, cacheDigestDirs[0])
+  await access(join(sharedCacheDir, "deps"))
+  const cacheEntries = await readdir(sharedCacheDir)
+  if (cacheEntries.includes("smoke") || cacheEntries.includes("smoke-two")) {
+    throw new Error(`Expected Vite optimized dependency cache to be shared across sessions, got ${cacheEntries.join(", ")}`)
+  }
   try {
     await access(join(root, "smoke", "node_modules", ".vite"))
     throw new Error("Expected Vite optimized dependency cache to stay out of the session workspace")
@@ -447,7 +458,11 @@ try {
   if (cacheDigestDirs.length !== 1) {
     throw new Error(`Expected relative cache root to contain one namespace, got ${cacheDigestDirs.join(", ")}`)
   }
-  await access(join(relativeCacheRoot, cacheDigestDirs[0], "relative"))
+  const sharedRelativeCacheDir = join(relativeCacheRoot, cacheDigestDirs[0])
+  const relativeCacheEntries = await readdir(sharedRelativeCacheDir)
+  if (relativeCacheEntries.includes("relative")) {
+    throw new Error(`Expected relative cacheRoot to share optimized deps across sessions, got ${relativeCacheEntries.join(", ")}`)
+  }
   try {
     await access(join(relativeRoot, "relative", ".vite"))
     throw new Error("Expected relative cacheRoot to resolve outside the session workspace")
