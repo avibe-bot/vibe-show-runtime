@@ -271,9 +271,11 @@ import stackback from "stackback"
 import formatStack from "stackback/formatstack"
 import { workerDep } from "./worker.ts?worker"
 import { absoluteDep } from "/src/root-absolute.ts"
+import rawExample from "./raw-example.ts?raw"
 import type {} from "missing-export-type-package"
 import { type InlineMissingType } from "missing-inline-type-only-package"
 export { type InlineMissingExportType } from "missing-inline-export-type-only-package"
+const eagerPages = import.meta.glob("./pages/*.tsx", { eager: true })
 // import "missing-commented-only-package"
 /* import "missing-block-comment-only-package" */
 const snippet = 'import "missing-string-only-package"'
@@ -282,7 +284,7 @@ export const stackDepth = stackback().length
 export const formattedStack = formatStack([])
 export const workerDependency = workerDep
 export const rootAbsoluteDependency = absoluteDep
-export const snippets = [snippet, templateSnippet]
+export const snippets = [snippet, templateSnippet, rawExample, eagerPages]
 export type { SmokeType }
 `)
   await writeFile(join(root, "smoke", "src", "worker.ts"), `import { nanoid } from "nanoid/non-secure"
@@ -292,6 +294,15 @@ export const workerDep = nanoid
   await writeFile(join(root, "smoke", "src", "root-absolute.ts"), `import pc from "picocolors"
 
 export const absoluteDep = pc.green
+`)
+  await mkdir(join(root, "smoke", "src", "pages"), { recursive: true })
+  await writeFile(join(root, "smoke", "src", "pages", "globbed.tsx"), `import MagicString from "magic-string"
+
+export const globbedDependency = MagicString
+`)
+  await writeFile(join(root, "smoke", "src", "raw-example.ts"), `import "missing-raw-only-package"
+
+export const rawOnly = true
 `)
   await writeFile(join(root, "smoke", "src", "App.tsx"), `import { stackDepth } from "./extra-dep"
 
@@ -331,14 +342,27 @@ export default function App() {
   if (!extraCacheDeps.some((entry) => entry.startsWith("picocolors"))) {
     throw new Error(`Expected root-absolute imports to scan reachable source dependencies, got cache deps: ${extraCacheDeps.join(", ")}`)
   }
-  if (extraCacheDeps.some((entry) => entry.startsWith("missing-string-only-package") || entry.startsWith("missing-template-only-package"))) {
-    throw new Error(`Expected import-like string literals to stay out of optimized deps, got cache deps: ${extraCacheDeps.join(", ")}`)
+  if (!extraCacheDeps.some((entry) => entry.startsWith("magic-string"))) {
+    throw new Error(`Expected Vite glob imports to scan reachable source dependencies, got cache deps: ${extraCacheDeps.join(", ")}`)
+  }
+  if (
+    extraCacheDeps.some((entry) =>
+      entry.startsWith("missing-string-only-package") ||
+      entry.startsWith("missing-template-only-package") ||
+      entry.startsWith("missing-raw-only-package")
+    )
+  ) {
+    throw new Error(`Expected import-like string literals and raw imports to stay out of optimized deps, got cache deps: ${extraCacheDeps.join(", ")}`)
   }
 
-  await writeFile(join(root, "smoke", "index.html"), `<div id="root"></div><script type="module" src="/src/demo.tsx"></script>`)
-  await writeFile(join(root, "smoke", "src", "demo.tsx"), `import ms from "magic-string"
+  await writeFile(join(root, "smoke", "index.html"), `<div id="root"></div><!-- <script type="module" src="/src/commented-demo.tsx"></script> --><script type="module" src="/src/demo.tsx"></script>`)
+  await writeFile(join(root, "smoke", "src", "main.tsx"), `import "missing-unused-main-package"
+`)
+  await writeFile(join(root, "smoke", "src", "demo.tsx"), `import { customAlphabet } from "nanoid"
 
-export const demo = new ms("").toString()
+export const demo = customAlphabet("abc")
+`)
+  await writeFile(join(root, "smoke", "src", "commented-demo.tsx"), `import "missing-commented-html-entry-package"
 `)
   const customEntryEnsure = await fetch(`${runtime.url}/sessions/smoke/ensure`, { method: "POST" }).then((res) => res.json())
   if (customEntryEnsure.state !== "active") {
@@ -347,8 +371,16 @@ export const demo = new ms("").toString()
   const customEntryCacheDigestDirs = await readdir(cacheRoot)
   const customEntryCacheDir = customEntryCacheDigestDirs.find((dir) => !updatedCacheDigestDirs.includes(dir))
   const customEntryCacheDeps = customEntryCacheDir ? await readdir(join(cacheRoot, customEntryCacheDir, "deps")) : []
-  if (!customEntryCacheDeps.some((entry) => entry.startsWith("magic-string"))) {
+  if (!customEntryCacheDeps.some((entry) => entry.startsWith("nanoid"))) {
     throw new Error(`Expected customized HTML entries to scan their dependencies, got cache deps: ${customEntryCacheDeps.join(", ")}`)
+  }
+  if (
+    customEntryCacheDeps.some((entry) =>
+      entry.startsWith("missing-unused-main-package") ||
+      entry.startsWith("missing-commented-html-entry-package")
+    )
+  ) {
+    throw new Error(`Expected custom HTML warmup to ignore unused and commented entries, got cache deps: ${customEntryCacheDeps.join(", ")}`)
   }
 
   const eventResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {

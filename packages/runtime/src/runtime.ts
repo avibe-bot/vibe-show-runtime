@@ -1,5 +1,5 @@
-import { access, lstat, mkdir, readFile, readlink, realpath, rm, symlink } from "node:fs/promises"
-import { dirname, extname, join, resolve } from "node:path"
+import { access, lstat, mkdir, readFile, readdir, readlink, realpath, rm, symlink } from "node:fs/promises"
+import { dirname, extname, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
 import react from "@vitejs/plugin-react"
@@ -136,7 +136,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     } satisfies InlineConfig
     await withViteCacheWarmLock(cacheDir, async () => {
       session.vite = await createViteServer(viteConfig)
-      await warmEntryModuleGraph(session.vite)
+      await warmEntryModuleGraph(session.vite, sourceDependencies.entryRequests)
     })
     session.state = "active"
     session.basePath = basePath
@@ -146,8 +146,10 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     return session
   }
 
-  async function warmEntryModuleGraph(vite: ViteDevServer) {
-    await vite.warmupRequest("/src/main.tsx")
+  async function warmEntryModuleGraph(vite: ViteDevServer, entryRequests: string[]) {
+    for (const entryRequest of entryRequests) {
+      await vite.warmupRequest(entryRequest)
+    }
     await vite.waitForRequestsIdle()
   }
 
@@ -255,6 +257,7 @@ async function resolveAllowedPackageRoots(nodeModules: string, packageNames: str
 }
 
 type SourceDependencies = {
+  entryRequests: string[]
   extraBareImports: string[]
   signature: string
 }
@@ -264,7 +267,8 @@ const HTML_MODULE_SCRIPT_RE = /<script\b(?=[^>]*\btype\s*=\s*["']module["'])(?=[
 
 async function sourceDependenciesForWorkspace(workspace: string, uiPackageName: string): Promise<SourceDependencies> {
   const extraBareImports = new Set<string>()
-  for (const sourceFile of await reachableSourceFiles(await workspaceEntryFiles(workspace), workspace)) {
+  const entries = await workspaceEntryFiles(workspace)
+  for (const sourceFile of await reachableSourceFiles(entries.map((entry) => entry.file), workspace)) {
     const source = await readFile(sourceFile, "utf8")
     for (const { specifier } of importSpecifiers(source)) {
       if (isRuntimeManagedImport(specifier, uiPackageName)) {
@@ -277,6 +281,7 @@ async function sourceDependenciesForWorkspace(workspace: string, uiPackageName: 
   }
   const sorted = [...extraBareImports].sort()
   return {
+    entryRequests: entries.map((entry) => entry.request),
     extraBareImports: sorted,
     signature: sorted.length ? createHash("sha256").update(sorted.join("\n")).digest("hex").slice(0, 16) : "shared"
   }
@@ -286,23 +291,24 @@ async function sourceDependencySignature(workspace: string, uiPackageName: strin
   return (await sourceDependenciesForWorkspace(workspace, uiPackageName)).signature
 }
 
-async function workspaceEntryFiles(workspace: string): Promise<string[]> {
-  const entries = new Set<string>()
+async function workspaceEntryFiles(workspace: string): Promise<Array<{ file: string; request: string }>> {
+  const entries = new Map<string, { file: string; request: string }>()
   try {
-    const html = await readFile(join(workspace, "index.html"), "utf8")
+    const html = stripHtmlComments(await readFile(join(workspace, "index.html"), "utf8"))
     for (const match of html.matchAll(HTML_MODULE_SCRIPT_RE)) {
       const sourcePath = workspaceLocalImportPath(workspace, workspace, match[1])
       if (sourcePath) {
-        entries.add(sourcePath)
+        entries.set(sourcePath, { file: sourcePath, request: normalizeViteRequestPath(match[1]) })
       }
     }
   } catch {
     // Fall back to the runtime-owned client shell when index.html is absent.
   }
   if (!entries.size) {
-    entries.add(join(workspace, "src", "main.tsx"))
+    const fallback = join(workspace, "src", "main.tsx")
+    entries.set(fallback, { file: fallback, request: "/src/main.tsx" })
   }
-  return [...entries]
+  return [...entries.values()]
 }
 
 async function reachableSourceFiles(entries: string[], workspace: string): Promise<string[]> {
@@ -325,6 +331,9 @@ async function reachableSourceFiles(entries: string[], workspace: string): Promi
       if (localPath) {
         queue.push(localPath)
       }
+    }
+    for (const localPath of await globSourceFiles(workspace, dirname(file), importGlobSpecifiers(source))) {
+      queue.push(localPath)
     }
   }
   return [...seen]
@@ -395,6 +404,25 @@ function importSpecifiers(source: string) {
       if (specifierToken?.kind === "string") {
         specifiers.push({ specifier: specifierToken.value })
       }
+    }
+  }
+  return specifiers
+}
+
+function importGlobSpecifiers(source: string) {
+  const specifiers: string[] = []
+  const tokens = javascriptTokens(source)
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (
+      tokens[index].value === "import" &&
+      tokens[index + 1]?.value === "." &&
+      tokens[index + 2]?.value === "meta" &&
+      tokens[index + 3]?.value === "." &&
+      tokens[index + 4]?.value === "glob" &&
+      tokens[index + 5]?.value === "(" &&
+      tokens[index + 6]?.kind === "string"
+    ) {
+      specifiers.push(tokens[index + 6].value)
     }
   }
   return specifiers
@@ -542,6 +570,9 @@ function isTypeOnlyImportClause(tokens: JavaScriptToken[]) {
 }
 
 function workspaceLocalImportPath(workspace: string, importerDir: string, specifier: string) {
+  if (!isExecutableSourceSpecifier(specifier)) {
+    return undefined
+  }
   const path = stripViteImportSuffix(specifier)
   if (path.startsWith("./") || path.startsWith("../")) {
     return resolve(importerDir, path)
@@ -552,9 +583,87 @@ function workspaceLocalImportPath(workspace: string, importerDir: string, specif
   return undefined
 }
 
+async function globSourceFiles(workspace: string, importerDir: string, specifiers: string[]) {
+  const files = new Set<string>()
+  for (const specifier of specifiers) {
+    const basePath = workspaceLocalImportPath(workspace, importerDir, specifier)
+    if (!basePath) {
+      continue
+    }
+    const pattern = normalizePath(relative(workspace, basePath))
+    for (const file of await sourceFilesUnder(workspace)) {
+      const relativeFile = normalizePath(relative(workspace, file))
+      if (globMatches(pattern, relativeFile)) {
+        files.add(file)
+      }
+    }
+  }
+  return [...files]
+}
+
+async function sourceFilesUnder(root: string) {
+  const files: string[] = []
+  async function visit(directory: string) {
+    let entries = []
+    try {
+      entries = await readdir(directory, { encoding: "utf8", withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (entry.name === "node_modules" || entry.name === ".git" || entry.name === "dist") {
+        continue
+      }
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) {
+        await visit(path)
+      } else if (entry.isFile() && SOURCE_DEPENDENCY_EXTENSIONS.has(extname(path))) {
+        files.push(path)
+      }
+    }
+  }
+  await visit(root)
+  return files
+}
+
+function globMatches(pattern: string, value: string) {
+  const regex = new RegExp(`^${pattern.split(/(\*\*)|(\*)/g).filter(Boolean).map((part) => {
+    if (part === "**") return ".*"
+    if (part === "*") return "[^/]*"
+    return escapeRegExp(part)
+  }).join("")}$`)
+  return regex.test(value)
+}
+
+function stripHtmlComments(source: string) {
+  return source.replace(/<!--[\s\S]*?-->/g, "")
+}
+
 function stripViteImportSuffix(specifier: string) {
   const queryIndex = specifier.search(/[?#]/)
   return queryIndex === -1 ? specifier : specifier.slice(0, queryIndex)
+}
+
+function isExecutableSourceSpecifier(specifier: string) {
+  const suffix = specifier.match(/[?#](.*)$/)?.[1]
+  if (!suffix) {
+    return true
+  }
+  const params = new URLSearchParams(suffix.replace(/^#/, ""))
+  return params.has("worker") || params.has("sharedworker")
+}
+
+function normalizeViteRequestPath(path: string) {
+  const normalized = stripViteImportSuffix(path)
+  return normalized.startsWith("/") ? normalized : `/${normalized}`
+}
+
+function normalizePath(path: string) {
+  return path.split(sep).join("/")
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
 function isIdentifierStart(char: string) {
