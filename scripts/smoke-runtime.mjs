@@ -1,5 +1,6 @@
-import { access, mkdtemp, mkdir, readFile, readlink, readdir, symlink, writeFile, rm } from "node:fs/promises"
+import { access, cp, mkdtemp, mkdir, readFile, readlink, readdir, symlink, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
+import { pathToFileURL } from "node:url"
 import { join, relative } from "node:path"
 import vm from "node:vm"
 import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
@@ -732,6 +733,54 @@ try {
   await relativeRuntime.close()
   await rm(relativeRoot, { recursive: true, force: true })
   await rm(relativeCacheRoot, { recursive: true, force: true })
+}
+
+const archiveLikeRoot = await mkdtemp(join(tmpdir(), "avibe-show-runtime-archive-like-"))
+try {
+  await mkdir(join(archiveLikeRoot, "packages"), { recursive: true })
+  for (const name of ["runtime", "ui", "sdk"]) {
+    await mkdir(join(archiveLikeRoot, "packages", name), { recursive: true })
+    await cp(join(process.cwd(), "packages", name, "package.json"), join(archiveLikeRoot, "packages", name, "package.json"))
+    await cp(join(process.cwd(), "packages", name, "dist"), join(archiveLikeRoot, "packages", name, "dist"), { recursive: true })
+  }
+  await cp(join(process.cwd(), "node_modules"), join(archiveLikeRoot, "node_modules"), {
+    recursive: true,
+    filter: (source) => !source.includes(`${join("node_modules", "@avibe")}`)
+  })
+  await mkdir(join(archiveLikeRoot, "node_modules", "@avibe"), { recursive: true })
+  await symlink("../../packages/runtime", join(archiveLikeRoot, "node_modules", "@avibe", "show-runtime"), "junction")
+  await symlink("../../packages/ui", join(archiveLikeRoot, "node_modules", "@avibe", "show-ui"), "junction")
+  await symlink("../../packages/sdk", join(archiveLikeRoot, "node_modules", "@avibe", "show-sdk"), "junction")
+  await mkdir(join(archiveLikeRoot, "packages", "runtime", "node_modules"), { recursive: true })
+  await cp(join(process.cwd(), "node_modules", "esbuild"), join(archiveLikeRoot, "packages", "runtime", "node_modules", "esbuild"), { recursive: true })
+  await cp(join(process.cwd(), "node_modules", "@esbuild"), join(archiveLikeRoot, "packages", "runtime", "node_modules", "@esbuild"), { recursive: true })
+
+  const archiveWorkspaceRoot = join(archiveLikeRoot, ".show")
+  const archiveCacheRoot = join(archiveLikeRoot, ".cache")
+  const { startShowRuntimeServer: startArchiveLikeRuntimeServer } = await import(pathToFileURL(join(archiveLikeRoot, "packages", "runtime", "dist", "server.js")).href)
+  const archiveLikeRuntime = await startArchiveLikeRuntimeServer({
+    workspaceRoot: archiveWorkspaceRoot,
+    cacheRoot: archiveCacheRoot,
+    fallbackDelaySeconds: 30
+  })
+  try {
+    const html = await loadAppEntry(archiveLikeRuntime.url, "archive-like")
+    if (!html.includes("/_show-runtime/vendor/")) {
+      throw new Error("Expected archive-like runtime to inject shared vendor assets")
+    }
+    const vendorReactUrl = html.match(/"react"\s*:\s*"(\/_show-runtime\/vendor\/[^"]+)"/)?.[1]
+    if (!vendorReactUrl) {
+      throw new Error("Expected archive-like runtime import map to include react")
+    }
+    const vendorReact = await fetch(`${archiveLikeRuntime.url}${vendorReactUrl}`)
+    if (vendorReact.status !== 200) {
+      throw new Error(`Expected archive-like runtime vendor React asset to load, got ${vendorReact.status}`)
+    }
+  } finally {
+    await archiveLikeRuntime.close()
+  }
+} finally {
+  await rm(archiveLikeRoot, { recursive: true, force: true })
 }
 
 async function readUntil(reader, needle) {

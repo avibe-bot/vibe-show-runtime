@@ -13,6 +13,7 @@ const archivePath = join(outDir, `vibe-show-runtime-node-${platform}.tgz`)
 const packages = ["runtime", "ui", "sdk"]
 const isWindows = process.platform === "win32"
 const rootPackage = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"))
+const rootLockfile = JSON.parse(readFileSync(join(repoRoot, "package-lock.json"), "utf8"))
 const nodeEngine = rootPackage.engines?.node
 
 if (!nodeEngine) {
@@ -46,10 +47,11 @@ try {
           "@avibe/show-runtime": "file:./packages/runtime",
           "@avibe/show-ui": "file:./packages/ui",
           "@avibe/show-sdk": "file:./packages/sdk",
-          "@vitejs/plugin-react": "^5.1.1",
-          react: "^19.2.0",
-          "react-dom": "^19.2.0",
-          vite: "^7.2.4"
+          "@vitejs/plugin-react": lockedDependencyVersion("@vitejs/plugin-react"),
+          esbuild: lockedDependencyVersion("esbuild"),
+          react: lockedDependencyVersion("react"),
+          "react-dom": lockedDependencyVersion("react-dom"),
+          vite: lockedDependencyVersion("vite")
         }
       },
       null,
@@ -63,6 +65,8 @@ try {
     stdio: "inherit",
     shell: isWindows
   })
+  assertNoNestedPackageInstalls(stage)
+  assertBundleDependencyRoot(stage)
 
   mkdirSync(outDir, { recursive: true })
   rmSync(archivePath, { force: true })
@@ -73,6 +77,44 @@ try {
   console.log(`Wrote ${archivePath}`)
 } finally {
   rmSync(stage, { recursive: true, force: true })
+}
+
+function assertNoNestedPackageInstalls(root) {
+  const nested = []
+  for (const name of packages) {
+    const nodeModules = join(root, "packages", name, "node_modules")
+    if (existsSync(nodeModules)) {
+      nested.push(nodeModules)
+    }
+  }
+  if (nested.length) {
+    throw new Error(
+      `Show Runtime bundle must use one shared dependency root; unexpected nested installs: ${nested.join(", ")}`
+    )
+  }
+}
+
+function assertBundleDependencyRoot(root) {
+  const required = [
+    "react",
+    "react-dom",
+    "@avibe/show-runtime",
+    "@avibe/show-ui",
+    "@avibe/show-sdk"
+  ]
+  const missing = required.filter((name) => !existsSync(join(root, "node_modules", ...name.split("/"), "package.json")))
+  if (missing.length) {
+    throw new Error(`Show Runtime bundle is missing shared dependencies: ${missing.join(", ")}`)
+  }
+}
+
+function lockedDependencyVersion(packageName) {
+  const packagePath = `node_modules/${packageName}`
+  const version = rootLockfile.packages?.[packagePath]?.version
+  if (!version) {
+    throw new Error(`Missing locked package version for ${packageName}`)
+  }
+  return version
 }
 
 function runtimePlatform() {
