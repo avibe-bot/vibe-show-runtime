@@ -180,7 +180,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     await ensureSessionTemplate(session.workspace)
     logTiming("warmSession.template", session.id, templateStarted)
     const uiPackageName = options.uiPackageName ?? "@avibe/show-ui"
-    const dependencyRoot = await resolveDependencyRoot(options.dependencyRoot)
+    const dependencyRoot = await resolveDependencyRoot(options.dependencyRoot, uiPackageName)
     const vendorStarted = performance.now()
     const bundle = await ensureVendorBundle({
       dependencyRoot,
@@ -1224,22 +1224,55 @@ async function withViteCacheWarmLock<T>(cacheDir: string, callback: () => Promis
 }
 
 /** Resolve the dependency root whose `node_modules` is the shared, pinned install. */
-async function resolveDependencyRoot(dependencyRoot?: string): Promise<string> {
-  return dependencyRoot ? resolve(dependencyRoot) : await findNearestDependencyRoot()
+async function resolveDependencyRoot(dependencyRoot?: string, uiPackageName = "@avibe/show-ui"): Promise<string> {
+  if (!dependencyRoot) {
+    return await findNearestDependencyRoot(uiPackageName)
+  }
+  const root = resolve(dependencyRoot)
+  const missing = await missingDependencyRootPackages(root, uiPackageName)
+  if (missing.length) {
+    throw new Error(`Invalid Show Runtime dependency root ${root}: missing ${missing.join(", ")}`)
+  }
+  return root
 }
 
-async function findNearestDependencyRoot() {
+async function findNearestDependencyRoot(uiPackageName = "@avibe/show-ui") {
   let current = dirname(fileURLToPath(import.meta.url))
+  const skipped: string[] = []
   while (current !== dirname(current)) {
     const candidate = join(current, "node_modules")
     try {
       await access(candidate)
-      return current
+      const missing = await missingDependencyRootPackages(current, uiPackageName)
+      if (missing.length === 0) {
+        return current
+      }
+      skipped.push(`${candidate} (missing ${missing.join(", ")})`)
     } catch {
-      current = dirname(current)
+      // No node_modules at this level.
+    }
+    current = dirname(current)
+  }
+  const detail = skipped.length ? `; skipped incomplete candidates: ${skipped.join("; ")}` : ""
+  throw new Error(`Unable to locate shared node_modules for Show Runtime${detail}`)
+}
+
+async function missingDependencyRootPackages(dependencyRoot: string, uiPackageName: string): Promise<string[]> {
+  const required = ["react", "react-dom", uiPackageName, "@avibe/show-sdk"]
+  const missing: string[] = []
+  for (const packageName of required) {
+    const packageJson = join(packageRoot(dependencyRoot, packageName), "package.json")
+    try {
+      await access(packageJson)
+    } catch {
+      missing.push(packageName)
     }
   }
-  throw new Error("Unable to locate shared node_modules for Show Runtime")
+  return missing
+}
+
+function packageRoot(dependencyRoot: string, packageName: string) {
+  return packageName.split("/").reduce((current, part) => join(current, part), join(dependencyRoot, "node_modules"))
 }
 
 export function toStatus(session: ShowSession): ShowSessionStatus {
