@@ -2,6 +2,7 @@ export const DEFAULT_MARK_SCOPE = "default"
 export const MARK_ATTRIBUTE_PREFIX = "mark-"
 export const DEFAULT_SHOW_EVENTS_PATH = "__show/events"
 export const SHOW_EVENT_WRITE_TOKEN_HEADER = "X-Vibe-Show-Token"
+export * from "./local-decisions.js"
 
 export type ShowActor = "human" | "assistant" | "system"
 export type MarkRole = "human" | "assistant"
