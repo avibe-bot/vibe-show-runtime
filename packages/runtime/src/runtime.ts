@@ -32,8 +32,10 @@ import { createDependencyResolver, pruneSupersededCacheDirs, type DependencyReso
 
 const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000
 const DEFAULT_IDLE_PRUNE_INTERVAL_MS = 5 * 60 * 1000
-/** Extra slack added to the cache-GC age cutoff so it trails an idle session's async close (#31). */
-const CACHE_GC_TRAILING_MARGIN_MS = 60 * 1000
+/** Slack added to the cache-GC age cutoff (#31). An hour, deliberately: reclaiming disk an hour
+ * later is free, but the wide margin makes every sub-hour touch/close/reuse race irrelevant — a
+ * dir is only ever deleted long after any live process could still be resolving or closing it. */
+const CACHE_GC_TRAILING_MARGIN_MS = 60 * 60 * 1000
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 const viteCacheWarmLocks = new Map<string, Promise<void>>()
 // One shared-install resolver per `node_modules` dir, built lazily on the first extras
@@ -107,9 +109,6 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     const dependencySignature = existing.state === "active" ? await sourceDependencySignature(existing.workspace, options.uiPackageName ?? "@avibe/show-ui") : undefined
     if (existing.state === "active" && existing.basePath === normalizedBasePath && existing.dependencySignature === dependencySignature) {
       existing.updatedAt = new Date()
-      // Keep this session's cache dirs fresh so the age-based GC treats them as live (#31).
-      void touchDir(existing.cacheDir)
-      if (vendorBundle) void touchDir(vendorBundle.result.outDir)
       logTiming("ensureSession", sessionId, started, { state: "active", reused: true })
       return toStatus(existing)
     }
@@ -189,11 +188,13 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     return session
   }
 
-  /** A session whose Vite server is live is still serving from its cache dir — including one in
-   * `closing`, whose server stays up until `waitForRequestsIdle()` + `vite.close()` finish. A
-   * suspended/closed session has had its `vite` cleared, so its dir is free to age out. */
+  /** A session is "serving" — and its cache dir must be kept live — unless it has reached a terminal
+   * state that released the dir. `closing` keeps its Vite server up until `waitForRequestsIdle()` +
+   * `vite.close()` finish, and `warming`/`created`/`active` all own the dir; only `idle`/`suspended`
+   * have let go. Keyed on STATE, not the transient `vite` pointer, so the async close window is
+   * covered structurally rather than by timing (#31). */
   function isSessionServing(session: ShowSession): boolean {
-    return Boolean(session.vite)
+    return session.state !== "idle" && session.state !== "suspended"
   }
 
   // Refresh the mtime of every cache dir this process still owns so the age-based GC (#31) never
@@ -221,12 +222,11 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   // longer than the cutoff — provably abandoned, since a live dir is touched on warm/access and by
   // the heartbeat. Never throws.
   async function pruneRuntimeCaches(): Promise<void> {
-    // The cutoff must exceed BOTH how long a dir can stay live untouched and the touch cadence:
-    // it trails the idle pruner (idleTtlMs + a cycle to run and close the session) AND the
-    // maintenance heartbeat (maintenanceIntervalMs — not idlePruneIntervalMs, which is 0 when idle
-    // pruning is disabled while the heartbeat still runs), plus a margin for the async close. Any
-    // smaller and a peer could age-delete a dir this process is still serving between heartbeats.
-    const maxAgeMs = idleTtlMs + maintenanceIntervalMs + CACHE_GC_TRAILING_MARGIN_MS
+    // The cutoff must exceed how long a live dir can go untouched: the longer of the maintenance
+    // heartbeat cadence and the idle-prune cadence, on top of the idle TTL a session can sit before
+    // it's pruned, plus an hour of slack. The heartbeat runs even when idle pruning is disabled, so
+    // it (not idlePruneIntervalMs) is the real touch cadence — take the max to be safe either way.
+    const maxAgeMs = idleTtlMs + Math.max(maintenanceIntervalMs, idlePruneIntervalMs) + CACHE_GC_TRAILING_MARGIN_MS
     try {
       if (vendorBundle) {
         await pruneSupersededCacheDirs(dirname(vendorBundle.result.outDir), {
@@ -276,11 +276,9 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     session.cacheDir = cacheDir
     viteCacheRoots.add(dirname(cacheDir))
     logTiming("warmSession.cacheDir", session.id, cacheStarted, { cacheDir })
-    // Mark the vendor + Vite dirs we're about to serve from as live (#31), then reclaim identity
-    // dirs untouched for longer than the idle TTL. Touch-before-prune is what makes the GC safe
-    // across concurrent servers: any dir a live session (here or in a peer) uses stays recent.
-    await touchDir(bundle.result.outDir)
-    await touchDir(cacheDir)
+    // The vendor + Vite dirs this warm serves from were already touched at their resolution
+    // chokepoints (ensureVendorBundle / viteCacheDir), so we can reclaim abandoned identity dirs
+    // now — anything untouched past the (hours-wide) cutoff belongs to no live process (#31).
     void pruneRuntimeCaches()
     const viteConfig = {
       base: basePath,
@@ -1347,6 +1345,10 @@ async function viteCacheDir(dependencyRoot: string, cacheRoot: string | undefine
   const digest = createHash("sha256").update(`${dependencyRoot}\0${dependencySignature}\0${vendorHash}`).digest("hex").slice(0, 16)
   const cacheDir = join(root, digest)
   await mkdir(cacheDir, { recursive: true })
+  // Single liveness chokepoint for the Vite optimize cache (#31): every resolution of a session's
+  // cache dir passes through here, so touching on resolve makes "any use ⟹ recently touched" a
+  // structural guarantee, mirroring ensureVendorBundle for the vendor pool.
+  await touchDir(cacheDir)
   return cacheDir
 }
 

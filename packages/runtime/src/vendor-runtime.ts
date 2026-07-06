@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises"
+import { readFile, utimes } from "node:fs/promises"
 import { dirname, join, normalize, resolve, sep } from "node:path"
 import { createHash } from "node:crypto"
 import type { ServerResponse } from "node:http"
@@ -63,14 +63,25 @@ export function ensureVendorBundle(options: EnsureVendorBundleOptions): Promise<
   const vendorCacheRoot = resolve(options.vendorCacheRoot)
   const cacheKey = `${dependencyRoot}\0${uiPackageName}\0${vendorCacheRoot}`
   const cached = vendorBundles.get(cacheKey)
-  if (cached) return cached
+  // Single liveness chokepoint for the vendor pool (#31): every resolution of the bundle to
+  // serve — memo hit OR a fresh/reused build — passes through here, so touching the out dir on
+  // resolve makes "any use ⟹ recently touched" a structural guarantee. The cache GC then only
+  // reaps dirs no live process has resolved within the (hours-wide) age cutoff.
+  if (cached) return cached.then(touchVendorOutDir)
   const built = buildVendorBundle(dependencyRoot, uiPackageName, vendorCacheRoot).catch((error) => {
     // Don't cache a failed build — let the next warm retry.
     if (vendorBundles.get(cacheKey) === built) vendorBundles.delete(cacheKey)
     throw error
   })
   vendorBundles.set(cacheKey, built)
-  return built
+  return built.then(touchVendorOutDir)
+}
+
+/** Mark a resolved vendor bundle's out dir live for the cache GC (#31). Best-effort; never throws. */
+async function touchVendorOutDir(bundle: VendorBundle): Promise<VendorBundle> {
+  const now = new Date()
+  await utimes(bundle.result.outDir, now, now).catch(() => {})
+  return bundle
 }
 
 async function buildVendorBundle(dependencyRoot: string, uiPackageName: string, vendorCacheRoot: string): Promise<VendorBundle> {
