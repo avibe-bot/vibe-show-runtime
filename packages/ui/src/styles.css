@@ -1,3 +1,18 @@
+/*
+ * Pin the cascade layer order FIRST, before any rules. Layer priority is fixed by the
+ * order layers are first declared in the document, and this file is imported BEFORE the
+ * workspace `styles.css` that pulls in `@import "tailwindcss";`. Tailwind v4 emits
+ * `@layer theme, base, components, utilities;`, so declaring the same order here keeps
+ * `base` (preflight) below `components` (these rules) — components render unchanged — while
+ * `utilities` stays above `components`, so a Tailwind utility on a component (e.g.
+ * `<Button className="bg-red-500">`) wins over the component default. Unlayered author CSS
+ * still beats every layer. Custom properties live in the layer too: they don't collide
+ * with Tailwind's `--tw-*`/`--color-*` namespace, and `ThemeProvider` sets `--avs-*` via
+ * inline styles (which outrank any layer), so theming is unaffected.
+ */
+@layer theme, base, components, utilities;
+
+@layer components {
 :root,
 .avs-theme {
   --avs-background: 0 0% 100%;
@@ -250,4 +265,5 @@
     width: 100%;
     border-radius: 1.125rem 1.125rem 0 0;
   }
+}
 }

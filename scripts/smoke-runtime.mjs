@@ -219,6 +219,23 @@ try {
   if (vendorReact.status !== 200 || !(vendorReact.headers.get("content-type") || "").includes("javascript")) {
     throw new Error(`Expected vendor react asset served as JS, got ${vendorReact.status} ${vendorReact.headers.get("content-type")}`)
   }
+  // The bundled @avibe/show-ui CSS must ship inside a cascade layer so Tailwind utilities
+  // can override component defaults. It must (a) pin the layer order first — matching
+  // Tailwind v4's `theme, base, components, utilities` — so preflight (base) stays below
+  // the component rules, and (b) wrap the `.avs-*` rules in `@layer components`. Without
+  // the pin, importing this file before the workspace `@import "tailwindcss";` would put
+  // `components` first (lowest priority) and preflight would break every component.
+  const vendorCssUrl = app.match(/href="(\/_show-runtime\/vendor\/[^"]+\.css)"/)[1]
+  const vendorCss = await fetch(`${runtime.url}${vendorCssUrl}`).then((res) => res.text())
+  if (!/@layer\s+theme\s*,\s*base\s*,\s*components\s*,\s*utilities\s*;/.test(vendorCss)) {
+    throw new Error(`Expected bundled show-ui CSS to pin the layer order (theme, base, components, utilities), got: ${vendorCss.slice(0, 120)}`)
+  }
+  if (!/@layer\s+components\s*\{/.test(vendorCss) || !vendorCss.includes(".avs-button")) {
+    throw new Error("Expected bundled show-ui CSS to wrap the .avs-* component rules in @layer components")
+  }
+  if (vendorCss.indexOf("@layer theme") > vendorCss.indexOf("@layer components")) {
+    throw new Error("Expected the layer-order pin to precede the @layer components block in the bundled show-ui CSS")
+  }
   if (!(vendorReact.headers.get("cache-control") || "").includes("immutable")) {
     throw new Error("Expected content-hashed vendor asset to be served with an immutable cache-control")
   }

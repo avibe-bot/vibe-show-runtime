@@ -17,6 +17,7 @@ export default function App() {
           <span className="inline-flex items-center gap-2 rounded-md bg-emerald-500/10 px-3 py-1 text-sm font-medium text-emerald-700">
             Tailwind utility classes are built in
           </span>
+          <Button className="bg-emerald-600 text-white">A utility className overrides the component default</Button>
         </section>
         <section className="grid">
           <Card>
