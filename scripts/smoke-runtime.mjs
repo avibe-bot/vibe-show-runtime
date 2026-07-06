@@ -1,4 +1,4 @@
-import { access, cp, mkdtemp, mkdir, readFile, readlink, readdir, symlink, writeFile, rm } from "node:fs/promises"
+import { access, cp, lstat, mkdtemp, mkdir, readFile, readlink, readdir, symlink, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { join, relative } from "node:path"
@@ -813,6 +813,58 @@ export default function App() {
   for (const rule of [".px-3", ".py-1", ".inline-flex"]) {
     if (!builtCss.includes(rule)) {
       throw new Error(`Expected the example's built CSS to include the "${rule}" utility (build path silently unstyled otherwise)`)
+    }
+  }
+
+  // (6) A legacy styles.css whose Tailwind import is COMMENTED OUT must still migrate:
+  // detection ignores comments, so a real import is prepended (else it stays unstyled).
+  await mkdir(join(root, "tailwind-commented", "src"), { recursive: true })
+  await writeFile(join(root, "tailwind-commented", "src", "styles.css"), `/* @import "tailwindcss"; */\nbody { margin: 0; }\n`)
+  await writeFile(join(root, "tailwind-commented", "src", "App.tsx"), `export default function App() {
+  return <main className="p-5">commented</main>
+}
+`)
+  const commentedEnsure = await fetch(`${runtime.url}/sessions/tailwind-commented/ensure`, { method: "POST" }).then((res) => res.json())
+  if (commentedEnsure.state !== "active") {
+    throw new Error(`Expected commented-import session to warm active, got ${JSON.stringify(commentedEnsure)}`)
+  }
+  const commentedStyles = await readFile(join(root, "tailwind-commented", "src", "styles.css"), "utf8")
+  if (!commentedStyles.startsWith(`@import "tailwindcss";`)) {
+    throw new Error(`Expected a real Tailwind import prepended over a commented-out one, got ${JSON.stringify(commentedStyles.slice(0, 60))}`)
+  }
+  const commentedCss = await fetch(`${runtime.url}/sessions/tailwind-commented/app/src/styles.css?direct`).then((res) => res.text())
+  if (!commentedCss.includes(".p-5")) {
+    throw new Error("Expected utilities to emit after migrating a commented-out Tailwind import")
+  }
+
+  // (7) An extra that pulls `tailwindcss` in transitively leaves a (possibly mismatched)
+  // real copy in the private node_modules; the runtime must replace it with the shared,
+  // runtime-owned package so `@import "tailwindcss";` resolves the matching v4 engine.
+  await mkdir(join(root, "tailwind-transitive", "src"), { recursive: true })
+  await mkdir(join(root, "tailwind-transitive", "fake-tw"), { recursive: true })
+  await writeFile(join(root, "tailwind-transitive", "fake-tw", "package.json"), `${JSON.stringify({ name: "tailwindcss", version: "3.9.9", main: "index.js" })}\n`)
+  await writeFile(join(root, "tailwind-transitive", "fake-tw", "index.js"), "module.exports = {}\n")
+  await mkdir(join(root, "tailwind-transitive", "extra-pkg"), { recursive: true })
+  await writeFile(join(root, "tailwind-transitive", "extra-pkg", "package.json"), `${JSON.stringify({ name: "show-extra-with-tw", version: "1.0.0", type: "module", main: "index.js", dependencies: { tailwindcss: "file:../fake-tw" } })}\n`)
+  await writeFile(join(root, "tailwind-transitive", "extra-pkg", "index.js"), `export const marker = "with-tw"\n`)
+  await writeFile(join(root, "tailwind-transitive", "package.json"), `${JSON.stringify({ name: "tailwind-transitive-page", private: true, dependencies: { "show-extra-with-tw": "file:./extra-pkg" } })}\n`)
+  await writeFile(join(root, "tailwind-transitive", "src", "App.tsx"), `import { marker } from "show-extra-with-tw"
+export default function App() {
+  return <main className="flex gap-4 p-6">{marker}</main>
+}
+`)
+  const transitiveEnsure = await fetch(`${runtime.url}/sessions/tailwind-transitive/ensure`, { method: "POST" }).then((res) => res.json())
+  if (transitiveEnsure.state !== "active") {
+    throw new Error(`Expected transitive-tailwindcss session to warm active, got ${JSON.stringify(transitiveEnsure)}`)
+  }
+  const transitiveLink = await lstat(join(root, "tailwind-transitive", "node_modules", "tailwindcss"))
+  if (!transitiveLink.isSymbolicLink()) {
+    throw new Error("Expected the transitive tailwindcss copy to be replaced with a symlink to the shared install")
+  }
+  const transitiveCss = await fetch(`${runtime.url}/sessions/tailwind-transitive/app/src/styles.css?direct`).then((res) => res.text())
+  for (const rule of [".flex", ".p-6"]) {
+    if (!transitiveCss.includes(rule)) {
+      throw new Error(`Expected extras+transitive-tailwindcss CSS to include "${rule}" (drifted copy not replaced otherwise)`)
     }
   }
 

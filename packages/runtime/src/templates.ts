@@ -38,8 +38,15 @@ async function ensureTailwindImport(path: string) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return
     throw error
   }
-  if (TAILWIND_IMPORT_PATTERN.test(contents)) return
+  // Detect against a comment-stripped copy so a legacy `/* @import "tailwindcss"; */`
+  // isn't mistaken for a real import (which would skip migration and stay unstyled).
+  if (TAILWIND_IMPORT_PATTERN.test(stripCssComments(contents))) return
   await writeFile(path, prependTailwindImport(contents), "utf8")
+}
+
+/** Strip CSS block comments (used only for import detection, not for the emitted file). */
+function stripCssComments(css: string): string {
+  return css.replace(/\/\*[\s\S]*?\*\//g, "")
 }
 
 /**

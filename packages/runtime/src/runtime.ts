@@ -437,23 +437,37 @@ async function ensureSessionDependencies(
  * Symlink one runtime-owned package from the shared install into a session's private
  * (extras) `node_modules`, so a tool that resolves it by filesystem walk-up from the
  * workspace (e.g. `@tailwindcss/vite` resolving `@import "tailwindcss";`) finds it without
- * forking it per session. Idempotent and confined to the session's own node_modules:
- * skips when anything already occupies the link path (a prior warm's link, or a package
- * the session installed itself) and no-ops when the shared install doesn't provide it.
+ * forking it per session. Idempotent and confined to the session's own node_modules.
+ *
+ * Replaces any NON-shared occupant: a directly-declared `tailwindcss` extra is dropped by
+ * `isRuntimeOwnedDependency`, but an extra can still pull `tailwindcss` in as a peer/
+ * transitive dep, leaving a real (possibly version-mismatched, or even v3) copy here.
+ * `@tailwindcss/vite` resolves the workspace copy first, so that drifted copy must be
+ * swapped for the runtime-owned one or the page can render unstyled. No-ops when the
+ * shared install doesn't provide the package.
  */
 async function ensureSharedPackageLink(nodeModules: string, sharedNodeModules: string, packageName: string) {
-  const linkPath = join(nodeModules, packageName)
-  try {
-    await lstat(linkPath)
-    return
-  } catch {
-    // Nothing at the link path yet; create the link below.
-  }
   const target = join(sharedNodeModules, packageName)
   try {
     await access(target)
   } catch {
     return
+  }
+  const linkPath = join(nodeModules, packageName)
+  try {
+    const stats = await lstat(linkPath)
+    if (stats.isSymbolicLink()) {
+      const currentTarget = resolve(dirname(linkPath), await readlink(linkPath))
+      if (currentTarget === resolve(target)) return
+      await rm(linkPath)
+    } else {
+      // A per-session or transitively-installed copy — replace it with the runtime-owned
+      // package so `@import "tailwindcss";` can't resolve a drifted/incompatible version.
+      // (Guarded: linkPath is always inside the session's own extras node_modules.)
+      await rm(linkPath, { recursive: true, force: true })
+    }
+  } catch {
+    // Nothing at the link path yet; create it below.
   }
   await symlink(target, linkPath, "junction")
 }
