@@ -67,18 +67,22 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   // session-independent path; it's set the first time any session warms (the build is
   // cached per dependency root in `ensureVendorBundle`).
   let vendorBundle: VendorBundle | undefined
-  // The Vite optimize-cache root (parent of the per-signature `<hash>` dirs), captured on the
-  // first warm so cache GC can sweep abandoned identity dirs there (#31).
-  let viteCacheRootDir: string | undefined
+  // Every Vite optimize-cache root this runtime has warmed into (parent of the per-signature
+  // `<hash>` dirs). Usually one, but with no explicit cacheRoot a session with declared extras
+  // roots under its own workspace, so we track a set and GC-scan all of them (#31).
+  const viteCacheRoots = new Set<string>()
   const idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS
   const idlePruneIntervalMs = options.idlePruneIntervalMs ?? DEFAULT_IDLE_PRUNE_INTERVAL_MS
-  const idlePruneTimer = idlePruneIntervalMs > 0
-    ? setInterval(() => {
-      // Keep the dirs this process still owns fresh for the cross-process age GC (#31): the
-      // vendor bundle is memoized for the process lifetime (and non-self-healing if its dir is
-      // swept), and an active session may go a while between browser fetches. Touch-on-access
-      // covers busy sessions; this heartbeat covers the idle-but-alive process/session.
-      void heartbeatCacheDirs()
+  // Maintenance heartbeat: keep the cache dirs this process owns fresh for the cross-process age GC
+  // (#31) — the vendor bundle is memoized for the process lifetime (and non-self-healing if swept),
+  // and an active session may go a while between browser fetches. Crucially this runs EVEN when idle
+  // pruning is disabled (idlePruneIntervalMs === 0, a supported option): a shared-cache peer can't
+  // see our sessions, so without the heartbeat it would delete a dir we are intentionally still
+  // serving. Idle pruning still only runs when enabled. unref'd so it never keeps the process alive.
+  const maintenanceIntervalMs = idlePruneIntervalMs > 0 ? idlePruneIntervalMs : DEFAULT_IDLE_PRUNE_INTERVAL_MS
+  const maintenanceTimer = setInterval(() => {
+    void heartbeatCacheDirs()
+    if (idlePruneIntervalMs > 0) {
       void pruneIdleSessions().catch((error) => {
         console.error(JSON.stringify({
           level: "warn",
@@ -87,9 +91,9 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
           message: error instanceof Error ? error.message : String(error)
         }))
       })
-    }, idlePruneIntervalMs)
-    : undefined
-  idlePruneTimer?.unref?.()
+    }
+  }, maintenanceIntervalMs)
+  maintenanceTimer.unref?.()
 
   async function ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus> {
     const started = performance.now()
@@ -146,7 +150,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   }
 
   async function close() {
-    if (idlePruneTimer) clearInterval(idlePruneTimer)
+    clearInterval(maintenanceTimer)
     await Promise.all([...sessions.values()].map((session) => closeSession(session)))
     await disposeSharedInstallResolvers()
   }
@@ -195,10 +199,21 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     }
   }
 
-  // Best-effort GC of superseded vendor + Vite cache-identity dirs (#31). Keeps the current
-  // vendor identity and every known session's Vite dir, and deletes only identity dirs untouched
-  // for longer than the idle TTL — provably abandoned, since a live session's dir is touched on
-  // warm and on access (and its session is pruned once idle past the TTL). Never throws.
+  /** Basenames of the Vite cache dirs of currently-active sessions — the ones actually being
+   * served, which the GC must keep. A suspended/idle-pruned session's dir is NOT live: it stops
+   * being touched and is allowed to age out (a resume re-optimizes it). */
+  function activeViteCacheDirNames(): string[] {
+    return [...sessions.values()]
+      .filter((session) => session.state === "active")
+      .map((session) => session.cacheDir)
+      .filter((dir): dir is string => Boolean(dir))
+      .map((dir) => basename(dir))
+  }
+
+  // Best-effort GC of superseded vendor + Vite cache-identity dirs (#31). Keeps the current vendor
+  // identity and every ACTIVE session's Vite dir, and deletes only identity dirs untouched for
+  // longer than the cutoff — provably abandoned, since a live dir is touched on warm/access. Never
+  // throws.
   async function pruneRuntimeCaches(): Promise<void> {
     // The GC cutoff must TRAIL the idle pruner: a dir only becomes deletable after its session
     // would have been idle-pruned (idleTtlMs) AND the pruner has had a cycle to run and close it
@@ -212,12 +227,9 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
           maxAgeMs
         })
       }
-      if (viteCacheRootDir) {
-        const liveDirs = [...sessions.values()]
-          .map((session) => session.cacheDir)
-          .filter((dir): dir is string => Boolean(dir))
-          .map((dir) => basename(dir))
-        await pruneSupersededCacheDirs(viteCacheRootDir, { keep: liveDirs, maxAgeMs })
+      const liveDirs = activeViteCacheDirNames()
+      for (const root of viteCacheRoots) {
+        await pruneSupersededCacheDirs(root, { keep: liveDirs, maxAgeMs })
       }
     } catch {
       // Cache GC is best-effort maintenance; never let it disrupt serving.
@@ -255,7 +267,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     const cacheStarted = performance.now()
     const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot, sourceDependencies.signature, bundle.result.manifest.hash)
     session.cacheDir = cacheDir
-    viteCacheRootDir = dirname(cacheDir)
+    viteCacheRoots.add(dirname(cacheDir))
     logTiming("warmSession.cacheDir", session.id, cacheStarted, { cacheDir })
     // Mark the vendor + Vite dirs we're about to serve from as live (#31), then reclaim identity
     // dirs untouched for longer than the idle TTL. Touch-before-prune is what makes the GC safe

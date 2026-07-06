@@ -444,10 +444,16 @@ export async function pruneSupersededCacheDirs(root: string, options: PruneCache
   const removed: string[] = []
   for (const entry of entries) {
     if (!entry.isDirectory() || keepNames.has(entry.name) || !CACHE_IDENTITY_RE.test(entry.name)) continue
-    const info = await statOrNull(join(root, entry.name))
+    const dir = join(root, entry.name)
+    const info = await statOrNull(dir)
     if (!info || info.mtimeMs > cutoff) continue // missing (raced) or recently touched -> in use, keep
     try {
-      await rm(join(root, entry.name), { recursive: true, force: true })
+      // Re-check the mtime immediately before deleting: a peer may have started reusing (and thus
+      // touched) this identity between the scan above and now. Narrows the TOCTOU window to the gap
+      // between this stat and the rm, so we don't remove a dir a concurrent warm just made live.
+      const fresh = await statOrNull(dir)
+      if (!fresh || fresh.mtimeMs > cutoff) continue
+      await rm(dir, { recursive: true, force: true })
       removed.push(entry.name)
     } catch {
       // Best-effort: a concurrent server may hold the dir; leave it for the next GC pass.
