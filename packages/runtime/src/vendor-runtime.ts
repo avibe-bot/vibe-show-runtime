@@ -1,4 +1,4 @@
-import { access, readFile, utimes } from "node:fs/promises"
+import { readFile, utimes } from "node:fs/promises"
 import { dirname, join, normalize, resolve, sep } from "node:path"
 import { createHash } from "node:crypto"
 import type { ServerResponse } from "node:http"
@@ -70,12 +70,12 @@ export function ensureVendorBundle(options: EnsureVendorBundleOptions): Promise<
   if (cached) {
     // Self-heal on reuse: the memo is module-global and outlives runtime.close(), while the cache
     // GC (#31) can let a peer reclaim a vendor dir this process is no longer heartbeating. Serving
-    // a stale memo would then 404 every /_show-runtime/vendor/* asset, so validate the out dir
-    // still exists before reuse; if it's gone, drop the memo and rebuild. This is the class
-    // terminator: it turns any residual delete-vs-reuse race from "broken until restart" into a
-    // single rebuild.
+    // a stale memo would then 404 every /_show-runtime/vendor/* asset. A SINGLE utimes both marks
+    // the dir live (the #31 chokepoint) AND confirms it still exists — if a peer reclaimed it,
+    // utimes throws, so we drop the memo and rebuild. One syscall, so no check-then-touch gap for a
+    // delete to slip through: this warm (not just the next) recovers with one rebuild.
     return cached.then(async (bundle) => {
-      if (await directoryExists(bundle.result.outDir)) return touchVendorOutDir(bundle)
+      if (await touchOutDir(bundle.result.outDir)) return bundle
       if (vendorBundles.get(cacheKey) === cached) vendorBundles.delete(cacheKey)
       return ensureVendorBundle(options) // memo now empty (or repopulated by a peer warm) -> rebuild/reuse
     })
@@ -86,21 +86,18 @@ export function ensureVendorBundle(options: EnsureVendorBundleOptions): Promise<
     throw error
   })
   vendorBundles.set(cacheKey, built)
-  return built.then(touchVendorOutDir)
+  return built.then(async (bundle) => {
+    await touchOutDir(bundle.result.outDir) // freshly built -> exists; just mark it live
+    return bundle
+  })
 }
 
-/** Mark a resolved vendor bundle's out dir live for the cache GC (#31). Best-effort; never throws. */
-async function touchVendorOutDir(bundle: VendorBundle): Promise<VendorBundle> {
-  const now = new Date()
-  await utimes(bundle.result.outDir, now, now).catch(() => {})
-  return bundle
-}
-
-/** Whether `path` still exists — the self-heal check for a memoized bundle whose dir a peer's cache
- * GC may have reclaimed (#31). */
-async function directoryExists(path: string): Promise<boolean> {
+/** Mark a vendor dir live for the cache GC AND confirm it still exists (#31): utimes touches it and
+ * throws if a peer's GC reclaimed it. Returns whether the dir is present. Never throws. */
+async function touchOutDir(dir: string): Promise<boolean> {
   try {
-    await access(path)
+    const now = new Date()
+    await utimes(dir, now, now)
     return true
   } catch {
     return false
