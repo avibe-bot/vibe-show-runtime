@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises"
+import { readFile, utimes } from "node:fs/promises"
 import { dirname, join, normalize, resolve, sep } from "node:path"
 import { createHash } from "node:crypto"
 import type { ServerResponse } from "node:http"
@@ -63,14 +63,45 @@ export function ensureVendorBundle(options: EnsureVendorBundleOptions): Promise<
   const vendorCacheRoot = resolve(options.vendorCacheRoot)
   const cacheKey = `${dependencyRoot}\0${uiPackageName}\0${vendorCacheRoot}`
   const cached = vendorBundles.get(cacheKey)
-  if (cached) return cached
+  // Single liveness chokepoint for the vendor pool (#31): every resolution of the bundle to
+  // serve — memo hit OR a fresh/reused build — passes through here, so touching the out dir on
+  // resolve makes "any use ⟹ recently touched" a structural guarantee. The cache GC then only
+  // reaps dirs no live process has resolved within the (hours-wide) age cutoff.
+  if (cached) {
+    // Self-heal on reuse: the memo is module-global and outlives runtime.close(), while the cache
+    // GC (#31) can let a peer reclaim a vendor dir this process is no longer heartbeating. Serving
+    // a stale memo would then 404 every /_show-runtime/vendor/* asset. A SINGLE utimes both marks
+    // the dir live (the #31 chokepoint) AND confirms it still exists — if a peer reclaimed it,
+    // utimes throws, so we drop the memo and rebuild. One syscall, so no check-then-touch gap for a
+    // delete to slip through: this warm (not just the next) recovers with one rebuild.
+    return cached.then(async (bundle) => {
+      if (await touchOutDir(bundle.result.outDir)) return bundle
+      if (vendorBundles.get(cacheKey) === cached) vendorBundles.delete(cacheKey)
+      return ensureVendorBundle(options) // memo now empty (or repopulated by a peer warm) -> rebuild/reuse
+    })
+  }
   const built = buildVendorBundle(dependencyRoot, uiPackageName, vendorCacheRoot).catch((error) => {
     // Don't cache a failed build — let the next warm retry.
     if (vendorBundles.get(cacheKey) === built) vendorBundles.delete(cacheKey)
     throw error
   })
   vendorBundles.set(cacheKey, built)
-  return built
+  return built.then(async (bundle) => {
+    await touchOutDir(bundle.result.outDir) // freshly built -> exists; just mark it live
+    return bundle
+  })
+}
+
+/** Mark a vendor dir live for the cache GC AND confirm it still exists (#31): utimes touches it and
+ * throws if a peer's GC reclaimed it. Returns whether the dir is present. Never throws. */
+async function touchOutDir(dir: string): Promise<boolean> {
+  try {
+    const now = new Date()
+    await utimes(dir, now, now)
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function buildVendorBundle(dependencyRoot: string, uiPackageName: string, vendorCacheRoot: string): Promise<VendorBundle> {

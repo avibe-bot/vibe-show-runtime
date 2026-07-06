@@ -33,6 +33,9 @@ export type ShowSession = {
   workspace: string
   basePath?: string
   dependencySignature?: string
+  /** Absolute path of this session's Vite optimize-cache dir; touched on warm/access so the
+   * age-based cache GC treats it as live and never sweeps it out from under the session (#31). */
+  cacheDir?: string
   state: ShowSessionState
   updatedAt: Date
   lastAccessedAt?: Date

@@ -408,6 +408,60 @@ async function statOrNull(path: string) {
   }
 }
 
+/** A cache-identity dir name: the 16-hex-char content digest used by the vendor pool and
+ * the Vite optimize cache. Matches ONLY those, so temp build dirs (`.avibe-vendor-build-*`)
+ * and any Vite lock/metadata files are never swept. */
+const CACHE_IDENTITY_RE = /^[0-9a-f]{16}$/
+
+export interface PruneCacheDirsOptions {
+  /** Dir names to keep regardless of age (the identities this process knows are in use). */
+  keep?: Iterable<string>
+  /** Delete only dirs whose mtime is older than this many ms — the liveness margin. */
+  maxAgeMs: number
+  /** Injectable clock (tests); defaults to now. */
+  now?: number
+}
+
+/**
+ * Best-effort GC of superseded cache-identity dirs under `root` (avibe-bot/vibe-show-runtime#31).
+ *
+ * Each vendor/Vite identity change lands in a fresh `<16-hex>` dir (~6MB for the vendor pool)
+ * and the old ones were never reclaimed. These roots are SHARED and additive by design — a
+ * rolling-restart peer or another worker may serve from any dir — so "superseded" cannot be
+ * decided by identity alone. Liveness is signalled by mtime: the runtime touches every dir it
+ * serves from (on warm and on access), so a dir untouched for longer than `maxAgeMs` (the idle
+ * TTL — past which its session is pruned) is provably abandoned. This deletes only those, and
+ * never a name in `keep` (the current identities, belt-and-suspenders against clock skew).
+ *
+ * Every step is best-effort and ENOENT/EBUSY-safe: a missing root, an unreadable entry, or a
+ * dir another process holds open is skipped, never thrown — so a live server is never disrupted
+ * and a lost race is a no-op. Returns the identity names removed (for logging/tests).
+ */
+export async function pruneSupersededCacheDirs(root: string, options: PruneCacheDirsOptions): Promise<string[]> {
+  const keepNames = new Set(options.keep ?? [])
+  const cutoff = (options.now ?? Date.now()) - Math.max(0, options.maxAgeMs)
+  const entries = await readdir(root, { encoding: "utf8", withFileTypes: true }).catch(() => [])
+  const removed: string[] = []
+  for (const entry of entries) {
+    if (!entry.isDirectory() || keepNames.has(entry.name) || !CACHE_IDENTITY_RE.test(entry.name)) continue
+    const dir = join(root, entry.name)
+    const info = await statOrNull(dir)
+    if (!info || info.mtimeMs > cutoff) continue // missing (raced) or recently touched -> in use, keep
+    try {
+      // Re-check the mtime immediately before deleting: a peer may have started reusing (and thus
+      // touched) this identity between the scan above and now. Narrows the TOCTOU window to the gap
+      // between this stat and the rm, so we don't remove a dir a concurrent warm just made live.
+      const fresh = await statOrNull(dir)
+      if (!fresh || fresh.mtimeMs > cutoff) continue
+      await rm(dir, { recursive: true, force: true })
+      removed.push(entry.name)
+    } catch {
+      // Best-effort: a concurrent server may hold the dir; leave it for the next GC pass.
+    }
+  }
+  return removed
+}
+
 /**
  * Pre-build the shared vendor bundle: bundle every provided specifier as an ESM
  * entry, splitting shared code (React, the JSX runtime, motion, ...) into common

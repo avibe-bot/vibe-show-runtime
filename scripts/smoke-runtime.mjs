@@ -1,4 +1,4 @@
-import { access, cp, lstat, mkdtemp, mkdir, readFile, readlink, readdir, symlink, writeFile, rm } from "node:fs/promises"
+import { access, cp, lstat, mkdtemp, mkdir, readFile, readlink, readdir, symlink, utimes, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { join, relative } from "node:path"
@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs"
 import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
 import { cn } from "../packages/ui/dist/utils.js"
-import { dependencyFingerprint } from "../packages/runtime/dist/vendor.js"
+import { dependencyFingerprint, pruneSupersededCacheDirs } from "../packages/runtime/dist/vendor.js"
 import {
   assistantMarkEvent,
   formatShowEventMessage,
@@ -1064,6 +1064,57 @@ try {
   console.log("vendor fingerprint content-awareness ok")
 } finally {
   await rm(fingerprintRoot, { recursive: true, force: true })
+}
+
+// --- Superseded cache-dir GC (regression for #31) -------------------------------------
+// Each vendor/Vite identity change lands in a fresh <16-hex> dir; the old ones used to pile
+// up (~6MB each in the vendor pool). The runtime touches a dir it serves from (on warm/access),
+// so GC reclaims only identity dirs untouched for longer than the idle TTL — provably abandoned.
+// Simulate a root of identity dirs at staggered ages (via mtime), plus a temp build dir and a
+// hex-named FILE that must never be swept, and assert the age + keep rules hold.
+const NOW = 1_600_000_000_000
+const MAX_AGE_MS = 3_600_000 // 1h liveness margin
+const gcRoot = await mkdtemp(join(tmpdir(), "avibe-show-gc-"))
+const makeIdentityDir = async (name, ageSeconds) => {
+  const dir = join(gcRoot, name)
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, "index-abc123.js"), "export const x = 1\n") // ~a real 6MB dir's shape
+  const when = new Date(NOW - ageSeconds * 1000)
+  await utimes(dir, when, when)
+  return name
+}
+try {
+  const current = await makeIdentityDir("0123456789abcdef", 7200) // in use: kept despite 2h age
+  const fresh = await makeIdentityDir("1111111111111111", 600)    // touched 10min ago -> live
+  const stale = await makeIdentityDir("2222222222222222", 7200)   // untouched 2h > 1h -> abandoned
+  const ancient = await makeIdentityDir("3333333333333333", 90000) // 25h -> abandoned
+  // Controls: a staging temp dir and a stray file with a hex-looking name — never identity dirs.
+  await mkdir(join(gcRoot, ".avibe-vendor-build-xyz"), { recursive: true })
+  await writeFile(join(gcRoot, "abcdef0123456789"), "not a dir\n")
+
+  const removed = new Set(await pruneSupersededCacheDirs(gcRoot, { keep: [current], maxAgeMs: MAX_AGE_MS, now: NOW }))
+  if (!removed.has(stale) || !removed.has(ancient)) {
+    throw new Error(`Expected abandoned (untouched > TTL) identity dirs to be swept, got: ${JSON.stringify([...removed])}`)
+  }
+  if (removed.has(current) || removed.has(fresh)) {
+    throw new Error("GC must keep the in-use identity and any recently-touched (live) dir")
+  }
+  const survivors = new Set(await readdir(gcRoot))
+  for (const kept of [current, fresh, ".avibe-vendor-build-xyz", "abcdef0123456789"]) {
+    if (!survivors.has(kept)) throw new Error(`GC wrongly removed ${kept}`)
+  }
+  for (const gone of [stale, ancient]) {
+    if (survivors.has(gone)) throw new Error(`GC failed to remove abandoned ${gone}`)
+  }
+
+  // A dir named in `keep` (a live session's cache dir) survives even when old — this is what
+  // protects a concurrent peer's live optimize dir that our single process can't see the age of.
+  await makeIdentityDir(stale, 7200) // recreate the old dir, now passed as live
+  const removed2 = await pruneSupersededCacheDirs(gcRoot, { keep: [current, stale], maxAgeMs: MAX_AGE_MS, now: NOW })
+  if (removed2.includes(stale)) throw new Error("GC must never sweep a dir named in `keep`, even an old one")
+  console.log("superseded cache-dir GC ok")
+} finally {
+  await rm(gcRoot, { recursive: true, force: true })
 }
 
 // --- Parent-death backstop (regression for avibe#813) ---------------------------------
