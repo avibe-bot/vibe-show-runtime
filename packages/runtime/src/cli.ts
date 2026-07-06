@@ -4,6 +4,11 @@ import { resolve } from "node:path"
 import { startShowRuntimeServer } from "./server.js"
 import { buildVendor } from "./vendor.js"
 
+// The parent PID at process load, captured BEFORE any async startup work. A parent's PID only
+// changes when it dies (reparenting), so comparing against this later detects orphaning even
+// when the parent dies during startup (before the watcher is installed).
+const INITIAL_PARENT_PID = process.ppid
+
 const command = subcommand()
 
 if (command === "build-vendor") {
@@ -51,6 +56,48 @@ async function runServer() {
   process.on("SIGTERM", () => {
     void runtime.close().then(() => process.exit(0))
   })
+
+  watchParentDeath(() => {
+    console.error("Vibe Show Runtime: parent process exited; shutting down orphaned server")
+    void runtime.close().then(() => process.exit(0))
+  })
+}
+
+// How often to check whether our parent has died. Poll-based because Node exposes no portable
+// parent-death signal (Linux `PR_SET_PDEATHSIG` needs a native addon); the delay only bounds
+// how long an orphan lingers, so a couple of seconds is fine.
+const PARENT_DEATH_POLL_MS = Number(process.env.VIBE_SHOW_RUNTIME_PARENT_DEATH_POLL_MS ?? "2000")
+
+/**
+ * Exit when the process that spawned this server dies. avibe runs the runtime as a child; if
+ * avibe is killed without reaping us (hard kill / crash — `atexit` does not run on SIGKILL),
+ * we would otherwise linger as an orphan, keep answering on our port with stale in-memory
+ * code/templates, and mutate workspaces under an outdated build (see avibe-bot/avibe#813).
+ *
+ * On UNIX a dead parent reparents its children to init (or, under a child subreaper, to that
+ * subreaper) — either way `process.ppid` moves off the value captured at startup. We treat any
+ * such change as the orphan signal (`process.ppid` is read live), which also covers a parent
+ * that died during startup (ppid already changed before this runs). No-op when started directly
+ * under init (no parent to outlive) or on Windows (no reparenting); opt out with
+ * VIBE_SHOW_RUNTIME_DISABLE_PARENT_DEATH_EXIT. Defense-in-depth: avibe still reaps the subtree
+ * on its own shutdown paths.
+ */
+function watchParentDeath(onOrphaned: () => void) {
+  if (process.env.VIBE_SHOW_RUNTIME_DISABLE_PARENT_DEATH_EXIT) return
+  if (INITIAL_PARENT_PID <= 1) return
+  // The parent may already have died during startup, before we got here.
+  if (process.ppid !== INITIAL_PARENT_PID) {
+    onOrphaned()
+    return
+  }
+  const timer = setInterval(() => {
+    if (process.ppid !== INITIAL_PARENT_PID) {
+      clearInterval(timer)
+      onOrphaned()
+    }
+  }, Math.max(100, PARENT_DEATH_POLL_MS))
+  // Don't keep the process alive solely for this poll — the HTTP server is the anchor.
+  timer.unref?.()
 }
 
 function subcommand() {
