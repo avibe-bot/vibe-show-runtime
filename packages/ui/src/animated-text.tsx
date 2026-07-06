@@ -80,7 +80,7 @@ function TypewriterText({ text, className }: { text: string; className?: string 
     return () => window.clearInterval(timer)
   }, [text])
 
-  return <span className={className}>{display}<span className="avs-typewriter-caret" /></span>
+  return <span className={className}>{display}<span className="ml-[0.08em] inline-block h-[0.95em] w-[0.08em] min-w-0.5 translate-y-[0.12em] bg-current align-baseline animate-[avs-caret-blink_0.8s_steps(2,start)_infinite] motion-reduce:animate-none" /></span>
 }
 
 function chooseMode(previous: string | undefined, next: string): TextMode {

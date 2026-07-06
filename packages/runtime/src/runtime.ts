@@ -425,6 +425,11 @@ async function ensureSessionDependencies(
   // the runtime-owned `tailwindcss` package in from the shared install. Shared-only sessions
   // already resolve it through the whole-node_modules symlink above.
   await ensureSharedPackageLink(extrasDir, sharedNodeModules, "tailwindcss")
+  // The workspace Tailwind entry also `@import`s the UI theme (`@avibe/show-ui/theme.css`),
+  // resolved by the same filesystem walk-up. Link the runtime-owned UI package in so extras
+  // sessions can resolve the theme + its `@source`d components. (JS imports of the package
+  // stay externalized to the shared vendor bundle; this symlink only serves CSS resolution.)
+  await ensureSharedPackageLink(extrasDir, sharedNodeModules, uiPackageName)
   return {
     nodeModules: extrasDir,
     sharedNodeModules,
@@ -469,6 +474,8 @@ async function ensureSharedPackageLink(nodeModules: string, sharedNodeModules: s
   } catch {
     // Nothing at the link path yet; create it below.
   }
+  // Ensure the scope dir exists for a scoped package (e.g. `@avibe/show-ui` → `@avibe/`).
+  await mkdir(dirname(linkPath), { recursive: true })
   await symlink(target, linkPath, "junction")
 }
 

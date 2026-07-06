@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "@avibe/show-ui/theme.css";
 
 body {
   margin: 0;

@@ -27,11 +27,11 @@ export function MetricCard({
         {description ? <CardDescription>{description}</CardDescription> : null}
       </CardHeader>
       <CardContent>
-        <div className="avs-metric-value">
+        <div className="flex items-baseline gap-1 text-[2rem] font-extrabold leading-none text-foreground">
           <AnimatedNumber value={value} format={format} />
         </div>
         {status ? (
-          <div className="avs-metric-status">
+          <div className="mt-3 flex items-center justify-between gap-3">
             <Badge variant={variant}>{status}</Badge>
           </div>
         ) : null}
