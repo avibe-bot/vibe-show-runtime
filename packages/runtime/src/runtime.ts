@@ -189,37 +189,44 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     return session
   }
 
+  /** A session whose Vite server is live is still serving from its cache dir — including one in
+   * `closing`, whose server stays up until `waitForRequestsIdle()` + `vite.close()` finish. A
+   * suspended/closed session has had its `vite` cleared, so its dir is free to age out. */
+  function isSessionServing(session: ShowSession): boolean {
+    return Boolean(session.vite)
+  }
+
   // Refresh the mtime of every cache dir this process still owns so the age-based GC (#31) never
   // treats a live dir as abandoned: the vendor bundle (memoized for the process lifetime) and every
-  // active session's Vite dir. Best-effort; runs on the idle-prune heartbeat. Never throws.
+  // serving session's Vite dir. Best-effort; runs on the maintenance heartbeat. Never throws.
   async function heartbeatCacheDirs(): Promise<void> {
     if (vendorBundle) await touchDir(vendorBundle.result.outDir)
     for (const session of sessions.values()) {
-      if (session.state === "active") await touchDir(session.cacheDir)
+      if (isSessionServing(session)) await touchDir(session.cacheDir)
     }
   }
 
-  /** Basenames of the Vite cache dirs of currently-active sessions — the ones actually being
-   * served, which the GC must keep. A suspended/idle-pruned session's dir is NOT live: it stops
-   * being touched and is allowed to age out (a resume re-optimizes it). */
-  function activeViteCacheDirNames(): string[] {
+  /** Basenames of the Vite cache dirs still being served (active or still-closing), which the GC
+   * must keep. A suspended/idle-pruned session's dir is NOT live and is allowed to age out. */
+  function liveViteCacheDirNames(): string[] {
     return [...sessions.values()]
-      .filter((session) => session.state === "active")
+      .filter(isSessionServing)
       .map((session) => session.cacheDir)
       .filter((dir): dir is string => Boolean(dir))
       .map((dir) => basename(dir))
   }
 
   // Best-effort GC of superseded vendor + Vite cache-identity dirs (#31). Keeps the current vendor
-  // identity and every ACTIVE session's Vite dir, and deletes only identity dirs untouched for
-  // longer than the cutoff — provably abandoned, since a live dir is touched on warm/access. Never
-  // throws.
+  // identity and every serving session's Vite dir, and deletes only identity dirs untouched for
+  // longer than the cutoff — provably abandoned, since a live dir is touched on warm/access and by
+  // the heartbeat. Never throws.
   async function pruneRuntimeCaches(): Promise<void> {
-    // The GC cutoff must TRAIL the idle pruner: a dir only becomes deletable after its session
-    // would have been idle-pruned (idleTtlMs) AND the pruner has had a cycle to run and close it
-    // (idlePruneIntervalMs) plus a margin for the async close. Tying it to idleTtlMs exactly would
-    // let a peer's still-serving dir become eligible at the instant its session turns prune-eligible.
-    const maxAgeMs = idleTtlMs + idlePruneIntervalMs + CACHE_GC_TRAILING_MARGIN_MS
+    // The cutoff must exceed BOTH how long a dir can stay live untouched and the touch cadence:
+    // it trails the idle pruner (idleTtlMs + a cycle to run and close the session) AND the
+    // maintenance heartbeat (maintenanceIntervalMs — not idlePruneIntervalMs, which is 0 when idle
+    // pruning is disabled while the heartbeat still runs), plus a margin for the async close. Any
+    // smaller and a peer could age-delete a dir this process is still serving between heartbeats.
+    const maxAgeMs = idleTtlMs + maintenanceIntervalMs + CACHE_GC_TRAILING_MARGIN_MS
     try {
       if (vendorBundle) {
         await pruneSupersededCacheDirs(dirname(vendorBundle.result.outDir), {
@@ -227,7 +234,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
           maxAgeMs
         })
       }
-      const liveDirs = activeViteCacheDirNames()
+      const liveDirs = liveViteCacheDirNames()
       for (const root of viteCacheRoots) {
         await pruneSupersededCacheDirs(root, { keep: liveDirs, maxAgeMs })
       }

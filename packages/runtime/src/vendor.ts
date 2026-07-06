@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -497,6 +497,12 @@ export async function buildVendor(options: BuildVendorOptions): Promise<BuildVen
   // without rebuilding or touching `outDir` (which another process may be serving).
   const reusable = await readReusableManifest(outDir, uiPackageName, depFingerprint)
   if (reusable) {
+    // Mark the reused dir live NOW, atomically with validation. Its mtime may already be older than
+    // a shared-cache peer's GC cutoff; touching here — rather than only later in the caller's warm —
+    // closes the window where a peer could age-delete it between our validation and the caller's
+    // touch, which would strand this bundle's memoized manifest on removed files (#31).
+    const now = new Date()
+    await utimes(outDir, now, now).catch(() => {})
     return { outDir, manifestPath: join(outDir, VENDOR_MANIFEST_FILENAME), manifest: reusable, outputFiles: reusable.outputFiles }
   }
 
