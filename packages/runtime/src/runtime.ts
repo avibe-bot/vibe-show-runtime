@@ -1,5 +1,5 @@
-import { access, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises"
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { access, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises"
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
 import { createRequire } from "node:module"
@@ -28,10 +28,12 @@ import {
   vendorImportMapPlugin,
   type VendorBundle
 } from "./vendor-runtime.js"
-import { createDependencyResolver, type DependencyResolver } from "./vendor.js"
+import { createDependencyResolver, pruneSupersededCacheDirs, type DependencyResolver } from "./vendor.js"
 
 const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000
 const DEFAULT_IDLE_PRUNE_INTERVAL_MS = 5 * 60 * 1000
+/** Extra slack added to the cache-GC age cutoff so it trails an idle session's async close (#31). */
+const CACHE_GC_TRAILING_MARGIN_MS = 60 * 1000
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 const viteCacheWarmLocks = new Map<string, Promise<void>>()
 // One shared-install resolver per `node_modules` dir, built lazily on the first extras
@@ -65,10 +67,18 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   // session-independent path; it's set the first time any session warms (the build is
   // cached per dependency root in `ensureVendorBundle`).
   let vendorBundle: VendorBundle | undefined
+  // The Vite optimize-cache root (parent of the per-signature `<hash>` dirs), captured on the
+  // first warm so cache GC can sweep abandoned identity dirs there (#31).
+  let viteCacheRootDir: string | undefined
   const idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS
   const idlePruneIntervalMs = options.idlePruneIntervalMs ?? DEFAULT_IDLE_PRUNE_INTERVAL_MS
   const idlePruneTimer = idlePruneIntervalMs > 0
     ? setInterval(() => {
+      // Keep the dirs this process still owns fresh for the cross-process age GC (#31): the
+      // vendor bundle is memoized for the process lifetime (and non-self-healing if its dir is
+      // swept), and an active session may go a while between browser fetches. Touch-on-access
+      // covers busy sessions; this heartbeat covers the idle-but-alive process/session.
+      void heartbeatCacheDirs()
       void pruneIdleSessions().catch((error) => {
         console.error(JSON.stringify({
           level: "warn",
@@ -93,6 +103,9 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     const dependencySignature = existing.state === "active" ? await sourceDependencySignature(existing.workspace, options.uiPackageName ?? "@avibe/show-ui") : undefined
     if (existing.state === "active" && existing.basePath === normalizedBasePath && existing.dependencySignature === dependencySignature) {
       existing.updatedAt = new Date()
+      // Keep this session's cache dirs fresh so the age-based GC treats them as live (#31).
+      void touchDir(existing.cacheDir)
+      if (vendorBundle) void touchDir(vendorBundle.result.outDir)
       logTiming("ensureSession", sessionId, started, { state: "active", reused: true })
       return toStatus(existing)
     }
@@ -172,6 +185,45 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     return session
   }
 
+  // Refresh the mtime of every cache dir this process still owns so the age-based GC (#31) never
+  // treats a live dir as abandoned: the vendor bundle (memoized for the process lifetime) and every
+  // active session's Vite dir. Best-effort; runs on the idle-prune heartbeat. Never throws.
+  async function heartbeatCacheDirs(): Promise<void> {
+    if (vendorBundle) await touchDir(vendorBundle.result.outDir)
+    for (const session of sessions.values()) {
+      if (session.state === "active") await touchDir(session.cacheDir)
+    }
+  }
+
+  // Best-effort GC of superseded vendor + Vite cache-identity dirs (#31). Keeps the current
+  // vendor identity and every known session's Vite dir, and deletes only identity dirs untouched
+  // for longer than the idle TTL — provably abandoned, since a live session's dir is touched on
+  // warm and on access (and its session is pruned once idle past the TTL). Never throws.
+  async function pruneRuntimeCaches(): Promise<void> {
+    // The GC cutoff must TRAIL the idle pruner: a dir only becomes deletable after its session
+    // would have been idle-pruned (idleTtlMs) AND the pruner has had a cycle to run and close it
+    // (idlePruneIntervalMs) plus a margin for the async close. Tying it to idleTtlMs exactly would
+    // let a peer's still-serving dir become eligible at the instant its session turns prune-eligible.
+    const maxAgeMs = idleTtlMs + idlePruneIntervalMs + CACHE_GC_TRAILING_MARGIN_MS
+    try {
+      if (vendorBundle) {
+        await pruneSupersededCacheDirs(dirname(vendorBundle.result.outDir), {
+          keep: [basename(vendorBundle.result.outDir)],
+          maxAgeMs
+        })
+      }
+      if (viteCacheRootDir) {
+        const liveDirs = [...sessions.values()]
+          .map((session) => session.cacheDir)
+          .filter((dir): dir is string => Boolean(dir))
+          .map((dir) => basename(dir))
+        await pruneSupersededCacheDirs(viteCacheRootDir, { keep: liveDirs, maxAgeMs })
+      }
+    } catch {
+      // Cache GC is best-effort maintenance; never let it disrupt serving.
+    }
+  }
+
   async function warmSession(session: ShowSession, basePath: string): Promise<ShowSession> {
     const started = performance.now()
     const mkdirStarted = performance.now()
@@ -202,7 +254,15 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     logTiming("warmSession.dependencyLink", session.id, linkStarted, { nodeModules: sharedDependencies.nodeModules, extrasSignature: sharedDependencies.extrasSignature })
     const cacheStarted = performance.now()
     const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot, sourceDependencies.signature, bundle.result.manifest.hash)
+    session.cacheDir = cacheDir
+    viteCacheRootDir = dirname(cacheDir)
     logTiming("warmSession.cacheDir", session.id, cacheStarted, { cacheDir })
+    // Mark the vendor + Vite dirs we're about to serve from as live (#31), then reclaim identity
+    // dirs untouched for longer than the idle TTL. Touch-before-prune is what makes the GC safe
+    // across concurrent servers: any dir a live session (here or in a peer) uses stays recent.
+    await touchDir(bundle.result.outDir)
+    await touchDir(cacheDir)
+    void pruneRuntimeCaches()
     const viteConfig = {
       base: basePath,
       root: session.workspace,
@@ -1269,6 +1329,13 @@ async function viteCacheDir(dependencyRoot: string, cacheRoot: string | undefine
   const cacheDir = join(root, digest)
   await mkdir(cacheDir, { recursive: true })
   return cacheDir
+}
+
+/** Best-effort mtime bump marking a cache dir as live for the age-based GC (#31). Never throws. */
+async function touchDir(path: string | undefined): Promise<void> {
+  if (!path) return
+  const now = new Date()
+  await utimes(path, now, now).catch(() => {})
 }
 
 async function withViteCacheWarmLock<T>(cacheDir: string, callback: () => Promise<T>): Promise<T> {
