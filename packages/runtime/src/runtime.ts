@@ -201,7 +201,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     const sharedDependencies = await ensureSessionDependencies(session.workspace, sourceDependencies.declaredExtras, dependencyRoot, uiPackageName)
     logTiming("warmSession.dependencyLink", session.id, linkStarted, { nodeModules: sharedDependencies.nodeModules, extrasSignature: sharedDependencies.extrasSignature })
     const cacheStarted = performance.now()
-    const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot, sourceDependencies.signature)
+    const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot, sourceDependencies.signature, bundle.result.manifest.hash)
     logTiming("warmSession.cacheDir", session.id, cacheStarted, { cacheDir })
     const viteConfig = {
       base: basePath,
@@ -1259,9 +1259,13 @@ async function optimizableBareImports(specifiers: string[], nodeModules: string,
   })
 }
 
-async function viteCacheDir(dependencyRoot: string, cacheRoot?: string, dependencySignature = "shared") {
+// Keyed by workspace source signature AND the vendor bundle's content hash. Folding the
+// vendor hash in sweeps the optimizeDeps cache into the same content-aware invalidation as
+// the vendor pool: a rebuilt vendor bundle (e.g. a content change in a `0.0.0` workspace
+// package) moves the hash, so a pre-bundled dep from the previous build is never reused.
+async function viteCacheDir(dependencyRoot: string, cacheRoot: string | undefined, dependencySignature = "shared", vendorHash = "") {
   const root = resolve(cacheRoot ?? join(dirname(dependencyRoot), ".vite-cache"))
-  const digest = createHash("sha256").update(`${dependencyRoot}\0${dependencySignature}`).digest("hex").slice(0, 16)
+  const digest = createHash("sha256").update(`${dependencyRoot}\0${dependencySignature}\0${vendorHash}`).digest("hex").slice(0, 16)
   const cacheDir = join(root, digest)
   await mkdir(cacheDir, { recursive: true })
   return cacheDir
