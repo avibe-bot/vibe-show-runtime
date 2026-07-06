@@ -4,6 +4,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { join, relative } from "node:path"
 import vm from "node:vm"
 import { spawn } from "node:child_process"
+import { readFileSync } from "node:fs"
 import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
 import { cn } from "../packages/ui/dist/utils.js"
@@ -1087,9 +1088,17 @@ if (process.platform !== "win32") {
   const isAlive = (pid) => {
     try {
       process.kill(pid, 0)
-      return true
     } catch {
-      return false
+      return false // no such process
+    }
+    // A zombie (exited but not yet reaped) still passes kill(0). Under a container/PID 1 that
+    // doesn't promptly reap adopted children, a correctly-exited orphan lingers as a zombie; on
+    // Linux /proc/<pid>/stat field 3 is the state, and 'Z' (defunct) means it has exited.
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8")
+      return stat[stat.lastIndexOf(")") + 2] !== "Z"
+    } catch {
+      return true // no /proc (e.g. macOS) or the entry vanished — trust the kill(0) result
     }
   }
   try {
