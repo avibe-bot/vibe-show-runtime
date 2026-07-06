@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -290,9 +290,27 @@ function rootPackageName(specifier: string): string {
  */
 export async function dependencyFingerprint(nodeModules: string, packageNames: string[]): Promise<string> {
   const entries = await Promise.all(
-    [...packageNames].sort(compareStrings).map(async (name) => `${name}@${await installedPackageVersion(nodeModules, name)}`)
+    [...packageNames].sort(compareStrings).map((name) => installedPackageSignature(nodeModules, name))
   )
   return createHash("sha256").update(entries.join("\n")).digest("hex").slice(0, 16)
+}
+
+// The sentinel version carried by the file:-linked workspace packages (`@avibe/*`): it never
+// moves across rebuilds or releases, so version alone cannot identify their content.
+const UNSTABLE_PACKAGE_VERSION = "0.0.0"
+
+/**
+ * Cache-identity signature for one provided package. Registry packages are immutable per
+ * version, so `name@version` is a sound (and cheap) content identity. The vendored workspace
+ * packages are permanently `0.0.0` (file:-linked), so a source rebuild changes their CONTENT
+ * without moving the version — fold a digest of their shipped code so the vendor/vite cache
+ * identity tracks the actual bytes and never reuses a stale bundle after a rebuild.
+ */
+async function installedPackageSignature(nodeModules: string, packageName: string): Promise<string> {
+  const version = await installedPackageVersion(nodeModules, packageName)
+  if (version !== UNSTABLE_PACKAGE_VERSION) return `${packageName}@${version}`
+  const content = await packageContentDigest(join(nodeModules, ...packageName.split("/")))
+  return `${packageName}@${version}#${content}`
 }
 
 /** Installed `version` of `<nodeModules>/<pkg>/package.json`, or `ABSENT_PACKAGE_VERSION`. */
@@ -304,6 +322,89 @@ async function installedPackageVersion(nodeModules: string, packageName: string)
     return typeof manifest.version === "string" ? manifest.version : ABSENT_PACKAGE_VERSION
   } catch {
     return ABSENT_PACKAGE_VERSION
+  }
+}
+
+/**
+ * Content digest of a package's bundling inputs: its `package.json` (name/version/`exports`/
+ * dependencies drive what the vendor bundle resolves) plus its shipped code — a stable hash
+ * over each file's label + byte length + bytes (sorted for determinism, nested `node_modules`
+ * skipped). Uses the package's `dist` when present (the publish surface) and falls back to the
+ * package root. Only called for unstable-version packages, which ship a small `dist`, so
+ * reading the bytes stays cheap. The length prefix keeps the framing injective (bytes may
+ * contain NUL), and an unreadable file is recorded as changed rather than throwing into warm.
+ */
+async function packageContentDigest(packageDir: string): Promise<string> {
+  const hash = createHash("sha256")
+  // Fold `package.json` first: an `exports`/dependency change with unchanged dist bytes must
+  // still move the fingerprint, so a reused vendor manifest/import map (invalidated only by
+  // this fingerprint — see readReusableManifest) is never served stale after an upgrade.
+  await updateHashWithFile(hash, join(packageDir, "package.json"), "package.json")
+  const distDir = join(packageDir, "dist")
+  const root = (await isDirectory(distDir)) ? distDir : packageDir
+  for (const relativePath of (await listFilesRecursive(root, root)).sort(compareStrings)) {
+    // Skip the package.json already folded above (only reachable in the package-root fallback).
+    if (root === packageDir && relativePath === "package.json") continue
+    await updateHashWithFile(hash, join(root, relativePath), relativePath)
+  }
+  return hash.digest("hex").slice(0, 16)
+}
+
+/**
+ * Fold one file into `hash` as `label\0<byteLength>\0<bytes>\0`. The length prefix keeps the
+ * framing injective (file bytes may contain NUL); a missing/unreadable file is recorded as
+ * changed rather than throwing into the warm path.
+ */
+async function updateHashWithFile(hash: ReturnType<typeof createHash>, path: string, label: string): Promise<void> {
+  hash.update(label).update("\0")
+  let bytes: Buffer
+  try {
+    bytes = await readFile(path)
+  } catch {
+    hash.update("missing\0")
+    return
+  }
+  hash.update(`${bytes.byteLength}\0`)
+  hash.update(bytes)
+  hash.update("\0")
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Normalized relative paths of every file under `root`, recursively, skipping nested
+ * `node_modules`. A symlink to a FILE is followed and included (a change to its target still
+ * moves the digest); symlinked directories are NOT recursed into, keeping the walk cycle-safe
+ * (the publish surface never ships those).
+ */
+async function listFilesRecursive(dir: string, root: string): Promise<string[]> {
+  const out: string[] = []
+  const entries = await readdir(dir, { encoding: "utf8", withFileTypes: true }).catch(() => [])
+  for (const entry of entries) {
+    if (entry.name === "node_modules") continue
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      out.push(...(await listFilesRecursive(full, root)))
+    } else if (entry.isFile()) {
+      out.push(normalizeSlashes(relative(root, full)))
+    } else if (entry.isSymbolicLink() && (await statOrNull(full))?.isFile()) {
+      out.push(normalizeSlashes(relative(root, full)))
+    }
+  }
+  return out
+}
+
+async function statOrNull(path: string) {
+  try {
+    return await stat(path)
+  } catch {
+    return null
   }
 }
 

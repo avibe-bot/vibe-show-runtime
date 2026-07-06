@@ -6,6 +6,7 @@ import vm from "node:vm"
 import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
 import { cn } from "../packages/ui/dist/utils.js"
+import { dependencyFingerprint } from "../packages/runtime/dist/vendor.js"
 import {
   assistantMarkEvent,
   formatShowEventMessage,
@@ -1020,6 +1021,47 @@ try {
   }
 } finally {
   await rm(archiveLikeRoot, { recursive: true, force: true })
+}
+
+// --- Vendor cache identity is content-aware (regression for #28) ----------------------
+// The vendor pool + optimizeDeps cache are keyed by a dependency fingerprint. The vendored
+// workspace packages are permanently 0.0.0, so a fingerprint that only hashed name@version
+// reused a stale bundle across restarts after a source rebuild — the shadcn migration would
+// have been invisibly no-op for upgrading users. Assert the fingerprint tracks the CONTENT
+// of 0.0.0 packages, while staying version-based (cheap) for immutable registry packages.
+const fingerprintRoot = await mkdtemp(join(tmpdir(), "avibe-show-fingerprint-"))
+const fingerprintModules = join(fingerprintRoot, "node_modules")
+const writeFingerprintPackage = async (name, version, content) => {
+  const dir = join(fingerprintModules, ...name.split("/"))
+  await mkdir(join(dir, "dist"), { recursive: true })
+  await writeFile(join(dir, "package.json"), JSON.stringify({ name, version }))
+  await writeFile(join(dir, "dist", "index.js"), content)
+}
+try {
+  const names = ["@fake/ui", "registry-pkg"]
+  await writeFingerprintPackage("@fake/ui", "0.0.0", "export const value = 1\n")
+  await writeFingerprintPackage("registry-pkg", "1.2.3", "export const value = 1\n")
+  const baseFingerprint = await dependencyFingerprint(fingerprintModules, names)
+  await writeFingerprintPackage("@fake/ui", "0.0.0", "export const value = 2\n")
+  const afterWorkspaceChange = await dependencyFingerprint(fingerprintModules, names)
+  if (afterWorkspaceChange === baseFingerprint) {
+    throw new Error("Expected the dependency fingerprint to change when a 0.0.0 package's content changes (stale vendor/vite cache across restarts otherwise)")
+  }
+  await writeFingerprintPackage("registry-pkg", "1.2.3", "export const value = 2\n")
+  const afterRegistryChange = await dependencyFingerprint(fingerprintModules, names)
+  if (afterRegistryChange !== afterWorkspaceChange) {
+    throw new Error("Expected the dependency fingerprint to stay version-based for an immutable registry package (its content is not hashed)")
+  }
+  // A 0.0.0 package's package.json (exports/deps drive bundling) MUST move the fingerprint
+  // even when the dist bytes are unchanged, so the vendor manifest/import map isn't reused stale.
+  await writeFile(join(fingerprintModules, "@fake", "ui", "package.json"), JSON.stringify({ name: "@fake/ui", version: "0.0.0", exports: { ".": "./dist/index.js", "./extra": "./dist/extra.js" } }))
+  const afterMetadataChange = await dependencyFingerprint(fingerprintModules, names)
+  if (afterMetadataChange === afterRegistryChange) {
+    throw new Error("Expected the dependency fingerprint to change when a 0.0.0 package's package.json (exports) changes with unchanged dist")
+  }
+  console.log("vendor fingerprint content-awareness ok")
+} finally {
+  await rm(fingerprintRoot, { recursive: true, force: true })
 }
 
 async function readUntil(reader, needle) {
