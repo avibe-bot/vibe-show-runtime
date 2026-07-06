@@ -47,7 +47,7 @@ async function ensureEntryImports(path: string) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return
     throw error
   }
-  const scanned = stripCssComments(contents)
+  const scanned = maskCssComments(contents)
   const hasTailwind = TAILWIND_IMPORT_PATTERN.test(scanned)
   const hasTheme = THEME_IMPORT_PATTERN.test(scanned)
   if (hasTailwind && hasTheme) return
@@ -63,17 +63,25 @@ async function ensureEntryImports(path: string) {
   await writeFile(path, contents, "utf8")
 }
 
-/** Insert the theme import immediately after the existing `@import "tailwindcss";` statement. */
+/**
+ * Insert the theme import immediately after the FIRST REAL (non-commented) `@import
+ * "tailwindcss";` statement. The match runs on the comment-masked copy so a commented-out
+ * import is skipped; the masking is length-preserving, so the offset maps back to `contents`.
+ */
 function insertThemeAfterTailwind(contents: string): string {
-  const match = /@import\s+["']tailwindcss["'][^;]*;/.exec(contents)
+  const match = /@import\s+["']tailwindcss["'][^;]*;/.exec(maskCssComments(contents))
   if (!match) return contents
   const end = match.index + match[0].length
   return `${contents.slice(0, end)}\n${THEME_IMPORT}${contents.slice(end)}`
 }
 
 /** Strip CSS block comments (used only for import detection, not for the emitted file). */
-function stripCssComments(css: string): string {
-  return css.replace(/\/\*[\s\S]*?\*\//g, "")
+// Blank out CSS block comments with EQUAL-LENGTH whitespace (not removal) so a match index
+// in the masked copy maps to the same offset in the source. Used both to detect real imports
+// and to locate where to insert after them — a commented-out import must never count or be
+// targeted (that would push a real import inside the comment and re-inject every warm).
+function maskCssComments(css: string): string {
+  return css.replace(/\/\*[\s\S]*?\*\//g, (match) => " ".repeat(match.length))
 }
 
 /**
