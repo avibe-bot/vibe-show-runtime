@@ -178,9 +178,9 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     await mkdir(session.workspace, { recursive: true })
     logTiming("warmSession.mkdir", session.id, mkdirStarted)
     const templateStarted = performance.now()
-    await ensureSessionTemplate(session.workspace)
-    logTiming("warmSession.template", session.id, templateStarted)
     const uiPackageName = options.uiPackageName ?? "@avibe/show-ui"
+    await ensureSessionTemplate(session.workspace, uiPackageName)
+    logTiming("warmSession.template", session.id, templateStarted)
     const dependencyRoot = await resolveDependencyRoot(options.dependencyRoot, uiPackageName)
     const vendorStarted = performance.now()
     const bundle = await ensureVendorBundle({
