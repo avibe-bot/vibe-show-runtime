@@ -1052,6 +1052,13 @@ try {
   if (afterRegistryChange !== afterWorkspaceChange) {
     throw new Error("Expected the dependency fingerprint to stay version-based for an immutable registry package (its content is not hashed)")
   }
+  // A 0.0.0 package's package.json (exports/deps drive bundling) MUST move the fingerprint
+  // even when the dist bytes are unchanged, so the vendor manifest/import map isn't reused stale.
+  await writeFile(join(fingerprintModules, "@fake", "ui", "package.json"), JSON.stringify({ name: "@fake/ui", version: "0.0.0", exports: { ".": "./dist/index.js", "./extra": "./dist/extra.js" } }))
+  const afterMetadataChange = await dependencyFingerprint(fingerprintModules, names)
+  if (afterMetadataChange === afterRegistryChange) {
+    throw new Error("Expected the dependency fingerprint to change when a 0.0.0 package's package.json (exports) changes with unchanged dist")
+  }
   console.log("vendor fingerprint content-awareness ok")
 } finally {
   await rm(fingerprintRoot, { recursive: true, force: true })

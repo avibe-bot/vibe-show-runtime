@@ -326,32 +326,47 @@ async function installedPackageVersion(nodeModules: string, packageName: string)
 }
 
 /**
- * Content digest of a package's shipped code: a stable hash over each file's normalized
- * relative path + byte length + bytes (sorted for determinism, nested `node_modules`
- * skipped). Hashes the package's `dist` when present (the publish surface) and falls back to
- * the package root. Only called for unstable-version packages, which ship a small `dist`, so
+ * Content digest of a package's bundling inputs: its `package.json` (name/version/`exports`/
+ * dependencies drive what the vendor bundle resolves) plus its shipped code — a stable hash
+ * over each file's label + byte length + bytes (sorted for determinism, nested `node_modules`
+ * skipped). Uses the package's `dist` when present (the publish surface) and falls back to the
+ * package root. Only called for unstable-version packages, which ship a small `dist`, so
  * reading the bytes stays cheap. The length prefix keeps the framing injective (bytes may
  * contain NUL), and an unreadable file is recorded as changed rather than throwing into warm.
  */
 async function packageContentDigest(packageDir: string): Promise<string> {
+  const hash = createHash("sha256")
+  // Fold `package.json` first: an `exports`/dependency change with unchanged dist bytes must
+  // still move the fingerprint, so a reused vendor manifest/import map (invalidated only by
+  // this fingerprint — see readReusableManifest) is never served stale after an upgrade.
+  await updateHashWithFile(hash, join(packageDir, "package.json"), "package.json")
   const distDir = join(packageDir, "dist")
   const root = (await isDirectory(distDir)) ? distDir : packageDir
-  const files = (await listFilesRecursive(root, root)).sort(compareStrings)
-  const hash = createHash("sha256")
-  for (const relativePath of files) {
-    hash.update(relativePath).update("\0")
-    let bytes: Buffer
-    try {
-      bytes = await readFile(join(root, relativePath))
-    } catch {
-      hash.update("missing\0")
-      continue
-    }
-    hash.update(`${bytes.byteLength}\0`)
-    hash.update(bytes)
-    hash.update("\0")
+  for (const relativePath of (await listFilesRecursive(root, root)).sort(compareStrings)) {
+    // Skip the package.json already folded above (only reachable in the package-root fallback).
+    if (root === packageDir && relativePath === "package.json") continue
+    await updateHashWithFile(hash, join(root, relativePath), relativePath)
   }
   return hash.digest("hex").slice(0, 16)
+}
+
+/**
+ * Fold one file into `hash` as `label\0<byteLength>\0<bytes>\0`. The length prefix keeps the
+ * framing injective (file bytes may contain NUL); a missing/unreadable file is recorded as
+ * changed rather than throwing into the warm path.
+ */
+async function updateHashWithFile(hash: ReturnType<typeof createHash>, path: string, label: string): Promise<void> {
+  hash.update(label).update("\0")
+  let bytes: Buffer
+  try {
+    bytes = await readFile(path)
+  } catch {
+    hash.update("missing\0")
+    return
+  }
+  hash.update(`${bytes.byteLength}\0`)
+  hash.update(bytes)
+  hash.update("\0")
 }
 
 async function isDirectory(path: string): Promise<boolean> {
