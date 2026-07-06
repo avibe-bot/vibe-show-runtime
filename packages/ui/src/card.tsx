@@ -1,5 +1,5 @@
 import * as React from "react"
-import { motion, type HTMLMotionProps } from "motion/react"
+import { motion, useReducedMotion, type HTMLMotionProps } from "motion/react"
 import { AnimatedText } from "./animated-text"
 import { cn } from "./utils"
 
@@ -20,21 +20,26 @@ type CardProps = Omit<
 }
 
 export const Card = React.forwardRef<HTMLDivElement, CardProps>(
-  ({ className, ...props }, ref) => (
-    <motion.div
-      layout
-      ref={ref}
-      className={cn(
-        "overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-sm will-change-[transform,opacity]",
-        className
-      )}
-      initial={{ opacity: 0, y: 12, scale: 0.985 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={{ opacity: 0, y: -8, scale: 0.985 }}
-      transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1], layout: { duration: 0.34 } }}
-      {...(props as HTMLMotionProps<"div">)}
-    />
-  )
+  ({ className, ...props }, ref) => {
+    // Honor prefers-reduced-motion: skip the entrance/exit offset (carried over from the
+    // old CSS reduced-motion block, now that the entrance is a motion/react animation).
+    const reduce = useReducedMotion()
+    return (
+      <motion.div
+        layout
+        ref={ref}
+        className={cn(
+          "overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-sm will-change-[transform,opacity]",
+          className
+        )}
+        initial={reduce ? false : { opacity: 0, y: 12, scale: 0.985 }}
+        animate={reduce ? { opacity: 1 } : { opacity: 1, y: 0, scale: 1 }}
+        exit={reduce ? { opacity: 0 } : { opacity: 0, y: -8, scale: 0.985 }}
+        transition={reduce ? { duration: 0 } : { duration: 0.3, ease: [0.16, 1, 0.3, 1], layout: { duration: 0.34 } }}
+        {...(props as HTMLMotionProps<"div">)}
+      />
+    )
+  }
 )
 Card.displayName = "Card"
 

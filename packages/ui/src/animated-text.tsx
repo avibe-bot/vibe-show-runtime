@@ -1,15 +1,17 @@
 import * as React from "react"
-import { AnimatePresence, motion, useMotionValue, useTransform, animate } from "motion/react"
+import { AnimatePresence, motion, useMotionValue, useReducedMotion, useTransform, animate } from "motion/react"
 
 type TextMode = "stable" | "typewriter" | "flip" | "fade"
 
 export function AnimatedText({ children, className }: { children: React.ReactNode; className?: string }) {
   const text = textFromChildren(children)
   const previous = usePrevious(text ?? undefined)
+  const reduce = useReducedMotion()
 
   if (text === null) return <>{children}</>
 
-  const mode = chooseMode(previous, text)
+  // Honor prefers-reduced-motion: render the text stably (no morph, typewriter, or caret).
+  const mode = reduce ? "stable" : chooseMode(previous, text)
   if (mode === "stable") return <span className={className}>{text}</span>
   if (mode === "typewriter") return <TypewriterText className={className} text={text} />
 
