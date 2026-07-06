@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { join, relative } from "node:path"
 import vm from "node:vm"
+import { spawn } from "node:child_process"
 import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
 import { cn } from "../packages/ui/dist/utils.js"
@@ -1062,6 +1063,77 @@ try {
   console.log("vendor fingerprint content-awareness ok")
 } finally {
   await rm(fingerprintRoot, { recursive: true, force: true })
+}
+
+// --- Parent-death backstop (regression for avibe#813) ---------------------------------
+// avibe spawns the runtime server as a child; if avibe is killed without reaping it, the
+// orphan would keep serving stale in-memory code. The server exits when it is reparented to
+// init (ppid=1). Spawn cli.js under a throwaway wrapper, SIGKILL the wrapper (no cleanup, like
+// a hard avibe death), and assert the orphaned server self-exits. UNIX-only (Windows doesn't
+// reparent to pid 1).
+if (process.platform !== "win32") {
+  const cliPath = fileURLToPath(new URL("../packages/runtime/dist/cli.js", import.meta.url))
+  const parentDeathRoot = await mkdtemp(join(tmpdir(), "avibe-show-parent-death-"))
+  const wrapperSource = [
+    `import { spawn } from "node:child_process"`,
+    `const child = spawn(process.execPath, [process.argv[1], "--workspace-root", process.argv[2], "--port", "0"], {`,
+    `  env: { ...process.env, VIBE_SHOW_RUNTIME_PARENT_DEATH_POLL_MS: "150" }, stdio: ["ignore", "pipe", "ignore"] })`,
+    `child.stdout.on("data", (data) => { if (String(data).includes("listening")) console.log("child-pid:" + child.pid) })`,
+    `setInterval(() => {}, 1000)`
+  ].join("\n")
+  const wrapper = spawn(process.execPath, ["--input-type=module", "-e", wrapperSource, cliPath, parentDeathRoot], {
+    stdio: ["ignore", "pipe", "ignore"]
+  })
+  const isAlive = (pid) => {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+  try {
+    const childPid = await new Promise((resolvePid, rejectPid) => {
+      const timeout = setTimeout(() => rejectPid(new Error("runtime server never reported listening")), 20000)
+      wrapper.stdout.on("data", (data) => {
+        const match = String(data).match(/child-pid:(\d+)/)
+        if (match) {
+          clearTimeout(timeout)
+          resolvePid(Number(match[1]))
+        }
+      })
+      wrapper.on("exit", () => rejectPid(new Error("wrapper exited before the runtime server reported listening")))
+    })
+    if (!isAlive(childPid)) {
+      throw new Error("Expected the spawned runtime server to be alive before its parent is killed")
+    }
+    // Hard-kill the wrapper (SIGKILL runs no shutdown hooks) to orphan the runtime server.
+    process.kill(wrapper.pid, "SIGKILL")
+    let orphanExited = false
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await new Promise((res) => setTimeout(res, 150))
+      if (!isAlive(childPid)) {
+        orphanExited = true
+        break
+      }
+    }
+    if (!orphanExited) {
+      try {
+        process.kill(childPid, "SIGKILL")
+      } catch {
+        // already gone
+      }
+      throw new Error("Expected the orphaned runtime server to self-exit after its parent died (avibe#813 backstop)")
+    }
+    console.log("parent-death backstop ok")
+  } finally {
+    try {
+      process.kill(wrapper.pid, "SIGKILL")
+    } catch {
+      // already gone
+    }
+    await rm(parentDeathRoot, { recursive: true, force: true })
+  }
 }
 
 async function readUntil(reader, needle) {
