@@ -1,5 +1,16 @@
-import { mkdir, writeFile } from "node:fs/promises"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
+
+const TAILWIND_IMPORT = `@import "tailwindcss";`
+// Matches an existing Tailwind entry in any quote/spacing form so migration never double-imports.
+const TAILWIND_IMPORT_PATTERN = /@import\s+["']tailwindcss["']/
+// A leading `@charset "...";` is the only statement allowed before `@import`. Match only
+// through the `;` (plus trailing spaces/one line ending) so rules sharing the line — e.g.
+// minified `@charset "utf-8";body{...}` — are NOT swallowed, which would push the import
+// after them and make it invalid.
+const LEADING_CHARSET_PATTERN = /^@charset\s+["'][^"']*["'];[ \t]*\r?\n?/i
+// UTF-8 byte order mark, preserved at position 0 when re-emitting an existing file.
+const BOM = "\ufeff"
 
 export async function ensureSessionTemplate(workspace: string) {
   await mkdir(join(workspace, "src"), { recursive: true })
@@ -9,6 +20,48 @@ export async function ensureSessionTemplate(workspace: string) {
   await writeIfMissing(join(workspace, "src", "main.tsx"), mainTsx())
   await writeIfMissing(join(workspace, "src", "App.tsx"), appTsx())
   await writeIfMissing(join(workspace, "src", "styles.css"), stylesCss())
+  await ensureTailwindImport(join(workspace, "src", "styles.css"))
+}
+
+/**
+ * Make Tailwind utilities available in workspaces whose `src/styles.css` predates the
+ * built-in Tailwind pipeline. New workspaces already lead with `@import "tailwindcss";`
+ * (see stylesCss), so this is a one-time, idempotent migration: it prepends the import
+ * only when absent, runs on every warm before the Vite server is created, and skips
+ * without writing when the import is already present.
+ */
+async function ensureTailwindImport(path: string) {
+  let contents: string
+  try {
+    contents = await readFile(path, "utf8")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+    throw error
+  }
+  // Detect against a comment-stripped copy so a legacy `/* @import "tailwindcss"; */`
+  // isn't mistaken for a real import (which would skip migration and stay unstyled).
+  if (TAILWIND_IMPORT_PATTERN.test(stripCssComments(contents))) return
+  await writeFile(path, prependTailwindImport(contents), "utf8")
+}
+
+/** Strip CSS block comments (used only for import detection, not for the emitted file). */
+function stripCssComments(css: string): string {
+  return css.replace(/\/\*[\s\S]*?\*\//g, "")
+}
+
+/**
+ * Insert the Tailwind import as the first CSS statement. `@import` must precede every
+ * rule except a leading `@charset`, so when the file opens with one (after an optional
+ * BOM) the import is placed right after it; otherwise it goes at the very top.
+ */
+function prependTailwindImport(contents: string): string {
+  const bom = contents.startsWith(BOM) ? BOM : ""
+  const body = bom ? contents.slice(1) : contents
+  const charset = LEADING_CHARSET_PATTERN.exec(body)
+  if (charset) {
+    return `${bom}${charset[0]}${TAILWIND_IMPORT}\n${body.slice(charset[0].length)}`
+  }
+  return `${bom}${TAILWIND_IMPORT}\n${body}`
 }
 
 async function writeIfMissing(path: string, contents: string) {
@@ -103,7 +156,9 @@ export default function App() {
 }
 
 function stylesCss() {
-  return `body {
+  return `@import "tailwindcss";
+
+body {
   margin: 0;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: #f6f7f9;
