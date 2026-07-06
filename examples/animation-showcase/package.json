@@ -10,6 +10,7 @@
   "dependencies": {
     "@avibe/show-runtime": "0.0.0",
     "@avibe/show-ui": "0.0.0",
+    "@tailwindcss/vite": "^4.3.2",
     "@vitejs/plugin-react": "^5.1.1",
     "lucide-react": "^0.555.0",
     "react": "^19.2.0",

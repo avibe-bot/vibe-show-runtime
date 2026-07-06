@@ -1,0 +1,77 @@
+/*
+ * @avibe/show-ui theme — the token bridge for the shadcn/ui components.
+ *
+ * This file is `@import`ed INTO the workspace's Tailwind entry (`src/styles.css`, the file
+ * with `@import "tailwindcss";`) so its `@theme` registers in that compilation — a CSS file
+ * imported only as a side effect via main.tsx would NOT contribute `@theme` to the entry.
+ *
+ * It does three things:
+ *   1. Keeps the legacy `--avs-*` variables defined (existing workspace CSS references them,
+ *      e.g. `hsl(var(--avs-ring))` in the scaffold placeholder) and holds the palette values.
+ *   2. Maps shadcn's token namespace onto those `--avs-*` values via `@theme inline`, so the
+ *      components look identical to the old hand-written skin by default. `inline` means the
+ *      utilities emit `var(--color-*)`, so `ThemeProvider`'s inline `--avs-*` overrides still
+ *      apply at runtime. Swapping to a stock shadcn palette later is a values-only edit here.
+ *   3. `@source`s the compiled component code so Tailwind generates the utility classes the
+ *      components use (they live in node_modules, which Tailwind does not auto-scan).
+ */
+
+:root,
+.avs-theme {
+  --avs-background: 0 0% 100%;
+  --avs-foreground: 222 47% 11%;
+  --avs-muted: 210 40% 96%;
+  --avs-muted-foreground: 215 16% 47%;
+  --avs-border: 214 32% 91%;
+  --avs-primary: 222 47% 11%;
+  --avs-primary-foreground: 210 40% 98%;
+  --avs-ring: 221 83% 53%;
+  --avs-success: 158 64% 24%;
+  --avs-warning: 32 95% 44%;
+  --avs-destructive: 0 84% 60%;
+  --avs-radius: 0.5rem;
+}
+
+@theme inline {
+  --color-background: hsl(var(--avs-background));
+  --color-foreground: hsl(var(--avs-foreground));
+  --color-card: hsl(var(--avs-background));
+  --color-card-foreground: hsl(var(--avs-foreground));
+  --color-popover: hsl(var(--avs-background));
+  --color-popover-foreground: hsl(var(--avs-foreground));
+  --color-primary: hsl(var(--avs-primary));
+  --color-primary-foreground: hsl(var(--avs-primary-foreground));
+  --color-secondary: hsl(var(--avs-muted));
+  --color-secondary-foreground: hsl(var(--avs-foreground));
+  --color-muted: hsl(var(--avs-muted));
+  --color-muted-foreground: hsl(var(--avs-muted-foreground));
+  --color-accent: hsl(var(--avs-muted));
+  --color-accent-foreground: hsl(var(--avs-foreground));
+  --color-destructive: hsl(var(--avs-destructive));
+  --color-destructive-foreground: hsl(0 0% 100%);
+  --color-border: hsl(var(--avs-border));
+  --color-input: hsl(var(--avs-border));
+  --color-ring: hsl(var(--avs-ring));
+  --color-success: hsl(var(--avs-success));
+  --color-success-foreground: hsl(0 0% 100%);
+  --color-warning: hsl(var(--avs-warning));
+  --color-warning-foreground: hsl(0 0% 100%);
+
+  --radius-sm: calc(var(--avs-radius) - 4px);
+  --radius-md: calc(var(--avs-radius) - 2px);
+  --radius-lg: var(--avs-radius);
+  --radius-xl: calc(var(--avs-radius) + 4px);
+}
+
+/*
+ * Generate the utility classes the shadcn components use. The components ship compiled to
+ * this package's `dist` (next to this file once installed), and Tailwind does not scan
+ * node_modules automatically, so opt them in explicitly. Paths are relative to THIS file.
+ *
+ * Exclude the bundled `tailwind-merge` chunk (`utils-<hash>.js`): its internal class-name
+ * data (every class group, e.g. `scroll-m*`) would otherwise be scanned as candidates and
+ * generate a large amount of unused CSS. The component class strings live in the named
+ * entry files, so scanning the rest of `dist` is sufficient.
+ */
+@source "./*.js";
+@source not "./utils-*.js";

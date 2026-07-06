@@ -5,6 +5,7 @@ import { join, relative } from "node:path"
 import vm from "node:vm"
 import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
+import { cn } from "../packages/ui/dist/utils.js"
 import {
   assistantMarkEvent,
   formatShowEventMessage,
@@ -866,6 +867,65 @@ export default function App() {
     if (!transitiveCss.includes(rule)) {
       throw new Error(`Expected extras+transitive-tailwindcss CSS to include "${rule}" (drifted copy not replaced otherwise)`)
     }
+  }
+
+  // --- shadcn/ui component migration -------------------------------------------------
+  // The components are real shadcn/ui: their styling is Tailwind utility classes generated
+  // from the theme, and utility overrides win via cn()/tailwind-merge (which closes the
+  // "utilities can't override components" gap).
+
+  // (8) Override contract: cn() merges a caller utility over the component default, DROPPING
+  // the conflicting default so only the override remains on the element.
+  const mergedButtonClass = cn("bg-primary text-primary-foreground shadow-sm", "bg-red-500")
+  if (mergedButtonClass.includes("bg-primary") || !mergedButtonClass.includes("bg-red-500")) {
+    throw new Error(`Expected cn() to drop the conflicting bg-primary and keep bg-red-500, got "${mergedButtonClass}"`)
+  }
+
+  // (9) Component pipeline (new workspace): the scaffolded entry imports the show-ui theme,
+  // whose @theme registers the tokens and whose @source generates the component utilities.
+  // The served CSS must carry `.bg-primary` mapped to the --avs- palette (default parity)
+  // and the agent's own `.bg-red-500` override utility.
+  await mkdir(join(root, "shadcn", "src"), { recursive: true })
+  await writeFile(join(root, "shadcn", "src", "App.tsx"), `import { Button } from "@/components/ui/button"
+export default function App() {
+  return <Button className="bg-red-500">Ship</Button>
+}
+`)
+  const shadcnEnsure = await fetch(`${runtime.url}/sessions/shadcn/ensure`, { method: "POST" }).then((res) => res.json())
+  if (shadcnEnsure.state !== "active") {
+    throw new Error(`Expected shadcn session to warm active, got ${JSON.stringify(shadcnEnsure)}`)
+  }
+  const shadcnStyles = await readFile(join(root, "shadcn", "src", "styles.css"), "utf8")
+  if (!/@import\s+["']tailwindcss["']/.test(shadcnStyles) || !/@import\s+["']@avibe\/show-ui\/theme\.css["']/.test(shadcnStyles)) {
+    throw new Error(`Expected the scaffolded entry to import both tailwindcss and the show-ui theme, got ${JSON.stringify(shadcnStyles.slice(0, 90))}`)
+  }
+  const shadcnCss = await fetch(`${runtime.url}/sessions/shadcn/app/src/styles.css?direct`).then((res) => res.text())
+  if (!/\.bg-primary\s*\{[^}]*var\(--avs-primary\)[^}]*\}/.test(shadcnCss)) {
+    throw new Error("Expected .bg-primary generated from the @source'd components and mapped to hsl(var(--avs-primary)) (default parity + @theme registration)")
+  }
+  if (!shadcnCss.includes(".bg-red-500")) {
+    throw new Error("Expected the agent's .bg-red-500 override utility to be generated")
+  }
+
+  // (10) Legacy workspace (predates the theme import): a styles.css with only the Tailwind
+  // entry must gain the show-ui theme import on warm so component tokens/utilities work.
+  await mkdir(join(root, "shadcn-legacy", "src"), { recursive: true })
+  await writeFile(join(root, "shadcn-legacy", "src", "styles.css"), "@import \"tailwindcss\";\nbody { margin: 0; }\n")
+  await writeFile(join(root, "shadcn-legacy", "src", "App.tsx"), `export default function App() {
+  return <main className="p-4">legacy</main>
+}
+`)
+  const shadcnLegacyEnsure = await fetch(`${runtime.url}/sessions/shadcn-legacy/ensure`, { method: "POST" }).then((res) => res.json())
+  if (shadcnLegacyEnsure.state !== "active") {
+    throw new Error(`Expected legacy shadcn session to warm active, got ${JSON.stringify(shadcnLegacyEnsure)}`)
+  }
+  const shadcnLegacyStyles = await readFile(join(root, "shadcn-legacy", "src", "styles.css"), "utf8")
+  if (!/@import\s+["']@avibe\/show-ui\/theme\.css["']/.test(shadcnLegacyStyles) || !shadcnLegacyStyles.includes("margin: 0")) {
+    throw new Error(`Expected the legacy entry to gain the show-ui theme import while preserving prior rules, got ${JSON.stringify(shadcnLegacyStyles.slice(0, 90))}`)
+  }
+  const shadcnLegacyCss = await fetch(`${runtime.url}/sessions/shadcn-legacy/app/src/styles.css?direct`).then((res) => res.text())
+  if (!shadcnLegacyCss.includes(".bg-primary")) {
+    throw new Error("Expected component utilities to generate in a migrated legacy workspace (theme import + @source)")
   }
 
   console.log("smoke runtime ok")

@@ -1,3 +1,6 @@
+@import "tailwindcss";
+@import "@avibe/show-ui/theme.css";
+
 body {
   margin: 0;
   background: #f8fafc;

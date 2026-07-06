@@ -1,9 +1,22 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
+const DEFAULT_UI_PACKAGE = "@avibe/show-ui"
 const TAILWIND_IMPORT = `@import "tailwindcss";`
 // Matches an existing Tailwind entry in any quote/spacing form so migration never double-imports.
 const TAILWIND_IMPORT_PATTERN = /@import\s+["']tailwindcss["']/
+// The UI theme entry (`<uiPackageName>/theme.css`). It MUST be imported into this Tailwind
+// entry (not merely as a main.tsx side effect) so its `@theme` tokens register in this
+// compilation and its `@source` makes the shadcn component utility classes get generated. It
+// goes right AFTER the tailwindcss import so it extends the default theme. Derived from the
+// configured `uiPackageName` (the alias/vendor/extras paths use the same name), so a custom
+// UI package resolves instead of a hardcoded `@avibe/show-ui`.
+const themeImport = (uiPackageName: string) => `@import "${uiPackageName}/theme.css";`
+const themeImportPattern = (uiPackageName: string) =>
+  new RegExp(`@import\\s+["']${escapeRegExp(uiPackageName)}/theme\\.css["']`)
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
 // A leading `@charset "...";` is the only statement allowed before `@import`. Match only
 // through the `;` (plus trailing spaces/one line ending) so rules sharing the line — e.g.
 // minified `@charset "utf-8";body{...}` — are NOT swallowed, which would push the import
@@ -12,25 +25,28 @@ const LEADING_CHARSET_PATTERN = /^@charset\s+["'][^"']*["'];[ \t]*\r?\n?/i
 // UTF-8 byte order mark, preserved at position 0 when re-emitting an existing file.
 const BOM = "\ufeff"
 
-export async function ensureSessionTemplate(workspace: string) {
+export async function ensureSessionTemplate(workspace: string, uiPackageName: string = DEFAULT_UI_PACKAGE) {
   await mkdir(join(workspace, "src"), { recursive: true })
   await mkdir(join(workspace, "api"), { recursive: true })
   await writeIfMissing(join(workspace, "index.html"), indexHtml())
   await writeIfMissing(join(workspace, "src", "show-runtime-config.ts"), showRuntimeConfigTs())
   await writeIfMissing(join(workspace, "src", "main.tsx"), mainTsx())
   await writeIfMissing(join(workspace, "src", "App.tsx"), appTsx())
-  await writeIfMissing(join(workspace, "src", "styles.css"), stylesCss())
-  await ensureTailwindImport(join(workspace, "src", "styles.css"))
+  await writeIfMissing(join(workspace, "src", "styles.css"), stylesCss(uiPackageName))
+  await ensureEntryImports(join(workspace, "src", "styles.css"), uiPackageName)
 }
 
 /**
- * Make Tailwind utilities available in workspaces whose `src/styles.css` predates the
- * built-in Tailwind pipeline. New workspaces already lead with `@import "tailwindcss";`
- * (see stylesCss), so this is a one-time, idempotent migration: it prepends the import
- * only when absent, runs on every warm before the Vite server is created, and skips
- * without writing when the import is already present.
+ * Keep the workspace Tailwind entry importing BOTH `tailwindcss` and the `@avibe/show-ui`
+ * theme, in that order. New workspaces already lead with both (see stylesCss); this is the
+ * idempotent, HMR-safe migration for workspaces whose `src/styles.css` predates them — it
+ * adds whichever import is missing and skips (no write) when both are present. Runs on every
+ * warm before the Vite server is created.
+ *
+ * Detection runs against a comment-stripped copy so a commented-out import is not mistaken
+ * for a real one (which would skip migration and leave the page unstyled).
  */
-async function ensureTailwindImport(path: string) {
+async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_UI_PACKAGE) {
   let contents: string
   try {
     contents = await readFile(path, "utf8")
@@ -38,30 +54,57 @@ async function ensureTailwindImport(path: string) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return
     throw error
   }
-  // Detect against a comment-stripped copy so a legacy `/* @import "tailwindcss"; */`
-  // isn't mistaken for a real import (which would skip migration and stay unstyled).
-  if (TAILWIND_IMPORT_PATTERN.test(stripCssComments(contents))) return
-  await writeFile(path, prependTailwindImport(contents), "utf8")
-}
-
-/** Strip CSS block comments (used only for import detection, not for the emitted file). */
-function stripCssComments(css: string): string {
-  return css.replace(/\/\*[\s\S]*?\*\//g, "")
+  const theme = themeImport(uiPackageName)
+  const scanned = maskCssComments(contents)
+  const hasTailwind = TAILWIND_IMPORT_PATTERN.test(scanned)
+  const hasTheme = themeImportPattern(uiPackageName).test(scanned)
+  if (hasTailwind && hasTheme) return
+  if (!hasTailwind) {
+    // No Tailwind entry yet: prepend it (plus the theme, unless the theme is already there)
+    // as the leading statement(s), after any `@charset`/BOM.
+    const block = hasTheme ? TAILWIND_IMPORT : `${TAILWIND_IMPORT}\n${theme}`
+    contents = prependImports(contents, block)
+  } else {
+    // Tailwind entry present but the theme is missing: insert it right after the import.
+    contents = insertThemeAfterTailwind(contents, theme)
+  }
+  await writeFile(path, contents, "utf8")
 }
 
 /**
- * Insert the Tailwind import as the first CSS statement. `@import` must precede every
- * rule except a leading `@charset`, so when the file opens with one (after an optional
- * BOM) the import is placed right after it; otherwise it goes at the very top.
+ * Insert the theme import immediately after the FIRST REAL (non-commented) `@import
+ * "tailwindcss";` statement. The match runs on the comment-masked copy so a commented-out
+ * import is skipped; the masking is length-preserving, so the offset maps back to `contents`.
  */
-function prependTailwindImport(contents: string): string {
+function insertThemeAfterTailwind(contents: string, theme: string): string {
+  const match = /@import\s+["']tailwindcss["'][^;]*;/.exec(maskCssComments(contents))
+  if (!match) return contents
+  const end = match.index + match[0].length
+  return `${contents.slice(0, end)}\n${theme}${contents.slice(end)}`
+}
+
+/** Strip CSS block comments (used only for import detection, not for the emitted file). */
+// Blank out CSS block comments with EQUAL-LENGTH whitespace (not removal) so a match index
+// in the masked copy maps to the same offset in the source. Used both to detect real imports
+// and to locate where to insert after them — a commented-out import must never count or be
+// targeted (that would push a real import inside the comment and re-inject every warm).
+function maskCssComments(css: string): string {
+  return css.replace(/\/\*[\s\S]*?\*\//g, (match) => " ".repeat(match.length))
+}
+
+/**
+ * Insert a leading `@import` block as the first CSS statement(s). `@import` must precede
+ * every rule except a leading `@charset`, so when the file opens with one (after an optional
+ * BOM) the block is placed right after it; otherwise it goes at the very top.
+ */
+function prependImports(contents: string, block: string): string {
   const bom = contents.startsWith(BOM) ? BOM : ""
   const body = bom ? contents.slice(1) : contents
   const charset = LEADING_CHARSET_PATTERN.exec(body)
   if (charset) {
-    return `${bom}${charset[0]}${TAILWIND_IMPORT}\n${body.slice(charset[0].length)}`
+    return `${bom}${charset[0]}${block}\n${body.slice(charset[0].length)}`
   }
-  return `${bom}${TAILWIND_IMPORT}\n${body}`
+  return `${bom}${block}\n${body}`
 }
 
 async function writeIfMissing(path: string, contents: string) {
@@ -155,8 +198,9 @@ export default function App() {
 `
 }
 
-function stylesCss() {
-  return `@import "tailwindcss";
+function stylesCss(uiPackageName: string = DEFAULT_UI_PACKAGE) {
+  return `${TAILWIND_IMPORT}
+${themeImport(uiPackageName)}
 
 body {
   margin: 0;
