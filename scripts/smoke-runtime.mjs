@@ -1,6 +1,6 @@
 import { access, cp, mkdtemp, mkdir, readFile, readlink, readdir, symlink, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { pathToFileURL } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { join, relative } from "node:path"
 import vm from "node:vm"
 import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
@@ -686,6 +686,133 @@ export const demo = customAlphabet("abc")
       await queryResumedReader.cancel()
     } catch {
       // the abort above may already close the reader
+    }
+  }
+
+  // --- Tailwind built-in capability -------------------------------------------------
+  // Tailwind v4 ships as a built-in: `src/styles.css` opts in with `@import "tailwindcss";`
+  // and the Vite plugin scans the workspace for utility classes. These are the regression
+  // that catches a Show Page rendering silently unstyled (utilities dropped, zero errors).
+
+  // (1) A NEW workspace: the template writes styles.css with the import already at the top,
+  // and utilities used in App.tsx must appear in the served/transformed CSS.
+  await mkdir(join(root, "tailwind", "src"), { recursive: true })
+  await writeFile(join(root, "tailwind", "src", "App.tsx"), `export default function App() {
+  return (
+    <main className="flex min-h-screen items-center justify-center gap-4 p-6">
+      <div className="rounded-xl bg-white p-6 shadow-lg">Tailwind is built in</div>
+    </main>
+  )
+}
+`)
+  const tailwindEnsure = await fetch(`${runtime.url}/sessions/tailwind/ensure`, { method: "POST" }).then((res) => res.json())
+  if (tailwindEnsure.state !== "active") {
+    throw new Error(`Expected Tailwind session to warm active, got ${JSON.stringify(tailwindEnsure)}`)
+  }
+  const tailwindStyles = await readFile(join(root, "tailwind", "src", "styles.css"), "utf8")
+  if (!tailwindStyles.startsWith(`@import "tailwindcss";`)) {
+    throw new Error(`Expected new workspace styles.css to lead with the Tailwind import, got ${JSON.stringify(tailwindStyles.slice(0, 40))}`)
+  }
+  const tailwindCss = await fetch(`${runtime.url}/sessions/tailwind/app/src/styles.css?direct`).then((res) => res.text())
+  for (const rule of [".flex", ".p-6", ".items-center", ".gap-4", ".rounded-xl"]) {
+    if (!tailwindCss.includes(rule)) {
+      throw new Error(`Expected served Tailwind CSS to include the "${rule}" utility used by App.tsx (silently unstyled otherwise)`)
+    }
+  }
+  if (!/@layer base\s*\{/.test(tailwindCss)) {
+    throw new Error("Expected Tailwind preflight inside @layer base so unlayered @avibe/show-ui component CSS still wins")
+  }
+
+  // (2) A PRE-EXISTING workspace whose styles.css predates the built-in pipeline: the
+  // runtime idempotently prepends the import on warm so utilities work without a rescaffold.
+  await mkdir(join(root, "tailwind-legacy", "src"), { recursive: true })
+  await writeFile(join(root, "tailwind-legacy", "src", "styles.css"), ":root { color-scheme: light; }\nbody { margin: 0; }\n")
+  await writeFile(join(root, "tailwind-legacy", "src", "App.tsx"), `export default function App() {
+  return <main className="grid gap-3 p-8">migrated</main>
+}
+`)
+  const legacyEnsure = await fetch(`${runtime.url}/sessions/tailwind-legacy/ensure`, { method: "POST" }).then((res) => res.json())
+  if (legacyEnsure.state !== "active") {
+    throw new Error(`Expected legacy Tailwind session to warm active, got ${JSON.stringify(legacyEnsure)}`)
+  }
+  const legacyStyles = await readFile(join(root, "tailwind-legacy", "src", "styles.css"), "utf8")
+  if (!legacyStyles.startsWith(`@import "tailwindcss";`) || !legacyStyles.includes("color-scheme: light")) {
+    throw new Error(`Expected legacy styles.css to gain the Tailwind import while preserving prior rules, got ${JSON.stringify(legacyStyles.slice(0, 60))}`)
+  }
+  if ((legacyStyles.match(/@import "tailwindcss"/g) || []).length !== 1) {
+    throw new Error("Expected the migration to insert the Tailwind import exactly once")
+  }
+  const legacyCss = await fetch(`${runtime.url}/sessions/tailwind-legacy/app/src/styles.css?direct`).then((res) => res.text())
+  for (const rule of [".gap-3", ".p-8"]) {
+    if (!legacyCss.includes(rule)) {
+      throw new Error(`Expected migrated workspace CSS to include the "${rule}" utility`)
+    }
+  }
+
+  // (3) Migration of a MINIFIED pre-existing styles.css that leads with `@charset`: the
+  // import must be inserted right after the `;`, before the rules sharing that line, so it
+  // stays a valid leading `@import` (not pushed after a rule, which browsers drop).
+  await mkdir(join(root, "tailwind-charset", "src"), { recursive: true })
+  await writeFile(join(root, "tailwind-charset", "src", "styles.css"), `@charset "utf-8";body{margin:0}.legacy{padding:2px}`)
+  await writeFile(join(root, "tailwind-charset", "src", "App.tsx"), `export default function App() {
+  return <main className="mt-4">charset</main>
+}
+`)
+  const charsetEnsure = await fetch(`${runtime.url}/sessions/tailwind-charset/ensure`, { method: "POST" }).then((res) => res.json())
+  if (charsetEnsure.state !== "active") {
+    throw new Error(`Expected @charset Tailwind session to warm active, got ${JSON.stringify(charsetEnsure)}`)
+  }
+  const charsetStyles = await readFile(join(root, "tailwind-charset", "src", "styles.css"), "utf8")
+  const charsetImportIdx = charsetStyles.indexOf(`@import "tailwindcss";`)
+  if (!charsetStyles.startsWith(`@charset "utf-8";`) || charsetImportIdx === -1 || charsetImportIdx > charsetStyles.indexOf("body{")) {
+    throw new Error(`Expected the import right after @charset and before any rule, got ${JSON.stringify(charsetStyles)}`)
+  }
+
+  // (4) An EXTRAS session (workspace package.json declares deps) gets a private node_modules
+  // holding only those extras — Tailwind's own resolver can't see the runtime's shared
+  // `tailwindcss`, so the runtime links it in. A local `file:` extra keeps this offline.
+  await mkdir(join(root, "tailwind-extras", "src"), { recursive: true })
+  await mkdir(join(root, "tailwind-extras", "extra-pkg"), { recursive: true })
+  await writeFile(join(root, "tailwind-extras", "extra-pkg", "package.json"), `${JSON.stringify({ name: "show-extra-pkg", version: "1.0.0", type: "module", main: "index.js" })}\n`)
+  await writeFile(join(root, "tailwind-extras", "extra-pkg", "index.js"), `export const marker = "extra-ok"\n`)
+  await writeFile(join(root, "tailwind-extras", "package.json"), `${JSON.stringify({ name: "tailwind-extras-page", private: true, dependencies: { "show-extra-pkg": "file:./extra-pkg" } })}\n`)
+  await writeFile(join(root, "tailwind-extras", "src", "App.tsx"), `import { marker } from "show-extra-pkg"
+export default function App() {
+  return <main className="flex gap-4 p-6">{marker}</main>
+}
+`)
+  const extrasEnsure = await fetch(`${runtime.url}/sessions/tailwind-extras/ensure`, { method: "POST" }).then((res) => res.json())
+  if (extrasEnsure.state !== "active") {
+    throw new Error(`Expected extras Tailwind session to warm active, got ${JSON.stringify(extrasEnsure)}`)
+  }
+  const extrasCssResponse = await fetch(`${runtime.url}/sessions/tailwind-extras/app/src/styles.css?direct`)
+  const extrasCss = await extrasCssResponse.text()
+  if (extrasCssResponse.status !== 200) {
+    throw new Error(`Expected extras session styles.css to resolve (tailwindcss linked into the private node_modules), got ${extrasCssResponse.status}: ${extrasCss.slice(0, 200)}`)
+  }
+  for (const rule of [".flex", ".p-6", ".gap-4"]) {
+    if (!extrasCss.includes(rule)) {
+      throw new Error(`Expected extras session CSS to include the "${rule}" utility (Tailwind unresolved in the extras node_modules otherwise)`)
+    }
+  }
+
+  // (5) Build path (public /p/ pages are served without HMR): the shadcn-alias example
+  // builds with the same Tailwind plugin. Assert its built CSS carries the utilities it
+  // uses. Requires a prior `npm run build` (CI runs `npm run check` before `npm run smoke`).
+  const exampleAssets = join(fileURLToPath(new URL("..", import.meta.url)), "examples", "shadcn-alias", "dist", "assets")
+  let builtCssFiles = []
+  try {
+    builtCssFiles = (await readdir(exampleAssets)).filter((name) => name.endsWith(".css"))
+  } catch {
+    builtCssFiles = []
+  }
+  if (!builtCssFiles.length) {
+    throw new Error(`Expected built example CSS under ${exampleAssets}; run "npm run build" before "npm run smoke"`)
+  }
+  const builtCss = await readFile(join(exampleAssets, builtCssFiles[0]), "utf8")
+  for (const rule of [".px-3", ".py-1", ".inline-flex"]) {
+    if (!builtCss.includes(rule)) {
+      throw new Error(`Expected the example's built CSS to include the "${rule}" utility (build path silently unstyled otherwise)`)
     }
   }
 

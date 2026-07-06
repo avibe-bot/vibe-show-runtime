@@ -20,6 +20,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      # Smoke boots the runtime server and asserts Tailwind utilities reach the served and
+      # built CSS (the regression against pages rendering silently unstyled). Gated on Linux
+      # — the platform used for CI and github-source installs — to avoid Windows-specific
+      # smoke flakiness; the Tailwind build path stays gated on every OS via `npm run check`.
+      - run: npm run smoke
+        if: matrix.os == 'ubuntu-latest'
       - run: npm run bundle:vibe-remote
       - uses: actions/upload-artifact@v4
         with:

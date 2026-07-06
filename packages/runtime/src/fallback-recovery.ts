@@ -189,7 +189,7 @@ export function fallbackRecoveryHtml() {
         <div class="avs-fallback-grid">
           <div class="avs-fallback-panel">
             <h2>Ask your agent to fix the Show Page</h2>
-            <textarea id="avs-agent-prompt" readonly>Please repair this Vibe Remote Show Page. Open the Show Page workspace, read the local Show Page/runtime instructions, then replace src/App.tsx with a polished React page. Use the shadcn-style components from @/components/ui and @avibe/show-ui. Do not edit index.html unless it is required. If the browser shows Ready to visualize, check src/App.tsx, src/main.tsx, src/styles.css, and the Vite/browser console for compile or runtime errors. Make the page responsive and verify it renders.</textarea>
+            <textarea id="avs-agent-prompt" readonly>Please repair this Vibe Remote Show Page. Open the Show Page workspace, read the local Show Page/runtime instructions, then replace src/App.tsx with a polished React page. Use the shadcn-style components from @/components/ui and @avibe/show-ui, and Tailwind CSS v4 utility classes (available in any className). Keep @import "tailwindcss"; at the top of src/styles.css. Do not edit index.html unless it is required. If the browser shows Ready to visualize, check src/App.tsx, src/main.tsx, src/styles.css, and the Vite/browser console for compile or runtime errors. Make the page responsive and verify it renders.</textarea>
             <button class="avs-copy-button" type="button" onclick="navigator.clipboard.writeText(document.getElementById('avs-agent-prompt').value).then(() => this.textContent = 'Copied')">Copy prompt</button>
           </div>
           <div class="avs-fallback-panel">
@@ -199,6 +199,7 @@ export function fallbackRecoveryHtml() {
               <li>Ask the agent to inspect Vite and browser console errors.</li>
               <li>The main file to edit is <code>src/App.tsx</code>.</li>
               <li>Use shared UI imports like <code>@/components/ui/card</code>.</li>
+              <li>Tailwind utility classes work in any <code>className</code>; keep <code>@import "tailwindcss";</code> atop <code>src/styles.css</code>.</li>
             </ul>
           </div>
         </div>

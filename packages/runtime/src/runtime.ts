@@ -6,6 +6,7 @@ import { createRequire } from "node:module"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import react from "@vitejs/plugin-react"
+import tailwindcss from "@tailwindcss/vite"
 import { createServer as createViteServer } from "vite"
 import type { InlineConfig, Plugin, ViteDevServer } from "vite"
 import {
@@ -228,6 +229,12 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
           ? []
           : [sharedResolveFallbackPlugin(sharedDependencies.sharedNodeModules, providedSpecifiers)]),
         showHmrTransitionPlugin({ fallbackDelaySeconds: options.fallbackDelaySeconds }),
+        // Tailwind v4 is a built-in runtime capability: `src/styles.css` opts in with
+        // `@import "tailwindcss";` (see templates.ensureSessionTemplate), and the plugin
+        // scans the workspace `src/**` for utility classes. It only transforms CSS, so it
+        // composes with the vendor import-map/externalize plugins (which own JS specifiers)
+        // and never sees a bare module they resolve.
+        tailwindcss(),
         react()
       ] as InlineConfig["plugins"],
       resolve: {
@@ -412,12 +419,43 @@ async function ensureSessionDependencies(
   // shared deps stay reachable via the resolve fallback (see warmSession), so we never
   // touch a parent/shared `node_modules` that may be a real host directory.
   const extrasDir = await ensureSessionExtrasInstall(workspace, declaredExtras)
+  // `@tailwindcss/vite` resolves `@import "tailwindcss";` from the workspace by filesystem
+  // walk-up (its own resolver, NOT Vite's JS resolve pipeline — so `sharedResolveFallbackPlugin`
+  // can't reach it). An extras session's node_modules holds only the declared extras, so link
+  // the runtime-owned `tailwindcss` package in from the shared install. Shared-only sessions
+  // already resolve it through the whole-node_modules symlink above.
+  await ensureSharedPackageLink(extrasDir, sharedNodeModules, "tailwindcss")
   return {
     nodeModules: extrasDir,
     sharedNodeModules,
     packageRoots: [...packageRoots, extrasDir, sharedNodeModules],
     extrasSignature: declaredExtras.signature
   }
+}
+
+/**
+ * Symlink one runtime-owned package from the shared install into a session's private
+ * (extras) `node_modules`, so a tool that resolves it by filesystem walk-up from the
+ * workspace (e.g. `@tailwindcss/vite` resolving `@import "tailwindcss";`) finds it without
+ * forking it per session. Idempotent and confined to the session's own node_modules:
+ * skips when anything already occupies the link path (a prior warm's link, or a package
+ * the session installed itself) and no-ops when the shared install doesn't provide it.
+ */
+async function ensureSharedPackageLink(nodeModules: string, sharedNodeModules: string, packageName: string) {
+  const linkPath = join(nodeModules, packageName)
+  try {
+    await lstat(linkPath)
+    return
+  } catch {
+    // Nothing at the link path yet; create the link below.
+  }
+  const target = join(sharedNodeModules, packageName)
+  try {
+    await access(target)
+  } catch {
+    return
+  }
+  await symlink(target, linkPath, "junction")
 }
 
 /**
@@ -608,8 +646,11 @@ function anchorLocalRange(range: string, workspace: string): string {
  * Whether a declared dependency NAME is owned by the runtime and must never be
  * installed per session. Prefix-matches the whole `@avibe/show-ui` / `@avibe/show-sdk`
  * packages (every subpath shares the shared install) plus the React family, `motion`,
- * and `lucide-react`. Distinct from the import-map externalize set (exact-match):
- * ownership is broader than what the bundle enumerates.
+ * and `lucide-react`. `tailwindcss` is owned too: its CSS engine version must match the
+ * runtime's `@tailwindcss/vite`/oxide, so it is linked in from the shared install
+ * (see ensureSharedPackageLink) rather than forked per session. Distinct from the
+ * import-map externalize set (exact-match): ownership is broader than what the bundle
+ * enumerates.
  */
 function isRuntimeOwnedDependency(name: string, uiPackageName: string): boolean {
   return name === "react" ||
@@ -619,6 +660,7 @@ function isRuntimeOwnedDependency(name: string, uiPackageName: string): boolean 
     name === "motion" ||
     name.startsWith("motion/") ||
     name === "lucide-react" ||
+    name === "tailwindcss" ||
     name === uiPackageName ||
     name.startsWith(`${uiPackageName}/`) ||
     name === "@avibe/show-sdk" ||
