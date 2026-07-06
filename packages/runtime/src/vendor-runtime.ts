@@ -1,4 +1,4 @@
-import { readFile, utimes } from "node:fs/promises"
+import { access, readFile, utimes } from "node:fs/promises"
 import { dirname, join, normalize, resolve, sep } from "node:path"
 import { createHash } from "node:crypto"
 import type { ServerResponse } from "node:http"
@@ -67,7 +67,19 @@ export function ensureVendorBundle(options: EnsureVendorBundleOptions): Promise<
   // serve — memo hit OR a fresh/reused build — passes through here, so touching the out dir on
   // resolve makes "any use ⟹ recently touched" a structural guarantee. The cache GC then only
   // reaps dirs no live process has resolved within the (hours-wide) age cutoff.
-  if (cached) return cached.then(touchVendorOutDir)
+  if (cached) {
+    // Self-heal on reuse: the memo is module-global and outlives runtime.close(), while the cache
+    // GC (#31) can let a peer reclaim a vendor dir this process is no longer heartbeating. Serving
+    // a stale memo would then 404 every /_show-runtime/vendor/* asset, so validate the out dir
+    // still exists before reuse; if it's gone, drop the memo and rebuild. This is the class
+    // terminator: it turns any residual delete-vs-reuse race from "broken until restart" into a
+    // single rebuild.
+    return cached.then(async (bundle) => {
+      if (await directoryExists(bundle.result.outDir)) return touchVendorOutDir(bundle)
+      if (vendorBundles.get(cacheKey) === cached) vendorBundles.delete(cacheKey)
+      return ensureVendorBundle(options) // memo now empty (or repopulated by a peer warm) -> rebuild/reuse
+    })
+  }
   const built = buildVendorBundle(dependencyRoot, uiPackageName, vendorCacheRoot).catch((error) => {
     // Don't cache a failed build — let the next warm retry.
     if (vendorBundles.get(cacheKey) === built) vendorBundles.delete(cacheKey)
@@ -82,6 +94,17 @@ async function touchVendorOutDir(bundle: VendorBundle): Promise<VendorBundle> {
   const now = new Date()
   await utimes(bundle.result.outDir, now, now).catch(() => {})
   return bundle
+}
+
+/** Whether `path` still exists — the self-heal check for a memoized bundle whose dir a peer's cache
+ * GC may have reclaimed (#31). */
+async function directoryExists(path: string): Promise<boolean> {
+  try {
+    await access(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function buildVendorBundle(dependencyRoot: string, uiPackageName: string, vendorCacheRoot: string): Promise<VendorBundle> {
