@@ -1130,7 +1130,16 @@ if (process.platform !== "win32") {
     `import { spawn } from "node:child_process"`,
     `const child = spawn(process.execPath, [process.argv[1], "--workspace-root", process.argv[2], "--port", "0"], {`,
     `  env: { ...process.env, VIBE_SHOW_RUNTIME_PARENT_DEATH_POLL_MS: "150" }, stdio: ["ignore", "pipe", "ignore"] })`,
-    `child.stdout.on("data", (data) => { if (String(data).includes("listening")) console.log("child-pid:" + child.pid) })`,
+    `let childStdout = ""`,
+    `let reported = false`,
+    `child.stdout.on("data", (data) => {`,
+    `  childStdout += String(data)`,
+    `  const match = childStdout.match(/Vibe Show Runtime listening at (\\S+)/)`,
+    `  if (!reported && match) {`,
+    `    reported = true`,
+    `    console.log(JSON.stringify({ childPid: child.pid, url: match[1] }))`,
+    `  }`,
+    `})`,
     `setInterval(() => {}, 1000)`
   ].join("\n")
   const wrapper = spawn(process.execPath, ["--input-type=module", "-e", wrapperSource, cliPath, parentDeathRoot], {
@@ -1153,20 +1162,31 @@ if (process.platform !== "win32") {
     }
   }
   try {
-    const childPid = await new Promise((resolvePid, rejectPid) => {
-      const timeout = setTimeout(() => rejectPid(new Error("runtime server never reported listening")), 20000)
+    const { childPid, url: cliRuntimeUrl } = await new Promise((resolveRuntime, rejectRuntime) => {
+      const timeout = setTimeout(() => rejectRuntime(new Error("runtime server never reported listening")), 20000)
       wrapper.stdout.on("data", (data) => {
-        const match = String(data).match(/child-pid:(\d+)/)
-        if (match) {
-          clearTimeout(timeout)
-          resolvePid(Number(match[1]))
+        const lines = String(data).trim().split(/\n+/).filter(Boolean)
+        for (const line of lines) {
+          let payload
+          try {
+            payload = JSON.parse(line)
+          } catch {
+            continue
+          }
+          if (typeof payload.childPid === "number" && typeof payload.url === "string") {
+            clearTimeout(timeout)
+            resolveRuntime(payload)
+            return
+          }
         }
       })
-      wrapper.on("exit", () => rejectPid(new Error("wrapper exited before the runtime server reported listening")))
+      wrapper.on("exit", () => rejectRuntime(new Error("wrapper exited before the runtime server reported listening")))
     })
     if (!isAlive(childPid)) {
       throw new Error("Expected the spawned runtime server to be alive before its parent is killed")
     }
+    await waitForRuntimeHealth(cliRuntimeUrl)
+    await loadAppEntry(cliRuntimeUrl, "cli-live")
     // Hard-kill the wrapper (SIGKILL runs no shutdown hooks) to orphan the runtime server.
     process.kill(wrapper.pid, "SIGKILL")
     let orphanExited = false
@@ -1221,4 +1241,20 @@ async function loadAppEntry(runtimeUrl, sessionId) {
   }
   await main.text()
   return html
+}
+
+async function waitForRuntimeHealth(runtimeUrl) {
+  const deadline = Date.now() + 5000
+  let lastError
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`${runtimeUrl}/health`)
+      if (response.ok) return
+      lastError = new Error(`health returned ${response.status}`)
+    } catch (error) {
+      lastError = error
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`Runtime CLI did not stay healthy after startup: ${lastError?.message || lastError}`)
 }

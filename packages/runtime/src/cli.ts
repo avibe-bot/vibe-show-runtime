@@ -9,6 +9,11 @@ import { buildVendor } from "./vendor.js"
 // when the parent dies during startup (before the watcher is installed).
 const INITIAL_PARENT_PID = process.ppid
 
+// How often to check whether our parent has died. Poll-based because Node exposes no portable
+// parent-death signal (Linux `PR_SET_PDEATHSIG` needs a native addon); the delay only bounds
+// how long an orphan lingers, so a couple of seconds is fine.
+const PARENT_DEATH_POLL_MS = Number(process.env.VIBE_SHOW_RUNTIME_PARENT_DEATH_POLL_MS ?? "2000")
+
 const command = subcommand()
 
 if (command === "build-vendor") {
@@ -62,11 +67,6 @@ async function runServer() {
     void runtime.close().then(() => process.exit(0))
   })
 }
-
-// How often to check whether our parent has died. Poll-based because Node exposes no portable
-// parent-death signal (Linux `PR_SET_PDEATHSIG` needs a native addon); the delay only bounds
-// how long an orphan lingers, so a couple of seconds is fine.
-const PARENT_DEATH_POLL_MS = Number(process.env.VIBE_SHOW_RUNTIME_PARENT_DEATH_POLL_MS ?? "2000")
 
 /**
  * Exit when the process that spawned this server dies. avibe runs the runtime as a child; if
