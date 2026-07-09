@@ -435,8 +435,11 @@ First-version hard rules:
 - no arbitrary process execution from handlers
 - session file APIs are scoped to that session workspace
 - public and private page rendering both use the live runtime and HMR
-- public write/event/handler/agent-action capabilities must be permissioned
-  separately from public page rendering
+- public handler access is disabled by default; only explicit
+  read-only/share-safe handlers or materialized public data snapshots may serve
+  public viewers
+- public write/event/agent-action capabilities must be permissioned separately
+  from public page rendering
 
 Vite configuration should use strict file-system serving rules and explicit
 allow lists. A session must not be able to import another session's source by

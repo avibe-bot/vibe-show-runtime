@@ -235,6 +235,7 @@ type AnnotationPayload = {
   anchor?: Anchor
   anchors?: Anchor[]
   userRegion?: { x: number; y: number; width: number; height: number }
+  viewport?: { width: number; height: number; scrollX: number; scrollY: number }
   matchedElements?: Anchor[]
   screenshot?: {
     attachmentId: string
@@ -242,6 +243,7 @@ type AnnotationPayload = {
     width: number
     height: number
     capturedRegion: { x: number; y: number; width: number; height: number }
+    viewport: { width: number; height: number; scrollX: number; scrollY: number }
     items: Array<{
       id: string
       label: number
@@ -254,9 +256,10 @@ type AnnotationPayload = {
 ```
 
 For smart area selection, `primaryAnchor` may be `element-group` or `area`, but
-`userRegion` and `matchedElements` should both be retained. For screenshot
-mode, the screenshot is the primary artifact and the numbered items are local
-coordinates inside that screenshot.
+`userRegion`, `viewport`, and `matchedElements` should all be retained. For
+screenshot mode, the screenshot is the primary artifact, the viewport preserves
+where it came from, and the numbered items are local coordinates inside that
+screenshot.
 
 ### Agent Session
 
@@ -651,16 +654,20 @@ replaceable, restartable, and versioned independently.
 Private `/show/<session-id>/...` may host live service pages and interaction
 events after authentication.
 
-Public `/p/<share-id>/...` must still host live service pages and HMR so users
-can watch agent edits in real time. It must not expose live handlers,
-annotation event submission, or agent session actions by accident.
+Public `/p/<share-id>/...` should still host live frontend pages and HMR so
+users can watch agent edits in real time. It must not expose write-capable
+handlers, annotation event submission, or agent session actions by accident.
 
 Initial policy:
 
 - private pages: live runtime and interaction allowed
-- public pages: live runtime and HMR allowed
-- public interaction: read-only by default; event submission, handlers, and
-  agent actions require a separate permission and abuse-control design
+- public pages: live frontend runtime and HMR allowed
+- public handlers: disabled by default unless a handler is explicitly declared
+  read-only and share-safe; pages that depend on private handlers for rendering
+  must use a materialized read-only data snapshot or a public-safe fallback
+- public interaction: read-only by default; event submission, write-capable
+  handlers, and agent actions require a separate permission and abuse-control
+  design
 
 ## Agentation Findings
 

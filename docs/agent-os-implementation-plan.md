@@ -427,6 +427,7 @@ Event data:
 type AreaSelectionPayload = {
   primaryAnchor: "element-group" | "area"
   userRegion: { x: number; y: number; width: number; height: number }
+  viewport: { width: number; height: number; scrollX: number; scrollY: number }
   matchedElements: Anchor[]
   classification: {
     confidence: number
@@ -631,6 +632,9 @@ Capabilities:
   `/p/<share-id>/...` clients without reconnecting or retargeting the other
   client's HMR connection; use base-neutral module URLs or separate runtime
   contexts per serving base
+- define public data loading before enabling live shares for handler-backed
+  pages: only explicit read-only/share-safe handlers may run publicly, otherwise
+  serve a materialized data snapshot or public-safe fallback
 - keep event submission, live handlers, and agent actions behind explicit
   permission checks
 - move immutable runtime/vendor assets to versioned, cacheable paths that can
@@ -708,11 +712,11 @@ Before marking the interaction system MVP complete:
 - The implementation does not depend on Agentation code.
 - Annotation capture works when the target element is fixed/sticky.
 - Annotation mode does not break normal page controls when disabled.
-- Non-text drag selection can submit either an element group or an area without
-  requiring a separate toolbar mode.
 - The SDK remains split from visual primitives.
 
 Post-MVP follow-up checks:
 
+- Non-text drag selection can submit either an element group or an area without
+  requiring a separate toolbar mode.
 - Screenshot annotation can batch multiple numbered comments into one image
   event once screenshot attachment storage is in scope.
