@@ -132,11 +132,24 @@ Avoid for v1:
 The global graph can be revisited later if active-session memory becomes a real
 bottleneck, but it should not be the first design.
 
+If public and private URLs need to be open for the same session at the same
+time, do not mutate one context's Vite `base` between request paths. Either keep
+generated module URLs base-neutral or create separate contexts for the distinct
+serving bases while preserving session-level isolation.
+
 ## Remote HMR Performance Model
 
 The runtime must preserve hot updates for local, remote, private, and public
 Show Pages. Remote performance should improve by separating immutable runtime
 assets from session source, not by replacing live pages with static snapshots.
+
+Observed slow paths over Cloudflare Tunnel are mostly Vite dev modules and
+runtime-owned dependencies:
+
+- `.vite/deps/*` optimized vendor modules such as React and React DOM
+- `@vite/client`
+- runtime package files such as `@avibe/show-ui/theme` and CSS
+- session source files such as `src/App.tsx`
 
 The optimization boundary should be:
 
@@ -146,12 +159,25 @@ The optimization boundary should be:
 - HMR WebSocket and event streams: never cached
 - HTML shell with injected session config: no-store
 
-The first implementation keeps one Vite context and one mutable Vite cache
-directory per active session, but moves those cache directories outside the
-session workspace. This preserves Vite's per-context cache safety while giving
-Vibe Remote one runtime-owned cache root to manage. A later immutable prebundle
-or runtime asset namespace can make browser-visible URLs stable across session
-and share paths.
+Recommended implementation:
+
+1. Give Vite a runtime-owned cache root outside each session workspace, with
+   per-session cache directories keyed by runtime digest, dependency manifest,
+   and source dependency signature. The source signature must include scanned
+   bare imports and declared extras because Vite optimizer metadata depends on
+   the `optimizeDeps.include` set.
+2. Add a runtime asset namespace such as
+   `/_show-runtime/<runtime-digest>/...` for runtime-owned package assets and
+   dependency chunks that do not contain session data.
+3. Keep `/show/<session-id>/...` and `/p/<share-id>/...` for session source,
+   HMR, HTML, events, and permissioned handlers.
+4. Make public and private serving bases coexist without stealing each other's
+   HMR clients. Prefer base-neutral generated module URLs; if Vite still needs
+   a baked `base`, use separate contexts per serving base.
+5. Set `Cache-Control: public, max-age=31536000, immutable` only on versioned
+   runtime assets. Keep session HTML and source modules fresh.
+6. Hide absolute `@fs/...` runtime package paths behind stable runtime asset
+   routes before exposing them through Vibe Remote.
 
 ## Session Workspace
 
@@ -408,7 +434,12 @@ First-version hard rules:
 - no `server.listen()` in session code
 - no arbitrary process execution from handlers
 - session file APIs are scoped to that session workspace
-- public sharing should not proxy live handlers until a policy exists
+- public and private page rendering both use the live runtime and HMR
+- public handler access is disabled by default; only explicit
+  read-only/share-safe handlers or materialized public data snapshots may serve
+  public viewers
+- public write/event/agent-action capabilities must be permissioned separately
+  from public page rendering
 
 Vite configuration should use strict file-system serving rules and explicit
 allow lists. A session must not be able to import another session's source by

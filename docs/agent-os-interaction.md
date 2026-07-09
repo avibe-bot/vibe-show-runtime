@@ -91,6 +91,176 @@ hard to model ahead of time:
 - "I updated this block; please confirm"
 - "this area still needs a decision"
 
+## Annotation Interaction Model
+
+The product surface should expose annotation as a small number of natural user
+actions, not as a dense toolbar of annotation types.
+
+The default shell should provide two explicit modes:
+
+```text
+Smart annotation mode
+  Point, click, select text, or drag a region. The system infers the anchor
+  type and opens a comment popover.
+
+Screenshot annotation mode
+  Select one visual region, add one or more numbered comments on that image,
+  then submit the image and comments together.
+```
+
+### Smart Annotation Mode
+
+Smart annotation mode handles element, text, and region feedback through one
+mode.
+
+Interaction rules:
+
+- Hovering outlines the element under the cursor.
+- Clicking an element opens a comment popover near the click point.
+- Dragging on text preserves normal browser text selection and creates a
+  `text-range` annotation.
+- Dragging in a non-text area creates a rectangle selection.
+- The popover is anchored near the click, selection, or drag end point, not in
+  a detached side panel.
+- Submitting leaves a numbered annotation marker on the page. Clicking the
+  marker opens the prior comment and any agent response/status.
+
+Non-text drag selection should be classified after mouse-up:
+
+```text
+Clear element cluster
+  -> primary anchor is element-group
+  -> preserve individual element anchors and the overall rectangle
+
+Blank/spacing/layout region
+  -> primary anchor is area
+  -> preserve the rectangle, viewport, scroll, and nearby elements
+
+Ambiguous
+  -> default to the higher-confidence choice
+  -> show a small popover toggle:
+     "按 3 个元素标注" / "按区域标注"
+```
+
+The user should never have to choose between "multi-select" and "area" before
+dragging. The system makes the first call, and the popover lets the user
+correct it only when the distinction matters.
+
+Classification hints:
+
+- Candidate elements must ignore the Avibe overlay itself, annotation markers,
+  popovers, and toolbar controls.
+- Prefer `element-group` when the rectangle tightly covers meaningful page
+  elements such as cards, buttons, table rows, chart sections, or list items.
+- Prefer `area` when the rectangle mainly describes spacing, alignment, empty
+  space, visual relationship, or a layout defect that is not owned by one DOM
+  node.
+- Avoid selecting full-page containers unless the user clearly dragged a large
+  page region.
+- Always preserve both the user-drawn region and the matched element list in
+  the event payload, even when one is marked as primary. This gives the agent
+  both code-facing and visual-facing context.
+
+### Screenshot Annotation Mode
+
+Screenshot mode should be separate from smart annotation mode because it has a
+different cost model and a different user goal.
+
+Interaction flow:
+
+1. User switches to screenshot mode.
+2. Cursor becomes a screenshot crosshair and the page shows a lightweight
+   "框选截图区域" hint.
+3. User drags one screenshot region.
+4. The selected region is captured as one screenshot draft.
+5. The draft displays an obvious border and a visible label such as
+   `截图 1`.
+6. User adds comments inside that captured image:
+   - click to place a numbered point comment
+   - drag inside the screenshot to place a numbered sub-region comment
+7. The draft shows numbered markers `1`, `2`, `3`, and a compact comment list.
+8. User submits once: one screenshot image plus all numbered comments are sent
+   to the agent.
+
+This mode should default to batching. Images are token-expensive, so sending
+one image with several numbered comments is better than sending several images
+with one comment each.
+
+Recommended screenshot draft behavior:
+
+- Keep only one active screenshot draft by default.
+- Let the user add, edit, delete, and reorder numbered comments before
+  sending.
+- "Add another comment" should not create another screenshot.
+- "Retake screenshot" replaces the draft region after confirmation.
+- Submit should create one `human.annotation.created` event whose annotation
+  kind is `screenshot` and whose payload contains the screenshot attachment and
+  an ordered `items[]` list of comments.
+
+### Sending Strategy
+
+Use different defaults for the two modes:
+
+- Smart annotation: default to immediate send after each comment. The agent can
+  start working quickly, and each marker becomes a durable page thread.
+- Screenshot annotation: default to batch send. The user is likely describing
+  multiple visible issues on one image, and one image with numbered comments is
+  cheaper and clearer for the agent.
+
+Future "collect mode" can be added if users frequently want to mark many
+non-screenshot annotations before dispatch. It should be an optional workflow,
+not the MVP default.
+
+### Annotation Event Shape
+
+The interaction layer should keep the protocol explicit about the user's
+primary intent while still preserving fallback context.
+
+Target shape:
+
+```ts
+type AnnotationPrimaryAnchor =
+  | "mark"
+  | "element"
+  | "text-range"
+  | "element-group"
+  | "area"
+  | "screenshot"
+
+type AnnotationPayload = {
+  id: string
+  intent?: "fix" | "change" | "question" | "approve"
+  comment?: string
+  primaryAnchor: AnnotationPrimaryAnchor
+  anchor?: Anchor
+  anchors?: Anchor[]
+  userRegion?: { x: number; y: number; width: number; height: number }
+  viewport?: { width: number; height: number; scrollX: number; scrollY: number }
+  matchedElements?: Anchor[]
+  screenshot?: {
+    attachmentId: string
+    mimeType: "image/png" | "image/webp"
+    width: number
+    height: number
+    capturedRegion: { x: number; y: number; width: number; height: number }
+    viewport: { width: number; height: number; scrollX: number; scrollY: number }
+    items: Array<{
+      id: string
+      label: number
+      comment: string
+      point?: { x: number; y: number }
+      rect?: { x: number; y: number; width: number; height: number }
+    }>
+  }
+}
+```
+
+For smart area selection, `primaryAnchor` may be `element-group` or `area`, but
+`userRegion`, `viewport`, and `matchedElements` should all be retained. For
+screenshot mode, the screenshot is the primary artifact, the viewport preserves
+where it came from, and the numbered items are local coordinates inside that
+screenshot.
+
 ### Agent Session
 
 Agent Session is the durable event and decision center. It owns:
@@ -346,7 +516,7 @@ Target shape:
 
 ```ts
 type Anchor = {
-  kind: "mark" | "element" | "text-range" | "area"
+  kind: "mark" | "element" | "text-range" | "area" | "element-group" | "screenshot"
   scope: string
   mark?: string
   selector?: string
@@ -484,15 +654,20 @@ replaceable, restartable, and versioned independently.
 Private `/show/<session-id>/...` may host live service pages and interaction
 events after authentication.
 
-Public `/p/<share-id>/...` must not expose live handlers, annotation event
-submission, or agent session actions by accident.
+Public `/p/<share-id>/...` should still host live frontend pages and HMR so
+users can watch agent edits in real time. It must not expose write-capable
+handlers, annotation event submission, or agent session actions by accident.
 
 Initial policy:
 
 - private pages: live runtime and interaction allowed
-- public pages: static snapshot or read-only rendering only
-- public live interaction: explicitly out of scope until a separate permission
-  and abuse-control design exists
+- public pages: live frontend runtime and HMR allowed
+- public handlers: disabled by default unless a handler is explicitly declared
+  read-only and share-safe; pages that depend on private handlers for rendering
+  must use a materialized read-only data snapshot or a public-safe fallback
+- public interaction: read-only by default; event submission, write-capable
+  handlers, and agent actions require a separate permission and abuse-control
+  design
 
 ## Agentation Findings
 
@@ -540,7 +715,7 @@ Important differences from Vibe Remote:
 | Drag / multi-select | Creates area or multi-element feedback with individual bounding boxes. | Implement after the basic overlay. Model as `area` or grouped anchors, not as one opaque annotation blob. |
 | Shadow DOM traversal | Crosses shadow roots for element lookup and parent traversal. | Required for robustness, but keep it as a low-level anchor utility in SDK, not in the toolbar component. |
 | React fiber detection | Reads React internal fiber metadata to derive component paths. | Use only as diagnostic metadata. Do not make fiber internals the primary anchor because React internals change. |
-| Source location detection | Reads development-only `_debugSource` metadata. | Useful in private dev/runtime mode only. Never require it for production or public snapshots. |
+| Source location detection | Reads development-only `_debugSource` metadata. | Useful as diagnostic metadata only. Never require it for public rendering or durable anchors. |
 | Computed style / forensic output | Adds detailed CSS and environment info for coding-agent debugging. | Keep as an opt-in diagnostic detail level. Default event payload should stay compact. |
 | Animation freeze | Pauses CSS animations, WAAPI animations, videos, and patched timers. | Reimplement later as `freezePageState()` for annotation capture. Must exclude Avibe overlay elements. |
 | Portal overlay isolation | Renders toolbar/popup through a portal and blocks propagation to page-level handlers. | Required. Overlay events must not close page dialogs, trigger page buttons, or interfere with form state. |
@@ -648,7 +823,7 @@ MVP:
 
 Not in MVP:
 
-- public live interaction
+- public live write/action access
 - arbitrary live public handlers
 - multi-user conflict resolution
 - visual diffing
@@ -697,7 +872,8 @@ Not in MVP:
 - Add missing/ambiguous anchor UI.
 - Add page-update to mark linkage.
 - Add multi-client fan-out and conflict handling.
-- Add optional static public snapshot rendering of resolved marks.
+- Add explicit public read/write policy while preserving live public rendering
+  and HMR.
 
 ## Open Decisions
 
