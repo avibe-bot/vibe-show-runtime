@@ -627,6 +627,10 @@ actions.
 Capabilities:
 
 - serve `/p/<share-id>/...` through the live runtime, including HMR
+- support concurrent private `/show/<session-id>/...` and public
+  `/p/<share-id>/...` clients without reconnecting or retargeting the other
+  client's HMR connection; use base-neutral module URLs or separate runtime
+  contexts per serving base
 - keep event submission, live handlers, and agent actions behind explicit
   permission checks
 - move immutable runtime/vendor assets to versioned, cacheable paths that can
@@ -636,7 +640,8 @@ Capabilities:
 Validation:
 
 - public/private auth boundary tests
-- browser smoke tests that public and private pages both receive HMR updates
+- browser smoke tests that public and private pages for the same session can be
+  open concurrently and both receive HMR updates
 - cache-header tests for immutable runtime assets and no-store session HTML
 - public permission tests for event POST, handlers, and agent actions
 
@@ -705,6 +710,9 @@ Before marking the interaction system MVP complete:
 - Annotation mode does not break normal page controls when disabled.
 - Non-text drag selection can submit either an element group or an area without
   requiring a separate toolbar mode.
-- Screenshot annotation can batch multiple numbered comments into one image
-  event.
 - The SDK remains split from visual primitives.
+
+Post-MVP follow-up checks:
+
+- Screenshot annotation can batch multiple numbered comments into one image
+  event once screenshot attachment storage is in scope.

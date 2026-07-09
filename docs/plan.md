@@ -132,6 +132,11 @@ Avoid for v1:
 The global graph can be revisited later if active-session memory becomes a real
 bottleneck, but it should not be the first design.
 
+If public and private URLs need to be open for the same session at the same
+time, do not mutate one context's Vite `base` between request paths. Either keep
+generated module URLs base-neutral or create separate contexts for the distinct
+serving bases while preserving session-level isolation.
+
 ## Remote HMR Performance Model
 
 The runtime must preserve hot updates for local, remote, private, and public
@@ -156,17 +161,22 @@ The optimization boundary should be:
 
 Recommended implementation:
 
-1. Give Vite a shared `cacheDir` outside each session workspace, keyed by
-   runtime digest plus dependency manifest. This keeps optimized deps stable
-   across sessions while preserving one Vite context per active session.
+1. Give Vite a runtime-owned cache root outside each session workspace, with
+   per-session cache directories keyed by runtime digest, dependency manifest,
+   and source dependency signature. The source signature must include scanned
+   bare imports and declared extras because Vite optimizer metadata depends on
+   the `optimizeDeps.include` set.
 2. Add a runtime asset namespace such as
    `/_show-runtime/<runtime-digest>/...` for runtime-owned package assets and
    dependency chunks that do not contain session data.
 3. Keep `/show/<session-id>/...` and `/p/<share-id>/...` for session source,
    HMR, HTML, events, and permissioned handlers.
-4. Set `Cache-Control: public, max-age=31536000, immutable` only on versioned
+4. Make public and private serving bases coexist without stealing each other's
+   HMR clients. Prefer base-neutral generated module URLs; if Vite still needs
+   a baked `base`, use separate contexts per serving base.
+5. Set `Cache-Control: public, max-age=31536000, immutable` only on versioned
    runtime assets. Keep session HTML and source modules fresh.
-5. Hide absolute `@fs/...` runtime package paths behind stable runtime asset
+6. Hide absolute `@fs/...` runtime package paths behind stable runtime asset
    routes before exposing them through Vibe Remote.
 
 ## Session Workspace
