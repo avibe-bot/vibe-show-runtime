@@ -85,6 +85,8 @@ Package changes:
   - `element`
   - `text-range`
   - `area`
+  - `element-group`
+  - `screenshot`
 - Add transcript projection helpers for human intents, human annotations, and
   assistant marks.
 
@@ -402,22 +404,128 @@ Capabilities:
 
 - drag rectangle to create area anchor
 - multi-select elements into grouped anchors
+- classify non-text drag selection after mouse-up:
+  - `element-group` when the rectangle clearly captures meaningful elements
+  - `area` when the rectangle mainly expresses spacing, layout, or empty visual
+    space
+  - ambiguous state with a popover toggle between the two interpretations
 - show individual bounding boxes on hover
 - preserve page scroll and viewport context
+- preserve both the user-drawn region and matched elements in the payload
 
 Agentation reference:
 
 - Use Agentation's area/multi-select behavior as a product reference.
 - Reimplement with Avibe event schema and anchor model.
+- Do not require the user to preselect "multi-select" versus "area". The drag
+  gesture is one gesture; the system infers the primary anchor and exposes a
+  correction toggle only when needed.
+
+Event data:
+
+```ts
+type AreaSelectionPayload = {
+  primaryAnchor: "element-group" | "area"
+  userRegion: { x: number; y: number; width: number; height: number }
+  matchedElements: Anchor[]
+  classification: {
+    confidence: number
+    reason: string
+    ambiguous: boolean
+  }
+}
+```
 
 Validation:
 
 - Browser smoke tests for area and multi-select.
+- Browser smoke test for ambiguous drag selection and popover toggle.
 - Payload size and transcript projection tests.
 
 Exit criteria:
 
 - User can say "this region" or "these items" with structured anchors.
+
+## Milestone 8.5: Screenshot Annotation Drafts
+
+Repo: `vibe-show-runtime`, with Vibe Remote attachment support available or
+stubbed in tests
+
+Purpose: support screenshot feedback without multiplying image payloads.
+
+Product behavior:
+
+- Screenshot mode is separate from smart annotation mode.
+- User selects one screenshot region.
+- The selected screenshot region receives an obvious border and label, for
+  example `截图 1`.
+- User can place multiple numbered comments on that one screenshot:
+  - point comments
+  - optional sub-region comments
+- A compact list lets the user edit, delete, and reorder comments before
+  sending.
+- Submit sends one image plus all numbered comments as one event.
+- Retake replaces the screenshot draft after confirmation.
+
+Technical approach:
+
+- Capture should be implemented behind an SDK utility so the UI can swap
+  strategies:
+  - browser-native capture where available and permission-appropriate
+  - DOM-to-image rendering for same-origin Show Page content
+  - Vibe Remote/runtime server-side screenshot fallback for cases where client
+    capture is blocked or incomplete
+- Store screenshot comments in local draft state until submit.
+- Convert marker coordinates to screenshot-local coordinates, not page-global
+  coordinates.
+- Keep image format configurable, with PNG as the safe default and WebP as a
+  possible size optimization.
+- Attach the image through Vibe Remote attachment/event storage before or as
+  part of event submission.
+
+Event data:
+
+```ts
+type ScreenshotAnnotationPayload = {
+  primaryAnchor: "screenshot"
+  screenshot: {
+    attachmentId: string
+    mimeType: "image/png" | "image/webp"
+    width: number
+    height: number
+    capturedRegion: { x: number; y: number; width: number; height: number }
+    viewport: { width: number; height: number; scrollX: number; scrollY: number }
+    items: Array<{
+      id: string
+      label: number
+      comment: string
+      point?: { x: number; y: number }
+      rect?: { x: number; y: number; width: number; height: number }
+    }>
+  }
+}
+```
+
+Batching rule:
+
+- Screenshot comments default to batch dispatch because images are token-heavy.
+- One screenshot event with numbered comments is the MVP default.
+- Multiple screenshot drafts can be explored later, but they should not be the
+  first implementation because they increase both UI complexity and agent token
+  cost.
+
+Validation:
+
+- Browser smoke test for selecting a screenshot region.
+- Browser smoke test for adding multiple numbered comments to one screenshot.
+- Event payload test that marker coordinates are screenshot-local.
+- Attachment upload/storage test in Vibe Remote once backend support exists.
+- Payload-size guard test for image metadata and transcript projection.
+
+Exit criteria:
+
+- User can capture one page region, add multiple numbered comments, and submit
+  one event containing one image and all comments.
 
 ## Milestone 9: Freeze Mode
 
@@ -509,29 +617,33 @@ Exit criteria:
 - A user annotation can trigger an agent turn and stream the response back to
   the same Show Page.
 
-## Milestone 12: Public Snapshot Story
+## Milestone 12: Public Live Story And Runtime Cache
 
 Repos: both
 
-Purpose: support public sharing without exposing live actions.
+Purpose: support public sharing and hot updates without exposing privileged
+actions.
 
 Capabilities:
 
-- build static snapshot of Show Page
-- include resolved/read-only marks if product wants them visible
-- strip event submission endpoints from public mode
-- no live handlers under `/p/<share-id>/...`
+- serve `/p/<share-id>/...` through the live runtime, including HMR
+- keep event submission, live handlers, and agent actions behind explicit
+  permission checks
+- move immutable runtime/vendor assets to versioned, cacheable paths that can
+  be reused across session and share URLs
+- keep session source modules and HMR channels unshared and fresh
 
 Validation:
 
 - public/private auth boundary tests
-- snapshot output tests
-- no event POST route under public URL
+- browser smoke tests that public and private pages both receive HMR updates
+- cache-header tests for immutable runtime assets and no-store session HTML
+- public permission tests for event POST, handlers, and agent actions
 
 Exit criteria:
 
-- A user can share a public page without exposing agent actions or live
-  handlers.
+- A user can share a public page that updates live as the agent edits it, while
+  privileged actions remain inaccessible unless explicitly allowed.
 
 ## PR Sequencing
 
@@ -546,9 +658,10 @@ Recommended PR order:
 7. `feat(sdk): add basic annotation overlay`
 8. `feat(sdk): add element context capture utilities`
 9. `feat(sdk): add area and multi-select annotations`
-10. `feat(sdk): add opt-in freeze mode`
-11. `feat(show): dispatch show events to agent sessions`
-12. `feat(show): add public show snapshot policy`
+10. `feat(sdk): add screenshot annotation drafts`
+11. `feat(sdk): add opt-in freeze mode`
+12. `feat(show): dispatch show events to agent sessions`
+13. `feat(show): add public live show policy`
 
 Each PR should include the scenario it unlocks and the evidence layer it
 updates: unit, contract, integration, browser smoke, or manual residual.
@@ -590,4 +703,8 @@ Before marking the interaction system MVP complete:
 - The implementation does not depend on Agentation code.
 - Annotation capture works when the target element is fixed/sticky.
 - Annotation mode does not break normal page controls when disabled.
+- Non-text drag selection can submit either an element group or an area without
+  requiring a separate toolbar mode.
+- Screenshot annotation can batch multiple numbered comments into one image
+  event.
 - The SDK remains split from visual primitives.
