@@ -1,4 +1,4 @@
-import { access, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises"
+import { access, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises"
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
@@ -72,10 +72,19 @@ async function disposeSharedInstallResolvers() {
   }))
 }
 
-async function workspaceBoundaryRoots(workspace: string): Promise<string[]> {
-  const resolved = resolve(workspace)
-  const canonical = await realpath(resolved).catch(() => resolved)
-  return [...new Set([resolved, canonical])]
+type WorkspaceFileBoundary = {
+  workspace: string
+  workspaceRoots: string[]
+  allowedRoots: string[]
+}
+
+async function fileBoundaryRoots(paths: string[]): Promise<string[]> {
+  const roots = await Promise.all(paths.map(async (path) => {
+    const resolved = resolve(path)
+    const canonical = await realpath(resolved).catch(() => resolved)
+    return [resolved, canonical]
+  }))
+  return [...new Set(roots.flat())]
 }
 
 function workspaceFsDenyPatterns(workspaceRoots: string[]): string[] {
@@ -94,7 +103,7 @@ function escapeViteGlobPath(path: string): string {
   return path.replace(/([\\*?[\]{}()!+@])/g, "\\$1")
 }
 
-function workspaceFileBoundaryPlugin(workspaceRoots: string[]): Plugin {
+function workspaceFileBoundaryPlugin(boundary: WorkspaceFileBoundary): Plugin {
   return {
     name: "avibe-show-workspace-file-boundary",
     apply: "serve",
@@ -103,39 +112,84 @@ function workspaceFileBoundaryPlugin(workspaceRoots: string[]): Plugin {
       // request boundary in front of every Vite serving path so public assets and
       // transformed/root files follow the same policy.
       server.middlewares.use((request, response, next) => {
-        if (!isDeniedWorkspaceRequest(request.url, workspaceRoots)) {
-          next()
-          return
-        }
-        response.statusCode = 404
-        response.setHeader("content-type", "text/plain; charset=utf-8")
-        response.end("Not found")
+        void isDeniedWorkspaceRequest(request.url, boundary).then((denied) => {
+          if (!denied) {
+            next()
+            return
+          }
+          response.statusCode = 404
+          response.setHeader("content-type", "text/plain; charset=utf-8")
+          response.end("Not found")
+        }).catch(next)
       })
     }
   }
 }
 
-function isDeniedWorkspaceRequest(rawUrl: string | undefined, workspaceRoots: string[]): boolean {
+async function isDeniedWorkspaceRequest(rawUrl: string | undefined, boundary: WorkspaceFileBoundary): Promise<boolean> {
   const pathname = decodeRequestPath(rawUrl)
   if (pathname === undefined) return true
 
   if (pathname.startsWith("/@fs/")) {
     const filePath = resolve(pathname.slice("/@fs/".length))
-    for (const workspaceRoot of workspaceRoots) {
-      const workspaceRelative = relative(workspaceRoot, filePath)
-      const isWorkspaceFile = workspaceRelative === "" || (
-        workspaceRelative !== ".." &&
-        !workspaceRelative.startsWith(`..${sep}`) &&
-        !isAbsolute(workspaceRelative)
-      )
-      if (isWorkspaceFile) {
-        return hasDeniedWorkspaceSegment(normalizePath(workspaceRelative))
-      }
+    const workspaceRelative = relativeWithin(boundary.workspaceRoots, filePath)
+    if (workspaceRelative === undefined) {
+      return hasSensitiveFileSegment(pathname)
     }
-    return hasSensitiveFileSegment(pathname)
+    if (hasDeniedWorkspaceSegment(normalizePath(workspaceRelative))) return true
+    const target = await realpath(filePath).catch(() => undefined)
+    return target ? isDeniedResolvedTarget(target, boundary) : false
   }
 
-  return hasDeniedWorkspaceSegment(pathname)
+  if (hasDeniedWorkspaceSegment(pathname)) return true
+  const target = await workspaceRequestFileTarget(pathname, boundary.workspace)
+  return target ? isDeniedResolvedTarget(target, boundary) : false
+}
+
+async function workspaceRequestFileTarget(pathname: string, workspace: string): Promise<string | undefined> {
+  const relativePath = pathname.replace(/^\/+/, "")
+  // Vite and sirv authorize the requested path, then follow symlinks while opening it.
+  // Resolve the file they would serve so a harmless alias cannot hide a denied target.
+  const candidates = [
+    resolve(workspace, "public", relativePath),
+    resolve(workspace, relativePath),
+    resolve(workspace, "index.html")
+  ]
+  for (const candidate of candidates) {
+    try {
+      const target = await realpath(candidate)
+      if ((await stat(target)).isFile()) return target
+    } catch {
+      // Vite may handle virtual, transformed, or missing paths after this boundary.
+    }
+  }
+  return undefined
+}
+
+function isDeniedResolvedTarget(target: string, boundary: WorkspaceFileBoundary): boolean {
+  const workspaceRelative = relativeWithin(boundary.workspaceRoots, target)
+  if (workspaceRelative !== undefined) {
+    return hasDeniedWorkspaceSegment(normalizePath(workspaceRelative))
+  }
+  const allowedRelative = relativeWithin(boundary.allowedRoots, target)
+  if (allowedRelative !== undefined) {
+    return hasSensitiveFileSegment(normalizePath(allowedRelative))
+  }
+  return true
+}
+
+function relativeWithin(roots: string[], target: string): string | undefined {
+  for (const root of roots) {
+    const candidate = relative(root, target)
+    if (candidate === "" || (
+      candidate !== ".." &&
+      !candidate.startsWith(`..${sep}`) &&
+      !isAbsolute(candidate)
+    )) {
+      return candidate
+    }
+  }
+  return undefined
 }
 
 function decodeRequestPath(rawUrl: string | undefined): string | undefined {
@@ -393,7 +447,13 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     // chokepoints (ensureVendorBundle / viteCacheDir), so we can reclaim abandoned identity dirs
     // now — anything untouched past the (hours-wide) cutoff belongs to no live process (#31).
     void pruneRuntimeCaches()
-    const workspaceRoots = await workspaceBoundaryRoots(session.workspace)
+    const fsAllow = [session.workspace, sharedDependencies.nodeModules, sharedDependencies.sharedNodeModules, ...sharedDependencies.packageRoots]
+    const workspaceRoots = await fileBoundaryRoots([session.workspace])
+    const fileBoundary: WorkspaceFileBoundary = {
+      workspace: resolve(session.workspace),
+      workspaceRoots,
+      allowedRoots: await fileBoundaryRoots(fsAllow)
+    }
     const viteConfig = {
       base: basePath,
       root: session.workspace,
@@ -406,12 +466,12 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
         },
         fs: {
           strict: true,
-          allow: [session.workspace, sharedDependencies.nodeModules, sharedDependencies.sharedNodeModules, ...sharedDependencies.packageRoots],
+          allow: fsAllow,
           deny: workspaceFsDenyPatterns(workspaceRoots)
         }
       },
       plugins: [
-        workspaceFileBoundaryPlugin(workspaceRoots),
+        workspaceFileBoundaryPlugin(fileBoundary),
         vendorImportMapPlugin(bundle),
         ...createVendorExternalizePlugins(providedSpecifiers),
         // Extras sessions resolve their own declared extras from workspace/node_modules;

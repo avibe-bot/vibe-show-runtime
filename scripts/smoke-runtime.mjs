@@ -168,6 +168,8 @@ await writeFile(join(root, "smoke", "public", "client.pem"), "do-not-serve-pem\n
 await writeFile(join(root, "smoke", "public", "client.crt"), "do-not-serve-crt\n")
 await writeFile(join(root, "smoke", "public", "client.key"), "do-not-serve-key\n")
 await writeFile(join(root, "smoke", "public", ".secrets", "token.txt"), "do-not-serve-dot-segment\n")
+await symlink("../.git/HEAD", join(root, "smoke", "public", "linked-git-head.txt"))
+await symlink(".env", join(root, "smoke", "public", "linked-env.txt"))
 await mkdir(join(root, "managed-git"), { recursive: true })
 await writeFile(join(root, "managed-git", ".git"), "gitdir: /tmp/private-show-gitdir\n")
 await symlink(join(staleDependencyRoot, "node_modules"), join(root, "smoke", "node_modules"), "junction")
@@ -238,6 +240,8 @@ try {
     ["public certificate", "/sessions/smoke/app/client.crt", "do-not-serve-crt"],
     ["public private key", "/sessions/smoke/app/client.key", "do-not-serve-key"],
     ["public dot-segment", "/sessions/smoke/app/.secrets/token.txt", "do-not-serve-dot-segment"],
+    ["public symlink to .git", "/sessions/smoke/app/linked-git-head.txt", "private-history"],
+    ["public symlink to .env", "/sessions/smoke/app/linked-env.txt", "PUBLIC_TOKEN"],
     ["real-path @fs dot-segment", `/sessions/smoke/app/@fs/${await realpath(join(root, "smoke"))}/public/.secrets/token.txt`, "do-not-serve-dot-segment"]
   ]
   for (const [label, path, secret] of deniedWorkspacePaths) {
@@ -415,6 +419,12 @@ export default function App() {
   }))
   if (extraDepModule.status !== 200 || !extraDepModule.body.includes("/deps/stackback.js")) {
     throw new Error(`Expected extra page dependency to be optimized, got ${extraDepModule.status}: ${extraDepModule.body.slice(0, 200)}`)
+  }
+  const optimizedStackbackUrl = extraDepModule.body.match(/["']([^"']*\/deps\/stackback\.js[^"']*)["']/)?.[1]
+  const optimizedStackbackPath = optimizedStackbackUrl?.replace(/^\/show\/smoke\//, "/sessions/smoke/app/")
+  const optimizedStackback = optimizedStackbackPath ? await fetch(`${runtime.url}${optimizedStackbackPath}`) : undefined
+  if (!optimizedStackbackUrl || !optimizedStackback || optimizedStackback.status !== 200 || !(await optimizedStackback.text()).includes("stackback")) {
+    throw new Error(`Expected optimized dependency URL to remain servable, got ${optimizedStackbackUrl ?? "missing URL"} (${optimizedStackback?.status ?? "no response"})`)
   }
   if (!extraDepModule.body.includes("/deps/stackback_formatstack.js")) {
     throw new Error(`Expected deep bare imports to stay optimized by full specifier, got: ${extraDepModule.body.slice(0, 300)}`)
