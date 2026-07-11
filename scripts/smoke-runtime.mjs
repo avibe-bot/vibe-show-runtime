@@ -1,10 +1,12 @@
-import { access, cp, lstat, mkdtemp, mkdir, readFile, readlink, readdir, symlink, utimes, writeFile, rm } from "node:fs/promises"
+import { access, cp, lstat, mkdtemp, mkdir, readFile, readlink, readdir, realpath, symlink, utimes, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { join, relative } from "node:path"
 import vm from "node:vm"
 import { spawn } from "node:child_process"
 import { readFileSync } from "node:fs"
+import { request as httpRequest } from "node:http"
+import { isFileLoadingAllowed } from "vite"
 import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
 import { cn } from "../packages/ui/dist/utils.js"
@@ -156,6 +158,20 @@ const cacheRoot = join(root, "runtime-cache")
 const staleDependencyRoot = await mkdtemp(join(tmpdir(), "avibe-show-stale-deps-"))
 await mkdir(join(staleDependencyRoot, "node_modules"), { recursive: true })
 await mkdir(join(root, "smoke"), { recursive: true })
+await mkdir(join(root, "smoke", ".git"), { recursive: true })
+await writeFile(join(root, "smoke", ".git", "HEAD"), "ref: refs/heads/private-history\n")
+await mkdir(join(root, "smoke", "public", ".secrets"), { recursive: true })
+await writeFile(join(root, "smoke", "public", "visible.txt"), "visible public asset\n")
+await writeFile(join(root, "smoke", "public", ".env"), "PUBLIC_TOKEN=do-not-serve\n")
+await writeFile(join(root, "smoke", "public", ".env.local"), "LOCAL_TOKEN=do-not-serve\n")
+await writeFile(join(root, "smoke", "public", "client.pem"), "do-not-serve-pem\n")
+await writeFile(join(root, "smoke", "public", "client.crt"), "do-not-serve-crt\n")
+await writeFile(join(root, "smoke", "public", "client.key"), "do-not-serve-key\n")
+await writeFile(join(root, "smoke", "public", ".secrets", "token.txt"), "do-not-serve-dot-segment\n")
+await symlink("../.git/HEAD", join(root, "smoke", "public", "linked-git-head.txt"))
+await symlink(".env", join(root, "smoke", "public", "linked-env.txt"))
+await mkdir(join(root, "managed-git"), { recursive: true })
+await writeFile(join(root, "managed-git", ".git"), "gitdir: /tmp/private-show-gitdir\n")
 await symlink(join(staleDependencyRoot, "node_modules"), join(root, "smoke", "node_modules"), "junction")
 const runtime = await startShowRuntimeServer({ workspaceRoot: root, cacheRoot, fallbackDelaySeconds: 30 })
 
@@ -177,6 +193,20 @@ try {
   if (secondEnsure.state !== "active") {
     throw new Error(`Expected second active session, got ${secondEnsure.state}`)
   }
+  const smokeVite = runtime.runtime.getSession("smoke")?.vite
+  const expectedDenyPatterns = ["**/.git", "**/.git/**", "**/.env", "**/.env.*", "**/*.pem", "**/*.crt", "**/*.key"]
+  if (!smokeVite?.config.server.fs.strict || expectedDenyPatterns.some((pattern) => !smokeVite.config.server.fs.deny.includes(pattern))) {
+    throw new Error(`Expected Vite fs.strict plus the runtime deny list, got ${JSON.stringify(smokeVite?.config.server.fs)}`)
+  }
+  if (isFileLoadingAllowed(smokeVite.config, join(root, "smoke", ".git", "HEAD"))) {
+    throw new Error("Expected Vite fs.deny to take priority over the workspace fs.allow entry")
+  }
+  if (!isFileLoadingAllowed(smokeVite.config, join(root, "smoke", "public", "visible.txt"))) {
+    throw new Error("Expected Vite fs policy to preserve normal workspace assets")
+  }
+  if (!isFileLoadingAllowed(smokeVite.config, join(process.cwd(), "packages", "ui", "dist", "button.js"))) {
+    throw new Error("Expected dot-directory ancestors outside the workspace not to block allowed runtime dependencies")
+  }
   const linkedNodeModules = await readlink(join(root, "smoke", "node_modules"))
   if (linkedNodeModules === join(staleDependencyRoot, "node_modules")) {
     throw new Error("Expected runtime to refresh stale session node_modules symlink")
@@ -196,6 +226,34 @@ try {
   }
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
     throw new Error("Expected app HTML asset URLs to stay under /show/<session>/")
+  }
+  const visibleAsset = await fetch(`${runtime.url}/sessions/smoke/app/visible.txt`)
+  if (visibleAsset.status !== 200 || (await visibleAsset.text()) !== "visible public asset\n") {
+    throw new Error(`Expected a normal public asset to remain servable, got ${visibleAsset.status}`)
+  }
+  const deniedWorkspacePaths = [
+    ["self-managed .git directory", "/sessions/smoke/app/.git/HEAD", "private-history"],
+    ["managed .git pointer", "/sessions/managed-git/app/.git", "private-show-gitdir"],
+    ["public .env", "/sessions/smoke/app/.env", "PUBLIC_TOKEN"],
+    ["public .env variant", "/sessions/smoke/app/.env.local", "LOCAL_TOKEN"],
+    ["public PEM credential", "/sessions/smoke/app/client.pem", "do-not-serve-pem"],
+    ["public certificate", "/sessions/smoke/app/client.crt", "do-not-serve-crt"],
+    ["public private key", "/sessions/smoke/app/client.key", "do-not-serve-key"],
+    ["public dot-segment", "/sessions/smoke/app/.secrets/token.txt", "do-not-serve-dot-segment"],
+    ["public symlink to .git", "/sessions/smoke/app/linked-git-head.txt", "private-history"],
+    ["public symlink to .env", "/sessions/smoke/app/linked-env.txt", "PUBLIC_TOKEN"],
+    ["real-path @fs dot-segment", `/sessions/smoke/app/@fs/${await realpath(join(root, "smoke"))}/public/.secrets/token.txt`, "do-not-serve-dot-segment"]
+  ]
+  for (const [label, path, secret] of deniedWorkspacePaths) {
+    const response = await fetch(`${runtime.url}${path}`)
+    const body = await response.text()
+    if (![403, 404].includes(response.status) || body.includes(secret)) {
+      throw new Error(`Expected ${label} to be denied, got ${response.status}: ${body.slice(0, 160)}`)
+    }
+  }
+  const encodedTraversal = await rawHttpGet(runtime.url, "/sessions/smoke/app/src/%2e%2e/.git/HEAD")
+  if (![403, 404].includes(encodedTraversal.status) || encodedTraversal.body.includes("private-history")) {
+    throw new Error(`Expected encoded traversal into .git to be denied, got ${encodedTraversal.status}: ${encodedTraversal.body.slice(0, 160)}`)
   }
   // Shared vendor: the served HTML must inject a JS import map (BEFORE the app module
   // script) mapping the provided specifiers to the session-independent vendor path,
@@ -361,6 +419,12 @@ export default function App() {
   }))
   if (extraDepModule.status !== 200 || !extraDepModule.body.includes("/deps/stackback.js")) {
     throw new Error(`Expected extra page dependency to be optimized, got ${extraDepModule.status}: ${extraDepModule.body.slice(0, 200)}`)
+  }
+  const optimizedStackbackUrl = extraDepModule.body.match(/["']([^"']*\/deps\/stackback\.js[^"']*)["']/)?.[1]
+  const optimizedStackbackPath = optimizedStackbackUrl?.replace(/^\/show\/smoke\//, "/sessions/smoke/app/")
+  const optimizedStackback = optimizedStackbackPath ? await fetch(`${runtime.url}${optimizedStackbackPath}`) : undefined
+  if (!optimizedStackbackUrl || !optimizedStackback || optimizedStackback.status !== 200 || !(await optimizedStackback.text()).includes("stackback")) {
+    throw new Error(`Expected optimized dependency URL to remain servable, got ${optimizedStackbackUrl ?? "missing URL"} (${optimizedStackback?.status ?? "no response"})`)
   }
   if (!extraDepModule.body.includes("/deps/stackback_formatstack.js")) {
     throw new Error(`Expected deep bare imports to stay optimized by full specifier, got: ${extraDepModule.body.slice(0, 300)}`)
@@ -935,6 +999,27 @@ export default function App() {
 } finally {
   await runtime.close()
   await rm(root, { recursive: true, force: true })
+}
+
+function rawHttpGet(origin, path) {
+  const url = new URL(origin)
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({
+      hostname: url.hostname,
+      port: url.port,
+      method: "GET",
+      path
+    }, (response) => {
+      const chunks = []
+      response.on("data", (chunk) => chunks.push(Buffer.from(chunk)))
+      response.on("end", () => resolve({
+        status: response.statusCode ?? 0,
+        body: Buffer.concat(chunks).toString("utf8")
+      }))
+    })
+    request.on("error", reject)
+    request.end()
+  })
 }
 
 const relativeCacheRoot = await mkdtemp(join(tmpdir(), "avibe-show-runtime-relative-cache-"))
