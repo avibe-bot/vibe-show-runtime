@@ -37,6 +37,7 @@ const DEFAULT_IDLE_PRUNE_INTERVAL_MS = 5 * 60 * 1000
  * dir is only ever deleted long after any live process could still be resolving or closing it. */
 const CACHE_GC_TRAILING_MARGIN_MS = 60 * 60 * 1000
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
+const RUNTIME_VITE_PACKAGE_ROOT = dirname(createRequire(import.meta.url).resolve("vite/package.json"))
 const SENSITIVE_FS_DENY_PATTERNS = [
   "**/.git",
   "**/.git/**",
@@ -457,6 +458,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     const fsAllow = await fileBoundaryRoots([
       session.workspace,
       cacheDir,
+      RUNTIME_VITE_PACKAGE_ROOT,
       sharedDependencies.nodeModules,
       sharedDependencies.sharedNodeModules,
       ...sharedDependencies.packageRoots

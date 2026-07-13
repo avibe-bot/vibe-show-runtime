@@ -1072,6 +1072,48 @@ function viteFsUrl(filePath) {
   return `/@fs/${filePath.replaceAll("\\", "/").replace(/^\/+/, "")}`
 }
 
+// An explicit dependencyRoot is valid without its own Vite copy: the runtime loads
+// Vite from its physical install, while React/UI/SDK can come from the selected shared
+// root. The serving boundary must trust that actual Vite package root for client.mjs
+// and env.mjs rather than assuming they live below dependencyRoot.
+const customDependencyRoot = await mkdtemp(join(tmpdir(), "avibe-show-custom-dependency-root-"))
+const customDependencyWorkspaces = join(customDependencyRoot, "show")
+const customDependencyCache = join(customDependencyRoot, "cache")
+await linkNodeModulesWithoutVite(join(process.cwd(), "node_modules"), join(customDependencyRoot, "node_modules"))
+try {
+  await access(join(customDependencyRoot, "node_modules", "vite"))
+  throw new Error("Expected the custom dependency root fixture to omit Vite")
+} catch (error) {
+  if (error.code !== "ENOENT") throw error
+}
+const customDependencyRuntime = await startShowRuntimeServer({
+  workspaceRoot: customDependencyWorkspaces,
+  cacheRoot: customDependencyCache,
+  dependencyRoot: customDependencyRoot
+})
+try {
+  const html = await loadAppEntry(customDependencyRuntime.url, "custom-dependency-root")
+  if (!html.includes("/_show-runtime/vendor/")) {
+    throw new Error("Expected the custom dependency-root session to warm normally")
+  }
+  const actualViteEnv = await realpath(join(process.cwd(), "node_modules", "vite", "dist", "client", "env.mjs"))
+  const actualViteEnvResponse = await fetch(`${customDependencyRuntime.url}/sessions/custom-dependency-root/app${viteFsUrl(actualViteEnv)}`)
+  if (actualViteEnvResponse.status !== 200) {
+    throw new Error(`Expected env.mjs from the runtime's actual Vite package root to load, got ${actualViteEnvResponse.status}`)
+  }
+} finally {
+  await customDependencyRuntime.close()
+  await rm(customDependencyRoot, { recursive: true, force: true })
+}
+
+async function linkNodeModulesWithoutVite(source, target) {
+  await mkdir(target, { recursive: true })
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    if (entry.name === "vite" || entry.name.startsWith(".")) continue
+    await symlink(join(source, entry.name), join(target, entry.name), entry.isFile() ? "file" : "junction")
+  }
+}
+
 const relativeCacheRoot = await mkdtemp(join(tmpdir(), "avibe-show-runtime-relative-cache-"))
 const relativeRoot = await mkdtemp(join(tmpdir(), "avibe-show-runtime-relative-root-"))
 const relativeRuntime = await startShowRuntimeServer({
