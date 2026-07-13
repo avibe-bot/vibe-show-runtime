@@ -158,6 +158,13 @@ const cacheRoot = join(root, "runtime-cache")
 const staleDependencyRoot = await mkdtemp(join(tmpdir(), "avibe-show-stale-deps-"))
 await mkdir(join(staleDependencyRoot, "node_modules"), { recursive: true })
 await mkdir(join(root, "smoke"), { recursive: true })
+await mkdir(join(root, "smoke", "src"), { recursive: true })
+const outsideHostFile = join(staleDependencyRoot, "host-secret")
+await writeFile(outsideHostFile, "HOST_SECRET_36\n")
+await symlink(outsideHostFile, join(root, "smoke", "src", "linked-outside.js"))
+await writeFile(join(root, "smoke", "src", "symlink-import.ts"), `import secret from "./linked-outside.js"
+export default secret
+`)
 await mkdir(join(root, "smoke", ".git"), { recursive: true })
 await writeFile(join(root, "smoke", ".git", "HEAD"), "ref: refs/heads/private-history\n")
 await mkdir(join(root, "smoke", "public", ".secrets"), { recursive: true })
@@ -198,6 +205,10 @@ try {
   if (!smokeVite?.config.server.fs.strict || expectedDenyPatterns.some((pattern) => !smokeVite.config.server.fs.deny.includes(pattern))) {
     throw new Error(`Expected Vite fs.strict plus the runtime deny list, got ${JSON.stringify(smokeVite?.config.server.fs)}`)
   }
+  const smokeCacheDir = runtime.runtime.getSession("smoke")?.cacheDir
+  if (!smokeCacheDir || !isFileLoadingAllowed(smokeVite.config, smokeCacheDir)) {
+    throw new Error(`Expected the exact session cache directory in Vite fs.allow, got ${JSON.stringify(smokeVite.config.server.fs.allow)}`)
+  }
   if (isFileLoadingAllowed(smokeVite.config, join(root, "smoke", ".git", "HEAD"))) {
     throw new Error("Expected Vite fs.deny to take priority over the workspace fs.allow entry")
   }
@@ -210,6 +221,40 @@ try {
   const linkedNodeModules = await readlink(join(root, "smoke", "node_modules"))
   if (linkedNodeModules === join(staleDependencyRoot, "node_modules")) {
     throw new Error("Expected runtime to refresh stale session node_modules symlink")
+  }
+
+  const canonicalOutsideHostFile = await realpath(outsideHostFile)
+  if (isFileLoadingAllowed(smokeVite.config, canonicalOutsideHostFile)) {
+    throw new Error("Expected the resolved outside import to start outside Vite fs.allow")
+  }
+  const symlinkImporter = await fetch(`${runtime.url}/sessions/smoke/app/src/symlink-import.ts`).then(async (res) => ({
+    status: res.status,
+    body: await res.text()
+  }))
+  const emittedOutsideUrl = symlinkImporter.body.match(/["']([^"']*\/@fs\/[^"']*host-secret[^"']*)["']/)?.[1]
+  const emittedOutsidePath = emittedOutsideUrl?.replace(/^\/show\/smoke\//, "/sessions/smoke/app/")
+  if (symlinkImporter.status !== 200 || !emittedOutsidePath) {
+    throw new Error(`Expected Vite to realpath the workspace symlink into an @fs import, got ${symlinkImporter.status}: ${symlinkImporter.body.slice(0, 200)}`)
+  }
+  if (!isFileLoadingAllowed(smokeVite.config, canonicalOutsideHostFile)) {
+    throw new Error("Expected Vite safeModulePaths to trust the resolved outside import after transforming its importer")
+  }
+  const emittedOutsideResponse = await fetch(`${runtime.url}${emittedOutsidePath}`)
+  const emittedOutsideBody = await emittedOutsideResponse.text()
+  if (emittedOutsideResponse.status !== 404 || emittedOutsideBody.includes("HOST_SECRET_36")) {
+    throw new Error(`Expected the runtime boundary to override Vite safeModulePaths, got ${emittedOutsideResponse.status}: ${emittedOutsideBody.slice(0, 160)}`)
+  }
+  const directSymlinkResponse = await fetch(`${runtime.url}/sessions/smoke/app${viteFsUrl(join(root, "smoke", "src", "linked-outside.js"))}`)
+  const directSymlinkBody = await directSymlinkResponse.text()
+  if (directSymlinkResponse.status !== 404 || directSymlinkBody.includes("HOST_SECRET_36")) {
+    throw new Error(`Expected the direct workspace-symlink @fs form to stay denied, got ${directSymlinkResponse.status}: ${directSymlinkBody.slice(0, 160)}`)
+  }
+
+  const viteEnvPath = await realpath(join(process.cwd(), "node_modules", "vite", "dist", "client", "env.mjs"))
+  const viteEnvResponse = await fetch(`${runtime.url}/sessions/smoke/app${viteFsUrl(viteEnvPath)}`)
+  const viteEnvBody = await viteEnvResponse.text()
+  if (viteEnvResponse.status !== 200 || !viteEnvBody.includes("const defines")) {
+    throw new Error(`Expected Vite env.mjs under the discovered dependency root to remain servable, got ${viteEnvResponse.status}: ${viteEnvBody.slice(0, 160)}`)
   }
 
   const handler = await fetch(`${runtime.url}/sessions/smoke/app/api/health`).then((res) => res.json())
@@ -325,8 +370,8 @@ try {
     status: res.status,
     body: await res.text()
   }))
-  if (projectRootModule.status !== 403 || !projectRootModule.body.includes("outside of Vite serving allow list")) {
-    throw new Error(`Expected project root files to stay outside Vite fs.allow, got ${projectRootModule.status}`)
+  if (projectRootModule.status !== 404 || projectRootModule.body.includes('"name": "vibe-show-runtime"')) {
+    throw new Error(`Expected project root files to stay outside the runtime boundary, got ${projectRootModule.status}`)
   }
   await access(cacheRoot)
   const cacheDigestDirs = await readdir(cacheRoot)
@@ -999,6 +1044,7 @@ export default function App() {
 } finally {
   await runtime.close()
   await rm(root, { recursive: true, force: true })
+  await rm(staleDependencyRoot, { recursive: true, force: true })
 }
 
 function rawHttpGet(origin, path) {
@@ -1020,6 +1066,10 @@ function rawHttpGet(origin, path) {
     request.on("error", reject)
     request.end()
   })
+}
+
+function viteFsUrl(filePath) {
+  return `/@fs/${filePath.replaceAll("\\", "/").replace(/^\/+/, "")}`
 }
 
 const relativeCacheRoot = await mkdtemp(join(tmpdir(), "avibe-show-runtime-relative-cache-"))
@@ -1102,6 +1152,11 @@ try {
     const vendorReact = await fetch(`${archiveLikeRuntime.url}${vendorReactUrl}`)
     if (vendorReact.status !== 200) {
       throw new Error(`Expected archive-like runtime vendor React asset to load, got ${vendorReact.status}`)
+    }
+    const archiveViteEnv = await realpath(join(archiveLikeRoot, "node_modules", "vite", "dist", "client", "env.mjs"))
+    const archiveViteEnvResponse = await fetch(`${archiveLikeRuntime.url}/sessions/archive-like/app${viteFsUrl(archiveViteEnv)}`)
+    if (archiveViteEnvResponse.status !== 200) {
+      throw new Error(`Expected env.mjs under an auto-discovered custom provider root to load, got ${archiveViteEnvResponse.status}`)
     }
   } finally {
     await archiveLikeRuntime.close()

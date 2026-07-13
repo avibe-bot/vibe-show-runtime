@@ -131,19 +131,25 @@ async function isDeniedWorkspaceRequest(rawUrl: string | undefined, boundary: Wo
   if (pathname === undefined) return true
 
   if (pathname.startsWith("/@fs/")) {
-    const filePath = resolve(pathname.slice("/@fs/".length))
+    const filePath = viteFsRequestPath(pathname)
     const workspaceRelative = relativeWithin(boundary.workspaceRoots, filePath)
-    if (workspaceRelative === undefined) {
-      return hasSensitiveFileSegment(pathname)
-    }
-    if (hasDeniedWorkspaceSegment(normalizePath(workspaceRelative))) return true
+    if (workspaceRelative !== undefined && hasDeniedWorkspaceSegment(normalizePath(workspaceRelative))) return true
     const target = await realpath(filePath).catch(() => undefined)
-    return target ? isDeniedResolvedTarget(target, boundary) : false
+    return target ? isDeniedResolvedTarget(target, boundary) : true
   }
 
   if (hasDeniedWorkspaceSegment(pathname)) return true
   const target = await workspaceRequestFileTarget(pathname, boundary.workspace)
   return target ? isDeniedResolvedTarget(target, boundary) : false
+}
+
+function viteFsRequestPath(pathname: string): string {
+  const rawPath = normalizePath(pathname.slice("/@fs/".length))
+  // Vite emits POSIX absolute paths as `/@fs/home/...`, so removing the URL
+  // prefix also removes the filesystem root slash. Restore it exactly once;
+  // Windows drive paths are already absolute without a leading slash.
+  const absolutePath = isAbsolute(rawPath) ? rawPath : `/${rawPath}`
+  return resolve(absolutePath)
 }
 
 async function workspaceRequestFileTarget(pathname: string, workspace: string): Promise<string | undefined> {
@@ -447,12 +453,18 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     // chokepoints (ensureVendorBundle / viteCacheDir), so we can reclaim abandoned identity dirs
     // now — anything untouched past the (hours-wide) cutoff belongs to no live process (#31).
     void pruneRuntimeCaches()
-    const fsAllow = [session.workspace, sharedDependencies.nodeModules, sharedDependencies.sharedNodeModules, ...sharedDependencies.packageRoots]
     const workspaceRoots = await fileBoundaryRoots([session.workspace])
+    const fsAllow = await fileBoundaryRoots([
+      session.workspace,
+      cacheDir,
+      sharedDependencies.nodeModules,
+      sharedDependencies.sharedNodeModules,
+      ...sharedDependencies.packageRoots
+    ])
     const fileBoundary: WorkspaceFileBoundary = {
       workspace: resolve(session.workspace),
       workspaceRoots,
-      allowedRoots: await fileBoundaryRoots(fsAllow)
+      allowedRoots: fsAllow
     }
     const viteConfig = {
       base: basePath,
