@@ -165,7 +165,7 @@ export function annotationStateMessage(state: AnnotationControlState): Annotatio
 
 /** Fetch the auth probe result, or `undefined` when the probe can't run / fails (kept non-fatal). */
 export async function fetchAnnotationAccess(
-  options: ShowClientOptions & { url?: string } = {}
+  options: ShowClientOptions & { url?: string; mePath?: string } = {}
 ): Promise<AnnotationAuthAccess | undefined> {
   const fetchImpl = options.fetch ?? (typeof fetch !== "undefined" ? fetch : undefined)
   if (!fetchImpl) return undefined
@@ -375,7 +375,7 @@ export function connectAnnotationHostBridge(
 /** Run the auth probe and reflect `canAnnotate` into the controller's `available` (contract §5). */
 export async function probeAnnotationAccess(
   controller: AnnotationController,
-  options: ShowClientOptions & { url?: string } = {}
+  options: ShowClientOptions & { url?: string; mePath?: string } = {}
 ): Promise<AnnotationAuthAccess | undefined> {
   const access = await fetchAnnotationAccess(options)
   if (access) {

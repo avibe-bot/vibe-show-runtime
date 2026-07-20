@@ -2457,7 +2457,9 @@ export function mountAnnotationOverlay(options: MountAnnotationOverlayOptions = 
   if (options.probeAuth !== false && config.annotation?.mePath) {
     // The probe both gates the UI (canAnnotate → available) and resolves the share-scoped write
     // token onto the runtime config so every event POST carries X-Vibe-Show-Token (contract §5 v2).
-    void probeAnnotationAccess(controller, { basePath: config.basePath }).then((access) => {
+    // Forward this mount's basePath + mePath so a host mounting with a custom config probes its own
+    // endpoint, not the global runtime config's.
+    void probeAnnotationAccess(controller, { basePath: config.basePath, mePath: config.annotation?.mePath }).then((access) => {
       applyResolvedWriteToken(config, access)
     })
   }

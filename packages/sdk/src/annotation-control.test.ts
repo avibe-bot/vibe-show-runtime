@@ -19,6 +19,7 @@ import {
   isAnnotationQueryMessage,
   reduceAnnotationState,
   readStoredAnnotationMode,
+  showAnnotationMeUrl,
   writeStoredAnnotationMode,
   type AnnotationControlState,
   type AnnotationModeStorage,
@@ -286,6 +287,16 @@ describe("auth probe (contract §5 v2)", () => {
       throw new Error("network")
     })
     await expect(fetchAnnotationAccess({ url: "https://show.test/__show/me", fetch: throws })).resolves.toBeUndefined()
+  })
+})
+
+describe("auth probe URL (contract §5)", () => {
+  it("defaults to {basePath}__show/me", () => {
+    expect(showAnnotationMeUrl({ basePath: "/show/x/" })).toBe("/show/x/__show/me")
+  })
+
+  it("honors an explicit mePath so a custom mount config probes its own endpoint", () => {
+    expect(showAnnotationMeUrl({ basePath: "/p/abc/", mePath: "custom/me" })).toBe("/p/abc/custom/me")
   })
 })
 

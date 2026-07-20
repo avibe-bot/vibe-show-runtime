@@ -587,11 +587,15 @@ export function showEventsUrl(options: ShowClientOptions = {}) {
   return eventsUrl(options)
 }
 
-/** URL of the auth probe endpoint (`{basePath}__show/me`), honoring the injected annotation config (contract §5). */
-export function showAnnotationMeUrl(options: ShowClientOptions = {}) {
+/**
+ * URL of the auth probe endpoint (`{basePath}__show/me`), honoring the annotation config (contract
+ * §5). An explicit `options.mePath` wins so a host that mounts with its own `config` resolves its
+ * endpoint rather than the global runtime config's.
+ */
+export function showAnnotationMeUrl(options: ShowClientOptions & { mePath?: string } = {}) {
   const runtime = readRuntimeConfig()
   const basePath = options.basePath ?? runtime.basePath ?? "./"
-  const mePath = runtime.annotation?.mePath ?? DEFAULT_SHOW_ME_PATH
+  const mePath = options.mePath ?? runtime.annotation?.mePath ?? DEFAULT_SHOW_ME_PATH
   return joinPath(basePath, mePath)
 }
 
@@ -1166,21 +1170,50 @@ async function withOverlayChromeHidden<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * The smallest element to hand snapDOM so a small selection doesn't force a full-document render.
+ * Walk up from the region's center element to the nearest ancestor whose viewport rect fully
+ * contains the region; fall back to `document.documentElement`. Returns the element and its rect
+ * (viewport-relative), which the caller uses to crop the region out of the rendered canvas.
+ */
+function pickSnapdomCaptureTarget(region: MarkAnchorRect): { element: Element; rect: MarkAnchorRect } {
+  const root = document.documentElement
+  const rootRect = rectFromDomRect(root.getBoundingClientRect())
+  const centerX = region.x + region.width / 2
+  const centerY = region.y + region.height / 2
+  let current: Element | null = deepElementFromPoint(centerX, centerY) ?? document.body ?? root
+  while (current && current !== root) {
+    const rect = rectFromDomRect(current.getBoundingClientRect())
+    if (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      rect.x <= region.x &&
+      rect.y <= region.y &&
+      rect.x + rect.width >= region.x + region.width &&
+      rect.y + rect.height >= region.y + region.height
+    ) {
+      return { element: current, rect }
+    }
+    current = current.parentElement
+  }
+  return { element: root, rect: rootRect }
+}
+
 function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<SnapdomModule> = importSnapdom): ScreenshotCaptureStrategy {
   return {
     name: "snapdom",
     isAvailable: () => typeof document !== "undefined" && typeof HTMLCanvasElement !== "undefined",
     async capture(region) {
-      const target = document.documentElement
       const module = await loadSnapdom()
+      // Render the smallest element that fully contains the region rather than the whole document,
+      // so a small selection on a very long / virtualized page doesn't materialize a huge canvas.
+      const { element, rect } = pickSnapdomCaptureTarget(region)
       // Exclude the overlay chrome so the render is clean page pixels, never the dimmer/toolbar/markers.
-      const source = await renderSnapdomCanvas(module, target, OVERLAY_CHROME_SELECTORS)
-      const pageWidth = Math.max(target.scrollWidth, target.clientWidth, 1)
-      const pageHeight = Math.max(target.scrollHeight, target.clientHeight, 1)
-      const ratioX = source.width / pageWidth
-      const ratioY = source.height / pageHeight
-      const scrollX = typeof window === "undefined" ? 0 : window.scrollX
-      const scrollY = typeof window === "undefined" ? 0 : window.scrollY
+      const source = await renderSnapdomCanvas(module, element, OVERLAY_CHROME_SELECTORS)
+      // `rect` is the captured element's viewport rect, so the region maps to it directly (no scroll
+      // math needed); the ratio absorbs any DPR/scale difference between the canvas and layout box.
+      const ratioX = source.width / Math.max(1, rect.width)
+      const ratioY = source.height / Math.max(1, rect.height)
       const { width, height } = constrainCaptureDimensions(region.width, region.height, maxEdge)
       const output = document.createElement("canvas")
       output.width = width
@@ -1191,8 +1224,8 @@ function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<Snap
       }
       context.drawImage(
         source,
-        (region.x + scrollX) * ratioX,
-        (region.y + scrollY) * ratioY,
+        (region.x - rect.x) * ratioX,
+        (region.y - rect.y) * ratioY,
         region.width * ratioX,
         region.height * ratioY,
         0,
