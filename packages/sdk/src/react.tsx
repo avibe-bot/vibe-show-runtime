@@ -1,5 +1,6 @@
 import * as React from "react"
 import { createPortal } from "react-dom"
+import { createRoot, type Root } from "react-dom/client"
 import { flushSync } from "react-dom"
 import {
   annotationFromAreaSelection,
@@ -11,10 +12,12 @@ import {
   markAttributes,
   markAttributeName,
   normalizeShowEvent,
+  readRuntimeConfig,
   screenshotAnnotationFromDraft,
   screenshotPointFromViewport,
   screenshotRectFromViewport,
   resolveAnchor,
+  showEventsUrl,
   submitAgentMark,
   submitAnnotation,
   submitIntent,
@@ -25,9 +28,12 @@ import {
   type AnnotationSubmitOptions,
   type HumanIntentPayload,
   type IntentSubmitOptions,
+  type AnnotationControlState,
+  type AnnotationMode,
   type MarkAnchorRect,
   type RuntimeConfig,
   type ShowAnchor,
+  type ShowAnnotationIntent,
   type SubmitShowEventOptions,
   type ShowAnnotation,
   type ScreenshotAnnotationItem,
@@ -35,6 +41,14 @@ import {
   type ShowEvent,
   type ShowEventInput
 } from "./index.js"
+import {
+  attachAnnotationWindowApi,
+  connectAnnotationHostBridge,
+  createAnnotationController,
+  probeAnnotationAccess,
+  type AnnotationController,
+  type AnnotationHost
+} from "./annotation-control.js"
 
 export type AgentMarkSubmitResult = Awaited<ReturnType<typeof submitShowEvent>>
 
@@ -124,16 +138,84 @@ export type ActionButtonProps = IntentSubmitOptions & {
 
 export type AnnotationOverlayMode = "idle" | "smart" | "screenshot"
 
+/** One selectable comment intent chip. `label` is host-localizable (contract: zh defaults). */
+export type AnnotationIntentOption = {
+  intent: ShowAnnotationIntent | string
+  label: string
+}
+
+/** Default intent chips: 评论/修改/疑问/批准 → comment/change/question/approve. */
+export const DEFAULT_ANNOTATION_INTENTS: AnnotationIntentOption[] = [
+  { intent: "comment", label: "评论" },
+  { intent: "change", label: "修改" },
+  { intent: "question", label: "疑问" },
+  { intent: "approve", label: "批准" }
+]
+
+/** All overlay copy, exposed so a host can fully localize the chrome (zh defaults below). */
+export type AnnotationOverlayLabels = {
+  smart: string
+  screenshot: string
+  exit: string
+  annotating: string
+  smartHint: string
+  screenshotHint: string
+  send: string
+  cancel: string
+  retake: string
+  addComment: string
+  sendBatch: (count: number) => string
+  screenshotTitle: (count: number) => string
+  commentPlaceholder: string
+  screenshotCommentPlaceholder: string
+  loginRequired: string
+  selectedArea: string
+  elementCount: (count: number) => string
+  byElements: string
+  byArea: string
+  enterToSend: string
+}
+
+export const DEFAULT_ANNOTATION_LABELS: AnnotationOverlayLabels = {
+  smart: "Smart",
+  screenshot: "截图",
+  exit: "Esc 退出",
+  annotating: "标注模式",
+  smartHint: "点选元素 · 选文字 · 框选区域",
+  screenshotHint: "拖拽框选截图区域",
+  send: "发送",
+  cancel: "取消",
+  retake: "重新截图",
+  addComment: "添加评论",
+  sendBatch: (count) => `发送 ${count} 条评论`,
+  screenshotTitle: (count) => (count ? `截图 1 · ${count} 条评论` : "截图 1"),
+  commentPlaceholder: "写下你的反馈…",
+  screenshotCommentPlaceholder: "点击截图内任意位置，添加下一条编号评论…",
+  loginRequired: "登录后可标注",
+  selectedArea: "选中区域",
+  elementCount: (count) => `${count} 个元素`,
+  byElements: "按元素",
+  byArea: "按区域",
+  enterToSend: "Enter 发送 · Esc 取消"
+}
+
 export type AnnotationOverlayProps = {
-  enabled?: boolean
-  defaultEnabled?: boolean
+  /** Controlled on/off (from the control plane). */
+  enabled: boolean
+  /** Controlled capture mode (from the control plane). */
+  mode: AnnotationMode
+  /** Whether writes are possible for the current viewer; false hides compose affordances. */
+  available?: boolean
+  /** Host layout: standalone shows FAB⇄toolbar; embedded shows the mode pill only. */
+  host?: AnnotationHost
   scope?: string
-  intent?: string
+  intents?: AnnotationIntentOption[]
+  defaultIntent?: ShowAnnotationIntent | string
   severity?: string
-  submitLabel?: string
-  placeholder?: string
-  showToolbar?: boolean
-  defaultMode?: Exclude<AnnotationOverlayMode, "idle">
+  labels?: Partial<AnnotationOverlayLabels>
+  onEnable?: (mode?: AnnotationMode) => void
+  onDisable?: () => void
+  onSetMode?: (mode: AnnotationMode) => void
   onSubmitted?: (annotation: ShowAnnotation, result: unknown) => void
 }
 
@@ -146,10 +228,17 @@ export type AgentMarkLayerProps = {
 
 type AssistantMarkLayerEvent = Extract<ShowEvent, { type: "assistant.mark.created" | "assistant.mark.updated" | "assistant.mark.resolved" }>
 
+export type AnnotationMarkerTone = "human" | "assistant" | "resolved"
+export type AnnotationMarkerVariant = "hover" | "selected" | "region"
+
 export type AnnotationMarkerProps = {
   rect: MarkAnchorRect
-  tone?: "human" | "assistant"
+  tone?: AnnotationMarkerTone
+  variant?: AnnotationMarkerVariant
+  /** Anchor chip text rendered above the box (e.g. the element label). */
   label?: string
+  /** Corner badge content (a number or an icon); omit for a plain highlight box. */
+  badge?: React.ReactNode
   children?: React.ReactNode
 }
 
@@ -605,20 +694,29 @@ export function ActionButton({
 
 export function AnnotationOverlay({
   enabled,
-  defaultEnabled = false,
+  mode,
+  available = true,
+  host = "standalone",
   scope,
-  intent = "comment",
+  intents,
+  defaultIntent,
   severity = "suggestion",
-  submitLabel = "Annotate",
-  placeholder = "Write a comment...",
-  showToolbar = true,
-  defaultMode = "smart",
+  labels,
+  onEnable,
+  onDisable,
+  onSetMode,
   onSubmitted
 }: AnnotationOverlayProps) {
   const context = React.useContext(ShowSessionContext)
-  const [internalEnabled, setInternalEnabled] = React.useState(defaultEnabled)
-  const active = enabled ?? internalEnabled
-  const [mode, setMode] = React.useState<AnnotationOverlayMode>((enabled ?? defaultEnabled) ? defaultMode : "idle")
+  const copy = React.useMemo(() => ({ ...DEFAULT_ANNOTATION_LABELS, ...labels }), [labels])
+  const intentOptions = intents ?? DEFAULT_ANNOTATION_INTENTS
+  // "Active" == the overlay can capture: enabled AND the viewer may write. Anonymous public
+  // visitors (available === false) see markers only, never a capture surface.
+  const active = enabled && available
+  const isMobile = useIsMobile()
+  const [selectedIntent, setSelectedIntent] = React.useState<ShowAnnotationIntent | string>(
+    defaultIntent ?? intentOptions[0]?.intent ?? "comment"
+  )
   const [hover, setHover] = React.useState<{ rect: MarkAnchorRect; label?: string } | null>(null)
   const [draft, setDraft] = React.useState<AnnotationDraft | null>(null)
   const [screenshotDraft, setScreenshotDraft] = React.useState<ScreenshotDraft | null>(null)
@@ -634,7 +732,6 @@ export function AnnotationOverlay({
   const screenshotCaptureTokenRef = React.useRef(0)
   const activeRef = React.useRef(active)
   const modeRef = React.useRef(mode)
-  const wasActiveRef = React.useRef(active)
   activeRef.current = active
   modeRef.current = mode
 
@@ -642,23 +739,18 @@ export function AnnotationOverlay({
     dragRef.current = drag
   }, [drag])
 
+  // Clear all transient annotation state whenever the overlay turns off (or loses write access) or
+  // the capture mode switches, so the page returns to exactly its pre-annotation state (§6).
   React.useEffect(() => {
-    const wasActive = wasActiveRef.current
-    wasActiveRef.current = active
-    if (active && !wasActive && mode === "idle") {
-      setMode(defaultMode)
-    }
-    if (!active && wasActive) {
-      setMode("idle")
-      setDraft(null)
-      resetScreenshotState()
-      setComment("")
-      setDrag(null)
-      setHover(null)
-      smartDragStartRef.current = null
-      suppressNextClickRef.current = false
-    }
-  }, [active, defaultMode, mode])
+    setDraft(null)
+    resetScreenshotState()
+    setComment("")
+    setDrag(null)
+    setHover(null)
+    smartDragStartRef.current = null
+    suppressNextClickRef.current = false
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- resetScreenshotState is a stable local
+  }, [enabled, mode, available])
 
   React.useEffect(() => {
     if (!active || mode !== "smart" || draft) {
@@ -782,23 +874,27 @@ export function AnnotationOverlay({
 
   React.useEffect(() => {
     function escape(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        setMode("idle")
+      if (event.key !== "Escape" || !active) return
+      // Esc cancels an open draft first; a second Esc (nothing open) exits annotation mode (§6).
+      if (draft || screenshotDraft) {
         setDraft(null)
         resetScreenshotState()
         setDrag(null)
         setHover(null)
+        return
       }
+      onDisable?.()
     }
     document.addEventListener("keydown", escape)
     return () => document.removeEventListener("keydown", escape)
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- resetScreenshotState is a stable local
+  }, [active, draft, screenshotDraft, onDisable])
 
   async function submit() {
     if (!draft || !comment.trim()) return
     const baseAnnotation: ShowAnnotation = {
       scope,
-      intent,
+      intent: selectedIntent,
       severity,
       status: "pending",
       comment: comment.trim(),
@@ -827,7 +923,7 @@ export function AnnotationOverlay({
     if (!active || !screenshotDraft?.capture || screenshotDraft.items.length === 0) return
     const annotation = screenshotAnnotationFromDraft({
       scope,
-      intent,
+      intent: selectedIntent,
       severity,
       status: "pending",
       dispatch: true,
@@ -847,15 +943,6 @@ export function AnnotationOverlay({
     } finally {
       setSubmitting(false)
     }
-  }
-
-  function setSmartMode(nextMode: Exclude<AnnotationOverlayMode, "idle">) {
-    setMode(nextMode)
-    setDraft(null)
-    resetScreenshotState()
-    setDrag(null)
-    setHover(null)
-    setError(null)
   }
 
   function resetScreenshotState() {
@@ -990,119 +1077,115 @@ export function AnnotationOverlay({
 
   if (typeof document === "undefined") return null
 
+  const ambiguous = draft?.selection?.classification.ambiguous
+  const nextItemLabel = screenshotItemSequenceRef.current + 1
+
   return createPortal(
     <>
-      {showToolbar ? (
-        <div data-show-annotation-ui="" style={toolbarStyle} onClick={(event) => event.stopPropagation()}>
-          <button type="button" aria-pressed={active} onClick={() => {
-            const next = !active
-            setInternalEnabled(next)
-            setMode(next ? defaultMode : "idle")
-            if (!next) {
-              setDraft(null)
-              setScreenshotDraft(null)
-              setDrag(null)
-              setHover(null)
-            }
-          }} style={toolbarButtonStyle}>{active ? "On" : "Off"}</button>
-          <button type="button" disabled={!active} aria-pressed={mode === "smart"} onClick={() => setSmartMode("smart")} style={toolbarButtonStyle}>Smart</button>
-          <button type="button" disabled={!active} aria-pressed={mode === "screenshot"} onClick={() => setSmartMode("screenshot")} style={toolbarButtonStyle}>Screenshot</button>
-        </div>
+      <AnnotationChrome
+        host={host}
+        enabled={enabled}
+        available={available}
+        mode={mode}
+        labels={copy}
+        onEnable={onEnable}
+        onDisable={onDisable}
+        onSetMode={onSetMode}
+      />
+
+      {active && mode === "smart" && hover && !draft ? (
+        <AnnotationMarker rect={hover.rect} tone="human" variant="hover" label={hover.label} />
       ) : null}
-      {hover && active && mode === "smart" && !draft ? <AnnotationMarker rect={hover.rect} tone="human" label={hover.label} /> : null}
-      {active && drag ? <AnnotationMarker rect={normalizeVisualRect(drag.rect)} tone="human" /> : null}
+      {active && mode === "smart" && drag ? (
+        <AnnotationMarker rect={normalizeVisualRect(drag.rect)} tone="human" variant="region" />
+      ) : null}
+
       {active && mode === "screenshot" ? (
         <div
           data-show-annotation-capture=""
-          style={areaCaptureStyle}
+          style={screenshotDraft ? screenshotItemSurfaceStyle : screenshotCaptureStyle}
           onPointerDown={onCapturePointerDown}
           onPointerMove={onCapturePointerMove}
           onPointerUp={onCapturePointerUp}
         />
       ) : null}
+      {active && mode === "screenshot" && !screenshotDraft && drag?.purpose === "screenshot-region" ? (
+        <ScreenshotRegionFrame rect={normalizeVisualRect(drag.rect)} label={copy.screenshotTitle(0)} />
+      ) : null}
+
       {active && draft ? (
         <>
-          <AnnotationMarker rect={draft.rect} tone="human" label={draft.label} />
-          <CommentPopover rect={draft.rect} onClose={() => setDraft(null)}>
-            {draft.selection?.classification.ambiguous ? (
+          <AnnotationMarker rect={draft.rect} tone="human" variant="selected" label={draft.label} />
+          <CommentSurface anchorRect={draft.rect} isMobile={isMobile} onClose={() => setDraft(null)}>
+            {draft.label ? <AnchorChip label={draft.label} /> : null}
+            {ambiguous ? (
               <div style={toggleRowStyle}>
-                <button type="button" style={draft.selection.primaryAnchor === "element-group" ? toggleActiveStyle : toggleButtonStyle} onClick={() => {
-                  const nextSelection = {
-                    ...draft.selection!,
-                    primaryAnchor: "element-group" as const,
-                    anchor: { ...draft.selection!.anchor, kind: "element-group" as const }
-                  }
-                  setDraft({ ...draft, selection: nextSelection, anchor: nextSelection.anchor, label: `${nextSelection.matchedElements.length} elements` })
-                }}>By elements</button>
-                <button type="button" style={draft.selection.primaryAnchor === "area" ? toggleActiveStyle : toggleButtonStyle} onClick={() => {
-                  const nextSelection = {
-                    ...draft.selection!,
-                    primaryAnchor: "area" as const,
-                    anchor: { ...draft.selection!.anchor, kind: "area" as const }
-                  }
-                  setDraft({ ...draft, selection: nextSelection, anchor: nextSelection.anchor, label: "Selected area" })
-                }}>By area</button>
+                <button type="button" style={draft.selection!.primaryAnchor === "element-group" ? toggleActiveStyle : toggleButtonStyle} onClick={() => {
+                  const nextSelection = { ...draft.selection!, primaryAnchor: "element-group" as const, anchor: { ...draft.selection!.anchor, kind: "element-group" as const } }
+                  setDraft({ ...draft, selection: nextSelection, anchor: nextSelection.anchor, label: copy.elementCount(nextSelection.matchedElements.length) })
+                }}>{copy.byElements}</button>
+                <button type="button" style={draft.selection!.primaryAnchor === "area" ? toggleActiveStyle : toggleButtonStyle} onClick={() => {
+                  const nextSelection = { ...draft.selection!, primaryAnchor: "area" as const, anchor: { ...draft.selection!.anchor, kind: "area" as const } }
+                  setDraft({ ...draft, selection: nextSelection, anchor: nextSelection.anchor, label: copy.selectedArea })
+                }}>{copy.byArea}</button>
               </div>
             ) : null}
+            <IntentChips options={intentOptions} value={selectedIntent} onChange={setSelectedIntent} />
             <textarea
               autoFocus
-              placeholder={placeholder}
+              placeholder={copy.commentPlaceholder}
               value={comment}
               onChange={(event) => setComment(event.target.value)}
-              style={textareaStyle}
+              onKeyDown={(event) => {
+                // Enter sends on desktop (Shift+Enter for a newline); mobile keeps Enter as newline.
+                if (event.key === "Enter" && !event.shiftKey && !isMobile) {
+                  event.preventDefault()
+                  void submit()
+                }
+              }}
+              style={overlayTextareaStyle}
             />
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-              <button type="button" onClick={() => setDraft(null)} style={secondaryButtonStyle}>Cancel</button>
-              <button type="button" disabled={submitting || !comment.trim()} onClick={() => void submit()} style={buttonStyle}>
-                {submitting ? "Sending..." : submitLabel}
+            <div style={cardFooterStyle}>
+              <span style={footerHintStyle}>{copy.enterToSend}</span>
+              <button type="button" disabled={submitting || !comment.trim()} onClick={() => void submit()} style={primaryButtonStyle}>
+                <SendIcon />
+                {submitting ? "…" : copy.send}
               </button>
             </div>
-            {error ? <p role="alert" style={errorStyle}>{error}</p> : null}
-          </CommentPopover>
+            {error ? <p role="alert" style={overlayErrorStyle}>{error}</p> : null}
+          </CommentSurface>
         </>
       ) : null}
+
       {active && screenshotDraft ? (
         <>
-          <AnnotationMarker rect={screenshotDraft.region} tone="assistant" label="Screenshot 1" />
+          <ScreenshotRegionFrame rect={screenshotDraft.region} label={copy.screenshotTitle(0)} showHandles />
           {screenshotDraft.items.map((item) =>
             item.viewportRect ? (
-              <AnnotationMarker key={item.id} rect={item.viewportRect} tone="assistant" label={String(item.label)} />
+              <AnnotationMarker key={item.id} rect={item.viewportRect} tone="human" variant="region" badge={item.label} />
             ) : item.viewportPoint ? (
-              <AnnotationMarker key={item.id} rect={{ x: item.viewportPoint.x - 6, y: item.viewportPoint.y - 6, width: 12, height: 12 }} tone="assistant" label={String(item.label)} />
+              <NumberPin key={item.id} point={item.viewportPoint} tone="human" label={item.label} />
             ) : null
           )}
-          {screenshotDraft.pendingRect ? <AnnotationMarker rect={screenshotDraft.pendingRect} tone="human" label={String(screenshotItemSequenceRef.current + 1)} /> : null}
-          {screenshotDraft.pendingPoint ? <AnnotationMarker rect={{ x: screenshotDraft.pendingPoint.x - 6, y: screenshotDraft.pendingPoint.y - 6, width: 12, height: 12 }} tone="human" label={String(screenshotItemSequenceRef.current + 1)} /> : null}
-          <CommentPopover rect={screenshotDraft.pendingRect ?? pointRect(screenshotDraft.pendingPoint) ?? screenshotDraft.region} onClose={() => setScreenshotDraft(null)}>
-            <div style={{ fontWeight: 600 }}>Screenshot 1</div>
-            {screenshotDraft.capture?.dataUrl ? <img src={screenshotDraft.capture.dataUrl} alt="" style={screenshotPreviewStyle} /> : null}
-            <textarea
-              placeholder="Comment on this screenshot..."
-              value={screenshotComment}
-              onChange={(event) => setScreenshotComment(event.target.value)}
-              style={textareaStyle}
+          {screenshotDraft.pendingRect ? <AnnotationMarker rect={screenshotDraft.pendingRect} tone="human" variant="selected" badge={nextItemLabel} /> : null}
+          {screenshotDraft.pendingPoint ? <NumberPin point={screenshotDraft.pendingPoint} tone="human" label={nextItemLabel} pending /> : null}
+          <CommentSurface anchorRect={screenshotDraft.region} isMobile={isMobile} onClose={() => resetScreenshotState()}>
+            <ScreenshotBatchCard
+              draft={screenshotDraft}
+              comment={screenshotComment}
+              submitting={submitting}
+              labels={copy}
+              onCommentChange={setScreenshotComment}
+              onAddComment={addScreenshotComment}
+              onRemoveItem={(id) => setScreenshotDraft({ ...screenshotDraft, items: screenshotDraft.items.filter((current) => current.id !== id) })}
+              onRetake={resetScreenshotState}
+              onSend={() => void submitScreenshotDraft()}
             />
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-              <button type="button" onClick={resetScreenshotState} style={secondaryButtonStyle}>Retake</button>
-              <button type="button" disabled={!screenshotComment.trim()} onClick={addScreenshotComment} style={secondaryButtonStyle}>Add comment</button>
-              <button type="button" disabled={submitting || screenshotDraft.items.length === 0} onClick={() => void submitScreenshotDraft()} style={buttonStyle}>
-                {submitting ? "Sending..." : "Send batch"}
-              </button>
-            </div>
-            {screenshotDraft.items.length ? (
-              <ol style={screenshotListStyle}>
-                {screenshotDraft.items.map((item) => (
-                  <li key={item.id}>
-                    <span>{item.comment}</span>
-                    <button type="button" style={inlineDeleteStyle} onClick={() => setScreenshotDraft({ ...screenshotDraft, items: screenshotDraft.items.filter((current) => current.id !== item.id) })}>Remove</button>
-                  </li>
-                ))}
-              </ol>
-            ) : null}
-            {error ? <p role="alert" style={errorStyle}>{error}</p> : null}
-          </CommentPopover>
+            {error ? <p role="alert" style={overlayErrorStyle}>{error}</p> : null}
+          </CommentSurface>
         </>
       ) : null}
+
       {error && active && !draft && !screenshotDraft ? (
         <div data-show-annotation-ui="" role="alert" style={floatingErrorStyle}>{error}</div>
       ) : null}
@@ -1110,6 +1193,238 @@ export function AnnotationOverlay({
     </>,
     document.body
   )
+}
+
+// ── Chrome: standalone FAB ⇄ pill toolbar, embedded mode pill, login hint ────────────────
+
+type AnnotationChromeProps = {
+  host: AnnotationHost
+  enabled: boolean
+  available: boolean
+  mode: AnnotationMode
+  labels: AnnotationOverlayLabels
+  onEnable?: (mode?: AnnotationMode) => void
+  onDisable?: () => void
+  onSetMode?: (mode: AnnotationMode) => void
+}
+
+function AnnotationChrome({ host, enabled, available, mode, labels, onEnable, onDisable, onSetMode }: AnnotationChromeProps) {
+  if (host === "embedded") {
+    // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
+    // status pill so the user knows annotation is live and how to exit (contract §2, design kn94D).
+    if (!enabled || !available) return null
+    return (
+      <div data-show-annotation-ui="" style={modePillStyle}>
+        <span style={{ ...modePillDotStyle, background: mode === "screenshot" ? COLORS.human : COLORS.human }} />
+        <span style={modePillLabelStyle}>
+          {mode === "screenshot" ? labels.screenshotHint : `${labels.annotating} · ${labels.smart}`}
+        </span>
+        <span style={modePillExitStyle}>{labels.exit}</span>
+      </div>
+    )
+  }
+
+  // Standalone tab: anonymous public visitors can't write — hide the FAB, show a quiet login hint.
+  if (!available) {
+    return (
+      <div data-show-annotation-ui="" style={loginHintStyle}>
+        <LockIcon />
+        {labels.loginRequired}
+      </div>
+    )
+  }
+
+  if (!enabled) {
+    return (
+      <button type="button" data-show-annotation-ui="" aria-label={labels.annotating} style={fabStyle} onClick={() => onEnable?.()}>
+        <AnnotateIcon />
+      </button>
+    )
+  }
+
+  return (
+    <div data-show-annotation-ui="" style={toolbarStyle} onClick={(event) => event.stopPropagation()}>
+      <button type="button" aria-label={labels.exit} style={toolbarIndicatorStyle} onClick={() => onDisable?.()}>
+        <AnnotateIcon />
+      </button>
+      <ModeTab active={mode === "smart"} onClick={() => onSetMode?.("smart")} icon={<SparkleIcon />} label={labels.smart} />
+      <ModeTab active={mode === "screenshot"} onClick={() => onSetMode?.("screenshot")} icon={<CameraIcon />} label={labels.screenshot} />
+      <button type="button" style={toolbarExitStyle} onClick={() => onDisable?.()}>{labels.exit}</button>
+    </div>
+  )
+}
+
+function ModeTab({ active, onClick, icon, label }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string }) {
+  return (
+    <button type="button" aria-pressed={active} onClick={onClick} style={active ? modeTabActiveStyle : modeTabStyle}>
+      {icon}
+      {label}
+    </button>
+  )
+}
+
+// ── Intent chips, anchor chip, comment surface (popover / mobile bottom-sheet) ──────────
+
+function IntentChips({ options, value, onChange }: { options: AnnotationIntentOption[]; value: string; onChange: (intent: string) => void }) {
+  return (
+    <div style={intentChipsStyle}>
+      {options.map((option) => {
+        const selected = option.intent === value
+        return (
+          <button key={option.intent} type="button" aria-pressed={selected} onClick={() => onChange(option.intent)} style={selected ? intentChipActiveStyle : intentChipStyle}>
+            <IntentIcon intent={option.intent} />
+            {option.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function AnchorChip({ label }: { label: string }) {
+  return (
+    <span style={anchorChipStyle}>
+      <AnchorIcon />
+      <span style={anchorChipTextStyle}>{label}</span>
+    </span>
+  )
+}
+
+/** The comment container: a positioned popover on desktop, a bottom sheet on mobile (design urZTa). */
+function CommentSurface({ anchorRect, isMobile, onClose, children }: { anchorRect: MarkAnchorRect; isMobile: boolean; onClose: () => void; children: React.ReactNode }) {
+  if (isMobile) {
+    return (
+      <div data-show-annotation-ui="" role="dialog" style={sheetStyle} onClick={(event) => event.stopPropagation()}>
+        <div style={sheetHandleStyle} />
+        <button type="button" aria-label="Close" onClick={onClose} style={closeButtonStyle}>×</button>
+        {children}
+      </div>
+    )
+  }
+  const top = Math.min(window.innerHeight - 260, Math.max(12, anchorRect.y + anchorRect.height + 10))
+  const left = Math.min(window.innerWidth - COMMENT_CARD_WIDTH - 12, Math.max(12, anchorRect.x))
+  return (
+    <div data-show-annotation-ui="" role="dialog" style={{ ...popoverStyle, top, left }} onClick={(event) => event.stopPropagation()}>
+      <button type="button" aria-label="Close" onClick={onClose} style={closeButtonStyle}>×</button>
+      {children}
+    </div>
+  )
+}
+
+// ── Screenshot chrome: spotlit region frame + numbered pins + batch card ────────────────
+
+function ScreenshotRegionFrame({ rect, label, showHandles }: { rect: MarkAnchorRect; label: string; showHandles?: boolean }) {
+  return (
+    <div data-show-annotation-ui="" style={{ ...regionFrameStyle, left: rect.x, top: rect.y, width: Math.max(rect.width, 1), height: Math.max(rect.height, 1) }}>
+      <span style={regionLabelStyle}>
+        <CameraIcon />
+        {label}
+      </span>
+      {showHandles ? REGION_HANDLES.map((corner) => <span key={corner} style={{ ...regionHandleStyle, ...regionHandlePosition(corner) }} />) : null}
+    </div>
+  )
+}
+
+function NumberPin({ point, tone, label, pending }: { point: { x: number; y: number }; tone: AnnotationMarkerTone; label: number | string; pending?: boolean }) {
+  const accent = tone === "assistant" ? COLORS.agent : COLORS.human
+  return (
+    <div
+      data-show-annotation-ui=""
+      style={{
+        position: "fixed",
+        left: point.x - 13,
+        top: point.y - 13,
+        width: 26,
+        height: 26,
+        borderRadius: 999,
+        display: "grid",
+        placeItems: "center",
+        font: `600 12px/1 ${FONT_STACK}`,
+        color: COLORS.onAccent,
+        background: accent,
+        border: `2px solid ${COLORS.surface}`,
+        boxShadow: `0 4px 14px ${accent}55`,
+        opacity: pending ? 0.7 : 1,
+        pointerEvents: "none",
+        zIndex: MARKER_Z
+      }}
+    >
+      {label}
+    </div>
+  )
+}
+
+type ScreenshotBatchCardProps = {
+  draft: ScreenshotDraft
+  comment: string
+  submitting: boolean
+  labels: AnnotationOverlayLabels
+  onCommentChange: (value: string) => void
+  onAddComment: () => void
+  onRemoveItem: (id: string) => void
+  onRetake: () => void
+  onSend: () => void
+}
+
+function ScreenshotBatchCard({ draft, comment, submitting, labels, onCommentChange, onAddComment, onRemoveItem, onRetake, onSend }: ScreenshotBatchCardProps) {
+  return (
+    <>
+      <div style={batchHeaderStyle}>
+        <CameraIcon />
+        <span style={{ fontWeight: 600 }}>{labels.screenshotTitle(draft.items.length)}</span>
+      </div>
+      {draft.capture?.dataUrl ? <img src={draft.capture.dataUrl} alt="" style={screenshotPreviewStyle} /> : null}
+      {draft.items.length ? (
+        <ol style={screenshotListStyle}>
+          {draft.items.map((item) => (
+            <li key={item.id} style={screenshotListItemStyle}>
+              <span style={listNumberStyle}>{item.label}</span>
+              <span style={listCommentStyle}>{item.comment}</span>
+              <button type="button" aria-label="Remove" style={inlineDeleteStyle} onClick={() => onRemoveItem(item.id!)}><TrashIcon /></button>
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      <textarea
+        placeholder={labels.screenshotCommentPlaceholder}
+        value={comment}
+        onChange={(event) => onCommentChange(event.target.value)}
+        style={overlayTextareaStyle}
+      />
+      <div style={cardFooterStyle}>
+        <button type="button" onClick={onRetake} style={secondaryButtonStyle}>
+          <RetakeIcon />
+          {labels.retake}
+        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button type="button" disabled={!comment.trim()} onClick={onAddComment} style={ghostButtonStyle}>{labels.addComment}</button>
+          <button type="button" disabled={submitting || draft.items.length === 0} onClick={onSend} style={primaryButtonStyle}>
+            <SendIcon />
+            {submitting ? "…" : labels.sendBatch(draft.items.length)}
+          </button>
+        </div>
+      </div>
+    </>
+  )
+}
+
+/** Track the mobile breakpoint (design switches the comment card to a bottom sheet ≤ 640px). */
+function useIsMobile(query = "(max-width: 640px)") {
+  const [isMobile, setIsMobile] = React.useState(() => matchMediaQuery(query))
+  React.useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return
+    const media = window.matchMedia(query)
+    const update = () => setIsMobile(media.matches)
+    update()
+    media.addEventListener("change", update)
+    return () => media.removeEventListener("change", update)
+  }, [query])
+  return isMobile
+}
+
+function matchMediaQuery(query: string) {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false
+  return window.matchMedia(query).matches
 }
 
 export function AgentMarkLayer({ events, scope, className, renderMark }: AgentMarkLayerProps) {
@@ -1142,7 +1457,7 @@ export function AgentMarkLayer({ events, scope, className, renderMark }: AgentMa
         renderMark ? (
           <React.Fragment key={event.id}>{renderMark(event, rect)}</React.Fragment>
         ) : (
-          <AnnotationMarker key={event.id} rect={rect} tone="assistant" label={agentMarkLabel(event)} />
+          <AnnotationMarker key={event.id} rect={rect} tone="assistant" variant="selected" badge={<BotIcon />} label={agentMarkLabel(event)} />
         )
       )}
     </div>,
@@ -1150,8 +1465,9 @@ export function AgentMarkLayer({ events, scope, className, renderMark }: AgentMa
   )
 }
 
-export function AnnotationMarker({ rect, tone = "human", label, children }: AnnotationMarkerProps) {
-  const color = tone === "assistant" ? "#2563eb" : "#f59e0b"
+export function AnnotationMarker({ rect, tone = "human", variant = "selected", label, badge, children }: AnnotationMarkerProps) {
+  const accent = tone === "assistant" ? COLORS.agent : tone === "resolved" ? COLORS.resolved : COLORS.human
+  const hover = variant === "hover"
   return (
     <div
       data-show-annotation-ui=""
@@ -1161,46 +1477,45 @@ export function AnnotationMarker({ rect, tone = "human", label, children }: Anno
         top: rect.y,
         width: Math.max(rect.width, 12),
         height: Math.max(rect.height, 12),
-        border: `2px solid ${color}`,
-        background: tone === "assistant" ? "rgba(37, 99, 235, 0.08)" : "rgba(245, 158, 11, 0.10)",
-        borderRadius: 6,
+        border: `${hover ? 1.5 : 2}px ${hover ? "dashed" : "solid"} ${accent}`,
+        background: `${accent}14`,
+        borderRadius: 10,
         pointerEvents: "none",
-        zIndex: 2147483000,
-        boxSizing: "border-box"
+        zIndex: MARKER_Z,
+        boxSizing: "border-box",
+        boxShadow: variant === "selected" ? `0 0 0 4px ${accent}22, 0 8px 28px ${accent}33` : "none"
       }}
     >
       {label ? (
-        <div
+        <span style={{ ...anchorChipStyle, ...markerChipStyle, borderColor: accent, color: accent }}>
+          <AnchorIcon />
+          <span style={anchorChipTextStyle}>{label}</span>
+        </span>
+      ) : null}
+      {badge !== undefined && badge !== null ? (
+        <span
           style={{
             position: "absolute",
-            left: -2,
-            top: -28,
-            maxWidth: 260,
-            padding: "3px 7px",
+            top: -12,
+            right: -12,
+            minWidth: 24,
+            height: 24,
+            padding: "0 6px",
             borderRadius: 999,
-            color: "#fff",
-            background: color,
-            fontSize: 12,
-            lineHeight: "18px",
-            whiteSpace: "nowrap",
-            overflow: "hidden",
-            textOverflow: "ellipsis"
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 3,
+            font: `600 12px/1 ${FONT_STACK}`,
+            color: COLORS.onAccent,
+            background: accent,
+            border: `2px solid ${COLORS.surface}`,
+            boxShadow: `0 4px 14px ${accent}55`
           }}
         >
-          {label}
-        </div>
+          {badge}
+        </span>
       ) : null}
-      {children}
-    </div>
-  )
-}
-
-function CommentPopover({ rect, children, onClose }: { rect: MarkAnchorRect; children: React.ReactNode; onClose: () => void }) {
-  const top = Math.min(window.innerHeight - 220, Math.max(12, rect.y + rect.height + 8))
-  const left = Math.min(window.innerWidth - 330, Math.max(12, rect.x))
-  return (
-    <div data-show-annotation-ui="" role="dialog" style={{ ...popoverStyle, top, left }} onClick={(event) => event.stopPropagation()}>
-      <button type="button" aria-label="Close" onClick={onClose} style={closeButtonStyle}>×</button>
       {children}
     </div>
   )
@@ -1259,11 +1574,6 @@ function centerPoint(rect: MarkAnchorRect) {
   return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }
 }
 
-function pointRect(point?: { x: number; y: number }): MarkAnchorRect | undefined {
-  if (!point) return undefined
-  return { x: point.x - 6, y: point.y - 6, width: 12, height: 12 }
-}
-
 function pointInsideRect(point: { x: number; y: number }, rect: MarkAnchorRect) {
   return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height
 }
@@ -1297,6 +1607,9 @@ function agentMarkLabel(event: ShowEvent) {
   const mark = (event as Extract<ShowEvent, { type: "assistant.mark.created" | "assistant.mark.updated" | "assistant.mark.resolved" }>).mark
   return mark.body || mark.target || "Agent"
 }
+
+// ── Light styles for the agent-authored page components (IntentForm/ChoiceGroup/AgentMarkForm).
+//    These render inside the page and must NOT adopt the overlay's fixed-dark chrome. ──────────
 
 const formStyle: React.CSSProperties = {
   display: "grid",
@@ -1337,31 +1650,10 @@ const buttonStyle: React.CSSProperties = {
   cursor: "pointer"
 }
 
-const secondaryButtonStyle: React.CSSProperties = {
-  ...buttonStyle,
-  color: "#111827",
-  background: "#f3f4f6"
-}
-
 const errorStyle: React.CSSProperties = {
   margin: 0,
   color: "#b91c1c",
   fontSize: 12
-}
-
-const floatingErrorStyle: React.CSSProperties = {
-  position: "fixed",
-  right: 16,
-  bottom: 64,
-  zIndex: 2147483300,
-  maxWidth: 320,
-  border: "1px solid rgba(185, 28, 28, 0.24)",
-  borderRadius: 8,
-  padding: "8px 10px",
-  color: "#991b1b",
-  background: "rgba(254, 242, 242, 0.96)",
-  boxShadow: "0 12px 36px rgba(15, 23, 42, 0.16)",
-  font: "12px/18px system-ui, -apple-system, BlinkMacSystemFont, sans-serif"
 }
 
 const choiceGroupStyle: React.CSSProperties = {
@@ -1382,71 +1674,191 @@ const choiceButtonStyle: React.CSSProperties = {
   cursor: "pointer"
 }
 
-const toolbarStyle: React.CSSProperties = {
-  position: "fixed",
-  right: 16,
-  bottom: 16,
-  zIndex: 2147483200,
-  display: "flex",
-  gap: 6,
-  padding: 6,
-  border: "1px solid rgba(15, 23, 42, 0.15)",
-  borderRadius: 999,
-  background: "rgba(255, 255, 255, 0.94)",
-  boxShadow: "0 12px 40px rgba(15, 23, 42, 0.18)",
-  backdropFilter: "blur(10px)"
-}
+// ── Overlay design system (self-contained; fixed dark, mint/violet accents; no @avibe/show-ui). ──
 
-const toolbarButtonStyle: React.CSSProperties = {
-  border: 0,
-  borderRadius: 999,
-  padding: "6px 10px",
-  font: "12px/18px system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
-  background: "#111827",
-  color: "#fff",
-  cursor: "pointer"
-}
+/** Overlay palette (design refs): dark chrome, mint human accent, violet agent accent. */
+const COLORS = {
+  surface: "#11111C",
+  surfacePopover: "rgba(17, 17, 28, 0.95)",
+  surfaceRaised: "rgba(255, 255, 255, 0.05)",
+  human: "#5BFFA0",
+  agent: "#7C5BFF",
+  resolved: "rgba(245, 246, 250, 0.35)",
+  danger: "#FF6B6B",
+  warn: "#FFC857",
+  onAccent: "#080812",
+  textPrimary: "#F5F6FA",
+  textMuted: "rgba(245, 246, 250, 0.58)",
+  border: "rgba(245, 246, 250, 0.12)",
+  borderStrong: "rgba(245, 246, 250, 0.2)"
+} as const
 
-const areaCaptureStyle: React.CSSProperties = {
-  position: "fixed",
-  inset: 0,
-  zIndex: 2147482500,
-  cursor: "crosshair",
-  background: "transparent"
-}
+const FONT_STACK = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
+const COMMENT_CARD_WIDTH = 340
 
-const layerStyle: React.CSSProperties = {
-  position: "fixed",
-  inset: 0,
-  pointerEvents: "none",
-  zIndex: 2147482900
+// z-index bands, all near the top of the 32-bit range so the overlay sits above host page chrome.
+const CAPTURE_Z = 2147482500
+const AGENT_LAYER_Z = 2147482900
+const MARKER_Z = 2147483000
+const CHROME_Z = 2147483200
+const CARD_Z = 2147483300
+const TOAST_Z = 2147483400
+
+const cardBaseStyle: React.CSSProperties = {
+  display: "grid",
+  gap: 10,
+  padding: 14,
+  color: COLORS.textPrimary,
+  background: COLORS.surfacePopover,
+  border: `1px solid ${COLORS.border}`,
+  borderRadius: 16,
+  boxShadow: "0 24px 70px rgba(4, 4, 10, 0.55)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  font: `13px/1.5 ${FONT_STACK}`
 }
 
 const popoverStyle: React.CSSProperties = {
+  ...cardBaseStyle,
   position: "fixed",
-  width: 320,
-  display: "grid",
-  gap: 10,
-  padding: 12,
-  border: "1px solid rgba(15, 23, 42, 0.15)",
-  borderRadius: 10,
-  background: "#fff",
-  boxShadow: "0 18px 50px rgba(15, 23, 42, 0.22)",
-  zIndex: 2147483300
+  width: COMMENT_CARD_WIDTH,
+  maxWidth: "calc(100vw - 24px)",
+  zIndex: CARD_Z
+}
+
+const sheetStyle: React.CSSProperties = {
+  ...cardBaseStyle,
+  position: "fixed",
+  left: 0,
+  right: 0,
+  bottom: 0,
+  width: "100%",
+  paddingTop: 20,
+  paddingBottom: "max(20px, env(safe-area-inset-bottom))",
+  borderRadius: "20px 20px 0 0",
+  zIndex: CARD_Z
+}
+
+const sheetHandleStyle: React.CSSProperties = {
+  position: "absolute",
+  top: 8,
+  left: "50%",
+  transform: "translateX(-50%)",
+  width: 40,
+  height: 4,
+  borderRadius: 999,
+  background: COLORS.borderStrong
 }
 
 const closeButtonStyle: React.CSSProperties = {
   position: "absolute",
-  top: 6,
-  right: 6,
-  width: 22,
-  height: 22,
+  top: 10,
+  right: 10,
+  width: 26,
+  height: 26,
   border: 0,
   borderRadius: 999,
-  background: "#f3f4f6",
+  color: COLORS.textMuted,
+  background: COLORS.surfaceRaised,
+  cursor: "pointer",
+  font: `16px/1 ${FONT_STACK}`
+}
+
+const overlayTextareaStyle: React.CSSProperties = {
+  minHeight: 84,
+  resize: "vertical",
+  color: COLORS.textPrimary,
+  background: "rgba(0, 0, 0, 0.25)",
+  border: `1px solid ${COLORS.border}`,
+  borderRadius: 12,
+  padding: "10px 12px",
+  font: `13px/1.5 ${FONT_STACK}`,
+  outline: "none",
+  boxSizing: "border-box",
+  width: "100%"
+}
+
+const cardFooterStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8
+}
+
+const footerHintStyle: React.CSSProperties = {
+  color: COLORS.textMuted,
+  fontSize: 12
+}
+
+const overlayErrorStyle: React.CSSProperties = {
+  margin: 0,
+  color: COLORS.danger,
+  fontSize: 12
+}
+
+const overlayButtonBase: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 6,
+  minHeight: 40,
+  padding: "0 16px",
+  border: `1px solid transparent`,
+  borderRadius: 12,
+  font: `600 13px/1 ${FONT_STACK}`,
   cursor: "pointer"
 }
 
+const primaryButtonStyle: React.CSSProperties = {
+  ...overlayButtonBase,
+  color: COLORS.onAccent,
+  background: COLORS.human,
+  boxShadow: `0 8px 24px ${COLORS.human}44`
+}
+
+const secondaryButtonStyle: React.CSSProperties = {
+  ...overlayButtonBase,
+  color: COLORS.textPrimary,
+  background: COLORS.surfaceRaised,
+  borderColor: COLORS.border
+}
+
+const ghostButtonStyle: React.CSSProperties = {
+  ...overlayButtonBase,
+  color: COLORS.textPrimary,
+  background: "transparent",
+  borderColor: COLORS.border
+}
+
+// Intent chips (评论/修改/疑问/批准).
+const intentChipsStyle: React.CSSProperties = {
+  display: "flex",
+  flexWrap: "wrap",
+  gap: 6
+}
+
+const intentChipStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 5,
+  minHeight: 30,
+  padding: "0 10px",
+  borderRadius: 999,
+  color: COLORS.textMuted,
+  background: "transparent",
+  border: `1px solid ${COLORS.border}`,
+  font: `500 12px/1 ${FONT_STACK}`,
+  cursor: "pointer"
+}
+
+const intentChipActiveStyle: React.CSSProperties = {
+  ...intentChipStyle,
+  color: COLORS.human,
+  background: `${COLORS.human}1f`,
+  borderColor: `${COLORS.human}66`
+}
+
+// Ambiguity toggle (by elements / by area).
 const toggleRowStyle: React.CSSProperties = {
   display: "grid",
   gridTemplateColumns: "1fr 1fr",
@@ -1454,43 +1866,611 @@ const toggleRowStyle: React.CSSProperties = {
 }
 
 const toggleButtonStyle: React.CSSProperties = {
-  border: "1px solid rgba(148, 163, 184, 0.7)",
-  borderRadius: 8,
-  padding: "6px 8px",
-  background: "#fff",
-  color: "#111827",
-  font: "12px/18px system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
+  minHeight: 32,
+  border: `1px solid ${COLORS.border}`,
+  borderRadius: 10,
+  background: "transparent",
+  color: COLORS.textMuted,
+  font: `500 12px/1 ${FONT_STACK}`,
   cursor: "pointer"
 }
 
 const toggleActiveStyle: React.CSSProperties = {
   ...toggleButtonStyle,
-  borderColor: "#111827",
-  background: "#111827",
-  color: "#fff"
+  color: COLORS.human,
+  background: `${COLORS.human}1f`,
+  borderColor: `${COLORS.human}66`
+}
+
+// Anchor chip ("⧉ Card · Open blockers").
+const anchorChipStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 5,
+  maxWidth: "100%",
+  padding: "4px 9px",
+  borderRadius: 8,
+  color: COLORS.human,
+  background: `${COLORS.human}1a`,
+  border: `1px solid ${COLORS.human}55`,
+  font: `600 12px/1.2 ${FONT_STACK}`,
+  boxSizing: "border-box"
+}
+
+const anchorChipTextStyle: React.CSSProperties = {
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap"
+}
+
+// Anchor chip variant floating above a marker box.
+const markerChipStyle: React.CSSProperties = {
+  position: "absolute",
+  left: 0,
+  top: -30,
+  maxWidth: 260,
+  background: COLORS.surface,
+  pointerEvents: "none"
+}
+
+// Standalone FAB (collapsed).
+const fabStyle: React.CSSProperties = {
+  position: "fixed",
+  right: 20,
+  bottom: 20,
+  zIndex: CHROME_Z,
+  width: 52,
+  height: 52,
+  display: "grid",
+  placeItems: "center",
+  borderRadius: 16,
+  color: COLORS.human,
+  background: COLORS.surfacePopover,
+  border: `1px solid ${COLORS.border}`,
+  boxShadow: "0 16px 44px rgba(4, 4, 10, 0.55)",
+  cursor: "pointer",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)"
+}
+
+// Standalone pill toolbar (expanded).
+const toolbarStyle: React.CSSProperties = {
+  position: "fixed",
+  right: 20,
+  bottom: 20,
+  zIndex: CHROME_Z,
+  display: "flex",
+  alignItems: "center",
+  gap: 4,
+  padding: 5,
+  borderRadius: 999,
+  color: COLORS.textPrimary,
+  background: COLORS.surfacePopover,
+  border: `1px solid ${COLORS.border}`,
+  boxShadow: "0 16px 44px rgba(4, 4, 10, 0.55)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)"
+}
+
+const toolbarIndicatorStyle: React.CSSProperties = {
+  width: 32,
+  height: 32,
+  display: "grid",
+  placeItems: "center",
+  borderRadius: 999,
+  border: 0,
+  color: COLORS.onAccent,
+  background: COLORS.human,
+  cursor: "pointer"
+}
+
+const modeTabStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 5,
+  minHeight: 32,
+  padding: "0 12px",
+  borderRadius: 999,
+  border: 0,
+  color: COLORS.textMuted,
+  background: "transparent",
+  font: `600 13px/1 ${FONT_STACK}`,
+  cursor: "pointer"
+}
+
+const modeTabActiveStyle: React.CSSProperties = {
+  ...modeTabStyle,
+  color: COLORS.human,
+  background: `${COLORS.human}1f`
+}
+
+const toolbarExitStyle: React.CSSProperties = {
+  minHeight: 32,
+  padding: "0 10px",
+  borderRadius: 999,
+  border: 0,
+  color: COLORS.textMuted,
+  background: "transparent",
+  font: `500 12px/1 ${FONT_STACK}`,
+  cursor: "pointer"
+}
+
+// Embedded mode pill (bottom-center status indicator).
+const modePillStyle: React.CSSProperties = {
+  position: "fixed",
+  left: "50%",
+  bottom: 20,
+  transform: "translateX(-50%)",
+  zIndex: CHROME_Z,
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 8,
+  padding: "8px 14px",
+  borderRadius: 999,
+  color: COLORS.textPrimary,
+  background: COLORS.surfacePopover,
+  border: `1px solid ${COLORS.border}`,
+  boxShadow: "0 16px 44px rgba(4, 4, 10, 0.55)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  font: `600 13px/1 ${FONT_STACK}`
+}
+
+const modePillDotStyle: React.CSSProperties = {
+  width: 8,
+  height: 8,
+  borderRadius: 999
+}
+
+const modePillLabelStyle: React.CSSProperties = {
+  color: COLORS.textPrimary
+}
+
+const modePillExitStyle: React.CSSProperties = {
+  color: COLORS.textMuted,
+  fontWeight: 500,
+  fontSize: 12
+}
+
+// Standalone login hint (anonymous public visitor; FAB hidden).
+const loginHintStyle: React.CSSProperties = {
+  position: "fixed",
+  right: 20,
+  bottom: 20,
+  zIndex: CHROME_Z,
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 7,
+  padding: "8px 12px",
+  borderRadius: 999,
+  color: COLORS.textMuted,
+  background: COLORS.surfacePopover,
+  border: `1px solid ${COLORS.border}`,
+  boxShadow: "0 12px 34px rgba(4, 4, 10, 0.5)",
+  font: `500 12px/1 ${FONT_STACK}`,
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)"
+}
+
+// Screenshot capture surfaces + region frame.
+const screenshotCaptureStyle: React.CSSProperties = {
+  position: "fixed",
+  inset: 0,
+  zIndex: CAPTURE_Z,
+  cursor: "crosshair",
+  background: "rgba(8, 8, 18, 0.28)"
+}
+
+const screenshotItemSurfaceStyle: React.CSSProperties = {
+  position: "fixed",
+  inset: 0,
+  zIndex: CAPTURE_Z,
+  cursor: "crosshair",
+  background: "transparent"
+}
+
+const regionFrameStyle: React.CSSProperties = {
+  position: "fixed",
+  border: `2px solid ${COLORS.human}`,
+  borderRadius: 8,
+  // Spotlight: a huge outset shadow dims everything outside the region (design annot-screenshot).
+  boxShadow: `0 0 0 100000px rgba(8, 8, 18, 0.6)`,
+  pointerEvents: "none",
+  zIndex: MARKER_Z,
+  boxSizing: "border-box"
+}
+
+const regionLabelStyle: React.CSSProperties = {
+  position: "absolute",
+  left: 0,
+  top: -30,
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 5,
+  padding: "4px 9px",
+  borderRadius: 8,
+  color: COLORS.onAccent,
+  background: COLORS.human,
+  font: `600 12px/1 ${FONT_STACK}`
+}
+
+const regionHandleStyle: React.CSSProperties = {
+  position: "absolute",
+  width: 10,
+  height: 10,
+  borderRadius: 3,
+  background: COLORS.human,
+  border: `2px solid ${COLORS.surface}`
+}
+
+// Batch card list.
+const batchHeaderStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  color: COLORS.textPrimary
 }
 
 const screenshotPreviewStyle: React.CSSProperties = {
   width: "100%",
-  maxHeight: 140,
+  maxHeight: 132,
   objectFit: "cover",
-  border: "1px solid rgba(148, 163, 184, 0.7)",
-  borderRadius: 8
+  border: `1px solid ${COLORS.border}`,
+  borderRadius: 10
 }
 
 const screenshotListStyle: React.CSSProperties = {
+  listStyle: "none",
   margin: 0,
-  paddingInlineStart: 22,
+  padding: 0,
   display: "grid",
   gap: 6,
-  fontSize: 12
+  maxHeight: 160,
+  overflowY: "auto"
+}
+
+const screenshotListItemStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "flex-start",
+  gap: 8,
+  padding: "6px 8px",
+  borderRadius: 10,
+  background: COLORS.surfaceRaised
+}
+
+const listNumberStyle: React.CSSProperties = {
+  flex: "0 0 auto",
+  minWidth: 20,
+  height: 20,
+  display: "grid",
+  placeItems: "center",
+  borderRadius: 999,
+  color: COLORS.onAccent,
+  background: COLORS.human,
+  font: `600 11px/1 ${FONT_STACK}`
+}
+
+const listCommentStyle: React.CSSProperties = {
+  flex: 1,
+  color: COLORS.textPrimary,
+  fontSize: 12,
+  lineHeight: 1.45,
+  wordBreak: "break-word"
 }
 
 const inlineDeleteStyle: React.CSSProperties = {
-  marginInlineStart: 8,
+  flex: "0 0 auto",
+  display: "grid",
+  placeItems: "center",
+  width: 22,
+  height: 22,
   border: 0,
+  borderRadius: 6,
   background: "transparent",
-  color: "#b91c1c",
-  cursor: "pointer",
-  font: "inherit"
+  color: COLORS.textMuted,
+  cursor: "pointer"
+}
+
+const floatingErrorStyle: React.CSSProperties = {
+  position: "fixed",
+  right: 20,
+  bottom: 84,
+  zIndex: TOAST_Z,
+  maxWidth: 320,
+  border: `1px solid ${COLORS.danger}55`,
+  borderRadius: 12,
+  padding: "10px 12px",
+  color: COLORS.danger,
+  background: COLORS.surfacePopover,
+  boxShadow: "0 12px 36px rgba(4, 4, 10, 0.5)",
+  font: `12px/1.5 ${FONT_STACK}`,
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)"
+}
+
+const layerStyle: React.CSSProperties = {
+  position: "fixed",
+  inset: 0,
+  pointerEvents: "none",
+  zIndex: AGENT_LAYER_Z
+}
+
+const REGION_HANDLES = ["nw", "ne", "sw", "se"] as const
+
+function regionHandlePosition(corner: (typeof REGION_HANDLES)[number]): React.CSSProperties {
+  const offset = -6
+  return {
+    top: corner.startsWith("n") ? offset : undefined,
+    bottom: corner.startsWith("s") ? offset : undefined,
+    left: corner.endsWith("w") ? offset : undefined,
+    right: corner.endsWith("e") ? offset : undefined
+  }
+}
+
+// ── Inline icons (self-contained; no lucide/icon-font dependency). ──────────────────────
+
+type IconProps = { size?: number }
+
+function svgProps(size: number) {
+  return {
+    width: size,
+    height: size,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 2,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    "aria-hidden": true,
+    focusable: false
+  }
+}
+
+function AnnotateIcon({ size = 18 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+      <path d="M12 8v6M9 11h6" />
+    </svg>
+  )
+}
+
+function SparkleIcon({ size = 15 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />
+    </svg>
+  )
+}
+
+function CameraIcon({ size = 15 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+      <circle cx="12" cy="13" r="4" />
+    </svg>
+  )
+}
+
+function SendIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <path d="M22 2L11 13" />
+      <path d="M22 2l-7 20-4-9-9-4 20-7z" />
+    </svg>
+  )
+}
+
+function AnchorIcon({ size = 13 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <rect x="3" y="3" width="7" height="7" rx="1.5" />
+      <path d="M14 8h5a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-5" />
+    </svg>
+  )
+}
+
+function LockIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <rect x="4" y="11" width="16" height="10" rx="2" />
+      <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+    </svg>
+  )
+}
+
+function BotIcon({ size = 13 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <rect x="4" y="8" width="16" height="12" rx="2" />
+      <path d="M12 8V4M9 14h.01M15 14h.01" />
+    </svg>
+  )
+}
+
+function TrashIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M6 6l1 14a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-14" />
+    </svg>
+  )
+}
+
+function RetakeIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+      <path d="M3 3v5h5" />
+    </svg>
+  )
+}
+
+function IntentIcon({ intent, size = 13 }: { intent: string; size?: number }) {
+  if (intent === "change" || intent === "fix") {
+    return (
+      <svg {...svgProps(size)}>
+        <path d="M14.7 6.3a4 4 0 0 1-5 5L4 17v3h3l5.7-5.7a4 4 0 0 1 5-5l-2.3-2.3z" />
+      </svg>
+    )
+  }
+  if (intent === "question") {
+    return (
+      <svg {...svgProps(size)}>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M9.5 9a2.5 2.5 0 0 1 4.5 1.5c0 1.5-2 2-2 3M12 17h.01" />
+      </svg>
+    )
+  }
+  if (intent === "approve") {
+    return (
+      <svg {...svgProps(size)}>
+        <path d="M7 11v9H4a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h3zM7 11l4-8a2 2 0 0 1 2 2v3h5a2 2 0 0 1 2 2l-1.5 6a2 2 0 0 1-2 1.5H7" />
+      </svg>
+    )
+  }
+  return (
+    <svg {...svgProps(size)}>
+      <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+    </svg>
+  )
+}
+
+// ── Overlay bootstrap: mount the control-plane-driven overlay in its own React root. ───────
+
+/** React error boundary so any overlay render failure degrades silently (never breaks the host). */
+class AnnotationErrorBoundary extends React.Component<{ children: React.ReactNode }, { failed: boolean }> {
+  state = { failed: false }
+  static getDerivedStateFromError() {
+    return { failed: true }
+  }
+  componentDidCatch(error: unknown) {
+    console.warn("[avibe-show] annotation overlay error", error)
+  }
+  render() {
+    return this.state.failed ? null : this.props.children
+  }
+}
+
+function useAnnotationControllerState(controller: AnnotationController): AnnotationControlState {
+  return React.useSyncExternalStore(controller.subscribe, controller.getState, controller.getState)
+}
+
+export type AnnotationRootProps = {
+  controller: AnnotationController
+  config?: RuntimeConfig
+} & Pick<AnnotationOverlayProps, "scope" | "intents" | "defaultIntent" | "severity" | "labels" | "onSubmitted">
+
+/**
+ * Bridges the framework-agnostic controller to the React overlay: subscribes to control state,
+ * forwards `system.annotation.control` SSE events into the controller, and renders the overlay.
+ *
+ * It fetches the current events once so `ShowSessionProvider` connects with `after_id` set; the SSE
+ * then delivers only NEW events, so a replayed historical control command never re-flips the page.
+ */
+export function AnnotationRoot({ controller, config = readRuntimeConfig(), scope, intents, defaultIntent, severity, labels, onSubmitted }: AnnotationRootProps) {
+  const state = useAnnotationControllerState(controller)
+  const [initialEvents, setInitialEvents] = React.useState<ShowEvent[] | null>(null)
+  const clientOptions = React.useMemo<ShowClientOptions>(
+    () => ({ basePath: config.basePath, eventsPath: config.eventsPath, streamPath: config.streamPath, writeToken: config.writeToken }),
+    [config.basePath, config.eventsPath, config.streamPath, config.writeToken]
+  )
+
+  React.useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const response = await fetch(showEventsUrl(clientOptions))
+        const body = response.ok ? ((await response.json()) as { events?: ShowEvent[] }) : { events: [] }
+        if (!cancelled) setInitialEvents(Array.isArray(body.events) ? body.events : [])
+      } catch {
+        if (!cancelled) setInitialEvents([])
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [clientOptions])
+
+  if (initialEvents === null) return null
+
+  return (
+    <ShowSessionProvider
+      sessionId={config.sessionId}
+      basePath={config.basePath}
+      eventsPath={config.eventsPath}
+      streamPath={config.streamPath}
+      writeToken={config.writeToken}
+      initialEvents={initialEvents}
+      onEvent={(event) => controller.applyControlEvent(event)}
+    >
+      <AnnotationOverlay
+        enabled={state.enabled}
+        mode={state.mode}
+        available={state.available}
+        host={controller.host}
+        scope={scope}
+        intents={intents}
+        defaultIntent={defaultIntent}
+        severity={severity}
+        labels={labels}
+        onEnable={(mode) => controller.enable(mode)}
+        onDisable={() => controller.disable()}
+        onSetMode={(mode) => controller.setMode(mode)}
+        onSubmitted={onSubmitted}
+      />
+    </ShowSessionProvider>
+  )
+}
+
+export type MountAnnotationOverlayOptions = Pick<AnnotationRootProps, "scope" | "intents" | "defaultIntent" | "severity" | "labels" | "onSubmitted"> & {
+  config?: RuntimeConfig
+  controller?: AnnotationController
+  container?: HTMLElement
+  /** Skip the `__show/me` auth probe (defaults to running it when a `mePath` is configured). */
+  probeAuth?: boolean
+}
+
+/**
+ * Mount the annotation overlay in its own React root appended to `document.body` (contract §7).
+ * Wires the control plane (window API, embedded postMessage bridge, auth probe) and returns an
+ * unmount function. Every failure is contained so the host page is never broken.
+ */
+export function mountAnnotationOverlay(options: MountAnnotationOverlayOptions = {}): () => void {
+  if (typeof document === "undefined") return () => {}
+  const config = options.config ?? readRuntimeConfig()
+  const controller = options.controller ?? createAnnotationController({ config })
+  attachAnnotationWindowApi(controller)
+  const disconnectBridge = controller.host === "embedded" ? connectAnnotationHostBridge(controller) : undefined
+  if (options.probeAuth !== false && config.annotation?.mePath) {
+    void probeAnnotationAccess(controller, { basePath: config.basePath })
+  }
+
+  const container = options.container ?? document.createElement("div")
+  container.setAttribute("data-show-annotation-root", "")
+  if (!container.isConnected) {
+    document.body.appendChild(container)
+  }
+  const root: Root = createRoot(container)
+  root.render(
+    <AnnotationErrorBoundary>
+      <AnnotationRoot
+        controller={controller}
+        config={config}
+        scope={options.scope}
+        intents={options.intents}
+        defaultIntent={options.defaultIntent}
+        severity={options.severity}
+        labels={options.labels}
+        onSubmitted={options.onSubmitted}
+      />
+    </AnnotationErrorBoundary>
+  )
+
+  return () => {
+    disconnectBridge?.()
+    root.unmount()
+    if (!options.container && container.parentNode) {
+      container.parentNode.removeChild(container)
+    }
+  }
 }
