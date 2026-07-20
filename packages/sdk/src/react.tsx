@@ -2449,10 +2449,11 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
 
   React.useEffect(() => {
     let cancelled = false
-    // Snapshot enable/mode before the fetch. The window API + embedded bridge are already live, so a
-    // parent/host command can change control state while this request is in flight; if it did, we
-    // must NOT let the historical directive replay over that fresher live command.
-    const before = controller.getState()
+    // Snapshot the control-dispatch revision before the fetch. The window API + embedded bridge are
+    // already live, so a parent/host command can arrive while this request is in flight; if ANY did
+    // (even a no-op that leaves enable/mode unchanged — e.g. `disable` while already disabled), we
+    // must NOT let the historical directive replay over that fresher, intentional live command.
+    const revisionBefore = controller.getControlRevision()
     void (async () => {
       try {
         const response = await fetch(showEventsUrl(eventFetchOptions))
@@ -2462,9 +2463,8 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
         // Adopt the agent's latest control directive from history before SSE connects: this both
         // handles a control event that landed while the iframe was loading (which the after_id-scoped
         // SSE would skip) and reflects the current desired mode on (re)load. Applied exactly once, and
-        // skipped when a live command already changed enable/mode since the fetch began.
-        const now = controller.getState()
-        const liveControlIntervened = now.enabled !== before.enabled || now.mode !== before.mode
+        // skipped when any live command was dispatched since the fetch began.
+        const liveControlIntervened = controller.getControlRevision() !== revisionBefore
         const latestControl = events.filter((event) => event.type === "system.annotation.control").at(-1)
         if (latestControl && !liveControlIntervened) controller.applyControlEvent(latestControl)
         setInitialEvents(events)

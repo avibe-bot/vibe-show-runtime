@@ -207,6 +207,17 @@ describe("annotation controller", () => {
     expect(api.getState().mode).toBe("screenshot")
     expect(controller.getState().mode).toBe("screenshot")
   })
+
+  it("counts every control dispatch, including a no-op that leaves state unchanged", () => {
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null })
+    const start = controller.getControlRevision()
+    controller.disable() // already disabled → no state change, but still a live command
+    expect(controller.getControlRevision()).toBe(start + 1)
+    controller.enable("smart")
+    expect(controller.getControlRevision()).toBe(start + 2)
+    controller.setAvailable(false) // NOT a control command → revision unchanged
+    expect(controller.getControlRevision()).toBe(start + 2)
+  })
 })
 
 describe("window API attachment (contract §2)", () => {

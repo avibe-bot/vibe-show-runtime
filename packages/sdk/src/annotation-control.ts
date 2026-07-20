@@ -206,6 +206,8 @@ export type AnnotationController = {
   dispatch(action: AnnotationControlAction): void
   applyControlEvent(event: ShowEvent): void
   setAvailable(available: boolean): void
+  /** Monotonic count of control dispatches (incl. no-ops); lets callers detect a live command arrived. */
+  getControlRevision(): number
   /** The window API object (contract §2), shared by reference with `__AVIBE_SHOW__.annotation.api`. */
   api(): AnnotationWindowApi
 }
@@ -239,6 +241,9 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
     available: deps.initialAvailable ?? config.annotation?.authenticated ?? Boolean(config.writeToken)
   }
   const subscribers = new Set<(state: AnnotationControlState) => void>()
+  // Counts EVERY control dispatch (enable/disable/set-mode/SSE), even a no-op that doesn't change
+  // state, so the overlay can tell "a live command arrived" apart from "state happens to match".
+  let controlRevision = 0
 
   function emit() {
     for (const callback of subscribers) {
@@ -259,6 +264,7 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
   }
 
   function dispatch(action: AnnotationControlAction) {
+    controlRevision += 1
     const next = reduceAnnotationState(state, action, { rememberedMode: state.mode })
     if (next.mode !== state.mode) {
       writeStoredAnnotationMode(sessionId, next.mode, storage)
@@ -295,6 +301,7 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
     setAvailable(available) {
       set({ ...state, available })
     },
+    getControlRevision: () => controlRevision,
     api: () => api
   }
 }
