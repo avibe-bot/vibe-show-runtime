@@ -2,10 +2,9 @@ export const DEFAULT_MARK_SCOPE = "default"
 export const MARK_ATTRIBUTE_PREFIX = "mark-"
 export const DEFAULT_SHOW_EVENTS_PATH = "__show/events"
 export const DEFAULT_SHOW_ME_PATH = "__show/me"
+// Every overlay write carries the write token on BOTH surfaces (contract §5 v2): the injected
+// session token on private pages, the share-scoped token from `__show/me` on public pages.
 export const SHOW_EVENT_WRITE_TOKEN_HEADER = "X-Vibe-Show-Token"
-/** Required on overlay event writes; the public surface checks its presence as a CSRF guard (contract §5). */
-export const SHOW_EVENT_CLIENT_HEADER = "X-Vibe-Show-Client"
-export const SHOW_EVENT_CLIENT_VALUE = "overlay"
 
 export type ShowActor = "human" | "assistant" | "system"
 export type MarkRole = "human" | "assistant"
@@ -185,15 +184,20 @@ export type AnnotationWindowApi = {
   subscribe(callback: (state: AnnotationControlState) => void): () => void
 }
 
-/** Result of the auth probe used to gate annotation writes (contract §5, `GET {basePath}__show/me`). */
+/**
+ * Result of the auth probe used to gate annotation writes (contract §5 v2, `GET {basePath}__show/me`).
+ * `writeToken` is present iff `canAnnotate` — the share-scoped token on public pages, the session
+ * token on private pages — and is sent as `X-Vibe-Show-Token` on every event write.
+ */
 export type AnnotationAuthAccess = {
   authenticated: boolean
   canAnnotate: boolean
+  writeToken?: string
 }
 
-/** Author identity recorded on accepted human events (contract §5, produced server-side). */
+/** Author identity recorded on accepted human events (contract §5 v2, produced server-side). */
 export type ShowEventAuthor = {
-  kind: "owner" | "member" | "local"
+  kind: "user" | "local"
   email?: string
 }
 
@@ -561,12 +565,9 @@ export async function submitShowEvent(event: ShowEventInput | ShowEvent, options
     ...normalizedEvent,
     sessionId: options.sessionId ?? normalizedEvent.sessionId ?? readSessionId()
   }
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-    // Marks every overlay write as coming from the page client; the public events surface
-    // checks this header's presence as a CSRF guard (contract §5), mirroring the token header.
-    [SHOW_EVENT_CLIENT_HEADER]: SHOW_EVENT_CLIENT_VALUE
-  }
+  const headers: Record<string, string> = { "content-type": "application/json" }
+  // Uniform write-token resolution (contract §5 v2): the caller-supplied token, else the injected
+  // session token, else the share-scoped token the auth probe resolved onto the runtime config.
   const token = options.writeToken ?? readRuntimeConfig().writeToken
   if (token) {
     headers[SHOW_EVENT_WRITE_TOKEN_HEADER] = token

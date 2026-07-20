@@ -43,6 +43,7 @@ import {
   type ShowEventInput
 } from "./index.js"
 import {
+  applyResolvedWriteToken,
   attachAnnotationWindowApi,
   connectAnnotationHostBridge,
   createAnnotationController,
@@ -2454,7 +2455,11 @@ export function mountAnnotationOverlay(options: MountAnnotationOverlayOptions = 
   attachAnnotationWindowApi(controller)
   const disconnectBridge = controller.host === "embedded" ? connectAnnotationHostBridge(controller) : undefined
   if (options.probeAuth !== false && config.annotation?.mePath) {
-    void probeAnnotationAccess(controller, { basePath: config.basePath })
+    // The probe both gates the UI (canAnnotate → available) and resolves the share-scoped write
+    // token onto the runtime config so every event POST carries X-Vibe-Show-Token (contract §5 v2).
+    void probeAnnotationAccess(controller, { basePath: config.basePath }).then((access) => {
+      applyResolvedWriteToken(config, access)
+    })
   }
 
   const container = options.container ?? document.createElement("div")

@@ -3,6 +3,7 @@ import {
   ANNOTATION_CONTROL_MESSAGE,
   ANNOTATION_QUERY_MESSAGE,
   ANNOTATION_STATE_MESSAGE,
+  applyResolvedWriteToken,
   annotationControlActionFromEvent,
   annotationControlActionFromMessage,
   annotationControlActionFromPayload,
@@ -259,12 +260,22 @@ describe("embedded host bridge (contract §3)", () => {
   })
 })
 
-describe("auth probe (contract §5)", () => {
-  it("maps the me endpoint response", async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ authenticated: true, canAnnotate: true }) }) as unknown as Response)
+describe("auth probe (contract §5 v2)", () => {
+  it("maps the me endpoint response including the share-scoped write token", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ authenticated: true, canAnnotate: true, writeToken: "share-tok" }) }) as unknown as Response)
     await expect(fetchAnnotationAccess({ url: "https://show.test/__show/me", fetch: fetchImpl })).resolves.toEqual({
       authenticated: true,
-      canAnnotate: true
+      canAnnotate: true,
+      writeToken: "share-tok"
+    })
+  })
+
+  it("ignores a write token when canAnnotate is false", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ authenticated: false, canAnnotate: false, writeToken: "stray" }) }) as unknown as Response)
+    await expect(fetchAnnotationAccess({ url: "https://show.test/__show/me", fetch: fetchImpl })).resolves.toEqual({
+      authenticated: false,
+      canAnnotate: false,
+      writeToken: undefined
     })
   })
 
@@ -275,5 +286,26 @@ describe("auth probe (contract §5)", () => {
       throw new Error("network")
     })
     await expect(fetchAnnotationAccess({ url: "https://show.test/__show/me", fetch: throws })).resolves.toBeUndefined()
+  })
+})
+
+describe("uniform write-token resolution (contract §5 v2)", () => {
+  it("fills the config write token from the probe on a public page", () => {
+    const config: RuntimeConfig = { sessionId: "ses_1" }
+    applyResolvedWriteToken(config, { authenticated: true, canAnnotate: true, writeToken: "share-tok" })
+    expect(config.writeToken).toBe("share-tok")
+  })
+
+  it("keeps the injected token (injected ?? me.writeToken) — injected wins", () => {
+    const config: RuntimeConfig = { sessionId: "ses_1", writeToken: "session-tok" }
+    applyResolvedWriteToken(config, { authenticated: true, canAnnotate: true, writeToken: "share-tok" })
+    expect(config.writeToken).toBe("session-tok")
+  })
+
+  it("never sets a token when writes are not allowed", () => {
+    const config: RuntimeConfig = { sessionId: "ses_1" }
+    applyResolvedWriteToken(config, { authenticated: false, canAnnotate: false })
+    applyResolvedWriteToken(config, undefined)
+    expect(config.writeToken).toBeUndefined()
   })
 })

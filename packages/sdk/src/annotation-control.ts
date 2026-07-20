@@ -173,10 +173,27 @@ export async function fetchAnnotationAccess(
     const response = await fetchImpl(options.url ?? showAnnotationMeUrl(options))
     if (!response.ok) return undefined
     const body = (await response.json()) as Partial<AnnotationAuthAccess>
-    return { authenticated: Boolean(body.authenticated), canAnnotate: Boolean(body.canAnnotate) }
+    const canAnnotate = Boolean(body.canAnnotate)
+    return {
+      authenticated: Boolean(body.authenticated),
+      canAnnotate,
+      // Present iff canAnnotate (contract §5 v2); ignore a stray token on a no-write response.
+      writeToken: canAnnotate && typeof body.writeToken === "string" ? body.writeToken : undefined
+    }
   } catch {
     return undefined
   }
+}
+
+/**
+ * Uniform overlay write-token resolution (contract §5 v2): `injected __AVIBE_SHOW__.writeToken ??
+ * me.writeToken`. Mutates the runtime config in place so every subsequent event POST sends the token
+ * via `X-Vibe-Show-Token` (private pages already carry the injected token; public pages fill it from
+ * the probe). The injected token always wins; a no-write result never clears an existing token.
+ */
+export function applyResolvedWriteToken(config: RuntimeConfig, access: AnnotationAuthAccess | undefined): void {
+  if (config.writeToken || !access?.canAnnotate || !access.writeToken) return
+  config.writeToken = access.writeToken
 }
 
 export type AnnotationController = {
