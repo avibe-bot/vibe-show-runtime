@@ -1297,9 +1297,22 @@ function AnchorChip({ label }: { label: string }) {
 
 /** The comment container: a positioned popover on desktop, a bottom sheet on mobile (design urZTa). */
 function CommentSurface({ anchorRect, isMobile, onClose, children }: { anchorRect: MarkAnchorRect; isMobile: boolean; onClose: () => void; children: React.ReactNode }) {
+  // Keyboard isolation: keep keys typed in the card from reaching host-page shortcuts (`/`, arrows,
+  // Cmd/Ctrl+K, …). Escape stays overlay-owned → cancel the card. Enter-to-send is handled on the
+  // smart textarea before this bubble-phase guard stops propagation.
+  const keyGuard = {
+    onKeyDown: (event: React.KeyboardEvent) => {
+      event.stopPropagation()
+      if (event.key === "Escape") {
+        event.preventDefault()
+        onClose()
+      }
+    },
+    onKeyUp: (event: React.KeyboardEvent) => event.stopPropagation()
+  }
   if (isMobile) {
     return (
-      <div data-show-annotation-ui="" role="dialog" style={sheetStyle} onClick={(event) => event.stopPropagation()}>
+      <div data-show-annotation-ui="" role="dialog" style={sheetStyle} onClick={(event) => event.stopPropagation()} {...keyGuard}>
         <div style={sheetHandleStyle} />
         <button type="button" aria-label="Close" onClick={onClose} style={closeButtonStyle}>×</button>
         {children}
@@ -1309,7 +1322,7 @@ function CommentSurface({ anchorRect, isMobile, onClose, children }: { anchorRec
   const top = Math.min(window.innerHeight - 260, Math.max(12, anchorRect.y + anchorRect.height + 10))
   const left = Math.min(window.innerWidth - COMMENT_CARD_WIDTH - 12, Math.max(12, anchorRect.x))
   return (
-    <div data-show-annotation-ui="" role="dialog" style={{ ...popoverStyle, top, left }} onClick={(event) => event.stopPropagation()}>
+    <div data-show-annotation-ui="" role="dialog" style={{ ...popoverStyle, top, left }} onClick={(event) => event.stopPropagation()} {...keyGuard}>
       <button type="button" aria-label="Close" onClick={onClose} style={closeButtonStyle}>×</button>
       {children}
     </div>
@@ -2382,6 +2395,10 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), scope
 
   React.useEffect(() => {
     let cancelled = false
+    // Snapshot enable/mode before the fetch. The window API + embedded bridge are already live, so a
+    // parent/host command can change control state while this request is in flight; if it did, we
+    // must NOT let the historical directive replay over that fresher live command.
+    const before = controller.getState()
     void (async () => {
       try {
         const response = await fetch(showEventsUrl(clientOptions))
@@ -2390,10 +2407,12 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), scope
         if (cancelled) return
         // Adopt the agent's latest control directive from history before SSE connects: this both
         // handles a control event that landed while the iframe was loading (which the after_id-scoped
-        // SSE would skip) and reflects the current desired mode on (re)load. It's applied exactly once
-        // — the provider connects past these events, so live onEvent only sees genuinely new ones.
+        // SSE would skip) and reflects the current desired mode on (re)load. Applied exactly once, and
+        // skipped when a live command already changed enable/mode since the fetch began.
+        const now = controller.getState()
+        const liveControlIntervened = now.enabled !== before.enabled || now.mode !== before.mode
         const latestControl = events.filter((event) => event.type === "system.annotation.control").at(-1)
-        if (latestControl) controller.applyControlEvent(latestControl)
+        if (latestControl && !liveControlIntervened) controller.applyControlEvent(latestControl)
         setInitialEvents(events)
       } catch {
         if (!cancelled) setInitialEvents([])
@@ -2454,11 +2473,13 @@ export function mountAnnotationOverlay(options: MountAnnotationOverlayOptions = 
   const controller = options.controller ?? createAnnotationController({ config })
   attachAnnotationWindowApi(controller)
   const disconnectBridge = controller.host === "embedded" ? connectAnnotationHostBridge(controller) : undefined
-  if (options.probeAuth !== false && config.annotation?.mePath) {
+  if (options.probeAuth !== false) {
     // The probe both gates the UI (canAnnotate → available) and resolves the share-scoped write
     // token onto the runtime config so every event POST carries X-Vibe-Show-Token (contract §5 v2).
-    // Forward this mount's basePath + mePath so a host mounting with a custom config probes its own
-    // endpoint, not the global runtime config's.
+    // Run it unconditionally (mePath defaults to `__show/me`) rather than gating on an injected
+    // `annotation.mePath`: a generated Show Page's scaffold config can normalize the global and drop
+    // that block, so gating on it would silently skip auth gating. Forward this mount's basePath +
+    // mePath so a host mounting with a custom config still probes its own endpoint.
     void probeAnnotationAccess(controller, { basePath: config.basePath, mePath: config.annotation?.mePath }).then((access) => {
       applyResolvedWriteToken(config, access)
     })

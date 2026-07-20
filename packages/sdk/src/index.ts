@@ -1181,8 +1181,17 @@ function pickSnapdomCaptureTarget(region: MarkAnchorRect): { element: Element; r
   const rootRect = rectFromDomRect(root.getBoundingClientRect())
   const centerX = region.x + region.width / 2
   const centerY = region.y + region.height / 2
-  let current: Element | null = deepElementFromPoint(centerX, centerY) ?? document.body ?? root
+  // The full-viewport capture surface sits on top of the page during a screenshot, so the topmost
+  // element at the region center IS overlay chrome. Skip overlay elements (via elementsFromPoint,
+  // which returns the whole stack) so we target the real page content underneath — otherwise snapDOM
+  // renders the overlay div and the screenshot comes back blank/dim.
+  const stack = typeof document.elementsFromPoint === "function" ? document.elementsFromPoint(centerX, centerY) : []
+  let current: Element | null = stack.find((element) => !isShowOverlayElement(element)) ?? document.body ?? root
   while (current && current !== root) {
+    if (isShowOverlayElement(current)) {
+      current = current.parentElement
+      continue
+    }
     const rect = rectFromDomRect(current.getBoundingClientRect())
     if (
       rect.width > 0 &&

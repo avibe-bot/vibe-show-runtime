@@ -164,6 +164,9 @@ function showSessionId() {
 const injected = globalThis.__AVIBE_SHOW__ ?? {}
 
 globalThis.__AVIBE_SHOW__ = {
+  // Preserve any other injected fields (e.g. the \`annotation\` block + its attached window API)
+  // so normalizing the transport config never drops the annotation overlay's config/gating.
+  ...injected,
   sessionId: injected.sessionId ?? showSessionId(),
   basePath: injected.basePath ?? showBasePath(),
   eventsPath: injected.eventsPath ?? "__show/events",
