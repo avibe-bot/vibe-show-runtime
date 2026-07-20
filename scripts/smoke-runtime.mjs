@@ -333,6 +333,24 @@ try {
   if (secondVendorApp.match(/"react"\s*:\s*"(\/_show-runtime\/vendor\/[^"]+)"/)?.[1] !== vendorReactUrl) {
     throw new Error("Expected two sessions to reference the same session-independent vendor react URL")
   }
+  // The annotation overlay bootstrap is served for every session at the app path `__show/annotation.js`
+  // (phase 1 contract §7): a self-contained ES module that keeps `react` bare for the import map.
+  const annotationBootstrap = await fetch(`${runtime.url}/sessions/smoke/app/__show/annotation.js`)
+  const annotationBootstrapBody = await annotationBootstrap.text()
+  if (annotationBootstrap.status !== 200 || !(annotationBootstrap.headers.get("content-type") || "").includes("javascript")) {
+    throw new Error(`Expected annotation bootstrap served as JS, got ${annotationBootstrap.status} ${annotationBootstrap.headers.get("content-type")}`)
+  }
+  if (!/from\s*"react"/.test(annotationBootstrapBody) || !/from\s*"react-dom\/client"/.test(annotationBootstrapBody)) {
+    throw new Error("Expected the annotation bootstrap to keep react / react-dom/client bare for the import map")
+  }
+  if (!annotationBootstrapBody.includes("data-show-annotation-root")) {
+    throw new Error("Expected the annotation bootstrap to mount the overlay root")
+  }
+  // Served for a pre-existing/second session too, and without warming it through Vite.
+  const annotationBootstrapTwo = await fetch(`${runtime.url}/sessions/smoke-two/app/__show/annotation.js`)
+  if (annotationBootstrapTwo.status !== 200) {
+    throw new Error(`Expected annotation bootstrap for every session, got ${annotationBootstrapTwo.status}`)
+  }
   await fetch(`${runtime.url}/sessions/smoke/app/src/main.tsx`).then(async (res) => {
     if (!res.ok) {
       throw new Error(`Expected session source module to load, got ${res.status}`)
@@ -575,6 +593,17 @@ export const demo = customAlphabet("abc")
   }).then((res) => res.json())
   if (intentResponse.event?.type !== "human.intent.submitted" || !intentResponse.event.message?.content.includes("[show-intent:default] choose")) {
     throw new Error(`Unexpected intent event: ${JSON.stringify(intentResponse)}`)
+  }
+
+  // Agent/CLI-only control events must be rejected on the page-client write surface (phase 1
+  // contract §4): a visitor must not be able to POST a command every subscriber applies via SSE.
+  const controlReject = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ type: "system.annotation.control", payload: { action: "enable", mode: "screenshot" } })
+  })
+  if (controlReject.status !== 403) {
+    throw new Error(`Expected system.annotation.control POST to be rejected with 403, got ${controlReject.status}`)
   }
 
   const annotationResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {

@@ -1,11 +1,12 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { parse } from "node:url"
 import type { AddressInfo } from "node:net"
-import { isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type ShowEventInput } from "@avibe/show-sdk"
+import { isAgentOnlyShowEventType, isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type ShowEventInput } from "@avibe/show-sdk"
 import type { ShowRuntimeOptions } from "./types.js"
 import { createShowRuntime } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
 import { isVendorAssetPath, serveVendorAsset } from "./vendor-runtime.js"
+import { isAnnotationBootstrapPath, serveAnnotationBootstrap } from "./annotation-bootstrap.js"
 
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 
@@ -121,6 +122,18 @@ async function routeRequest(
   if (appMatch) {
     const sessionId = appMatch[1]
     const appPath = `/${appMatch[2] || ""}`
+
+    // The annotation overlay bootstrap is session-independent JS shared by every workspace
+    // (contract §7). Serve it straight off disk WITHOUT warming the session — the page requests it
+    // after its HTML has already warmed the session, and a static asset should never trigger a warm.
+    // Known-by-design (orchestrator ruled (a), see PR ledger): the runtime SERVES this asset; the
+    // `<script src=".../__show/annotation.js">` tag is INJECTED by avibe (`_inject_show_runtime_config`,
+    // §7). Injecting it here too would double-mount the overlay, so the runtime deliberately doesn't.
+    if (request.method === "GET" && isAnnotationBootstrapPath(appPath)) {
+      await serveAnnotationBootstrap(appPath, response)
+      return
+    }
+
     const requestStarted = performance.now()
     const status = await runtime.ensureSession(sessionId, publicBasePath(request))
     logRequestTiming("ensureSessionForAppRequest", sessionId, appPath, requestStarted, { state: status.state })
@@ -234,6 +247,15 @@ function recordShowEvent(runtime: ReturnType<typeof createShowRuntime>, sessionI
   }
   if (!isShowEventType(payload.type)) {
     return { ok: false, status: 400, error: "Unsupported event type" }
+  }
+  // Agent/CLI-only control events (e.g. system.annotation.control) must never be accepted from this
+  // page-client write surface — otherwise a visitor could POST a command every subscriber applies
+  // via SSE (contract §4). Known-by-design (orchestrator ruled (a), see PR ledger): the trust
+  // boundary is avibe, which owns event persistence + SSE and publishes agent/CLI control on its own
+  // stream in production; the runtime's broker is intentionally not the control publish path, so
+  // there is no missing trusted publisher here — this rejection is correct defense-in-depth.
+  if (isAgentOnlyShowEventType(payload.type)) {
+    return { ok: false, status: 403, error: "Event type is not accepted from page clients" }
   }
   try {
     return { ok: true, value: runtime.recordShowEvent(sessionId, payload as ShowEventInput) }

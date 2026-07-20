@@ -1,4 +1,5 @@
 export * from "./aliases.js"
+export * from "./annotation-bootstrap.js"
 export * from "./runtime.js"
 export * from "./server.js"
 export * from "./types.js"

@@ -1,6 +1,9 @@
 export const DEFAULT_MARK_SCOPE = "default"
 export const MARK_ATTRIBUTE_PREFIX = "mark-"
 export const DEFAULT_SHOW_EVENTS_PATH = "__show/events"
+export const DEFAULT_SHOW_ME_PATH = "__show/me"
+// Every overlay write carries the write token on BOTH surfaces (contract §5 v2): the injected
+// session token on private pages, the share-scoped token from `__show/me` on public pages.
 export const SHOW_EVENT_WRITE_TOKEN_HEADER = "X-Vibe-Show-Token"
 
 export type ShowActor = "human" | "assistant" | "system"
@@ -18,6 +21,7 @@ export type ShowEventType =
   | "human.annotation.dismissed"
   | "system.runtime.status"
   | "system.runtime.error"
+  | "system.annotation.control"
 
 export const SHOW_EVENT_TYPES = [
   "assistant.mark.created",
@@ -30,8 +34,24 @@ export const SHOW_EVENT_TYPES = [
   "human.annotation.resolved",
   "human.annotation.dismissed",
   "system.runtime.status",
-  "system.runtime.error"
+  "system.runtime.error",
+  "system.annotation.control"
 ] as const satisfies readonly ShowEventType[]
+
+/** Event type of the agent/CLI-driven annotation control command (phase 1 contract §4). */
+export const SHOW_ANNOTATION_CONTROL_EVENT_TYPE = "system.annotation.control" as const
+
+/**
+ * Event types only the trusted agent/CLI path may write; a page client's event POST must never be
+ * allowed to submit these (contract §4: control events are agent-driven, applied by all subscribers
+ * via SSE — accepting them from an untrusted write surface lets a visitor impersonate a command).
+ */
+export const AGENT_ONLY_SHOW_EVENT_TYPES = [SHOW_ANNOTATION_CONTROL_EVENT_TYPE] as const satisfies readonly ShowEventType[]
+
+/** Whether an event type is agent/CLI-only and must be rejected on the page-client write surface. */
+export function isAgentOnlyShowEventType(value: unknown): boolean {
+  return typeof value === "string" && (AGENT_ONLY_SHOW_EVENT_TYPES as readonly string[]).includes(value)
+}
 
 export type AnchorKind = "mark" | "element" | "text-range" | "area" | "element-group" | "group" | "screenshot"
 
@@ -132,6 +152,68 @@ export type ShowAnnotationSeverity = "blocking" | "important" | "suggestion"
 export type ShowAnnotationStatus = "pending" | "acknowledged" | "resolved" | "dismissed"
 export type ShowAnnotationPrimaryAnchor = "mark" | "element" | "text-range" | "element-group" | "area" | "screenshot"
 
+/** The two annotation capture modes the overlay exposes (phase 1 contract §2). */
+export type AnnotationMode = "smart" | "screenshot"
+
+/** Public annotation control state broadcast to hosts and the window API (contract §2/§3). */
+export type AnnotationControlState = {
+  enabled: boolean
+  mode: AnnotationMode
+  /** Whether writes are possible for the current viewer (false = anonymous public visitor). */
+  available: boolean
+}
+
+/** A control command applied by the window API, chat host postMessage, or an agent SSE event. */
+export type AnnotationControlAction =
+  | { action: "enable"; mode?: AnnotationMode }
+  | { action: "disable" }
+  | { action: "set-mode"; mode: AnnotationMode }
+
+/** Payload of a `system.annotation.control` event (contract §4). */
+export type ShowAnnotationControlPayload = {
+  action: "enable" | "disable" | "set-mode"
+  mode?: AnnotationMode
+}
+
+/** The window control API attached at `__AVIBE_SHOW__.annotation.api` (contract §2). */
+export type AnnotationWindowApi = {
+  enable(mode?: AnnotationMode): void
+  disable(): void
+  setMode(mode: AnnotationMode): void
+  getState(): AnnotationControlState
+  subscribe(callback: (state: AnnotationControlState) => void): () => void
+}
+
+/**
+ * Result of the auth probe used to gate annotation writes (contract §5 v2, `GET {basePath}__show/me`).
+ * `writeToken` is present iff `canAnnotate` — the share-scoped token on public pages, the session
+ * token on private pages — and is sent as `X-Vibe-Show-Token` on every event write.
+ */
+export type AnnotationAuthAccess = {
+  authenticated: boolean
+  canAnnotate: boolean
+  writeToken?: string
+}
+
+/** Author identity recorded on accepted human events (contract §5 v2, produced server-side). */
+export type ShowEventAuthor = {
+  kind: "user" | "local"
+  email?: string
+}
+
+/**
+ * Annotation config injected by the server (`authenticated`, `mePath`) plus the runtime-attached
+ * control `api` (contract §1/§2). Both live under `__AVIBE_SHOW__.annotation`.
+ */
+export type AnnotationRuntimeConfig = {
+  /** Server-known auth state at render time (contract §1). */
+  authenticated?: boolean
+  /** `__show/me` relative to `basePath` (contract §1). */
+  mePath?: string
+  /** Attached by the runtime overlay bootstrap once mounted (contract §2). */
+  api?: AnnotationWindowApi
+}
+
 export type AreaSelectionClassification = {
   confidence: number
   reason: string
@@ -175,6 +257,8 @@ export type ShowAnnotation = {
   classification?: AreaSelectionClassification
   screenshot?: ScreenshotAnnotationPayload
   authorId?: string
+  /** Author identity recorded server-side on accepted writes (contract §5). */
+  author?: ShowEventAuthor
   createdAt?: string
   updatedAt?: string
   resolvedAt?: string
@@ -255,12 +339,22 @@ export type SystemRuntimeEvent = {
   [key: string]: unknown
 }
 
+export type SystemAnnotationControlEvent = {
+  id: string
+  type: "system.annotation.control"
+  sessionId?: string
+  payload: ShowAnnotationControlPayload
+  createdAt: string
+  [key: string]: unknown
+}
+
 export type ShowEvent =
   | AssistantMarkEvent
   | HumanIntentSubmittedEvent
   | HumanAnnotationEvent
   | AssistantPageUpdatedEvent
   | SystemRuntimeEvent
+  | SystemAnnotationControlEvent
 
 export type ShowEventInput = {
   type: ShowEventType
@@ -323,6 +417,8 @@ export type RuntimeConfig = {
   eventsPath?: string
   streamPath?: string
   writeToken?: string
+  /** Annotation config injected by the server + control API attached by the runtime (contract §1/§2). */
+  annotation?: AnnotationRuntimeConfig
 }
 
 export type CollectElementContextOptions = {
@@ -470,6 +566,8 @@ export async function submitShowEvent(event: ShowEventInput | ShowEvent, options
     sessionId: options.sessionId ?? normalizedEvent.sessionId ?? readSessionId()
   }
   const headers: Record<string, string> = { "content-type": "application/json" }
+  // Uniform write-token resolution (contract §5 v2): the caller-supplied token, else the injected
+  // session token, else the share-scoped token the auth probe resolved onto the runtime config.
   const token = options.writeToken ?? readRuntimeConfig().writeToken
   if (token) {
     headers[SHOW_EVENT_WRITE_TOKEN_HEADER] = token
@@ -487,6 +585,18 @@ export async function submitShowEvent(event: ShowEventInput | ShowEvent, options
 
 export function showEventsUrl(options: ShowClientOptions = {}) {
   return eventsUrl(options)
+}
+
+/**
+ * URL of the auth probe endpoint (`{basePath}__show/me`), honoring the annotation config (contract
+ * §5). An explicit `options.mePath` wins so a host that mounts with its own `config` resolves its
+ * endpoint rather than the global runtime config's.
+ */
+export function showAnnotationMeUrl(options: ShowClientOptions & { mePath?: string } = {}) {
+  const runtime = readRuntimeConfig()
+  const basePath = options.basePath ?? runtime.basePath ?? "./"
+  const mePath = options.mePath ?? runtime.annotation?.mePath ?? DEFAULT_SHOW_ME_PATH
+  return joinPath(basePath, mePath)
 }
 
 export function showEventsStreamUrl(options: ShowClientOptions = {}) {
@@ -918,30 +1028,249 @@ export function collectElementsInArea(rect: MarkAnchorRect, options: CollectArea
   return selected.map((element) => collectElementContext(element, { ...options, source: "area-selection" }))
 }
 
-export async function captureScreenshotRegion(region: MarkAnchorRect): Promise<ScreenshotCaptureResult> {
+/** Longest image edge (px) a screenshot capture is downscaled to, bounding payload size (phase 1). */
+export const SCREENSHOT_MAX_EDGE = 2048
+
+/** A rendered screenshot image plus its pixel dimensions. */
+export type CapturedImage = {
+  dataUrl: string
+  width: number
+  height: number
+}
+
+/**
+ * One screenshot capture backend. `isAvailable` is a cheap capability probe (a `false` skips the
+ * strategy without an attempt); `capture` renders the viewport-relative `region` to an image or
+ * throws so the next strategy is tried.
+ */
+export type ScreenshotCaptureStrategy = {
+  name: "snapdom" | "display-media"
+  isAvailable(): boolean
+  capture(region: MarkAnchorRect): Promise<CapturedImage>
+}
+
+/** The shape of `@zumer/snapdom` the capture path uses (function form or static `toCanvas`). */
+export type SnapdomResult = { toCanvas(): Promise<HTMLCanvasElement> | HTMLCanvasElement }
+export type SnapdomCapture = ((target: Element, options?: Record<string, unknown>) => Promise<SnapdomResult> | SnapdomResult) & {
+  toCanvas?: (target: Element, options?: Record<string, unknown>) => Promise<HTMLCanvasElement> | HTMLCanvasElement
+}
+export type SnapdomModule = {
+  snapdom?: SnapdomCapture
+  default?: SnapdomCapture
+}
+
+export type ScreenshotCaptureOptions = {
+  /** Ordered capture strategies; the first available one that succeeds wins. Defaults to snapDOM → display-media. */
+  strategies?: ScreenshotCaptureStrategy[]
+  /** Longest image edge in px (default {@link SCREENSHOT_MAX_EDGE}); larger captures are downscaled. */
+  maxEdge?: number
+  /** Loader for the snapDOM module (defaults to a dynamic import of `@zumer/snapdom`). */
+  loadSnapdom?: () => Promise<SnapdomModule>
+}
+
+/**
+ * Downscale `width`x`height` so its longest edge is at most `maxEdge`, preserving aspect ratio.
+ * Returns the (rounded) target dimensions and the applied scale (1 when no downscale was needed).
+ */
+export function constrainCaptureDimensions(width: number, height: number, maxEdge = SCREENSHOT_MAX_EDGE) {
+  const safeWidth = Math.max(1, Math.round(width))
+  const safeHeight = Math.max(1, Math.round(height))
+  const longest = Math.max(safeWidth, safeHeight)
+  if (longest <= maxEdge) {
+    return { width: safeWidth, height: safeHeight, scale: 1 }
+  }
+  const scale = maxEdge / longest
+  return {
+    width: Math.max(1, Math.round(safeWidth * scale)),
+    height: Math.max(1, Math.round(safeHeight * scale)),
+    scale
+  }
+}
+
+/** First strategy whose capability probe passes, or `undefined` when none can run. */
+export function selectCaptureStrategy(strategies: ScreenshotCaptureStrategy[]): ScreenshotCaptureStrategy | undefined {
+  return strategies.find((strategy) => strategy.isAvailable())
+}
+
+/**
+ * The default capture pipeline: same-origin snapDOM render first (works on iOS Safari, which lacks
+ * `getDisplayMedia`), then `getDisplayMedia` as a desktop-only fallback.
+ */
+export function defaultCaptureStrategies(options: { maxEdge?: number; loadSnapdom?: () => Promise<SnapdomModule> } = {}): ScreenshotCaptureStrategy[] {
+  const maxEdge = options.maxEdge ?? SCREENSHOT_MAX_EDGE
+  return [snapdomCaptureStrategy(maxEdge, options.loadSnapdom), displayMediaCaptureStrategy(maxEdge)]
+}
+
+/**
+ * Capture `region` (viewport-relative CSS px) to a PNG, trying each strategy in order and falling
+ * through on failure. `capturedRegion` stays the full CSS-px coordinate space annotation items are
+ * placed against; `width`/`height` are the (possibly downscaled) image pixel dimensions. The
+ * payload shape is unchanged from the display-media-only implementation.
+ */
+export async function captureScreenshotRegion(region: MarkAnchorRect, options: ScreenshotCaptureOptions = {}): Promise<ScreenshotCaptureResult> {
   const capturedRegion = normalizeAnchorRect(region)
-  const width = Math.max(1, Math.round(capturedRegion.width))
-  const height = Math.max(1, Math.round(capturedRegion.height))
-  const result: ScreenshotCaptureResult = {
+  const maxEdge = options.maxEdge ?? SCREENSHOT_MAX_EDGE
+  const strategies = options.strategies ?? defaultCaptureStrategies({ maxEdge, loadSnapdom: options.loadSnapdom })
+  const base: ScreenshotCaptureResult = {
     attachmentId: randomId("screenshot"),
     mimeType: "image/png",
-    width,
-    height,
+    width: Math.max(1, Math.round(capturedRegion.width)),
+    height: Math.max(1, Math.round(capturedRegion.height)),
     capturedRegion,
     viewport: viewport(),
     captured: false
   }
-  try {
-    const dataUrl = await captureDisplayRegionDataUrl(capturedRegion, width, height)
-    return {
-      ...result,
-      captured: true,
-      dataUrl
+  let lastError: string | undefined
+  for (const strategy of strategies) {
+    if (!strategy.isAvailable()) continue
+    try {
+      const image = await strategy.capture(capturedRegion)
+      return { ...base, captured: true, dataUrl: image.dataUrl, width: image.width, height: image.height }
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : `Screenshot capture failed (${strategy.name})`
     }
-  } catch (error) {
-    return {
-      ...result,
-      captureError: error instanceof Error ? error.message : "Screenshot capture unavailable"
+  }
+  return { ...base, captureError: lastError ?? "Screenshot capture is not available in this browser" }
+}
+
+async function importSnapdom(): Promise<SnapdomModule> {
+  return (await import("@zumer/snapdom")) as unknown as SnapdomModule
+}
+
+/**
+ * Same-origin capture via snapDOM: render the whole document to a canvas, then crop the requested
+ * region (adjusted for scroll and any DPR-driven canvas/page size ratio) into a size-capped output.
+ */
+/**
+ * Overlay chrome that must never appear in a captured screenshot: the toolbar/pills/cards, the
+ * screenshot capture surface (a full-viewport dimmer), the agent-mark layer, and the mount root.
+ * snapDOM excludes them natively; the display-media path hides them around the frame grab.
+ */
+const OVERLAY_CHROME_SELECTORS = [
+  "[data-show-annotation-ui]",
+  "[data-show-annotation-capture]",
+  "[data-show-agent-mark-layer]",
+  "[data-show-annotation-root]"
+]
+
+/** Hide the overlay chrome (via `visibility` so layout — and thus region geometry — is unchanged) for the duration of `run`. */
+async function withOverlayChromeHidden<T>(run: () => Promise<T>): Promise<T> {
+  if (typeof document === "undefined") return run()
+  const hidden: Array<{ element: HTMLElement; previous: string }> = []
+  for (const element of document.querySelectorAll<HTMLElement>(OVERLAY_CHROME_SELECTORS.join(","))) {
+    hidden.push({ element, previous: element.style.visibility })
+    element.style.visibility = "hidden"
+  }
+  try {
+    return await run()
+  } finally {
+    for (const { element, previous } of hidden) {
+      element.style.visibility = previous
+    }
+  }
+}
+
+/**
+ * The smallest element to hand snapDOM so a small selection doesn't force a full-document render.
+ * Walk up from the region's center element to the nearest ancestor whose viewport rect fully
+ * contains the region; fall back to `document.documentElement`. Returns the element and its rect
+ * (viewport-relative), which the caller uses to crop the region out of the rendered canvas.
+ */
+function pickSnapdomCaptureTarget(region: MarkAnchorRect): { element: Element; rect: MarkAnchorRect } {
+  const root = document.documentElement
+  const rootRect = rectFromDomRect(root.getBoundingClientRect())
+  const centerX = region.x + region.width / 2
+  const centerY = region.y + region.height / 2
+  // The full-viewport capture surface sits on top of the page during a screenshot, so the topmost
+  // element at the region center IS overlay chrome. Skip overlay elements (via elementsFromPoint,
+  // which returns the whole stack) so we target the real page content underneath — otherwise snapDOM
+  // renders the overlay div and the screenshot comes back blank/dim.
+  const stack = typeof document.elementsFromPoint === "function" ? document.elementsFromPoint(centerX, centerY) : []
+  let current: Element | null = stack.find((element) => !isShowOverlayElement(element)) ?? document.body ?? root
+  while (current && current !== root) {
+    if (isShowOverlayElement(current)) {
+      current = current.parentElement
+      continue
+    }
+    const rect = rectFromDomRect(current.getBoundingClientRect())
+    if (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      rect.x <= region.x &&
+      rect.y <= region.y &&
+      rect.x + rect.width >= region.x + region.width &&
+      rect.y + rect.height >= region.y + region.height
+    ) {
+      return { element: current, rect }
+    }
+    current = current.parentElement
+  }
+  return { element: root, rect: rootRect }
+}
+
+function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<SnapdomModule> = importSnapdom): ScreenshotCaptureStrategy {
+  return {
+    name: "snapdom",
+    isAvailable: () => typeof document !== "undefined" && typeof HTMLCanvasElement !== "undefined",
+    async capture(region) {
+      const module = await loadSnapdom()
+      // Render the smallest element that fully contains the region rather than the whole document,
+      // so a small selection on a very long / virtualized page doesn't materialize a huge canvas.
+      const { element, rect } = pickSnapdomCaptureTarget(region)
+      // Exclude the overlay chrome so the render is clean page pixels, never the dimmer/toolbar/markers.
+      const source = await renderSnapdomCanvas(module, element, OVERLAY_CHROME_SELECTORS)
+      // `rect` is the captured element's viewport rect, so the region maps to it directly (no scroll
+      // math needed); the ratio absorbs any DPR/scale difference between the canvas and layout box.
+      const ratioX = source.width / Math.max(1, rect.width)
+      const ratioY = source.height / Math.max(1, rect.height)
+      const { width, height } = constrainCaptureDimensions(region.width, region.height, maxEdge)
+      const output = document.createElement("canvas")
+      output.width = width
+      output.height = height
+      const context = output.getContext("2d")
+      if (!context) {
+        throw new Error("Canvas capture context is unavailable")
+      }
+      context.drawImage(
+        source,
+        (region.x - rect.x) * ratioX,
+        (region.y - rect.y) * ratioY,
+        region.width * ratioX,
+        region.height * ratioY,
+        0,
+        0,
+        width,
+        height
+      )
+      return { dataUrl: output.toDataURL("image/png"), width, height }
+    }
+  }
+}
+
+async function renderSnapdomCanvas(module: SnapdomModule, target: Element, exclude: string[]): Promise<HTMLCanvasElement> {
+  const capture = module.snapdom ?? module.default
+  const options = { fast: true, exclude, excludeMode: "hide" }
+  if (capture && typeof capture.toCanvas === "function") {
+    return await capture.toCanvas(target, options)
+  }
+  if (typeof capture === "function") {
+    const result = await capture(target, options)
+    return await result.toCanvas()
+  }
+  throw new Error("snapDOM module did not expose a capture function")
+}
+
+/** Desktop-only fallback: `getDisplayMedia` screen share, cropped to the region and size-capped. */
+function displayMediaCaptureStrategy(maxEdge: number): ScreenshotCaptureStrategy {
+  return {
+    name: "display-media",
+    isAvailable: () =>
+      typeof document !== "undefined" &&
+      Boolean((globalThis.navigator?.mediaDevices as { getDisplayMedia?: unknown } | undefined)?.getDisplayMedia),
+    async capture(region) {
+      const { width, height } = constrainCaptureDimensions(region.width, region.height, maxEdge)
+      const dataUrl = await captureDisplayRegionDataUrl(region, width, height)
+      return { dataUrl, width, height }
     }
   }
 }
@@ -964,29 +1293,34 @@ async function captureDisplayRegionDataUrl(region: MarkAnchorRect, width: number
     video.srcObject = stream
     await video.play()
     await waitForVideoFrame(video)
-    const sourceWidth = video.videoWidth || width
-    const sourceHeight = video.videoHeight || height
-    const scaleX = sourceWidth / Math.max(1, window.innerWidth)
-    const scaleY = sourceHeight / Math.max(1, window.innerHeight)
-    const canvas = document.createElement("canvas")
-    canvas.width = width
-    canvas.height = height
-    const context = canvas.getContext("2d")
-    if (!context) {
-      throw new Error("Canvas capture context is unavailable")
-    }
-    context.drawImage(
-      video,
-      Math.round(region.x * scaleX),
-      Math.round(region.y * scaleY),
-      Math.round(region.width * scaleX),
-      Math.round(region.height * scaleY),
-      0,
-      0,
-      width,
-      height
-    )
-    return canvas.toDataURL("image/png")
+    // Hide the overlay chrome, wait one more frame so the shared screen re-composites without it,
+    // then grab. Best-effort for a screen-share stream (the crop is still page-relative).
+    return await withOverlayChromeHidden(async () => {
+      await waitForVideoFrame(video)
+      const sourceWidth = video.videoWidth || width
+      const sourceHeight = video.videoHeight || height
+      const scaleX = sourceWidth / Math.max(1, window.innerWidth)
+      const scaleY = sourceHeight / Math.max(1, window.innerHeight)
+      const canvas = document.createElement("canvas")
+      canvas.width = width
+      canvas.height = height
+      const context = canvas.getContext("2d")
+      if (!context) {
+        throw new Error("Canvas capture context is unavailable")
+      }
+      context.drawImage(
+        video,
+        Math.round(region.x * scaleX),
+        Math.round(region.y * scaleY),
+        Math.round(region.width * scaleX),
+        Math.round(region.height * scaleY),
+        0,
+        0,
+        width,
+        height
+      )
+      return canvas.toDataURL("image/png")
+    })
   } finally {
     for (const track of stream.getTracks()) {
       track.stop()
@@ -1013,21 +1347,36 @@ function waitForVideoFrame(video: HTMLVideoElement) {
   })
 }
 
-export function screenshotPointFromViewport(point: { x: number; y: number }, capturedRegion: MarkAnchorRect) {
+/**
+ * Convert a viewport point to screenshot-image-local pixels. `scale` (image width ÷ captured-region
+ * CSS width, default 1) maps coordinates into the possibly-downsampled image so item markers land on
+ * the actual PNG, not the original CSS-pixel space (which is larger for regions past the size cap).
+ */
+export function screenshotPointFromViewport(point: { x: number; y: number }, capturedRegion: MarkAnchorRect, scale = 1) {
   return {
-    x: Math.round(point.x - capturedRegion.x),
-    y: Math.round(point.y - capturedRegion.y)
+    x: Math.round((point.x - capturedRegion.x) * scale),
+    y: Math.round((point.y - capturedRegion.y) * scale)
   }
 }
 
-export function screenshotRectFromViewport(rect: MarkAnchorRect, capturedRegion: MarkAnchorRect): MarkAnchorRect {
+/** Convert a viewport rect to screenshot-image-local pixels; see {@link screenshotPointFromViewport} for `scale`. */
+export function screenshotRectFromViewport(rect: MarkAnchorRect, capturedRegion: MarkAnchorRect, scale = 1): MarkAnchorRect {
   const normalized = normalizeAnchorRect(rect)
   return normalizeAnchorRect({
-    x: normalized.x - capturedRegion.x,
-    y: normalized.y - capturedRegion.y,
-    width: normalized.width,
-    height: normalized.height
+    x: (normalized.x - capturedRegion.x) * scale,
+    y: (normalized.y - capturedRegion.y) * scale,
+    width: normalized.width * scale,
+    height: normalized.height * scale
   })
+}
+
+/**
+ * The image-space scale for a capture result: image pixel width ÷ captured-region CSS width (1 when
+ * not downsampled). Pass to {@link screenshotPointFromViewport} / {@link screenshotRectFromViewport}.
+ */
+export function screenshotCaptureScale(capture: { width: number; capturedRegion: MarkAnchorRect }): number {
+  const regionWidth = capture.capturedRegion.width
+  return regionWidth > 0 ? capture.width / regionWidth : 1
 }
 
 export function normalizeAnchorRect(rect: MarkAnchorRect): MarkAnchorRect {
@@ -1531,3 +1880,7 @@ function unionContentRect(element: Element): DOMRect | undefined {
   const bottom = Math.max(...rects.map((rect) => rect.bottom))
   return new DOMRect(left, top, right - left, bottom - top)
 }
+
+// Annotation control plane (phase 1 contract §2/§3/§4). Kept in a focused module; re-exported
+// here so `@avibe/show-sdk` consumers get the control API from the package root.
+export * from "./annotation-control.js"
