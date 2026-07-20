@@ -6,6 +6,7 @@ import type { ShowRuntimeOptions } from "./types.js"
 import { createShowRuntime } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
 import { isVendorAssetPath, serveVendorAsset } from "./vendor-runtime.js"
+import { isAnnotationBootstrapPath, serveAnnotationBootstrap } from "./annotation-bootstrap.js"
 
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 
@@ -121,6 +122,15 @@ async function routeRequest(
   if (appMatch) {
     const sessionId = appMatch[1]
     const appPath = `/${appMatch[2] || ""}`
+
+    // The annotation overlay bootstrap is session-independent JS shared by every workspace
+    // (contract §7). Serve it straight off disk WITHOUT warming the session — the page requests it
+    // after its HTML has already warmed the session, and a static asset should never trigger a warm.
+    if (request.method === "GET" && isAnnotationBootstrapPath(appPath)) {
+      await serveAnnotationBootstrap(appPath, response)
+      return
+    }
+
     const requestStarted = performance.now()
     const status = await runtime.ensureSession(sessionId, publicBasePath(request))
     logRequestTiming("ensureSessionForAppRequest", sessionId, appPath, requestStarted, { state: status.state })
