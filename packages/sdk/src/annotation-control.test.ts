@@ -13,6 +13,7 @@ import {
   createAnnotationController,
   detectAnnotationHost,
   fetchAnnotationAccess,
+  isAgentOnlyShowEventType,
   isAnnotationMode,
   isAnnotationQueryMessage,
   reduceAnnotationState,
@@ -137,6 +138,12 @@ describe("control action parsing (contract §3/§4)", () => {
   it("builds a state broadcast message", () => {
     expect(annotationStateMessage(INITIAL_STATE)).toEqual({ type: ANNOTATION_STATE_MESSAGE, ...INITIAL_STATE })
   })
+
+  it("flags the control event as agent-only (never client-writable)", () => {
+    expect(isAgentOnlyShowEventType("system.annotation.control")).toBe(true)
+    expect(isAgentOnlyShowEventType("human.annotation.created")).toBe(false)
+    expect(isAgentOnlyShowEventType("assistant.mark.created")).toBe(false)
+  })
 })
 
 describe("annotation controller", () => {
@@ -213,7 +220,7 @@ describe("embedded host bridge (contract §3)", () => {
           listener = undefined
         }
       },
-      dispatch: (data: unknown) => listener?.({ data } as MessageEvent),
+      dispatch: (data: unknown, origin = "https://show.test") => listener?.({ data, origin } as MessageEvent),
       hasListener: () => listener !== undefined
     }
   }
@@ -241,6 +248,14 @@ describe("embedded host bridge (contract §3)", () => {
 
     disconnect()
     expect(win.hasListener()).toBe(false)
+  })
+
+  it("ignores control messages from a foreign origin", () => {
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, host: "embedded", storage: null })
+    const win = fakeWindow()
+    connectAnnotationHostBridge(controller, { window: win.target, parent: { postMessage: () => {} }, origin: "https://show.test" })
+    win.dispatch({ type: ANNOTATION_CONTROL_MESSAGE, action: "enable", mode: "screenshot" }, "https://evil.example")
+    expect(controller.getState().enabled).toBe(false)
   })
 })
 

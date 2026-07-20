@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { parse } from "node:url"
 import type { AddressInfo } from "node:net"
-import { isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type ShowEventInput } from "@avibe/show-sdk"
+import { isAgentOnlyShowEventType, isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type ShowEventInput } from "@avibe/show-sdk"
 import type { ShowRuntimeOptions } from "./types.js"
 import { createShowRuntime } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
@@ -244,6 +244,12 @@ function recordShowEvent(runtime: ReturnType<typeof createShowRuntime>, sessionI
   }
   if (!isShowEventType(payload.type)) {
     return { ok: false, status: 400, error: "Unsupported event type" }
+  }
+  // Agent/CLI-only control events (e.g. system.annotation.control) must never be accepted from this
+  // page-client write surface — otherwise a visitor could POST a command every subscriber applies
+  // via SSE (contract §4). The trusted CLI/agent path publishes them out of band.
+  if (isAgentOnlyShowEventType(payload.type)) {
+    return { ok: false, status: 403, error: "Event type is not accepted from page clients" }
   }
   try {
     return { ok: true, value: runtime.recordShowEvent(sessionId, payload as ShowEventInput) }

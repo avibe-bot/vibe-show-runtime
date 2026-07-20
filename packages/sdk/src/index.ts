@@ -42,6 +42,18 @@ export const SHOW_EVENT_TYPES = [
 /** Event type of the agent/CLI-driven annotation control command (phase 1 contract §4). */
 export const SHOW_ANNOTATION_CONTROL_EVENT_TYPE = "system.annotation.control" as const
 
+/**
+ * Event types only the trusted agent/CLI path may write; a page client's event POST must never be
+ * allowed to submit these (contract §4: control events are agent-driven, applied by all subscribers
+ * via SSE — accepting them from an untrusted write surface lets a visitor impersonate a command).
+ */
+export const AGENT_ONLY_SHOW_EVENT_TYPES = [SHOW_ANNOTATION_CONTROL_EVENT_TYPE] as const satisfies readonly ShowEventType[]
+
+/** Whether an event type is agent/CLI-only and must be rejected on the page-client write surface. */
+export function isAgentOnlyShowEventType(value: unknown): boolean {
+  return typeof value === "string" && (AGENT_ONLY_SHOW_EVENT_TYPES as readonly string[]).includes(value)
+}
+
 export type AnchorKind = "mark" | "element" | "text-range" | "area" | "element-group" | "group" | "screenshot"
 
 export type MarkAnchorRect = {
@@ -1124,6 +1136,35 @@ async function importSnapdom(): Promise<SnapdomModule> {
  * Same-origin capture via snapDOM: render the whole document to a canvas, then crop the requested
  * region (adjusted for scroll and any DPR-driven canvas/page size ratio) into a size-capped output.
  */
+/**
+ * Overlay chrome that must never appear in a captured screenshot: the toolbar/pills/cards, the
+ * screenshot capture surface (a full-viewport dimmer), the agent-mark layer, and the mount root.
+ * snapDOM excludes them natively; the display-media path hides them around the frame grab.
+ */
+const OVERLAY_CHROME_SELECTORS = [
+  "[data-show-annotation-ui]",
+  "[data-show-annotation-capture]",
+  "[data-show-agent-mark-layer]",
+  "[data-show-annotation-root]"
+]
+
+/** Hide the overlay chrome (via `visibility` so layout — and thus region geometry — is unchanged) for the duration of `run`. */
+async function withOverlayChromeHidden<T>(run: () => Promise<T>): Promise<T> {
+  if (typeof document === "undefined") return run()
+  const hidden: Array<{ element: HTMLElement; previous: string }> = []
+  for (const element of document.querySelectorAll<HTMLElement>(OVERLAY_CHROME_SELECTORS.join(","))) {
+    hidden.push({ element, previous: element.style.visibility })
+    element.style.visibility = "hidden"
+  }
+  try {
+    return await run()
+  } finally {
+    for (const { element, previous } of hidden) {
+      element.style.visibility = previous
+    }
+  }
+}
+
 function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<SnapdomModule> = importSnapdom): ScreenshotCaptureStrategy {
   return {
     name: "snapdom",
@@ -1131,7 +1172,8 @@ function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<Snap
     async capture(region) {
       const target = document.documentElement
       const module = await loadSnapdom()
-      const source = await renderSnapdomCanvas(module, target)
+      // Exclude the overlay chrome so the render is clean page pixels, never the dimmer/toolbar/markers.
+      const source = await renderSnapdomCanvas(module, target, OVERLAY_CHROME_SELECTORS)
       const pageWidth = Math.max(target.scrollWidth, target.clientWidth, 1)
       const pageHeight = Math.max(target.scrollHeight, target.clientHeight, 1)
       const ratioX = source.width / pageWidth
@@ -1162,13 +1204,14 @@ function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<Snap
   }
 }
 
-async function renderSnapdomCanvas(module: SnapdomModule, target: Element): Promise<HTMLCanvasElement> {
+async function renderSnapdomCanvas(module: SnapdomModule, target: Element, exclude: string[]): Promise<HTMLCanvasElement> {
   const capture = module.snapdom ?? module.default
+  const options = { fast: true, exclude, excludeMode: "hide" }
   if (capture && typeof capture.toCanvas === "function") {
-    return await capture.toCanvas(target, { fast: true })
+    return await capture.toCanvas(target, options)
   }
   if (typeof capture === "function") {
-    const result = await capture(target, { fast: true })
+    const result = await capture(target, options)
     return await result.toCanvas()
   }
   throw new Error("snapDOM module did not expose a capture function")
@@ -1207,29 +1250,34 @@ async function captureDisplayRegionDataUrl(region: MarkAnchorRect, width: number
     video.srcObject = stream
     await video.play()
     await waitForVideoFrame(video)
-    const sourceWidth = video.videoWidth || width
-    const sourceHeight = video.videoHeight || height
-    const scaleX = sourceWidth / Math.max(1, window.innerWidth)
-    const scaleY = sourceHeight / Math.max(1, window.innerHeight)
-    const canvas = document.createElement("canvas")
-    canvas.width = width
-    canvas.height = height
-    const context = canvas.getContext("2d")
-    if (!context) {
-      throw new Error("Canvas capture context is unavailable")
-    }
-    context.drawImage(
-      video,
-      Math.round(region.x * scaleX),
-      Math.round(region.y * scaleY),
-      Math.round(region.width * scaleX),
-      Math.round(region.height * scaleY),
-      0,
-      0,
-      width,
-      height
-    )
-    return canvas.toDataURL("image/png")
+    // Hide the overlay chrome, wait one more frame so the shared screen re-composites without it,
+    // then grab. Best-effort for a screen-share stream (the crop is still page-relative).
+    return await withOverlayChromeHidden(async () => {
+      await waitForVideoFrame(video)
+      const sourceWidth = video.videoWidth || width
+      const sourceHeight = video.videoHeight || height
+      const scaleX = sourceWidth / Math.max(1, window.innerWidth)
+      const scaleY = sourceHeight / Math.max(1, window.innerHeight)
+      const canvas = document.createElement("canvas")
+      canvas.width = width
+      canvas.height = height
+      const context = canvas.getContext("2d")
+      if (!context) {
+        throw new Error("Canvas capture context is unavailable")
+      }
+      context.drawImage(
+        video,
+        Math.round(region.x * scaleX),
+        Math.round(region.y * scaleY),
+        Math.round(region.width * scaleX),
+        Math.round(region.height * scaleY),
+        0,
+        0,
+        width,
+        height
+      )
+      return canvas.toDataURL("image/png")
+    })
   } finally {
     for (const track of stream.getTracks()) {
       track.stop()
@@ -1256,21 +1304,36 @@ function waitForVideoFrame(video: HTMLVideoElement) {
   })
 }
 
-export function screenshotPointFromViewport(point: { x: number; y: number }, capturedRegion: MarkAnchorRect) {
+/**
+ * Convert a viewport point to screenshot-image-local pixels. `scale` (image width ÷ captured-region
+ * CSS width, default 1) maps coordinates into the possibly-downsampled image so item markers land on
+ * the actual PNG, not the original CSS-pixel space (which is larger for regions past the size cap).
+ */
+export function screenshotPointFromViewport(point: { x: number; y: number }, capturedRegion: MarkAnchorRect, scale = 1) {
   return {
-    x: Math.round(point.x - capturedRegion.x),
-    y: Math.round(point.y - capturedRegion.y)
+    x: Math.round((point.x - capturedRegion.x) * scale),
+    y: Math.round((point.y - capturedRegion.y) * scale)
   }
 }
 
-export function screenshotRectFromViewport(rect: MarkAnchorRect, capturedRegion: MarkAnchorRect): MarkAnchorRect {
+/** Convert a viewport rect to screenshot-image-local pixels; see {@link screenshotPointFromViewport} for `scale`. */
+export function screenshotRectFromViewport(rect: MarkAnchorRect, capturedRegion: MarkAnchorRect, scale = 1): MarkAnchorRect {
   const normalized = normalizeAnchorRect(rect)
   return normalizeAnchorRect({
-    x: normalized.x - capturedRegion.x,
-    y: normalized.y - capturedRegion.y,
-    width: normalized.width,
-    height: normalized.height
+    x: (normalized.x - capturedRegion.x) * scale,
+    y: (normalized.y - capturedRegion.y) * scale,
+    width: normalized.width * scale,
+    height: normalized.height * scale
   })
+}
+
+/**
+ * The image-space scale for a capture result: image pixel width ÷ captured-region CSS width (1 when
+ * not downsampled). Pass to {@link screenshotPointFromViewport} / {@link screenshotRectFromViewport}.
+ */
+export function screenshotCaptureScale(capture: { width: number; capturedRegion: MarkAnchorRect }): number {
+  const regionWidth = capture.capturedRegion.width
+  return regionWidth > 0 ? capture.width / regionWidth : 1
 }
 
 export function normalizeAnchorRect(rect: MarkAnchorRect): MarkAnchorRect {

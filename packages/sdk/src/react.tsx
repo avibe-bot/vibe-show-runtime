@@ -14,6 +14,7 @@ import {
   normalizeShowEvent,
   readRuntimeConfig,
   screenshotAnnotationFromDraft,
+  screenshotCaptureScale,
   screenshotPointFromViewport,
   screenshotRectFromViewport,
   resolveAnchor,
@@ -1051,19 +1052,22 @@ export function AnnotationOverlay({
     const label = ++screenshotItemSequenceRef.current
     const id = `shot_item_${label}`
     const capturedRegion = screenshotDraft.capture.capturedRegion
+    // Item coordinates are stored in screenshot-image space, so they still land on the PNG when the
+    // capture was downsampled past the size cap (scale < 1); scale is 1 for the common case.
+    const scale = screenshotCaptureScale(screenshotDraft.capture)
     const item: ScreenshotCommentDraft = screenshotDraft.pendingRect
       ? {
           id,
           label,
           comment: screenshotComment.trim(),
-          rect: screenshotRectFromViewport(screenshotDraft.pendingRect, capturedRegion),
+          rect: screenshotRectFromViewport(screenshotDraft.pendingRect, capturedRegion, scale),
           viewportRect: screenshotDraft.pendingRect
         }
       : {
           id,
           label,
           comment: screenshotComment.trim(),
-          point: screenshotPointFromViewport(screenshotDraft.pendingPoint ?? centerPoint(screenshotDraft.region), capturedRegion),
+          point: screenshotPointFromViewport(screenshotDraft.pendingPoint ?? centerPoint(screenshotDraft.region), capturedRegion, scale),
           viewportPoint: screenshotDraft.pendingPoint ?? centerPoint(screenshotDraft.region)
         }
     setScreenshotDraft({
@@ -2381,7 +2385,15 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), scope
       try {
         const response = await fetch(showEventsUrl(clientOptions))
         const body = response.ok ? ((await response.json()) as { events?: ShowEvent[] }) : { events: [] }
-        if (!cancelled) setInitialEvents(Array.isArray(body.events) ? body.events : [])
+        const events = Array.isArray(body.events) ? body.events : []
+        if (cancelled) return
+        // Adopt the agent's latest control directive from history before SSE connects: this both
+        // handles a control event that landed while the iframe was loading (which the after_id-scoped
+        // SSE would skip) and reflects the current desired mode on (re)load. It's applied exactly once
+        // — the provider connects past these events, so live onEvent only sees genuinely new ones.
+        const latestControl = events.filter((event) => event.type === "system.annotation.control").at(-1)
+        if (latestControl) controller.applyControlEvent(latestControl)
+        setInitialEvents(events)
       } catch {
         if (!cancelled) setInitialEvents([])
       }
@@ -2389,7 +2401,7 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), scope
     return () => {
       cancelled = true
     }
-  }, [clientOptions])
+  }, [clientOptions, controller])
 
   if (initialEvents === null) return null
 

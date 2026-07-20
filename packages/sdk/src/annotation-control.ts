@@ -330,6 +330,11 @@ export function connectAnnotationHostBridge(
     }
   }
   const listener = (event: MessageEvent) => {
+    // Same-origin bridge (contract §3): reject control/query messages from any other origin so a
+    // foreign embedder that holds an iframe reference cannot toggle or probe annotation state.
+    if (origin !== "*" && event.origin !== origin) {
+      return
+    }
     const action = annotationControlActionFromMessage(event.data)
     if (action) {
       controller.dispatch(action)

@@ -3,6 +3,9 @@ import {
   captureScreenshotRegion,
   constrainCaptureDimensions,
   defaultCaptureStrategies,
+  screenshotCaptureScale,
+  screenshotPointFromViewport,
+  screenshotRectFromViewport,
   selectCaptureStrategy,
   SCREENSHOT_MAX_EDGE,
   type CapturedImage,
@@ -115,5 +118,29 @@ describe("captureScreenshotRegion strategy selection", () => {
     // In a non-DOM env the snapDOM strategy is unavailable, so its loader is never invoked.
     await captureScreenshotRegion(REGION, { strategies: defaultCaptureStrategies({ loadSnapdom }) })
     expect(loadSnapdom).not.toHaveBeenCalled()
+  })
+})
+
+describe("screenshot item coordinates (image space)", () => {
+  it("scale is 1 when the capture is not downsampled", () => {
+    expect(screenshotCaptureScale({ width: 300, capturedRegion: REGION })).toBe(1)
+  })
+
+  it("scale reflects the downsample factor for large regions", () => {
+    const region: MarkAnchorRect = { x: 0, y: 0, width: 4096, height: 2048 }
+    expect(screenshotCaptureScale({ width: 2048, capturedRegion: region })).toBeCloseTo(0.5)
+  })
+
+  it("maps a point/rect into the downsampled image so markers stay on the PNG", () => {
+    const region: MarkAnchorRect = { x: 0, y: 0, width: 4096, height: 2048 }
+    const scale = screenshotCaptureScale({ width: 2048, capturedRegion: region })
+    // A marker near the right edge (x≈4000 CSS) must land inside the 2048px-wide image.
+    expect(screenshotPointFromViewport({ x: 4000, y: 100 }, region, scale)).toEqual({ x: 2000, y: 50 })
+    expect(screenshotRectFromViewport({ x: 2000, y: 0, width: 400, height: 200 }, region, scale)).toEqual({
+      x: 1000,
+      y: 0,
+      width: 200,
+      height: 100
+    })
   })
 })

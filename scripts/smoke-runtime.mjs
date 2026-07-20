@@ -595,6 +595,17 @@ export const demo = customAlphabet("abc")
     throw new Error(`Unexpected intent event: ${JSON.stringify(intentResponse)}`)
   }
 
+  // Agent/CLI-only control events must be rejected on the page-client write surface (phase 1
+  // contract §4): a visitor must not be able to POST a command every subscriber applies via SSE.
+  const controlReject = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ type: "system.annotation.control", payload: { action: "enable", mode: "screenshot" } })
+  })
+  if (controlReject.status !== 403) {
+    throw new Error(`Expected system.annotation.control POST to be rejected with 403, got ${controlReject.status}`)
+  }
+
   const annotationResponse = await fetch(`${runtime.url}/sessions/smoke/app/__show/events`, {
     method: "POST",
     headers: { "content-type": "application/json" },
