@@ -3,7 +3,7 @@ import {
   ANNOTATION_CONTROL_MESSAGE,
   ANNOTATION_QUERY_MESSAGE,
   ANNOTATION_STATE_MESSAGE,
-  applyResolvedWriteToken,
+  resolveWriteToken,
   annotationControlActionFromEvent,
   annotationControlActionFromMessage,
   annotationControlActionFromPayload,
@@ -157,6 +157,14 @@ describe("annotation controller", () => {
     expect(controller.host).toBe("standalone")
   })
 
+  it("defaults available to false when neither an auth hint nor a write token proves writability", () => {
+    expect(createAnnotationController({ config: { sessionId: "ses_1" }, storage: null }).getState().available).toBe(false)
+  })
+
+  it("defaults available to true when an injected write token proves writability", () => {
+    expect(createAnnotationController({ config: { sessionId: "ses_1", writeToken: "tok" }, storage: null }).getState().available).toBe(true)
+  })
+
   it("enable() uses the remembered mode and notifies subscribers", () => {
     const storage = memoryStorage({ [annotationModeStorageKey("ses_1")]: "screenshot" })
     const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage })
@@ -301,22 +309,16 @@ describe("auth probe URL (contract §5)", () => {
 })
 
 describe("uniform write-token resolution (contract §5 v2)", () => {
-  it("fills the config write token from the probe on a public page", () => {
-    const config: RuntimeConfig = { sessionId: "ses_1" }
-    applyResolvedWriteToken(config, { authenticated: true, canAnnotate: true, writeToken: "share-tok" })
-    expect(config.writeToken).toBe("share-tok")
+  it("resolves the share token from the probe on a public page", () => {
+    expect(resolveWriteToken({ sessionId: "ses_1" }, { authenticated: true, canAnnotate: true, writeToken: "share-tok" })).toBe("share-tok")
   })
 
   it("keeps the injected token (injected ?? me.writeToken) — injected wins", () => {
-    const config: RuntimeConfig = { sessionId: "ses_1", writeToken: "session-tok" }
-    applyResolvedWriteToken(config, { authenticated: true, canAnnotate: true, writeToken: "share-tok" })
-    expect(config.writeToken).toBe("session-tok")
+    expect(resolveWriteToken({ sessionId: "ses_1", writeToken: "session-tok" }, { authenticated: true, canAnnotate: true, writeToken: "share-tok" })).toBe("session-tok")
   })
 
-  it("never sets a token when writes are not allowed", () => {
-    const config: RuntimeConfig = { sessionId: "ses_1" }
-    applyResolvedWriteToken(config, { authenticated: false, canAnnotate: false })
-    applyResolvedWriteToken(config, undefined)
-    expect(config.writeToken).toBeUndefined()
+  it("resolves no token when writes are not allowed", () => {
+    expect(resolveWriteToken({ sessionId: "ses_1" }, { authenticated: false, canAnnotate: false })).toBeUndefined()
+    expect(resolveWriteToken({ sessionId: "ses_1" }, undefined)).toBeUndefined()
   })
 })

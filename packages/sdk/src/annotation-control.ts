@@ -187,13 +187,12 @@ export async function fetchAnnotationAccess(
 
 /**
  * Uniform overlay write-token resolution (contract §5 v2): `injected __AVIBE_SHOW__.writeToken ??
- * me.writeToken`. Mutates the runtime config in place so every subsequent event POST sends the token
- * via `X-Vibe-Show-Token` (private pages already carry the injected token; public pages fill it from
- * the probe). The injected token always wins; a no-write result never clears an existing token.
+ * me.writeToken`. The injected token always wins; a probe with `canAnnotate:false` (or no token)
+ * contributes nothing. Returned (not mutated onto a config) so the overlay can thread it through the
+ * event client as React state — a custom-config mount must not rely on the global config fallback.
  */
-export function applyResolvedWriteToken(config: RuntimeConfig, access: AnnotationAuthAccess | undefined): void {
-  if (config.writeToken || !access?.canAnnotate || !access.writeToken) return
-  config.writeToken = access.writeToken
+export function resolveWriteToken(config: RuntimeConfig, access: AnnotationAuthAccess | undefined): string | undefined {
+  return config.writeToken ?? (access?.canAnnotate ? access.writeToken : undefined)
 }
 
 export type AnnotationController = {
@@ -234,7 +233,10 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
   let state: AnnotationControlState = {
     enabled: false,
     mode: rememberedMode,
-    available: deps.initialAvailable ?? config.annotation?.authenticated ?? true
+    // Default to writable only when we can prove it: the server-known auth hint, else an injected
+    // write token (private page). Absent both (e.g. an anonymous public viewer, or a scaffold that
+    // dropped the annotation block), start gated off — the auth probe upgrades it if canAnnotate.
+    available: deps.initialAvailable ?? config.annotation?.authenticated ?? Boolean(config.writeToken)
   }
   const subscribers = new Set<(state: AnnotationControlState) => void>()
 

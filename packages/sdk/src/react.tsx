@@ -43,11 +43,11 @@ import {
   type ShowEventInput
 } from "./index.js"
 import {
-  applyResolvedWriteToken,
   attachAnnotationWindowApi,
   connectAnnotationHostBridge,
   createAnnotationController,
-  probeAnnotationAccess,
+  fetchAnnotationAccess,
+  resolveWriteToken,
   type AnnotationController,
   type AnnotationHost
 } from "./annotation-control.js"
@@ -202,10 +202,14 @@ export const DEFAULT_ANNOTATION_LABELS: AnnotationOverlayLabels = {
 }
 
 export type AnnotationOverlayProps = {
-  /** Controlled on/off (from the control plane). */
-  enabled: boolean
-  /** Controlled capture mode (from the control plane). */
-  mode: AnnotationMode
+  /** Controlled on/off (from the control plane). Omit for uncontrolled use (internal FAB toggle). */
+  enabled?: boolean
+  /** Uncontrolled initial on/off when `enabled` is omitted. */
+  defaultEnabled?: boolean
+  /** Controlled capture mode. Omit for uncontrolled use. */
+  mode?: AnnotationMode
+  /** Uncontrolled initial mode when `mode` is omitted. */
+  defaultMode?: AnnotationMode
   /** Whether writes are possible for the current viewer; false hides compose affordances. */
   available?: boolean
   /** Host layout: standalone shows FAB⇄toolbar; embedded shows the mode pill only. */
@@ -695,8 +699,10 @@ export function ActionButton({
 }
 
 export function AnnotationOverlay({
-  enabled,
-  mode,
+  enabled: enabledProp,
+  defaultEnabled = false,
+  mode: modeProp,
+  defaultMode = "smart",
   available = true,
   host = "standalone",
   scope,
@@ -712,6 +718,27 @@ export function AnnotationOverlay({
   const context = React.useContext(ShowSessionContext)
   const copy = React.useMemo(() => ({ ...DEFAULT_ANNOTATION_LABELS, ...labels }), [labels])
   const intentOptions = intents ?? DEFAULT_ANNOTATION_INTENTS
+  // Controlled when `enabled`/`mode` are supplied (the control-plane wrapper); otherwise uncontrolled
+  // with internal state so a direct `<AnnotationOverlay />` consumer can still toggle via the FAB.
+  const [internalEnabled, setInternalEnabled] = React.useState(defaultEnabled)
+  const [internalMode, setInternalMode] = React.useState<AnnotationMode>(defaultMode)
+  const isEnabledControlled = enabledProp !== undefined
+  const isModeControlled = modeProp !== undefined
+  const enabled = isEnabledControlled ? enabledProp : internalEnabled
+  const mode = isModeControlled ? modeProp : internalMode
+  const enable = React.useCallback((next?: AnnotationMode) => {
+    if (!isEnabledControlled) setInternalEnabled(true)
+    if (next && !isModeControlled) setInternalMode(next)
+    onEnable?.(next)
+  }, [isEnabledControlled, isModeControlled, onEnable])
+  const disable = React.useCallback(() => {
+    if (!isEnabledControlled) setInternalEnabled(false)
+    onDisable?.()
+  }, [isEnabledControlled, onDisable])
+  const changeMode = React.useCallback((next: AnnotationMode) => {
+    if (!isModeControlled) setInternalMode(next)
+    onSetMode?.(next)
+  }, [isModeControlled, onSetMode])
   // "Active" == the overlay can capture: enabled AND the viewer may write. Anonymous public
   // visitors (available === false) see markers only, never a capture surface.
   const active = enabled && available
@@ -885,12 +912,12 @@ export function AnnotationOverlay({
         setHover(null)
         return
       }
-      onDisable?.()
+      disable()
     }
     document.addEventListener("keydown", escape)
     return () => document.removeEventListener("keydown", escape)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resetScreenshotState is a stable local
-  }, [active, draft, screenshotDraft, onDisable])
+  }, [active, draft, screenshotDraft, disable])
 
   async function submit() {
     if (!draft || !comment.trim()) return
@@ -1093,9 +1120,9 @@ export function AnnotationOverlay({
         available={available}
         mode={mode}
         labels={copy}
-        onEnable={onEnable}
-        onDisable={onDisable}
-        onSetMode={onSetMode}
+        onEnable={enable}
+        onDisable={disable}
+        onSetMode={changeMode}
       />
 
       {active && mode === "smart" && hover && !draft ? (
@@ -2376,22 +2403,49 @@ function useAnnotationControllerState(controller: AnnotationController): Annotat
 export type AnnotationRootProps = {
   controller: AnnotationController
   config?: RuntimeConfig
+  /** Run the `__show/me` auth probe (default true); pass false to skip it. */
+  probeAuth?: boolean
 } & Pick<AnnotationOverlayProps, "scope" | "intents" | "defaultIntent" | "severity" | "labels" | "onSubmitted">
 
 /**
  * Bridges the framework-agnostic controller to the React overlay: subscribes to control state,
- * forwards `system.annotation.control` SSE events into the controller, and renders the overlay.
+ * forwards `system.annotation.control` SSE events into the controller, runs the auth probe, and
+ * renders the overlay.
  *
  * It fetches the current events once so `ShowSessionProvider` connects with `after_id` set; the SSE
  * then delivers only NEW events, so a replayed historical control command never re-flips the page.
  */
-export function AnnotationRoot({ controller, config = readRuntimeConfig(), scope, intents, defaultIntent, severity, labels, onSubmitted }: AnnotationRootProps) {
+export function AnnotationRoot({ controller, config = readRuntimeConfig(), probeAuth = true, scope, intents, defaultIntent, severity, labels, onSubmitted }: AnnotationRootProps) {
   const state = useAnnotationControllerState(controller)
   const [initialEvents, setInitialEvents] = React.useState<ShowEvent[] | null>(null)
-  const clientOptions = React.useMemo<ShowClientOptions>(
-    () => ({ basePath: config.basePath, eventsPath: config.eventsPath, streamPath: config.streamPath, writeToken: config.writeToken }),
-    [config.basePath, config.eventsPath, config.streamPath, config.writeToken]
+  // The resolved write token lives in React state so a probe that fills it (public share) re-renders
+  // and the event client's writeToken updates — a custom-config mount can't rely on the global.
+  const [writeToken, setWriteToken] = React.useState<string | undefined>(config.writeToken)
+  const eventFetchOptions = React.useMemo<ShowClientOptions>(
+    () => ({ basePath: config.basePath, eventsPath: config.eventsPath, streamPath: config.streamPath }),
+    [config.basePath, config.eventsPath, config.streamPath]
   )
+
+  // Auth probe (contract §5 v2): gate the UI on canAnnotate and resolve the share-scoped write token
+  // into state so THIS mount's submits carry it. On a failed/absent probe we can't confirm write
+  // access, so gate off unless an injected token / auth hint already proves this mount may write.
+  React.useEffect(() => {
+    if (!probeAuth) return
+    let cancelled = false
+    void (async () => {
+      const access = await fetchAnnotationAccess({ basePath: config.basePath, mePath: config.annotation?.mePath })
+      if (cancelled) return
+      if (access) {
+        controller.setAvailable(access.canAnnotate)
+        setWriteToken(resolveWriteToken(config, access))
+      } else if (!config.writeToken && !config.annotation?.authenticated) {
+        controller.setAvailable(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [controller, probeAuth, config.basePath, config.writeToken, config.annotation?.mePath, config.annotation?.authenticated])
 
   React.useEffect(() => {
     let cancelled = false
@@ -2401,7 +2455,7 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), scope
     const before = controller.getState()
     void (async () => {
       try {
-        const response = await fetch(showEventsUrl(clientOptions))
+        const response = await fetch(showEventsUrl(eventFetchOptions))
         const body = response.ok ? ((await response.json()) as { events?: ShowEvent[] }) : { events: [] }
         const events = Array.isArray(body.events) ? body.events : []
         if (cancelled) return
@@ -2421,7 +2475,7 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), scope
     return () => {
       cancelled = true
     }
-  }, [clientOptions, controller])
+  }, [eventFetchOptions, controller])
 
   if (initialEvents === null) return null
 
@@ -2431,7 +2485,7 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), scope
       basePath={config.basePath}
       eventsPath={config.eventsPath}
       streamPath={config.streamPath}
-      writeToken={config.writeToken}
+      writeToken={writeToken}
       initialEvents={initialEvents}
       onEvent={(event) => controller.applyControlEvent(event)}
     >
@@ -2458,7 +2512,7 @@ export type MountAnnotationOverlayOptions = Pick<AnnotationRootProps, "scope" | 
   config?: RuntimeConfig
   controller?: AnnotationController
   container?: HTMLElement
-  /** Skip the `__show/me` auth probe (defaults to running it when a `mePath` is configured). */
+  /** Set false to skip the `__show/me` auth probe (default: run it). */
   probeAuth?: boolean
 }
 
@@ -2473,17 +2527,6 @@ export function mountAnnotationOverlay(options: MountAnnotationOverlayOptions = 
   const controller = options.controller ?? createAnnotationController({ config })
   attachAnnotationWindowApi(controller)
   const disconnectBridge = controller.host === "embedded" ? connectAnnotationHostBridge(controller) : undefined
-  if (options.probeAuth !== false) {
-    // The probe both gates the UI (canAnnotate → available) and resolves the share-scoped write
-    // token onto the runtime config so every event POST carries X-Vibe-Show-Token (contract §5 v2).
-    // Run it unconditionally (mePath defaults to `__show/me`) rather than gating on an injected
-    // `annotation.mePath`: a generated Show Page's scaffold config can normalize the global and drop
-    // that block, so gating on it would silently skip auth gating. Forward this mount's basePath +
-    // mePath so a host mounting with a custom config still probes its own endpoint.
-    void probeAnnotationAccess(controller, { basePath: config.basePath, mePath: config.annotation?.mePath }).then((access) => {
-      applyResolvedWriteToken(config, access)
-    })
-  }
 
   const container = options.container ?? document.createElement("div")
   container.setAttribute("data-show-annotation-root", "")
@@ -2496,6 +2539,7 @@ export function mountAnnotationOverlay(options: MountAnnotationOverlayOptions = 
       <AnnotationRoot
         controller={controller}
         config={config}
+        probeAuth={options.probeAuth}
         scope={options.scope}
         intents={options.intents}
         defaultIntent={options.defaultIntent}
