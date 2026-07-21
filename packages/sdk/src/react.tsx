@@ -47,6 +47,7 @@ import {
   connectAnnotationHostBridge,
   createAnnotationController,
   fetchAnnotationAccess,
+  isBatchControlNewer,
   isLiveControlEvent,
   resolveWriteToken,
   type AnnotationController,
@@ -794,8 +795,11 @@ export function AnnotationOverlay({
 
   // Lock page scrolling while framing a screenshot so a touch drag draws the region instead of
   // scrolling the page; fully restored on exit / mode switch / disable (mobile screenshot fix, §7).
+  // TOUCH-ONLY: a mouse drag never scrolls the page, and locking body/html overflow on desktop would
+  // remove a classic scrollbar and reflow the page BEFORE the user frames — so the capture would differ
+  // from what they saw (#408). Gated on input capability, not layout.
   React.useEffect(() => {
-    if (!active || mode !== "screenshot" || typeof document === "undefined") return
+    if (!active || mode !== "screenshot" || !touchInput || typeof document === "undefined") return
     const body = document.body
     const html = document.documentElement
     const previous = {
@@ -823,7 +827,7 @@ export function AnnotationOverlay({
       html.style.overflow = previous.htmlOverflow
       document.removeEventListener("touchmove", blockCaptureTouchScroll)
     }
-  }, [active, mode])
+  }, [active, mode, touchInput])
 
   React.useEffect(() => {
     if (!active || mode !== "smart" || draft) {
@@ -2603,12 +2607,13 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
         const events = Array.isArray(body.events) ? body.events : []
         if (cancelled) return
         const liveControl = events.filter((event) => isLiveControlEvent(event, pageLoadedAtRef.current)).at(-1)
-        // This replayed batch control is the LOWEST-priority source: apply it only while the controller
-        // is still pristine (revision 0 = uncommanded since creation, which precedes the window
-        // API/bridge attach). ANY command since — a pre-fetch OR in-flight window-API/bridge command,
-        // or a live SSE control — is fresher intent this replay must not clobber. A state check, not a
-        // fetch-start snapshot, so the pre-fetch window is covered too (#513, #237).
-        if (liveControl && controller.getCommandRevision() === 0) {
+        // Apply this replayed batch control only if it is chronologically NEWER than any intent already
+        // applied since load (a window/bridge command, or an earlier live control). Ordering by the
+        // control's `createdAt` vs the last command's timestamp — a shared-clock comparison — is what a
+        // revision counter could not do: a genuinely-live control authored AFTER a startup command still
+        // lands, while a stale batch control a fresher command superseded is skipped. Covers the
+        // pre-fetch and in-flight windows alike (#513, #237, #402).
+        if (liveControl && isBatchControlNewer(liveControl.createdAt, controller.getLastCommandAt())) {
           controller.applyControlEvent(liveControl)
         }
         setInitialEvents(events)

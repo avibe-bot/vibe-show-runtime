@@ -16,6 +16,7 @@ import {
   fetchAnnotationAccess,
   isAgentOnlyShowEventType,
   isAnnotationMode,
+  isBatchControlNewer,
   isLiveControlEvent,
   isAnnotationQueryMessage,
   reduceAnnotationState,
@@ -239,14 +240,21 @@ describe("annotation controller", () => {
     expect(controller.getState().mode).toBe("screenshot")
   })
 
-  it("starts pristine at revision 0 and counts only commands, not the auth probe (initial-fetch replay guard)", () => {
-    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null })
-    expect(controller.getCommandRevision()).toBe(0) // pristine → the batch replay applies a live control only while this is 0
-    controller.setAvailable(true) // auth-probe path must NOT count as a command
-    expect(controller.getCommandRevision()).toBe(0)
+  it("tracks getLastCommandAt from a clock for local commands, event createdAt for controls, not the auth probe", () => {
+    let clock = "2026-07-22T00:00:01.000Z"
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null, now: () => clock })
+    expect(controller.getLastCommandAt()).toBeUndefined() // pristine → the batch replay applies any live control
+    controller.setAvailable(true) // auth-probe path must NOT count as an intent
+    expect(controller.getLastCommandAt()).toBeUndefined()
+    controller.enable("smart") // local command → stamped from the injected clock
+    expect(controller.getLastCommandAt()).toBe("2026-07-22T00:00:01.000Z")
+    // A control event is stamped with its OWN createdAt (its logical time), not the clock…
+    controller.applyControlEvent({ type: "system.annotation.control", createdAt: "2026-07-22T00:00:05.000Z", payload: { action: "disable" } } as unknown as ShowEvent)
+    expect(controller.getLastCommandAt()).toBe("2026-07-22T00:00:05.000Z")
+    // …and the high-water mark never rolls backwards for an older out-of-order intent.
+    clock = "2026-07-22T00:00:03.000Z"
     controller.enable("smart")
-    controller.disable()
-    expect(controller.getCommandRevision()).toBe(2) // any command since creation → guard skips the replay
+    expect(controller.getLastCommandAt()).toBe("2026-07-22T00:00:05.000Z")
   })
 
   it("reflects auth changes via setAvailable without touching enabled/mode", () => {
@@ -288,6 +296,29 @@ describe("live-only control events (owner ruling round 2)", () => {
 
   it("ignores non-control events", () => {
     expect(isLiveControlEvent({ id: "m", type: "assistant.mark.created", createdAt: "2026-07-21T10:00:01.000Z" } as unknown as ShowEvent, PAGE_LOAD)).toBe(false)
+  })
+})
+
+describe("initial-batch control ordering (isBatchControlNewer, round 4)", () => {
+  const T1 = "2026-07-22T00:00:01.000Z" // batch control authored earliest
+  const T2 = "2026-07-22T00:00:02.000Z" // a startup command
+  const T3 = "2026-07-22T00:00:03.000Z" // batch control authored latest
+
+  it("applies the batch control when the controller is pristine (control-only: no prior command)", () => {
+    expect(isBatchControlNewer(T1, undefined)).toBe(true)
+  })
+
+  it("skips the batch control when a later command already superseded it (local-then-batch-older)", () => {
+    expect(isBatchControlNewer(T1, T2)).toBe(false) // control@T1 older than command@T2 → local wins
+  })
+
+  it("applies a genuinely-live batch control authored after the command (batch-newer)", () => {
+    expect(isBatchControlNewer(T3, T2)).toBe(true) // control@T3 newer than command@T2 → still live, must apply
+  })
+
+  it("never applies an undated batch control", () => {
+    expect(isBatchControlNewer(undefined, undefined)).toBe(false)
+    expect(isBatchControlNewer(undefined, T2)).toBe(false)
   })
 })
 
