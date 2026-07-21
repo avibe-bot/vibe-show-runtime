@@ -274,7 +274,11 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
   }
 
   function dispatch(action: AnnotationControlAction, options: { fromControlEvent?: boolean } = {}) {
-    const next = reduceAnnotationState(state, action, { rememberedMode: state.mode })
+    // `enable()` with no mode resolves to the USER's remembered preference (persisted storage, else
+    // the default) — NOT the live `state.mode`, which an agent control event can have temporarily
+    // changed. This keeps an agent's `--mode X` from becoming the user's default on the next enable.
+    const rememberedMode = readStoredAnnotationMode(sessionId, storage) ?? DEFAULT_ANNOTATION_MODE
+    const next = reduceAnnotationState(state, action, { rememberedMode })
     // Persist mode memory only on an explicit USER selection (UI toolbar/popup, window API, chat-host
     // bridge) — never from an agent SSE control event — so an agent's `--mode X` can't overwrite the
     // user's remembered preference (owner ruling, round 2).

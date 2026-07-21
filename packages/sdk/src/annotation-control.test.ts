@@ -205,6 +205,17 @@ describe("annotation controller", () => {
     expect(controller.getState().enabled).toBe(false)
   })
 
+  it("enable() uses the persisted user mode, not an agent control's temporary mode (round 2 finding)", () => {
+    const storage = memoryStorage()
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage })
+    controller.setMode("smart") // user picks smart → persisted
+    controller.applyControlEvent({ type: "system.annotation.control", payload: { action: "enable", mode: "screenshot" } } as unknown as ShowEvent) // agent → screenshot (live only)
+    expect(controller.getState().mode).toBe("screenshot")
+    controller.disable()
+    controller.enable() // user re-opens via FAB with no mode
+    expect(controller.getState().mode).toBe("smart") // the user's remembered preference wins, not the agent's
+  })
+
   it("reflects auth changes via setAvailable without touching enabled/mode", () => {
     const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null, initialAvailable: false })
     expect(controller.getState().available).toBe(false)

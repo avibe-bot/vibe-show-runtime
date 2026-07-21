@@ -720,7 +720,13 @@ export function AnnotationOverlay({
   onSubmitted
 }: AnnotationOverlayProps) {
   const context = React.useContext(ShowSessionContext)
-  const copy = React.useMemo(() => ({ ...DEFAULT_ANNOTATION_LABELS, ...labels }), [labels])
+  const copy = React.useMemo(() => {
+    const merged = { ...DEFAULT_ANNOTATION_LABELS, ...labels }
+    // If a host localized `exit` but not `exitShort`, use their `exit` on touch too (avoid mixed
+    // languages after upgrade); fall back to the built-in short label only when neither is provided.
+    merged.exitShort = labels?.exitShort ?? labels?.exit ?? DEFAULT_ANNOTATION_LABELS.exitShort
+    return merged
+  }, [labels])
   const intentOptions = intents ?? DEFAULT_ANNOTATION_INTENTS
   // Controlled when `enabled`/`mode` are supplied (the control-plane wrapper); otherwise uncontrolled
   // with internal state so a direct `<AnnotationOverlay />` consumer can still toggle via the FAB.
@@ -2568,14 +2574,17 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
     let cancelled = false
     void (async () => {
       try {
-        // Fetch current events only to seed marks + set the SSE `after_id`; control events are NOT
-        // adopted from this history (owner ruling: control is live-only — a page always boots with
-        // annotation disabled and only a genuinely live command enables it). Live control is applied
-        // via `onEvent` below, gated by `isLiveControlEvent`.
+        // Fetch current events to seed marks + set the SSE `after_id`. STALE control events (created
+        // before page load) are ignored — control is live-only (owner ruling). But a control created
+        // AFTER page load can land in this initial batch (before the SSE opens with `after_id` past
+        // it); that one is genuinely live and must be applied here, or advancing `after_id` would drop
+        // it entirely. Later live controls arrive via `onEvent`.
         const response = await fetch(showEventsUrl(eventFetchOptions))
         const body = response.ok ? ((await response.json()) as { events?: ShowEvent[] }) : { events: [] }
         const events = Array.isArray(body.events) ? body.events : []
         if (cancelled) return
+        const liveControl = events.filter((event) => isLiveControlEvent(event, pageLoadedAtRef.current)).at(-1)
+        if (liveControl) controller.applyControlEvent(liveControl)
         setInitialEvents(events)
       } catch {
         if (!cancelled) setInitialEvents([])
@@ -2584,7 +2593,7 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
     return () => {
       cancelled = true
     }
-  }, [eventFetchOptions])
+  }, [eventFetchOptions, controller])
 
   if (initialEvents === null) return null
 
