@@ -139,6 +139,22 @@ export function annotationControlActionFromEvent(event: ShowEvent): AnnotationCo
   return annotationControlActionFromPayload((event as { payload?: ShowAnnotationControlPayload }).payload)
 }
 
+/**
+ * Whether a control event is LIVE (created at/after this page loaded) vs a replayed stale command
+ * (owner ruling, round 2: control is live-only, never applied from replay — a page always boots with
+ * annotation disabled and only a genuinely live command may enable it).
+ *
+ * Avibe is local-first: the agent/CLI that authors the event and the browser share one machine
+ * clock, so comparing the event's ISO `createdAt` against the page-load ISO timestamp is reliable
+ * (both are UTC `Z`, so lexicographic order is chronological). An event without a `createdAt` is
+ * treated as NOT live (safer: never resurrect an ambiguous historical command).
+ */
+export function isLiveControlEvent(event: ShowEvent, pageLoadedAt: string): boolean {
+  if (event.type !== "system.annotation.control") return false
+  const createdAt = typeof event.createdAt === "string" ? event.createdAt : undefined
+  return createdAt !== undefined && createdAt >= pageLoadedAt
+}
+
 export function annotationControlActionFromMessage(data: unknown): AnnotationControlAction | undefined {
   if (!data || typeof data !== "object") return undefined
   const message = data as { type?: unknown; action?: unknown; mode?: unknown }
@@ -206,8 +222,6 @@ export type AnnotationController = {
   dispatch(action: AnnotationControlAction): void
   applyControlEvent(event: ShowEvent): void
   setAvailable(available: boolean): void
-  /** Monotonic count of control dispatches (incl. no-ops); lets callers detect a live command arrived. */
-  getControlRevision(): number
   /** The window API object (contract §2), shared by reference with `__AVIBE_SHOW__.annotation.api`. */
   api(): AnnotationWindowApi
 }
@@ -241,10 +255,6 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
     available: deps.initialAvailable ?? config.annotation?.authenticated ?? Boolean(config.writeToken)
   }
   const subscribers = new Set<(state: AnnotationControlState) => void>()
-  // Counts EVERY control dispatch (enable/disable/set-mode/SSE), even a no-op that doesn't change
-  // state, so the overlay can tell "a live command arrived" apart from "state happens to match".
-  let controlRevision = 0
-
   function emit() {
     for (const callback of subscribers) {
       try {
@@ -263,10 +273,12 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
     emit()
   }
 
-  function dispatch(action: AnnotationControlAction) {
-    controlRevision += 1
+  function dispatch(action: AnnotationControlAction, options: { fromControlEvent?: boolean } = {}) {
     const next = reduceAnnotationState(state, action, { rememberedMode: state.mode })
-    if (next.mode !== state.mode) {
+    // Persist mode memory only on an explicit USER selection (UI toolbar/popup, window API, chat-host
+    // bridge) — never from an agent SSE control event — so an agent's `--mode X` can't overwrite the
+    // user's remembered preference (owner ruling, round 2).
+    if (next.mode !== state.mode && !options.fromControlEvent) {
       writeStoredAnnotationMode(sessionId, next.mode, storage)
     }
     set(next)
@@ -296,12 +308,11 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
     dispatch,
     applyControlEvent(event) {
       const action = annotationControlActionFromEvent(event)
-      if (action) dispatch(action)
+      if (action) dispatch(action, { fromControlEvent: true })
     },
     setAvailable(available) {
       set({ ...state, available })
     },
-    getControlRevision: () => controlRevision,
     api: () => api
   }
 }

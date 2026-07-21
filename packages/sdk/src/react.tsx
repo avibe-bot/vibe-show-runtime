@@ -47,6 +47,7 @@ import {
   connectAnnotationHostBridge,
   createAnnotationController,
   fetchAnnotationAccess,
+  isLiveControlEvent,
   resolveWriteToken,
   type AnnotationController,
   type AnnotationHost
@@ -159,6 +160,8 @@ export type AnnotationOverlayLabels = {
   smart: string
   screenshot: string
   exit: string
+  /** Tappable exit label used on touch devices (no hardware Esc). */
+  exitShort: string
   annotating: string
   smartHint: string
   screenshotHint: string
@@ -182,6 +185,7 @@ export const DEFAULT_ANNOTATION_LABELS: AnnotationOverlayLabels = {
   smart: "Smart",
   screenshot: "截图",
   exit: "Esc 退出",
+  exitShort: "退出",
   annotating: "标注模式",
   smartHint: "点选元素 · 选文字 · 框选区域",
   screenshotHint: "拖拽框选截图区域",
@@ -781,6 +785,39 @@ export function AnnotationOverlay({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resetScreenshotState is a stable local
   }, [enabled, mode, available])
 
+  // Lock page scrolling while framing a screenshot so a touch drag draws the region instead of
+  // scrolling the page; fully restored on exit / mode switch / disable (mobile screenshot fix, §7).
+  React.useEffect(() => {
+    if (!active || mode !== "screenshot" || typeof document === "undefined") return
+    const body = document.body
+    const html = document.documentElement
+    const previous = {
+      bodyOverflow: body.style.overflow,
+      bodyOverscroll: body.style.overscrollBehavior,
+      bodyTouchAction: body.style.touchAction,
+      htmlOverflow: html.style.overflow
+    }
+    body.style.overflow = "hidden"
+    body.style.overscrollBehavior = "contain"
+    body.style.touchAction = "none"
+    html.style.overflow = "hidden"
+    // Extra iOS safety: cancel touchmove on the capture surface (rubber-band/momentum scroll can
+    // still fire there despite touch-action:none). Scoped so the comment card can still scroll.
+    const blockCaptureTouchScroll = (event: TouchEvent) => {
+      if (event.target instanceof Element && event.target.closest("[data-show-annotation-capture]")) {
+        event.preventDefault()
+      }
+    }
+    document.addEventListener("touchmove", blockCaptureTouchScroll, { passive: false })
+    return () => {
+      body.style.overflow = previous.bodyOverflow
+      body.style.overscrollBehavior = previous.bodyOverscroll
+      body.style.touchAction = previous.bodyTouchAction
+      html.style.overflow = previous.htmlOverflow
+      document.removeEventListener("touchmove", blockCaptureTouchScroll)
+    }
+  }, [active, mode])
+
   React.useEffect(() => {
     if (!active || mode !== "smart" || draft) {
       setHover(null)
@@ -1119,6 +1156,7 @@ export function AnnotationOverlay({
         enabled={enabled}
         available={available}
         mode={mode}
+        isMobile={isMobile}
         labels={copy}
         onEnable={enable}
         onDisable={disable}
@@ -1148,7 +1186,21 @@ export function AnnotationOverlay({
       {active && draft ? (
         <>
           <AnnotationMarker rect={draft.rect} tone="human" variant="selected" label={draft.label} />
-          <CommentSurface anchorRect={draft.rect} isMobile={isMobile} onClose={() => setDraft(null)}>
+          <CommentSurface
+            anchorRect={draft.rect}
+            isMobile={isMobile}
+            onClose={() => setDraft(null)}
+            footer={
+              <div style={cardFooterStyle}>
+                {/* No "Enter 发送 · Esc 取消" hint on touch devices: Enter is a newline and there's no Esc. */}
+                <span style={footerHintStyle}>{isMobile ? "" : copy.enterToSend}</span>
+                <button type="button" disabled={submitting || !comment.trim()} onClick={() => void submit()} style={primaryButtonStyle}>
+                  <SendIcon />
+                  {submitting ? "…" : copy.send}
+                </button>
+              </div>
+            }
+          >
             {draft.label ? <AnchorChip label={draft.label} /> : null}
             {ambiguous ? (
               <div style={toggleRowStyle}>
@@ -1177,13 +1229,6 @@ export function AnnotationOverlay({
               }}
               style={overlayTextareaStyle}
             />
-            <div style={cardFooterStyle}>
-              <span style={footerHintStyle}>{copy.enterToSend}</span>
-              <button type="button" disabled={submitting || !comment.trim()} onClick={() => void submit()} style={primaryButtonStyle}>
-                <SendIcon />
-                {submitting ? "…" : copy.send}
-              </button>
-            </div>
             {error ? <p role="alert" style={overlayErrorStyle}>{error}</p> : null}
           </CommentSurface>
         </>
@@ -1201,17 +1246,28 @@ export function AnnotationOverlay({
           )}
           {screenshotDraft.pendingRect ? <AnnotationMarker rect={screenshotDraft.pendingRect} tone="human" variant="selected" badge={nextItemLabel} /> : null}
           {screenshotDraft.pendingPoint ? <NumberPin point={screenshotDraft.pendingPoint} tone="human" label={nextItemLabel} pending /> : null}
-          <CommentSurface anchorRect={screenshotDraft.region} isMobile={isMobile} onClose={() => resetScreenshotState()}>
-            <ScreenshotBatchCard
+          <CommentSurface
+            anchorRect={screenshotDraft.region}
+            isMobile={isMobile}
+            onClose={() => resetScreenshotState()}
+            footer={
+              <ScreenshotBatchFooter
+                draft={screenshotDraft}
+                comment={screenshotComment}
+                submitting={submitting}
+                labels={copy}
+                onAddComment={addScreenshotComment}
+                onRetake={resetScreenshotState}
+                onSend={() => void submitScreenshotDraft()}
+              />
+            }
+          >
+            <ScreenshotBatchBody
               draft={screenshotDraft}
               comment={screenshotComment}
-              submitting={submitting}
               labels={copy}
               onCommentChange={setScreenshotComment}
-              onAddComment={addScreenshotComment}
               onRemoveItem={(id) => setScreenshotDraft({ ...screenshotDraft, items: screenshotDraft.items.filter((current) => current.id !== id) })}
-              onRetake={resetScreenshotState}
-              onSend={() => void submitScreenshotDraft()}
             />
             {error ? <p role="alert" style={overlayErrorStyle}>{error}</p> : null}
           </CommentSurface>
@@ -1234,24 +1290,28 @@ type AnnotationChromeProps = {
   enabled: boolean
   available: boolean
   mode: AnnotationMode
+  isMobile: boolean
   labels: AnnotationOverlayLabels
   onEnable?: (mode?: AnnotationMode) => void
   onDisable?: () => void
   onSetMode?: (mode: AnnotationMode) => void
 }
 
-function AnnotationChrome({ host, enabled, available, mode, labels, onEnable, onDisable, onSetMode }: AnnotationChromeProps) {
+function AnnotationChrome({ host, enabled, available, mode, isMobile, labels, onEnable, onDisable, onSetMode }: AnnotationChromeProps) {
+  // No "Esc" wording on touch devices (no hardware Esc); the exit affordance is always tappable.
+  const exitLabel = isMobile ? labels.exitShort : labels.exit
+
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
     // status pill so the user knows annotation is live and how to exit (contract §2, design kn94D).
     if (!enabled || !available) return null
     return (
-      <div data-show-annotation-ui="" style={modePillStyle}>
-        <span style={{ ...modePillDotStyle, background: mode === "screenshot" ? COLORS.human : COLORS.human }} />
+      <div data-show-annotation-ui="" style={modePillStyle} onClick={(event) => event.stopPropagation()}>
+        <span style={{ ...modePillDotStyle, background: COLORS.human }} />
         <span style={modePillLabelStyle}>
           {mode === "screenshot" ? labels.screenshotHint : `${labels.annotating} · ${labels.smart}`}
         </span>
-        <span style={modePillExitStyle}>{labels.exit}</span>
+        <button type="button" style={modePillExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
       </div>
     )
   }
@@ -1276,12 +1336,12 @@ function AnnotationChrome({ host, enabled, available, mode, labels, onEnable, on
 
   return (
     <div data-show-annotation-ui="" style={toolbarStyle} onClick={(event) => event.stopPropagation()}>
-      <button type="button" aria-label={labels.exit} style={toolbarIndicatorStyle} onClick={() => onDisable?.()}>
+      <button type="button" aria-label={exitLabel} style={toolbarIndicatorStyle} onClick={() => onDisable?.()}>
         <AnnotateIcon />
       </button>
       <ModeTab active={mode === "smart"} onClick={() => onSetMode?.("smart")} icon={<SparkleIcon />} label={labels.smart} />
       <ModeTab active={mode === "screenshot"} onClick={() => onSetMode?.("screenshot")} icon={<CameraIcon />} label={labels.screenshot} />
-      <button type="button" style={toolbarExitStyle} onClick={() => onDisable?.()}>{labels.exit}</button>
+      <button type="button" style={toolbarExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
     </div>
   )
 }
@@ -1322,8 +1382,12 @@ function AnchorChip({ label }: { label: string }) {
   )
 }
 
-/** The comment container: a positioned popover on desktop, a bottom sheet on mobile (design urZTa). */
-function CommentSurface({ anchorRect, isMobile, onClose, children }: { anchorRect: MarkAnchorRect; isMobile: boolean; onClose: () => void; children: React.ReactNode }) {
+/**
+ * The comment container: a positioned popover on desktop, a bottom sheet on mobile (design urZTa).
+ * Capped height with a scrollable body and a PINNED footer, so a long anchor label / comment list
+ * can never push the send row off-screen (mobile overflow fix, §4).
+ */
+function CommentSurface({ anchorRect, isMobile, onClose, footer, children }: { anchorRect: MarkAnchorRect; isMobile: boolean; onClose: () => void; footer?: React.ReactNode; children: React.ReactNode }) {
   // Keyboard isolation: keep keys typed in the card from reaching host-page shortcuts (`/`, arrows,
   // Cmd/Ctrl+K, …). Escape stays overlay-owned → cancel the card. Enter-to-send is handled on the
   // smart textarea before this bubble-phase guard stops propagation.
@@ -1337,12 +1401,18 @@ function CommentSurface({ anchorRect, isMobile, onClose, children }: { anchorRec
     },
     onKeyUp: (event: React.KeyboardEvent) => event.stopPropagation()
   }
+  const inner = (
+    <>
+      <button type="button" aria-label="Close" onClick={onClose} style={closeButtonStyle}>×</button>
+      <div style={commentBodyStyle}>{children}</div>
+      {footer ? <div style={commentFooterStyle}>{footer}</div> : null}
+    </>
+  )
   if (isMobile) {
     return (
       <div data-show-annotation-ui="" role="dialog" style={sheetStyle} onClick={(event) => event.stopPropagation()} {...keyGuard}>
         <div style={sheetHandleStyle} />
-        <button type="button" aria-label="Close" onClick={onClose} style={closeButtonStyle}>×</button>
-        {children}
+        {inner}
       </div>
     )
   }
@@ -1350,8 +1420,7 @@ function CommentSurface({ anchorRect, isMobile, onClose, children }: { anchorRec
   const left = Math.min(window.innerWidth - COMMENT_CARD_WIDTH - 12, Math.max(12, anchorRect.x))
   return (
     <div data-show-annotation-ui="" role="dialog" style={{ ...popoverStyle, top, left }} onClick={(event) => event.stopPropagation()} {...keyGuard}>
-      <button type="button" aria-label="Close" onClick={onClose} style={closeButtonStyle}>×</button>
-      {children}
+      {inner}
     </div>
   )
 }
@@ -1411,7 +1480,8 @@ type ScreenshotBatchCardProps = {
   onSend: () => void
 }
 
-function ScreenshotBatchCard({ draft, comment, submitting, labels, onCommentChange, onAddComment, onRemoveItem, onRetake, onSend }: ScreenshotBatchCardProps) {
+/** Scrollable body of the screenshot batch card (header, preview, numbered comment list, input). */
+function ScreenshotBatchBody({ draft, comment, labels, onCommentChange, onRemoveItem }: Pick<ScreenshotBatchCardProps, "draft" | "comment" | "labels" | "onCommentChange" | "onRemoveItem">) {
   return (
     <>
       <div style={batchHeaderStyle}>
@@ -1436,25 +1506,35 @@ function ScreenshotBatchCard({ draft, comment, submitting, labels, onCommentChan
         onChange={(event) => onCommentChange(event.target.value)}
         style={overlayTextareaStyle}
       />
-      <div style={cardFooterStyle}>
-        <button type="button" onClick={onRetake} style={secondaryButtonStyle}>
-          <RetakeIcon />
-          {labels.retake}
-        </button>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button type="button" disabled={!comment.trim()} onClick={onAddComment} style={ghostButtonStyle}>{labels.addComment}</button>
-          <button type="button" disabled={submitting || draft.items.length === 0} onClick={onSend} style={primaryButtonStyle}>
-            <SendIcon />
-            {submitting ? "…" : labels.sendBatch(draft.items.length)}
-          </button>
-        </div>
-      </div>
     </>
   )
 }
 
-/** Track the mobile breakpoint (design switches the comment card to a bottom sheet ≤ 640px). */
-function useIsMobile(query = "(max-width: 640px)") {
+/** Pinned footer of the screenshot batch card (retake / add comment / send batch). */
+function ScreenshotBatchFooter({ draft, comment, submitting, labels, onAddComment, onRetake, onSend }: Pick<ScreenshotBatchCardProps, "draft" | "comment" | "submitting" | "labels" | "onAddComment" | "onRetake" | "onSend">) {
+  return (
+    <div style={cardFooterStyle}>
+      <button type="button" onClick={onRetake} style={secondaryButtonStyle}>
+        <RetakeIcon />
+        {labels.retake}
+      </button>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button type="button" disabled={!comment.trim()} onClick={onAddComment} style={ghostButtonStyle}>{labels.addComment}</button>
+        <button type="button" disabled={submitting || draft.items.length === 0} onClick={onSend} style={primaryButtonStyle}>
+          <SendIcon />
+          {submitting ? "…" : labels.sendBatch(draft.items.length)}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Detect a touch-primary device (phone/tablet) by CAPABILITY, not width or UA: a coarse pointer with
+ * no hover. This drives the bottom-sheet layout, the dropped Enter/Esc hints, and the tappable exit
+ * button — and degrades sanely for iPad+keyboard (no hover ⇒ treated as touch) rather than sniffing.
+ */
+function useIsMobile(query = "(hover: none) and (pointer: coarse)") {
   const [isMobile, setIsMobile] = React.useState(() => matchMediaQuery(query))
   React.useEffect(() => {
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") return
@@ -1750,7 +1830,9 @@ const CARD_Z = 2147483300
 const TOAST_Z = 2147483400
 
 const cardBaseStyle: React.CSSProperties = {
-  display: "grid",
+  // Flex column so the body scrolls and the footer (send row) stays pinned within the capped height.
+  display: "flex",
+  flexDirection: "column",
   gap: 10,
   padding: 14,
   color: COLORS.textPrimary,
@@ -1768,6 +1850,8 @@ const popoverStyle: React.CSSProperties = {
   position: "fixed",
   width: COMMENT_CARD_WIDTH,
   maxWidth: "calc(100vw - 24px)",
+  maxHeight: "70vh",
+  overflow: "hidden",
   zIndex: CARD_Z
 }
 
@@ -1778,10 +1862,26 @@ const sheetStyle: React.CSSProperties = {
   right: 0,
   bottom: 0,
   width: "100%",
+  maxHeight: "85vh",
+  overflow: "hidden",
   paddingTop: 20,
   paddingBottom: "max(20px, env(safe-area-inset-bottom))",
   borderRadius: "20px 20px 0 0",
   zIndex: CARD_Z
+}
+
+// Scrollable middle of the comment card; the pinned footer sits below it.
+const commentBodyStyle: React.CSSProperties = {
+  display: "grid",
+  gap: 10,
+  flex: "1 1 auto",
+  minHeight: 0,
+  overflowY: "auto",
+  overflowX: "hidden"
+}
+
+const commentFooterStyle: React.CSSProperties = {
+  flex: "0 0 auto"
 }
 
 const sheetHandleStyle: React.CSSProperties = {
@@ -1939,10 +2039,14 @@ const anchorChipStyle: React.CSSProperties = {
   background: `${COLORS.human}1a`,
   border: `1px solid ${COLORS.human}55`,
   font: `600 12px/1.2 ${FONT_STACK}`,
-  boxSizing: "border-box"
+  boxSizing: "border-box",
+  // Clip the label so a long anchor never widens the card (§4).
+  overflow: "hidden"
 }
 
 const anchorChipTextStyle: React.CSSProperties = {
+  // `minWidth: 0` lets this flex child shrink so the ellipsis actually engages inside the chip.
+  minWidth: 0,
   overflow: "hidden",
   textOverflow: "ellipsis",
   whiteSpace: "nowrap"
@@ -2072,9 +2176,16 @@ const modePillLabelStyle: React.CSSProperties = {
 }
 
 const modePillExitStyle: React.CSSProperties = {
+  border: 0,
+  borderRadius: 999,
+  padding: "6px 12px",
+  minHeight: 32,
   color: COLORS.textMuted,
+  background: COLORS.surfaceRaised,
   fontWeight: 500,
-  fontSize: 12
+  fontSize: 12,
+  cursor: "pointer",
+  fontFamily: FONT_STACK
 }
 
 // Standalone login hint (anonymous public visitor; FAB hidden).
@@ -2103,7 +2214,9 @@ const screenshotCaptureStyle: React.CSSProperties = {
   inset: 0,
   zIndex: CAPTURE_Z,
   cursor: "crosshair",
-  background: "rgba(8, 8, 18, 0.28)"
+  background: "rgba(8, 8, 18, 0.28)",
+  // Touch drag draws the region instead of scrolling the page (mobile screenshot fix).
+  touchAction: "none"
 }
 
 const screenshotItemSurfaceStyle: React.CSSProperties = {
@@ -2111,7 +2224,8 @@ const screenshotItemSurfaceStyle: React.CSSProperties = {
   inset: 0,
   zIndex: CAPTURE_Z,
   cursor: "crosshair",
-  background: "transparent"
+  background: "transparent",
+  touchAction: "none"
 }
 
 const regionFrameStyle: React.CSSProperties = {
@@ -2412,12 +2526,15 @@ export type AnnotationRootProps = {
  * forwards `system.annotation.control` SSE events into the controller, runs the auth probe, and
  * renders the overlay.
  *
- * It fetches the current events once so `ShowSessionProvider` connects with `after_id` set; the SSE
- * then delivers only NEW events, so a replayed historical control command never re-flips the page.
+ * Control events are LIVE-ONLY (owner ruling): the page always boots with annotation disabled and
+ * only a control event created at/after page load may enable it — a stale command replayed by the
+ * SSE stream is ignored via `isLiveControlEvent`.
  */
 export function AnnotationRoot({ controller, config = readRuntimeConfig(), probeAuth = true, scope, intents, defaultIntent, severity, labels, onSubmitted }: AnnotationRootProps) {
   const state = useAnnotationControllerState(controller)
   const [initialEvents, setInitialEvents] = React.useState<ShowEvent[] | null>(null)
+  // Page-load timestamp: control events older than this are treated as replay and ignored. Set once.
+  const pageLoadedAtRef = React.useRef<string>(new Date().toISOString())
   // The resolved write token lives in React state so a probe that fills it (public share) re-renders
   // and the event client's writeToken updates — a custom-config mount can't rely on the global.
   const [writeToken, setWriteToken] = React.useState<string | undefined>(config.writeToken)
@@ -2449,24 +2566,16 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
 
   React.useEffect(() => {
     let cancelled = false
-    // Snapshot the control-dispatch revision before the fetch. The window API + embedded bridge are
-    // already live, so a parent/host command can arrive while this request is in flight; if ANY did
-    // (even a no-op that leaves enable/mode unchanged — e.g. `disable` while already disabled), we
-    // must NOT let the historical directive replay over that fresher, intentional live command.
-    const revisionBefore = controller.getControlRevision()
     void (async () => {
       try {
+        // Fetch current events only to seed marks + set the SSE `after_id`; control events are NOT
+        // adopted from this history (owner ruling: control is live-only — a page always boots with
+        // annotation disabled and only a genuinely live command enables it). Live control is applied
+        // via `onEvent` below, gated by `isLiveControlEvent`.
         const response = await fetch(showEventsUrl(eventFetchOptions))
         const body = response.ok ? ((await response.json()) as { events?: ShowEvent[] }) : { events: [] }
         const events = Array.isArray(body.events) ? body.events : []
         if (cancelled) return
-        // Adopt the agent's latest control directive from history before SSE connects: this both
-        // handles a control event that landed while the iframe was loading (which the after_id-scoped
-        // SSE would skip) and reflects the current desired mode on (re)load. Applied exactly once, and
-        // skipped when any live command was dispatched since the fetch began.
-        const liveControlIntervened = controller.getControlRevision() !== revisionBefore
-        const latestControl = events.filter((event) => event.type === "system.annotation.control").at(-1)
-        if (latestControl && !liveControlIntervened) controller.applyControlEvent(latestControl)
         setInitialEvents(events)
       } catch {
         if (!cancelled) setInitialEvents([])
@@ -2475,7 +2584,7 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
     return () => {
       cancelled = true
     }
-  }, [eventFetchOptions, controller])
+  }, [eventFetchOptions])
 
   if (initialEvents === null) return null
 
@@ -2487,7 +2596,10 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
       streamPath={config.streamPath}
       writeToken={writeToken}
       initialEvents={initialEvents}
-      onEvent={(event) => controller.applyControlEvent(event)}
+      onEvent={(event) => {
+        // Apply ONLY live control events (created at/after page load); ignore replayed stale ones.
+        if (isLiveControlEvent(event, pageLoadedAtRef.current)) controller.applyControlEvent(event)
+      }}
     >
       <AnnotationOverlay
         enabled={state.enabled}

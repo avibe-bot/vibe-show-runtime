@@ -16,6 +16,7 @@ import {
   fetchAnnotationAccess,
   isAgentOnlyShowEventType,
   isAnnotationMode,
+  isLiveControlEvent,
   isAnnotationQueryMessage,
   reduceAnnotationState,
   readStoredAnnotationMode,
@@ -175,13 +176,25 @@ describe("annotation controller", () => {
     expect(seen.at(-1)).toMatchObject({ enabled: true, mode: "screenshot" })
   })
 
-  it("persists mode memory on set-mode and across a fresh controller (reload)", () => {
+  it("defaults mode to smart when nothing is remembered (owner ruling round 2)", () => {
+    expect(createAnnotationController({ config: { sessionId: "ses_1" }, storage: memoryStorage() }).getState().mode).toBe("smart")
+  })
+
+  it("persists mode memory on a USER set-mode and across a fresh controller (reload)", () => {
     const storage = memoryStorage()
     const first = createAnnotationController({ config: { sessionId: "ses_1" }, storage })
     first.setMode("screenshot")
     expect(readStoredAnnotationMode("ses_1", storage)).toBe("screenshot")
     const second = createAnnotationController({ config: { sessionId: "ses_1" }, storage })
     expect(second.getState().mode).toBe("screenshot")
+  })
+
+  it("does NOT persist mode memory from an agent SSE control event (owner ruling round 2)", () => {
+    const storage = memoryStorage()
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage })
+    controller.applyControlEvent({ type: "system.annotation.control", payload: { action: "enable", mode: "screenshot" } } as unknown as ShowEvent)
+    expect(controller.getState().mode).toBe("screenshot") // applied to live state…
+    expect(readStoredAnnotationMode("ses_1", storage)).toBeUndefined() // …but the user's memory is untouched
   })
 
   it("applies agent SSE control events", () => {
@@ -208,15 +221,29 @@ describe("annotation controller", () => {
     expect(controller.getState().mode).toBe("screenshot")
   })
 
-  it("counts every control dispatch, including a no-op that leaves state unchanged", () => {
-    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null })
-    const start = controller.getControlRevision()
-    controller.disable() // already disabled → no state change, but still a live command
-    expect(controller.getControlRevision()).toBe(start + 1)
-    controller.enable("smart")
-    expect(controller.getControlRevision()).toBe(start + 2)
-    controller.setAvailable(false) // NOT a control command → revision unchanged
-    expect(controller.getControlRevision()).toBe(start + 2)
+})
+
+describe("live-only control events (owner ruling round 2)", () => {
+  const PAGE_LOAD = "2026-07-21T10:00:00.000Z"
+  function controlEvent(createdAt?: string): ShowEvent {
+    return { id: "e1", type: "system.annotation.control", payload: { action: "enable", mode: "screenshot" }, createdAt } as unknown as ShowEvent
+  }
+
+  it("treats a control event created at/after page load as live", () => {
+    expect(isLiveControlEvent(controlEvent("2026-07-21T10:00:01.000Z"), PAGE_LOAD)).toBe(true)
+    expect(isLiveControlEvent(controlEvent(PAGE_LOAD), PAGE_LOAD)).toBe(true)
+  })
+
+  it("treats a control event created before page load (replay) as stale", () => {
+    expect(isLiveControlEvent(controlEvent("2026-07-20T09:00:00.000Z"), PAGE_LOAD)).toBe(false)
+  })
+
+  it("treats a control event with no createdAt as not live", () => {
+    expect(isLiveControlEvent(controlEvent(undefined), PAGE_LOAD)).toBe(false)
+  })
+
+  it("ignores non-control events", () => {
+    expect(isLiveControlEvent({ id: "m", type: "assistant.mark.created", createdAt: "2026-07-21T10:00:01.000Z" } as unknown as ShowEvent, PAGE_LOAD)).toBe(false)
   })
 })
 
