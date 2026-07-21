@@ -139,6 +139,35 @@ export function annotationControlActionFromEvent(event: ShowEvent): AnnotationCo
   return annotationControlActionFromPayload((event as { payload?: ShowAnnotationControlPayload }).payload)
 }
 
+/**
+ * Whether a control event is LIVE (created at/after this page loaded) vs a replayed stale command
+ * (owner ruling, round 2: control is live-only, never applied from replay — a page always boots with
+ * annotation disabled and only a genuinely live command may enable it).
+ *
+ * Avibe is local-first: the agent/CLI that authors the event and the browser share one machine
+ * clock, so comparing the event's ISO `createdAt` against the page-load ISO timestamp is reliable
+ * (both are UTC `Z`, so lexicographic order is chronological). An event without a `createdAt` is
+ * treated as NOT live (safer: never resurrect an ambiguous historical command).
+ */
+export function isLiveControlEvent(event: ShowEvent, pageLoadedAt: string): boolean {
+  if (event.type !== "system.annotation.control") return false
+  const createdAt = typeof event.createdAt === "string" ? event.createdAt : undefined
+  return createdAt !== undefined && createdAt >= pageLoadedAt
+}
+
+/**
+ * Whether a control replayed from the initial-events batch (authored at ISO `controlAt`) is
+ * chronologically newer than the last intent already applied (`lastCommandAt`), and so should be
+ * applied. `undefined lastCommandAt` = the controller is still pristine ⇒ apply. `undefined controlAt`
+ * = an undated control ⇒ never apply (safer). This shared-clock ordering is what lets a genuinely-live
+ * agent control created *after* a startup window/bridge command survive, while a stale batch control a
+ * fresher command already superseded is dropped — the correct model a revision counter cannot express.
+ */
+export function isBatchControlNewer(controlAt: string | undefined, lastCommandAt: string | undefined): boolean {
+  if (controlAt === undefined) return false
+  return lastCommandAt === undefined || controlAt > lastCommandAt
+}
+
 export function annotationControlActionFromMessage(data: unknown): AnnotationControlAction | undefined {
   if (!data || typeof data !== "object") return undefined
   const message = data as { type?: unknown; action?: unknown; mode?: unknown }
@@ -199,6 +228,15 @@ export type AnnotationController = {
   readonly host: AnnotationHost
   readonly sessionId: string | undefined
   getState(): AnnotationControlState
+  /**
+   * ISO time of the most recent intent applied since creation — a local window/bridge command (stamped
+   * when dispatched) or a control event (its `createdAt`) — or `undefined` if none. A consumer
+   * replaying a low-priority control (e.g. the one carried in the initial-events fetch) applies it only
+   * if its `createdAt` is newer than this ({@link isBatchControlNewer}); the shared-clock ordering that
+   * a plain counter cannot provide, so a genuinely-live control created after a startup command still
+   * lands while a stale batch control a fresher command superseded is skipped.
+   */
+  getLastCommandAt(): string | undefined
   subscribe(callback: (state: AnnotationControlState) => void): () => void
   enable(mode?: AnnotationMode): void
   disable(): void
@@ -206,8 +244,6 @@ export type AnnotationController = {
   dispatch(action: AnnotationControlAction): void
   applyControlEvent(event: ShowEvent): void
   setAvailable(available: boolean): void
-  /** Monotonic count of control dispatches (incl. no-ops); lets callers detect a live command arrived. */
-  getControlRevision(): number
   /** The window API object (contract §2), shared by reference with `__AVIBE_SHOW__.annotation.api`. */
   api(): AnnotationWindowApi
 }
@@ -219,6 +255,8 @@ export type AnnotationControllerDeps = {
   storage?: AnnotationModeStorage | null
   /** Initial `available` value; defaults to the injected `annotation.authenticated`, else `true`. */
   initialAvailable?: boolean
+  /** Injectable clock for stamping local-command intent times (default: system clock). */
+  now?: () => string
 }
 
 /**
@@ -230,7 +268,11 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
   const sessionId = config.sessionId
   const host = deps.host ?? detectAnnotationHost()
   const storage = deps.storage === undefined ? safeLocalStorage() : deps.storage ?? undefined
-  const rememberedMode = readStoredAnnotationMode(sessionId, storage) ?? DEFAULT_ANNOTATION_MODE
+  const now = deps.now ?? (() => new Date().toISOString())
+  // The USER's remembered mode preference, held IN MEMORY (seeded from storage) so it survives a
+  // session with no storage too. Updated only on an explicit user mode selection, never by an agent
+  // control event; `enable()` with no mode resolves through this, not the live `state.mode`.
+  let rememberedMode = readStoredAnnotationMode(sessionId, storage) ?? DEFAULT_ANNOTATION_MODE
 
   let state: AnnotationControlState = {
     enabled: false,
@@ -241,10 +283,6 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
     available: deps.initialAvailable ?? config.annotation?.authenticated ?? Boolean(config.writeToken)
   }
   const subscribers = new Set<(state: AnnotationControlState) => void>()
-  // Counts EVERY control dispatch (enable/disable/set-mode/SSE), even a no-op that doesn't change
-  // state, so the overlay can tell "a live command arrived" apart from "state happens to match".
-  let controlRevision = 0
-
   function emit() {
     for (const callback of subscribers) {
       try {
@@ -263,12 +301,33 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
     emit()
   }
 
-  function dispatch(action: AnnotationControlAction) {
-    controlRevision += 1
-    const next = reduceAnnotationState(state, action, { rememberedMode: state.mode })
-    if (next.mode !== state.mode) {
-      writeStoredAnnotationMode(sessionId, next.mode, storage)
+  // ISO time of the most recent intent applied since creation, used to chronologically order the
+  // async initial-fetch control replay against any command that raced it (see
+  // {@link AnnotationController.getLastCommandAt} and {@link isBatchControlNewer}).
+  let lastCommandAt: string | undefined
+
+  function dispatch(action: AnnotationControlAction, options: { fromControlEvent?: boolean; at?: string } = {}) {
+    // Stamp WHEN this intent occurred so an in-flight initial-events fetch can order its replayed batch
+    // control against it: a local window/bridge command is stamped `now()`; a control event carries its
+    // own `createdAt` via `options.at`. (Local-first: the agent that authors events and this browser
+    // share one wall clock, so the ISO strings are comparable.) Keep the MAX so an out-of-order apply
+    // never rolls the high-water mark backwards.
+    const at = options.at ?? now()
+    if (lastCommandAt === undefined || at > lastCommandAt) lastCommandAt = at
+    // Remember the mode on an explicit USER mode selection, keyed on the ACTION SOURCE — not a state
+    // delta. A user picking the already-active (e.g. agent-set) mode is still an explicit choice and
+    // must be remembered, else the next mode-less `enable()` reverts it (round 2 review). Agent
+    // control events (`fromControlEvent`) never update it. Held in memory AND persisted best-effort,
+    // so the preference survives both an agent's temporary `--mode X` and a storageless session.
+    if (!options.fromControlEvent && (action.action === "set-mode" || action.action === "enable")) {
+      if (action.mode !== undefined) {
+        rememberedMode = action.mode
+        writeStoredAnnotationMode(sessionId, action.mode, storage)
+      }
     }
+    // `enable()` with no mode resolves to the USER's remembered preference — NOT the live `state.mode`,
+    // which an agent control event can have temporarily changed.
+    const next = reduceAnnotationState(state, action, { rememberedMode })
     set(next)
   }
 
@@ -289,6 +348,7 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
     host,
     sessionId,
     getState: () => state,
+    getLastCommandAt: () => lastCommandAt,
     subscribe: api.subscribe,
     enable: api.enable,
     disable: api.disable,
@@ -296,12 +356,13 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
     dispatch,
     applyControlEvent(event) {
       const action = annotationControlActionFromEvent(event)
-      if (action) dispatch(action)
+      // Order this control by its own createdAt (its logical time), not "now": a control replayed
+      // from the initial batch must compare against commands using the moment it was authored.
+      if (action) dispatch(action, { fromControlEvent: true, at: typeof event.createdAt === "string" ? event.createdAt : undefined })
     },
     setAvailable(available) {
       set({ ...state, available })
     },
-    getControlRevision: () => controlRevision,
     api: () => api
   }
 }

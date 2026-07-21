@@ -16,6 +16,8 @@ import {
   fetchAnnotationAccess,
   isAgentOnlyShowEventType,
   isAnnotationMode,
+  isBatchControlNewer,
+  isLiveControlEvent,
   isAnnotationQueryMessage,
   reduceAnnotationState,
   readStoredAnnotationMode,
@@ -175,7 +177,11 @@ describe("annotation controller", () => {
     expect(seen.at(-1)).toMatchObject({ enabled: true, mode: "screenshot" })
   })
 
-  it("persists mode memory on set-mode and across a fresh controller (reload)", () => {
+  it("defaults mode to smart when nothing is remembered (owner ruling round 2)", () => {
+    expect(createAnnotationController({ config: { sessionId: "ses_1" }, storage: memoryStorage() }).getState().mode).toBe("smart")
+  })
+
+  it("persists mode memory on a USER set-mode and across a fresh controller (reload)", () => {
     const storage = memoryStorage()
     const first = createAnnotationController({ config: { sessionId: "ses_1" }, storage })
     first.setMode("screenshot")
@@ -184,12 +190,71 @@ describe("annotation controller", () => {
     expect(second.getState().mode).toBe("screenshot")
   })
 
+  it("does NOT persist mode memory from an agent SSE control event (owner ruling round 2)", () => {
+    const storage = memoryStorage()
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage })
+    controller.applyControlEvent({ type: "system.annotation.control", payload: { action: "enable", mode: "screenshot" } } as unknown as ShowEvent)
+    expect(controller.getState().mode).toBe("screenshot") // applied to live state…
+    expect(readStoredAnnotationMode("ses_1", storage)).toBeUndefined() // …but the user's memory is untouched
+  })
+
   it("applies agent SSE control events", () => {
     const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null })
     controller.applyControlEvent({ type: "system.annotation.control", payload: { action: "enable", mode: "screenshot" } } as unknown as ShowEvent)
     expect(controller.getState()).toMatchObject({ enabled: true, mode: "screenshot" })
     controller.applyControlEvent({ type: "system.annotation.control", payload: { action: "disable" } } as unknown as ShowEvent)
     expect(controller.getState().enabled).toBe(false)
+  })
+
+  it("enable() uses the persisted user mode, not an agent control's temporary mode (round 2 finding)", () => {
+    const storage = memoryStorage()
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage })
+    controller.setMode("smart") // user picks smart → persisted
+    controller.applyControlEvent({ type: "system.annotation.control", payload: { action: "enable", mode: "screenshot" } } as unknown as ShowEvent) // agent → screenshot (live only)
+    expect(controller.getState().mode).toBe("screenshot")
+    controller.disable()
+    controller.enable() // user re-opens via FAB with no mode
+    expect(controller.getState().mode).toBe("smart") // the user's remembered preference wins, not the agent's
+  })
+
+  it("remembers a user-selected mode IN MEMORY even without storage (round 2 finding)", () => {
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null })
+    controller.setMode("screenshot") // user picks screenshot; no storage to persist to
+    controller.disable()
+    controller.enable() // re-open via FAB with no mode
+    expect(controller.getState().mode).toBe("screenshot") // in-memory preference survives, not reset to smart
+  })
+
+  it("persists an explicit user mode even when it already matches the agent-set state (round 2 finding)", () => {
+    const storage = memoryStorage()
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage })
+    // A live agent control puts the state in screenshot while the user's remembered pref is still smart.
+    controller.applyControlEvent({ type: "system.annotation.control", payload: { action: "enable", mode: "screenshot" } } as unknown as ShowEvent)
+    expect(controller.getState().mode).toBe("screenshot")
+    expect(readStoredAnnotationMode("ses_1", storage)).toBeUndefined()
+    // The user clicks the already-active screenshot tab — an explicit adoption, even though state is unchanged.
+    controller.setMode("screenshot")
+    expect(readStoredAnnotationMode("ses_1", storage)).toBe("screenshot") // now remembered…
+    controller.disable()
+    controller.enable() // …so the next mode-less enable keeps screenshot instead of reverting to smart
+    expect(controller.getState().mode).toBe("screenshot")
+  })
+
+  it("tracks getLastCommandAt from a clock for local commands, event createdAt for controls, not the auth probe", () => {
+    let clock = "2026-07-22T00:00:01.000Z"
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null, now: () => clock })
+    expect(controller.getLastCommandAt()).toBeUndefined() // pristine → the batch replay applies any live control
+    controller.setAvailable(true) // auth-probe path must NOT count as an intent
+    expect(controller.getLastCommandAt()).toBeUndefined()
+    controller.enable("smart") // local command → stamped from the injected clock
+    expect(controller.getLastCommandAt()).toBe("2026-07-22T00:00:01.000Z")
+    // A control event is stamped with its OWN createdAt (its logical time), not the clock…
+    controller.applyControlEvent({ type: "system.annotation.control", createdAt: "2026-07-22T00:00:05.000Z", payload: { action: "disable" } } as unknown as ShowEvent)
+    expect(controller.getLastCommandAt()).toBe("2026-07-22T00:00:05.000Z")
+    // …and the high-water mark never rolls backwards for an older out-of-order intent.
+    clock = "2026-07-22T00:00:03.000Z"
+    controller.enable("smart")
+    expect(controller.getLastCommandAt()).toBe("2026-07-22T00:00:05.000Z")
   })
 
   it("reflects auth changes via setAvailable without touching enabled/mode", () => {
@@ -208,15 +273,52 @@ describe("annotation controller", () => {
     expect(controller.getState().mode).toBe("screenshot")
   })
 
-  it("counts every control dispatch, including a no-op that leaves state unchanged", () => {
-    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null })
-    const start = controller.getControlRevision()
-    controller.disable() // already disabled → no state change, but still a live command
-    expect(controller.getControlRevision()).toBe(start + 1)
-    controller.enable("smart")
-    expect(controller.getControlRevision()).toBe(start + 2)
-    controller.setAvailable(false) // NOT a control command → revision unchanged
-    expect(controller.getControlRevision()).toBe(start + 2)
+})
+
+describe("live-only control events (owner ruling round 2)", () => {
+  const PAGE_LOAD = "2026-07-21T10:00:00.000Z"
+  function controlEvent(createdAt?: string): ShowEvent {
+    return { id: "e1", type: "system.annotation.control", payload: { action: "enable", mode: "screenshot" }, createdAt } as unknown as ShowEvent
+  }
+
+  it("treats a control event created at/after page load as live", () => {
+    expect(isLiveControlEvent(controlEvent("2026-07-21T10:00:01.000Z"), PAGE_LOAD)).toBe(true)
+    expect(isLiveControlEvent(controlEvent(PAGE_LOAD), PAGE_LOAD)).toBe(true)
+  })
+
+  it("treats a control event created before page load (replay) as stale", () => {
+    expect(isLiveControlEvent(controlEvent("2026-07-20T09:00:00.000Z"), PAGE_LOAD)).toBe(false)
+  })
+
+  it("treats a control event with no createdAt as not live", () => {
+    expect(isLiveControlEvent(controlEvent(undefined), PAGE_LOAD)).toBe(false)
+  })
+
+  it("ignores non-control events", () => {
+    expect(isLiveControlEvent({ id: "m", type: "assistant.mark.created", createdAt: "2026-07-21T10:00:01.000Z" } as unknown as ShowEvent, PAGE_LOAD)).toBe(false)
+  })
+})
+
+describe("initial-batch control ordering (isBatchControlNewer, round 4)", () => {
+  const T1 = "2026-07-22T00:00:01.000Z" // batch control authored earliest
+  const T2 = "2026-07-22T00:00:02.000Z" // a startup command
+  const T3 = "2026-07-22T00:00:03.000Z" // batch control authored latest
+
+  it("applies the batch control when the controller is pristine (control-only: no prior command)", () => {
+    expect(isBatchControlNewer(T1, undefined)).toBe(true)
+  })
+
+  it("skips the batch control when a later command already superseded it (local-then-batch-older)", () => {
+    expect(isBatchControlNewer(T1, T2)).toBe(false) // control@T1 older than command@T2 → local wins
+  })
+
+  it("applies a genuinely-live batch control authored after the command (batch-newer)", () => {
+    expect(isBatchControlNewer(T3, T2)).toBe(true) // control@T3 newer than command@T2 → still live, must apply
+  })
+
+  it("never applies an undated batch control", () => {
+    expect(isBatchControlNewer(undefined, undefined)).toBe(false)
+    expect(isBatchControlNewer(undefined, T2)).toBe(false)
   })
 })
 
