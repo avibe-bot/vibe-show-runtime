@@ -216,6 +216,39 @@ describe("annotation controller", () => {
     expect(controller.getState().mode).toBe("smart") // the user's remembered preference wins, not the agent's
   })
 
+  it("remembers a user-selected mode IN MEMORY even without storage (round 2 finding)", () => {
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null })
+    controller.setMode("screenshot") // user picks screenshot; no storage to persist to
+    controller.disable()
+    controller.enable() // re-open via FAB with no mode
+    expect(controller.getState().mode).toBe("screenshot") // in-memory preference survives, not reset to smart
+  })
+
+  it("persists an explicit user mode even when it already matches the agent-set state (round 2 finding)", () => {
+    const storage = memoryStorage()
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage })
+    // A live agent control puts the state in screenshot while the user's remembered pref is still smart.
+    controller.applyControlEvent({ type: "system.annotation.control", payload: { action: "enable", mode: "screenshot" } } as unknown as ShowEvent)
+    expect(controller.getState().mode).toBe("screenshot")
+    expect(readStoredAnnotationMode("ses_1", storage)).toBeUndefined()
+    // The user clicks the already-active screenshot tab — an explicit adoption, even though state is unchanged.
+    controller.setMode("screenshot")
+    expect(readStoredAnnotationMode("ses_1", storage)).toBe("screenshot") // now remembered…
+    controller.disable()
+    controller.enable() // …so the next mode-less enable keeps screenshot instead of reverting to smart
+    expect(controller.getState().mode).toBe("screenshot")
+  })
+
+  it("increments getCommandRevision on every command (the initial-fetch replay guard, round 2)", () => {
+    const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null })
+    const start = controller.getCommandRevision()
+    controller.setAvailable(true) // auth-probe path must NOT count as a command
+    expect(controller.getCommandRevision()).toBe(start)
+    controller.enable("smart")
+    controller.disable()
+    expect(controller.getCommandRevision()).toBe(start + 2) // a fetch snapshotting `start` now sees it moved → skips replay
+  })
+
   it("reflects auth changes via setAvailable without touching enabled/mode", () => {
     const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null, initialAvailable: false })
     expect(controller.getState().available).toBe(false)

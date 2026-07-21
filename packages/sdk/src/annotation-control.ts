@@ -215,6 +215,13 @@ export type AnnotationController = {
   readonly host: AnnotationHost
   readonly sessionId: string | undefined
   getState(): AnnotationControlState
+  /**
+   * Monotonic counter incremented on every dispatched command. A consumer that kicks off async work
+   * (e.g. the initial-events fetch) can snapshot this first and, when the work resolves, apply its
+   * result only if the count is unchanged — proving no fresher command (window API / postMessage /
+   * live SSE control) landed meanwhile and would otherwise be clobbered by the stale replay.
+   */
+  getCommandRevision(): number
   subscribe(callback: (state: AnnotationControlState) => void): () => void
   enable(mode?: AnnotationMode): void
   disable(): void
@@ -244,7 +251,10 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
   const sessionId = config.sessionId
   const host = deps.host ?? detectAnnotationHost()
   const storage = deps.storage === undefined ? safeLocalStorage() : deps.storage ?? undefined
-  const rememberedMode = readStoredAnnotationMode(sessionId, storage) ?? DEFAULT_ANNOTATION_MODE
+  // The USER's remembered mode preference, held IN MEMORY (seeded from storage) so it survives a
+  // session with no storage too. Updated only on an explicit user mode selection, never by an agent
+  // control event; `enable()` with no mode resolves through this, not the live `state.mode`.
+  let rememberedMode = readStoredAnnotationMode(sessionId, storage) ?? DEFAULT_ANNOTATION_MODE
 
   let state: AnnotationControlState = {
     enabled: false,
@@ -273,18 +283,29 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
     emit()
   }
 
+  // Monotonic count of dispatched commands, used to guard the async initial-fetch control replay
+  // against a fresher command that raced it (see {@link AnnotationController.getCommandRevision}).
+  let commandRevision = 0
+
   function dispatch(action: AnnotationControlAction, options: { fromControlEvent?: boolean } = {}) {
-    // `enable()` with no mode resolves to the USER's remembered preference (persisted storage, else
-    // the default) — NOT the live `state.mode`, which an agent control event can have temporarily
-    // changed. This keeps an agent's `--mode X` from becoming the user's default on the next enable.
-    const rememberedMode = readStoredAnnotationMode(sessionId, storage) ?? DEFAULT_ANNOTATION_MODE
-    const next = reduceAnnotationState(state, action, { rememberedMode })
-    // Persist mode memory only on an explicit USER selection (UI toolbar/popup, window API, chat-host
-    // bridge) — never from an agent SSE control event — so an agent's `--mode X` can't overwrite the
-    // user's remembered preference (owner ruling, round 2).
-    if (next.mode !== state.mode && !options.fromControlEvent) {
-      writeStoredAnnotationMode(sessionId, next.mode, storage)
+    // Every command bumps the revision so an in-flight initial-events fetch can detect that its
+    // replayed batch control is now stale and skip it (see AnnotationRoot). Agent control events
+    // dispatch too and are likewise fresher than the historical batch, so they bump it as well.
+    commandRevision += 1
+    // Remember the mode on an explicit USER mode selection, keyed on the ACTION SOURCE — not a state
+    // delta. A user picking the already-active (e.g. agent-set) mode is still an explicit choice and
+    // must be remembered, else the next mode-less `enable()` reverts it (round 2 review). Agent
+    // control events (`fromControlEvent`) never update it. Held in memory AND persisted best-effort,
+    // so the preference survives both an agent's temporary `--mode X` and a storageless session.
+    if (!options.fromControlEvent && (action.action === "set-mode" || action.action === "enable")) {
+      if (action.mode !== undefined) {
+        rememberedMode = action.mode
+        writeStoredAnnotationMode(sessionId, action.mode, storage)
+      }
     }
+    // `enable()` with no mode resolves to the USER's remembered preference — NOT the live `state.mode`,
+    // which an agent control event can have temporarily changed.
+    const next = reduceAnnotationState(state, action, { rememberedMode })
     set(next)
   }
 
@@ -305,6 +326,7 @@ export function createAnnotationController(deps: AnnotationControllerDeps = {}):
     host,
     sessionId,
     getState: () => state,
+    getCommandRevision: () => commandRevision,
     subscribe: api.subscribe,
     enable: api.enable,
     disable: api.disable,

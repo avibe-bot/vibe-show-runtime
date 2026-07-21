@@ -1536,11 +1536,14 @@ function ScreenshotBatchFooter({ draft, comment, submitting, labels, onAddCommen
 }
 
 /**
- * Detect a touch-primary device (phone/tablet) by CAPABILITY, not width or UA: a coarse pointer with
- * no hover. This drives the bottom-sheet layout, the dropped Enter/Esc hints, and the tappable exit
- * button — and degrades sanely for iPad+keyboard (no hover ⇒ treated as touch) rather than sniffing.
+ * Detect when to use the mobile bottom-sheet layout (also drives the dropped Enter/Esc hints and the
+ * tappable exit button). Primarily a CAPABILITY check — a coarse pointer with no hover — so a real
+ * phone/tablet (incl. iPad+keyboard: no hover ⇒ treated as touch) is caught without UA sniffing. The
+ * `max-width` arm is OR'd back in for the narrow-but-fine-pointer case (desktop split-view / small
+ * window): there the fixed-width desktop popover would compute a negative `left` and clip off-screen,
+ * so a genuinely cramped viewport gets the sheet regardless of pointer type (#534).
  */
-function useIsMobile(query = "(hover: none) and (pointer: coarse)") {
+function useIsMobile(query = "(hover: none) and (pointer: coarse), (max-width: 640px)") {
   const [isMobile, setIsMobile] = React.useState(() => matchMediaQuery(query))
   React.useEffect(() => {
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") return
@@ -2572,6 +2575,11 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
 
   React.useEffect(() => {
     let cancelled = false
+    // Snapshot the command revision BEFORE the fetch: the window API + embedded bridge are already
+    // attached (mountAnnotationOverlay wires them before this fetch starts), so a local enable/disable
+    // — or a live SSE control — can land while the GET is in flight. If any does, the replayed batch
+    // control below is stale relative to it and must NOT clobber the fresher command (#513).
+    const revisionAtFetchStart = controller.getCommandRevision()
     void (async () => {
       try {
         // Fetch current events to seed marks + set the SSE `after_id`. STALE control events (created
@@ -2584,7 +2592,9 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
         const events = Array.isArray(body.events) ? body.events : []
         if (cancelled) return
         const liveControl = events.filter((event) => isLiveControlEvent(event, pageLoadedAtRef.current)).at(-1)
-        if (liveControl) controller.applyControlEvent(liveControl)
+        if (liveControl && controller.getCommandRevision() === revisionAtFetchStart) {
+          controller.applyControlEvent(liveControl)
+        }
         setInitialEvents(events)
       } catch {
         if (!cancelled) setInitialEvents([])
