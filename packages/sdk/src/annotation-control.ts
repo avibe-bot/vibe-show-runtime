@@ -216,10 +216,10 @@ export type AnnotationController = {
   readonly sessionId: string | undefined
   getState(): AnnotationControlState
   /**
-   * Monotonic counter incremented on every dispatched command. A consumer that kicks off async work
-   * (e.g. the initial-events fetch) can snapshot this first and, when the work resolves, apply its
-   * result only if the count is unchanged — proving no fresher command (window API / postMessage /
-   * live SSE control) landed meanwhile and would otherwise be clobbered by the stale replay.
+   * Monotonic count of dispatched commands, starting at 0 at creation (before the window API/bridge is
+   * even attached). A consumer replaying a low-priority control (e.g. the one carried in the initial-
+   * events fetch) applies it only while this is still 0 — proving NO command from any source (window
+   * API / postMessage / live SSE control) has landed since creation and would be clobbered by it.
    */
   getCommandRevision(): number
   subscribe(callback: (state: AnnotationControlState) => void): () => void

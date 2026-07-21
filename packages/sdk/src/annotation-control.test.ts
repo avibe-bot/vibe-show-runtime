@@ -239,14 +239,14 @@ describe("annotation controller", () => {
     expect(controller.getState().mode).toBe("screenshot")
   })
 
-  it("increments getCommandRevision on every command (the initial-fetch replay guard, round 2)", () => {
+  it("starts pristine at revision 0 and counts only commands, not the auth probe (initial-fetch replay guard)", () => {
     const controller = createAnnotationController({ config: { sessionId: "ses_1" }, storage: null })
-    const start = controller.getCommandRevision()
+    expect(controller.getCommandRevision()).toBe(0) // pristine → the batch replay applies a live control only while this is 0
     controller.setAvailable(true) // auth-probe path must NOT count as a command
-    expect(controller.getCommandRevision()).toBe(start)
+    expect(controller.getCommandRevision()).toBe(0)
     controller.enable("smart")
     controller.disable()
-    expect(controller.getCommandRevision()).toBe(start + 2) // a fetch snapshotting `start` now sees it moved → skips replay
+    expect(controller.getCommandRevision()).toBe(2) // any command since creation → guard skips the replay
   })
 
   it("reflects auth changes via setAvailable without touching enabled/mode", () => {

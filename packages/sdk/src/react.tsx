@@ -752,7 +752,8 @@ export function AnnotationOverlay({
   // "Active" == the overlay can capture: enabled AND the viewer may write. Anonymous public
   // visitors (available === false) see markers only, never a capture surface.
   const active = enabled && available
-  const isMobile = useIsMobile()
+  const cramped = useCrampedLayout()
+  const touchInput = useTouchInput()
   const [selectedIntent, setSelectedIntent] = React.useState<ShowAnnotationIntent | string>(
     defaultIntent ?? intentOptions[0]?.intent ?? "comment"
   )
@@ -800,15 +801,16 @@ export function AnnotationOverlay({
     const previous = {
       bodyOverflow: body.style.overflow,
       bodyOverscroll: body.style.overscrollBehavior,
-      bodyTouchAction: body.style.touchAction,
       htmlOverflow: html.style.overflow
     }
     body.style.overflow = "hidden"
     body.style.overscrollBehavior = "contain"
-    body.style.touchAction = "none"
     html.style.overflow = "hidden"
-    // Extra iOS safety: cancel touchmove on the capture surface (rubber-band/momentum scroll can
-    // still fire there despite touch-action:none). Scoped so the comment card can still scroll.
+    // Deliberately NOT `body { touch-action: none }`: the comment sheet is portaled under <body>, so an
+    // ancestor-level lock would also kill touch panning inside a long batch card (reaching the textarea
+    // / older items). The drag surface owns its own `touch-action: none` (screenshotCaptureStyle) and
+    // this touchmove guard is SCOPED to it — so a region drag never scrolls the page, yet the card stays
+    // scrollable (#242). Page scroll is already pinned by the overflow:hidden above.
     const blockCaptureTouchScroll = (event: TouchEvent) => {
       if (event.target instanceof Element && event.target.closest("[data-show-annotation-capture]")) {
         event.preventDefault()
@@ -818,7 +820,6 @@ export function AnnotationOverlay({
     return () => {
       body.style.overflow = previous.bodyOverflow
       body.style.overscrollBehavior = previous.bodyOverscroll
-      body.style.touchAction = previous.bodyTouchAction
       html.style.overflow = previous.htmlOverflow
       document.removeEventListener("touchmove", blockCaptureTouchScroll)
     }
@@ -1162,7 +1163,7 @@ export function AnnotationOverlay({
         enabled={enabled}
         available={available}
         mode={mode}
-        isMobile={isMobile}
+        touchInput={touchInput}
         labels={copy}
         onEnable={enable}
         onDisable={disable}
@@ -1194,12 +1195,12 @@ export function AnnotationOverlay({
           <AnnotationMarker rect={draft.rect} tone="human" variant="selected" label={draft.label} />
           <CommentSurface
             anchorRect={draft.rect}
-            isMobile={isMobile}
+            cramped={cramped}
             onClose={() => setDraft(null)}
             footer={
               <div style={cardFooterStyle}>
                 {/* No "Enter 发送 · Esc 取消" hint on touch devices: Enter is a newline and there's no Esc. */}
-                <span style={footerHintStyle}>{isMobile ? "" : copy.enterToSend}</span>
+                <span style={footerHintStyle}>{touchInput ? "" : copy.enterToSend}</span>
                 <button type="button" disabled={submitting || !comment.trim()} onClick={() => void submit()} style={primaryButtonStyle}>
                   <SendIcon />
                   {submitting ? "…" : copy.send}
@@ -1227,8 +1228,10 @@ export function AnnotationOverlay({
               value={comment}
               onChange={(event) => setComment(event.target.value)}
               onKeyDown={(event) => {
-                // Enter sends on desktop (Shift+Enter for a newline); mobile keeps Enter as newline.
-                if (event.key === "Enter" && !event.shiftKey && !isMobile) {
+                // Enter sends when a hardware keyboard is present (Shift+Enter for a newline); a
+                // touch device keeps Enter as a newline. Keyed on input capability, not layout, so a
+                // narrow desktop window in the sheet layout still submits on Enter.
+                if (event.key === "Enter" && !event.shiftKey && !touchInput) {
                   event.preventDefault()
                   void submit()
                 }
@@ -1254,7 +1257,7 @@ export function AnnotationOverlay({
           {screenshotDraft.pendingPoint ? <NumberPin point={screenshotDraft.pendingPoint} tone="human" label={nextItemLabel} pending /> : null}
           <CommentSurface
             anchorRect={screenshotDraft.region}
-            isMobile={isMobile}
+            cramped={cramped}
             onClose={() => resetScreenshotState()}
             footer={
               <ScreenshotBatchFooter
@@ -1296,16 +1299,17 @@ type AnnotationChromeProps = {
   enabled: boolean
   available: boolean
   mode: AnnotationMode
-  isMobile: boolean
+  touchInput: boolean
   labels: AnnotationOverlayLabels
   onEnable?: (mode?: AnnotationMode) => void
   onDisable?: () => void
   onSetMode?: (mode: AnnotationMode) => void
 }
 
-function AnnotationChrome({ host, enabled, available, mode, isMobile, labels, onEnable, onDisable, onSetMode }: AnnotationChromeProps) {
-  // No "Esc" wording on touch devices (no hardware Esc); the exit affordance is always tappable.
-  const exitLabel = isMobile ? labels.exitShort : labels.exit
+function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, onEnable, onDisable, onSetMode }: AnnotationChromeProps) {
+  // No "Esc" wording on touch devices (no hardware Esc); the exit affordance is always tappable. Keyed
+  // on input capability, not layout, so a narrow desktop window still shows the clickable "Esc" label.
+  const exitLabel = touchInput ? labels.exitShort : labels.exit
 
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
@@ -1393,7 +1397,7 @@ function AnchorChip({ label }: { label: string }) {
  * Capped height with a scrollable body and a PINNED footer, so a long anchor label / comment list
  * can never push the send row off-screen (mobile overflow fix, §4).
  */
-function CommentSurface({ anchorRect, isMobile, onClose, footer, children }: { anchorRect: MarkAnchorRect; isMobile: boolean; onClose: () => void; footer?: React.ReactNode; children: React.ReactNode }) {
+function CommentSurface({ anchorRect, cramped, onClose, footer, children }: { anchorRect: MarkAnchorRect; cramped: boolean; onClose: () => void; footer?: React.ReactNode; children: React.ReactNode }) {
   // Keyboard isolation: keep keys typed in the card from reaching host-page shortcuts (`/`, arrows,
   // Cmd/Ctrl+K, …). Escape stays overlay-owned → cancel the card. Enter-to-send is handled on the
   // smart textarea before this bubble-phase guard stops propagation.
@@ -1414,7 +1418,7 @@ function CommentSurface({ anchorRect, isMobile, onClose, footer, children }: { a
       {footer ? <div style={commentFooterStyle}>{footer}</div> : null}
     </>
   )
-  if (isMobile) {
+  if (cramped) {
     return (
       <div data-show-annotation-ui="" role="dialog" style={sheetStyle} onClick={(event) => event.stopPropagation()} {...keyGuard}>
         <div style={sheetHandleStyle} />
@@ -1535,25 +1539,37 @@ function ScreenshotBatchFooter({ draft, comment, submitting, labels, onAddCommen
   )
 }
 
-/**
- * Detect when to use the mobile bottom-sheet layout (also drives the dropped Enter/Esc hints and the
- * tappable exit button). Primarily a CAPABILITY check — a coarse pointer with no hover — so a real
- * phone/tablet (incl. iPad+keyboard: no hover ⇒ treated as touch) is caught without UA sniffing. The
- * `max-width` arm is OR'd back in for the narrow-but-fine-pointer case (desktop split-view / small
- * window): there the fixed-width desktop popover would compute a negative `left` and clip off-screen,
- * so a genuinely cramped viewport gets the sheet regardless of pointer type (#534).
- */
-function useIsMobile(query = "(hover: none) and (pointer: coarse), (max-width: 640px)") {
-  const [isMobile, setIsMobile] = React.useState(() => matchMediaQuery(query))
+// Two ORTHOGONAL concerns, deliberately NOT one flag (they diverge on a narrow desktop window):
+//  • TOUCH INPUT — the primary pointer is coarse with no hover, so there's no hardware keyboard/Esc
+//    to rely on. Drives Enter-to-send suppression, the Esc-vs-tap exit label, and touch-scroll locks.
+//    Never width-based: a narrow desktop window still has a keyboard.
+//  • CRAMPED LAYOUT — the comment card should use the bottom sheet instead of the fixed-width popover:
+//    a touch device OR a viewport too narrow (≤640px) for the 340px popover (which would clip
+//    off-screen). Layout-only — it must NOT gate keyboard affordances.
+const TOUCH_INPUT_QUERY = "(hover: none) and (pointer: coarse)"
+const CRAMPED_LAYOUT_QUERY = `${TOUCH_INPUT_QUERY}, (max-width: 640px)`
+
+/** Touch-primary input (coarse pointer, no hover); incl. iPad+keyboard, without UA sniffing. */
+function useTouchInput() {
+  return useMediaQuery(TOUCH_INPUT_QUERY)
+}
+
+/** Use the bottom-sheet layout: touch device OR a viewport too narrow for the popover (#534). */
+function useCrampedLayout() {
+  return useMediaQuery(CRAMPED_LAYOUT_QUERY)
+}
+
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = React.useState(() => matchMediaQuery(query))
   React.useEffect(() => {
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") return
     const media = window.matchMedia(query)
-    const update = () => setIsMobile(media.matches)
+    const update = () => setMatches(media.matches)
     update()
     media.addEventListener("change", update)
     return () => media.removeEventListener("change", update)
   }, [query])
-  return isMobile
+  return matches
 }
 
 function matchMediaQuery(query: string) {
@@ -2575,11 +2591,6 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
 
   React.useEffect(() => {
     let cancelled = false
-    // Snapshot the command revision BEFORE the fetch: the window API + embedded bridge are already
-    // attached (mountAnnotationOverlay wires them before this fetch starts), so a local enable/disable
-    // — or a live SSE control — can land while the GET is in flight. If any does, the replayed batch
-    // control below is stale relative to it and must NOT clobber the fresher command (#513).
-    const revisionAtFetchStart = controller.getCommandRevision()
     void (async () => {
       try {
         // Fetch current events to seed marks + set the SSE `after_id`. STALE control events (created
@@ -2592,7 +2603,12 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
         const events = Array.isArray(body.events) ? body.events : []
         if (cancelled) return
         const liveControl = events.filter((event) => isLiveControlEvent(event, pageLoadedAtRef.current)).at(-1)
-        if (liveControl && controller.getCommandRevision() === revisionAtFetchStart) {
+        // This replayed batch control is the LOWEST-priority source: apply it only while the controller
+        // is still pristine (revision 0 = uncommanded since creation, which precedes the window
+        // API/bridge attach). ANY command since — a pre-fetch OR in-flight window-API/bridge command,
+        // or a live SSE control — is fresher intent this replay must not clobber. A state check, not a
+        // fetch-start snapshot, so the pre-fetch window is covered too (#513, #237).
+        if (liveControl && controller.getCommandRevision() === 0) {
           controller.applyControlEvent(liveControl)
         }
         setInitialEvents(events)
