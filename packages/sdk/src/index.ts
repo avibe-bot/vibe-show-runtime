@@ -1,5 +1,11 @@
 export const DEFAULT_MARK_SCOPE = "default"
 export const MARK_ATTRIBUTE_PREFIX = "mark-"
+/**
+ * Declarative agent-note content attribute. Lives OUTSIDE the `mark-*` anchor family on purpose
+ * (`mark-*` = WHERE / anchors, `agent-note` = WHAT / the agent's words), so it can never collide with
+ * a free-form `mark-<scope>` anchor — e.g. scope "note" stays a valid anchor scope (review #269).
+ */
+export const AGENT_NOTE_ATTRIBUTE = "agent-note"
 export const DEFAULT_SHOW_EVENTS_PATH = "__show/events"
 export const DEFAULT_SHOW_ME_PATH = "__show/me"
 // Every overlay write carries the write token on BOTH surfaces (contract §5 v2): the injected
@@ -694,6 +700,156 @@ export function assistantMarkEvent(
     },
     createdAt: occurredAt
   }
+}
+
+// ── Agent-mark lifecycle helpers (Phase 2 reverse marks) — pure, DOM-free ───────────────
+
+export type AgentMarkKind = "reply" | "note"
+
+/**
+ * Identity that drives replace/supersede: a **reply** mark (payload `replyTo`) replaces the prior
+ * reply to the same annotation; a **note** mark replaces the prior note on the same target+scope.
+ * (A same-id re-emit lands in the same bucket because its target/replyTo are unchanged.)
+ */
+export function agentMarkIdentity(mark: AgentMark): string {
+  const replyTo = typeof mark.replyTo === "string" ? mark.replyTo : undefined
+  if (replyTo) return `reply:${replyTo}`
+  return `note:${normalizeScope(mark.scope)}:${mark.target}`
+}
+
+export type ReducedAgentMark = {
+  identity: string
+  kind: AgentMarkKind
+  event: AssistantMarkEvent
+  createdAt: string
+  /** The newest event in this identity is a resolve ⇒ retired on a fresh load (read-to-retire). */
+  resolvedByEvent: boolean
+}
+
+function isResolveEvent(event: AssistantMarkEvent): boolean {
+  return event.type === "assistant.mark.resolved" || event.mark.status === "resolved"
+}
+
+/**
+ * Collapse a raw event stream into one entry per mark identity. Within an identity the newest
+ * CREATE/UPDATE (by `createdAt`) is the active version (replace/supersede). It is flagged
+ * `resolvedByEvent` only when a resolve (read receipt) targets that active version — same `mark.id`
+ * AND authored at/after it — so a late receipt for an already-superseded older mark id never retires
+ * the newer answer, and a re-mark after a resolve re-activates. Callers render a `resolvedByEvent`
+ * mark only if the user re-read it in the current view (gray), never on a fresh load. Pure — no DOM.
+ */
+export function reduceAgentMarkEvents(events: readonly ShowEvent[], scope?: string): ReducedAgentMark[] {
+  const byIdentity = new Map<string, { versions: AssistantMarkEvent[]; resolves: AssistantMarkEvent[] }>()
+  for (const event of events) {
+    if (!event.type.startsWith("assistant.mark.")) continue
+    const markEvent = event as AssistantMarkEvent
+    if (scope !== undefined && normalizeScope(markEvent.mark.scope) !== normalizeScope(scope)) continue
+    const identity = agentMarkIdentity(markEvent.mark)
+    const bucket = byIdentity.get(identity) ?? { versions: [], resolves: [] }
+    if (isResolveEvent(markEvent)) bucket.resolves.push(markEvent)
+    else bucket.versions.push(markEvent)
+    byIdentity.set(identity, bucket)
+  }
+  const result: ReducedAgentMark[] = []
+  for (const [identity, { versions, resolves }] of byIdentity) {
+    if (versions.length === 0) continue // only receipts — nothing active to render
+    const active = versions.reduce((best, event) => (event.createdAt >= best.createdAt ? event : best))
+    result.push({
+      identity,
+      kind: typeof active.mark.replyTo === "string" && active.mark.replyTo ? "reply" : "note",
+      event: active,
+      createdAt: active.createdAt,
+      // Retired only when THIS active version was resolved (its own id, at/after it) — not by a stale
+      // receipt for an older superseded mark id in the same identity.
+      resolvedByEvent: resolves.some((resolve) => resolve.mark.id === active.mark.id && resolve.createdAt >= active.createdAt)
+    })
+  }
+  return result
+}
+
+export type RenderableAgentMark = { read: boolean; anchored: boolean }
+
+export type AgentMarkPartition<T> = {
+  /** Unread + anchored, capped — render as loud violet dots inline. */
+  inlineUnread: T[]
+  /** Read-this-view + anchored — render as small gray dots inline (uncapped). */
+  inlineRead: T[]
+  /** Unread + anchored beyond the cap — badge list only. */
+  overflow: T[]
+  /** Anchor resolution failed — badge list only, never guess-pinned. */
+  failed: T[]
+  /** Count of all unread active marks (the aggregate badge number). */
+  unreadCount: number
+  /** Badge is shown when something can't/shouldn't render inline (overflow or an anchor failure). */
+  showBadge: boolean
+}
+
+/**
+ * Partition resolved marks into inline dots vs the aggregate badge list. At most `cap` UNREAD anchored
+ * marks render inline; read-this-view anchored marks render inline (gray, uncapped); unread anchored
+ * beyond the cap overflow to the badge; every anchor-failed mark goes to the badge list only (never
+ * mis-pinned). Input order is preserved, so the caller controls which `cap` render inline (sort
+ * first). Pure — no DOM.
+ */
+export function partitionAgentMarks<T extends RenderableAgentMark>(marks: readonly T[], cap = 5): AgentMarkPartition<T> {
+  const anchoredUnread = marks.filter((m) => m.anchored && !m.read)
+  const inlineRead = marks.filter((m) => m.anchored && m.read)
+  const failed = marks.filter((m) => !m.anchored)
+  const inlineUnread = anchoredUnread.slice(0, cap)
+  const overflow = anchoredUnread.slice(cap)
+  const unreadCount = anchoredUnread.length + failed.filter((m) => !m.read).length
+  return { inlineUnread, inlineRead, overflow, failed, unreadCount, showBadge: overflow.length > 0 || failed.length > 0 }
+}
+
+/** localStorage key holding the set of read attribute-note tokens for a session. */
+export const AGENT_MARK_READ_STORAGE_PREFIX = "avibe:mark-read:"
+
+export function agentMarkReadStorageKey(sessionId: string | undefined): string {
+  return `${AGENT_MARK_READ_STORAGE_PREFIX}${sessionId ?? "default"}`
+}
+
+/** Cheap, stable non-cryptographic hash (djb2) — used to detect attribute-note text changes. */
+export function hashMarkText(text: string): string {
+  let hash = 5381
+  for (let i = 0; i < text.length; i += 1) hash = (Math.imul(hash, 33) + text.charCodeAt(i)) | 0
+  return (hash >>> 0).toString(36)
+}
+
+/**
+ * Read-state token for a declarative `agent-note`: scope + anchor identity + text hash. Editing the
+ * note text changes the hash ⇒ a new token ⇒ the note is unread again (spec rule 1 / D4).
+ */
+export function attributeNoteReadToken(scope: string | undefined, anchorId: string, text: string): string {
+  return `${normalizeScope(scope)}:${anchorId}#${hashMarkText(text)}`
+}
+
+/**
+ * Whether a resolved anchor is trustworthy enough to pin a mark inline. Any resolution EXCEPT
+ * `missing` (element not found) is trusted — including `area`/`element-group`/`group`/`screenshot`,
+ * which intentionally carry a deliberate region rect and no DOM element (a reply to a human
+ * area/screenshot selection). A `missing` anchor holds only a stale fallback rect and is routed to
+ * the badge list, never guess-pinned (spec rule 4 / D6).
+ */
+export function isMarkAnchored(confidence: AnchorResolveResult["confidence"], hasRect: boolean): boolean {
+  return confidence !== "missing" && hasRect
+}
+
+/**
+ * The anchor to render an agent mark at, resolved through the canonical path (no hand-rolled
+ * selectors): the mark's own event `anchor` wins; else a reply mark resolves through the referenced
+ * annotation event's anchor (found by `replyTo` in the stream); else the target is parsed by
+ * `targetToAnchor`, which correctly handles the SDK mark-id form (`mark-<scope>-<id>` ⇒ a mark anchor)
+ * as well as plain CSS selectors — so a mark-id target is never mistaken for a tag selector.
+ */
+export function resolveAgentMarkAnchor(event: AssistantMarkEvent, events: readonly ShowEvent[]): ShowAnchor | undefined {
+  if (event.anchor) return event.anchor
+  const replyTo = typeof event.mark.replyTo === "string" ? event.mark.replyTo : undefined
+  if (replyTo) {
+    const referenced = events.find((candidate) => candidate.id === replyTo)
+    const referencedAnchor = referenced && "anchor" in referenced ? (referenced as { anchor?: ShowAnchor }).anchor : undefined
+    if (referencedAnchor) return referencedAnchor
+  }
+  return targetToAnchor(event.mark.target, normalizeScope(event.mark.scope))
 }
 
 export function humanIntentEvent(

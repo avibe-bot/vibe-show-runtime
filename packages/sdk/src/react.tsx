@@ -9,6 +9,13 @@ import {
   collectElementContext,
   collectTextSelectionAnchor,
   deepElementFromPoint,
+  reduceAgentMarkEvents,
+  partitionAgentMarks,
+  attributeNoteReadToken,
+  agentMarkReadStorageKey,
+  AGENT_NOTE_ATTRIBUTE,
+  isMarkAnchored,
+  resolveAgentMarkAnchor,
   markAttributes,
   markAttributeName,
   normalizeShowEvent,
@@ -40,7 +47,8 @@ import {
   type ScreenshotAnnotationItem,
   type ShowClientOptions,
   type ShowEvent,
-  type ShowEventInput
+  type ShowEventInput,
+  type ReducedAgentMark
 } from "./index.js"
 import {
   APPROVE_INTENT,
@@ -52,8 +60,10 @@ import {
   isBatchControlNewer,
   isLiveControlEvent,
   resolveWriteToken,
+  safeLocalStorage,
   type AnnotationController,
-  type AnnotationHost
+  type AnnotationHost,
+  type AnnotationModeStorage
 } from "./annotation-control.js"
 
 export type AgentMarkSubmitResult = Awaited<ReturnType<typeof submitShowEvent>>
@@ -246,7 +256,13 @@ export type AgentMarkLayerProps = {
   events?: ShowEvent[]
   scope?: string
   className?: string
+  /** Escape hatch: a custom renderer keeps the pre-lifecycle simple layer (no bubbles/badge). */
   renderMark?: (event: ShowEvent, rect: MarkAnchorRect) => React.ReactNode
+  /** Whether the viewer can post read receipts (canAnnotate). Default: inferred from a write token.
+   *  Anonymous viewers (false) keep read state in localStorage only, never POST. */
+  canAnnotate?: boolean
+  /** Host mode — drives badge placement (clear the FAB in standalone; bottom-right free in embedded). */
+  host?: AnnotationHost
 }
 
 type AssistantMarkLayerEvent = Extract<ShowEvent, { type: "assistant.mark.created" | "assistant.mark.updated" | "assistant.mark.resolved" }>
@@ -1315,7 +1331,7 @@ export function AnnotationOverlay({
       {error && active && !draft && !screenshotDraft ? (
         <div data-show-annotation-ui="" role="alert" style={floatingErrorStyle}>{error}</div>
       ) : null}
-      <AgentMarkLayer scope={scope} />
+      <AgentMarkLayer scope={scope} host={host} canAnnotate={available} />
     </>,
     document.body
   )
@@ -1659,7 +1675,22 @@ function usePageScrollLock(active: boolean, touchGuardSelector?: string) {
   }, [active, touchGuardSelector])
 }
 
-export function AgentMarkLayer({ events, scope, className, renderMark }: AgentMarkLayerProps) {
+export function AgentMarkLayer(props: AgentMarkLayerProps) {
+  // A custom `renderMark` keeps the original simple layer (backward compatible). The default path is
+  // the Phase 2 conversation lifecycle: unread violet dot → answer bubble → read-retire + aggregate badge.
+  if (props.renderMark) return <LegacyAgentMarkLayer {...props} renderMark={props.renderMark} />
+  return (
+    <AgentMarkConversation
+      events={props.events}
+      scope={props.scope}
+      className={props.className}
+      canAnnotate={props.canAnnotate}
+      host={props.host ?? "standalone"}
+    />
+  )
+}
+
+function LegacyAgentMarkLayer({ events, scope, className, renderMark }: AgentMarkLayerProps & { renderMark: NonNullable<AgentMarkLayerProps["renderMark"]> }) {
   const context = React.useContext(ShowSessionContext)
   const sourceEvents = events ?? context?.events ?? []
   const tick = useViewportTick()
@@ -1685,16 +1716,349 @@ export function AgentMarkLayer({ events, scope, className, renderMark }: AgentMa
   if (typeof document === "undefined" || marks.length === 0) return null
   return createPortal(
     <div className={className} data-show-agent-mark-layer="" style={layerStyle}>
-      {marks.map(({ event, rect }) =>
-        renderMark ? (
-          <React.Fragment key={event.id}>{renderMark(event, rect)}</React.Fragment>
-        ) : (
-          <AnnotationMarker key={event.id} rect={rect} tone="assistant" variant="selected" badge={<BotIcon />} label={agentMarkLabel(event)} />
-        )
-      )}
+      {marks.map(({ event, rect }) => (
+        <React.Fragment key={event.id}>{renderMark(event, rect)}</React.Fragment>
+      ))}
     </div>,
     document.body
   )
+}
+
+// ── Phase 2 agent reverse-mark conversation lifecycle ───────────────────────────────────
+
+type MarkCandidate = {
+  readKey: string
+  kind: "reply" | "note" | "attribute-note"
+  body: string
+  targetLabel: string
+  createdAt: string
+  anchor: ShowAnchor | undefined
+  /** Read on a prior load (event-backed resolve, or a persisted read token) ⇒ not rendered unless re-read this view. */
+  retiredAtLoad: boolean
+  event?: ReducedAgentMark["event"]
+}
+type ResolvedMarkCandidate = MarkCandidate & { rect?: MarkAnchorRect; element?: Element; anchored: boolean; read: boolean }
+type AttributeNoteMark = { anchor: ShowAnchor; text: string }
+
+/** Scan the page for declarative `agent-note="<text>"` elements, re-scanning on DOM mutation (mirrors
+ *  useMarkRegistry). One descriptor per element: its anchor + the note text. */
+function useAttributeNoteMarks(scope?: string): AttributeNoteMark[] {
+  const [version, setVersion] = React.useState(0)
+  React.useEffect(() => {
+    if (typeof document === "undefined" || typeof MutationObserver === "undefined") return
+    const observer = new MutationObserver(() => setVersion((value) => value + 1))
+    observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: [AGENT_NOTE_ATTRIBUTE] })
+    return () => observer.disconnect()
+  }, [])
+  return React.useMemo(() => {
+    void version
+    if (typeof document === "undefined") return []
+    const notes: AttributeNoteMark[] = []
+    for (const element of Array.from(document.querySelectorAll(`[${AGENT_NOTE_ATTRIBUTE}]`))) {
+      const text = (element.getAttribute(AGENT_NOTE_ATTRIBUTE) ?? "").trim()
+      if (!text) continue
+      notes.push({ anchor: collectElementContext(element, { scope }), text })
+    }
+    return notes
+  }, [scope, version])
+}
+
+function AgentMarkConversation({ events, scope, className, canAnnotate, host }: {
+  events?: ShowEvent[]
+  scope?: string
+  className?: string
+  canAnnotate?: boolean
+  host: AnnotationHost
+}) {
+  const context = React.useContext(ShowSessionContext)
+  const sourceEvents = events ?? context?.events ?? []
+  const sessionId = context?.config.sessionId
+  // Gate the read-receipt POST on an ACTUAL write token, resolved the SAME way submitShowEvent does —
+  // the provider token OR the injected `__AVIBE_SHOW__.writeToken` runtime fallback (#276) — not the
+  // `available`/authenticated hint (true before the /__show/me probe populates a token, #572). No
+  // token ⇒ localStorage path (durable on this device); when a token exists, reads POST cross-device.
+  // `canAnnotate === false` is an explicit anonymous opt-out.
+  const writeToken = context?.config.writeToken ?? readRuntimeConfig().writeToken
+  const canPost = canAnnotate !== false && Boolean(writeToken)
+  const tick = useViewportTick()
+  const attributeNotes = useAttributeNoteMarks(scope)
+  const storage = React.useMemo(() => safeLocalStorage(), [])
+  const readTokensAtLoad = React.useMemo(() => loadReadTokens(sessionId, storage), [sessionId, storage])
+  const [readInView, setReadInView] = React.useState<ReadonlySet<string>>(() => new Set())
+  const [expandedKey, setExpandedKey] = React.useState<string | null>(null)
+  const [listOpen, setListOpen] = React.useState(false)
+  const [flashKey, setFlashKey] = React.useState<string | null>(null)
+  const flashTimer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  React.useEffect(() => () => { if (flashTimer.current) clearTimeout(flashTimer.current) }, [])
+
+  const candidates = React.useMemo<MarkCandidate[]>(() => {
+    const list: MarkCandidate[] = []
+    for (const reduced of reduceAgentMarkEvents(sourceEvents, scope)) {
+      // VERSIONED read key (identity + a TRUE version: the winning mark id, else its createdAt): the
+      // anonymous-viewer localStorage read path must hide only the exact version read, so an agent
+      // re-mark (new mark id, even same body) shows again as unread rather than inheriting the prior
+      // read token (#67/#288). The logged-in path is event-backed via resolvedByEvent (newest-wins).
+      const readKey = `${reduced.identity}#${reduced.event.mark.id || reduced.createdAt}`
+      list.push({
+        readKey,
+        kind: reduced.kind,
+        body: reduced.event.mark.body,
+        targetLabel: reduced.event.mark.target || (reduced.kind === "reply" ? "回应" : "标注"),
+        createdAt: reduced.createdAt,
+        // Canonical anchor resolution (event anchor → reply's referenced annotation anchor → target via
+        // targetToAnchor, which handles the SDK mark-id form and selectors) — no hand-rolled selector (#257/#283).
+        anchor: resolveAgentMarkAnchor(reduced.event, sourceEvents),
+        // event-backed read (cross-device) OR an anonymous viewer's persisted (versioned) localStorage read.
+        retiredAtLoad: reduced.resolvedByEvent || readTokensAtLoad.has(readKey),
+        event: reduced.event
+      })
+    }
+    for (const note of attributeNotes) {
+      const anchorId = note.anchor.mark ?? note.anchor.selector ?? note.anchor.textQuote ?? note.text
+      const token = attributeNoteReadToken(scope ?? note.anchor.scope, anchorId, note.text)
+      list.push({
+        readKey: token,
+        kind: "attribute-note",
+        body: note.text,
+        targetLabel: note.anchor.label ?? anchorId,
+        createdAt: "",
+        anchor: note.anchor,
+        retiredAtLoad: readTokensAtLoad.has(token)
+      })
+    }
+    // Newest event marks first; attribute notes (no timestamp) sort last, keeping DOM order.
+    return list.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""))
+  }, [sourceEvents, scope, attributeNotes, readTokensAtLoad])
+
+  const resolved = React.useMemo<ResolvedMarkCandidate[]>(() => {
+    void tick
+    if (typeof document === "undefined") return []
+    return candidates
+      .map((candidate) => {
+        const anchorResult = candidate.anchor ? resolveAnchor(candidate.anchor, document) : undefined
+        // Trust any resolution except `missing` — incl. area/screenshot region rects with no element
+        // (a reply to a human area selection, #72). Only `missing` (stale fallback rect) is routed to
+        // the badge list, and its stale rect is dropped so the bubble never opens at a guessed position
+        // (#69). Never guess-pin (spec rule 4 / D6).
+        const anchored = anchorResult ? isMarkAnchored(anchorResult.confidence, Boolean(anchorResult.rect)) : false
+        return { ...candidate, rect: anchored ? anchorResult?.rect : undefined, element: anchorResult?.element, anchored, read: readInView.has(candidate.readKey) }
+      })
+      // Retired on a fresh load and not re-read this view ⇒ gone (created − resolved on replay).
+      .filter((candidate) => !candidate.retiredAtLoad || candidate.read)
+  }, [candidates, readInView, tick])
+
+  const partition = React.useMemo(() => partitionAgentMarks(resolved, 5), [resolved])
+  const rendered = React.useMemo(
+    () => [...partition.inlineUnread, ...partition.inlineRead, ...partition.overflow, ...partition.failed],
+    [partition]
+  )
+
+  const markRead = React.useCallback((candidate: ResolvedMarkCandidate) => {
+    if (readInView.has(candidate.readKey)) return
+    setReadInView((prev) => new Set(prev).add(candidate.readKey))
+    if (candidate.kind === "attribute-note" || !canPost) {
+      // Declarative note (no event identity) or anonymous viewer (cannot POST) ⇒ localStorage only.
+      writeReadToken(sessionId, storage, candidate.readKey)
+    } else if (candidate.event) {
+      // Read receipt: event-backed, cross-device. Author is stamped server-side (the reading user).
+      // Empty message content ⇒ metadata-only: the runtime's recordShowEvent skips empty content, so
+      // opening a bubble never re-appends the answer to chat history (#61). The bubble reads the mark
+      // body directly, so the answer is still shown.
+      void context?.submitEvent({
+        type: "assistant.mark.resolved",
+        mark: candidate.event.mark,
+        anchor: candidate.event.anchor,
+        message: { role: "assistant", content: "" }
+      })
+    }
+  }, [readInView, canPost, sessionId, storage, context])
+
+  const openMark = React.useCallback((candidate: ResolvedMarkCandidate) => {
+    setExpandedKey(candidate.readKey)
+    markRead(candidate)
+  }, [markRead])
+
+  const openFromList = React.useCallback((candidate: ResolvedMarkCandidate) => {
+    if (candidate.element && typeof candidate.element.scrollIntoView === "function") {
+      try { candidate.element.scrollIntoView({ behavior: "smooth", block: "center" }) } catch { /* older browsers */ }
+      setFlashKey(candidate.readKey)
+      if (flashTimer.current) clearTimeout(flashTimer.current)
+      flashTimer.current = setTimeout(() => setFlashKey(null), 1200)
+    }
+    openMark(candidate)
+  }, [openMark])
+
+  if (typeof document === "undefined" || rendered.length === 0) return null
+  const expanded = rendered.find((candidate) => candidate.readKey === expandedKey) ?? null
+  const flashed = flashKey ? rendered.find((candidate) => candidate.readKey === flashKey && candidate.rect) : undefined
+  return createPortal(
+    <div className={className} data-show-agent-mark-layer="" style={layerStyle}>
+      {partition.inlineUnread.map((candidate) =>
+        candidate.rect ? <MarkDot key={candidate.readKey} rect={candidate.rect} read={false} onClick={() => openMark(candidate)} /> : null
+      )}
+      {partition.inlineRead.map((candidate) =>
+        candidate.rect ? <MarkDot key={candidate.readKey} rect={candidate.rect} read onClick={() => openMark(candidate)} /> : null
+      )}
+      {flashed?.rect ? <AnnotationMarker rect={flashed.rect} tone="assistant" variant="selected" /> : null}
+      {partition.showBadge ? <MarkBadge count={partition.unreadCount} host={host} onClick={() => setListOpen((value) => !value)} /> : null}
+      {listOpen ? <MarkList marks={rendered} host={host} onOpen={openFromList} onClose={() => setListOpen(false)} /> : null}
+      {expanded ? <MarkBubble mark={expanded} onClose={() => setExpandedKey(null)} /> : null}
+    </div>,
+    document.body
+  )
+}
+
+function MarkDot({ rect, read, onClick }: { rect: MarkAnchorRect; read: boolean; onClick: () => void }) {
+  const size = read ? 12 : 16
+  return (
+    <button
+      type="button"
+      data-show-annotation-ui=""
+      aria-label="Agent 标注"
+      onClick={onClick}
+      style={{
+        position: "fixed",
+        left: rect.x + rect.width - size / 2,
+        top: rect.y - size / 2,
+        width: size,
+        height: size,
+        padding: 0,
+        borderRadius: 999,
+        cursor: "pointer",
+        boxSizing: "border-box",
+        border: `2px solid ${COLORS.surface}`,
+        background: read ? COLORS.resolved : COLORS.agent,
+        boxShadow: read ? "none" : `0 0 0 4px ${COLORS.agent}33, 0 4px 14px ${COLORS.agent}55`,
+        pointerEvents: "auto",
+        zIndex: MARKER_Z,
+        transition: "background 160ms ease, box-shadow 160ms ease, width 160ms ease, height 160ms ease"
+      }}
+    />
+  )
+}
+
+function MarkBubble({ mark, onClose }: { mark: ResolvedMarkCandidate; onClose: () => void }) {
+  const width = 300
+  const rect = mark.rect
+  const left = rect ? Math.min(window.innerWidth - width - 12, Math.max(12, rect.x)) : Math.max(12, (window.innerWidth - width) / 2)
+  const top = rect ? Math.min(window.innerHeight - 180, Math.max(12, rect.y + rect.height + 12)) : Math.max(12, window.innerHeight / 2 - 90)
+  // Cap the fixed bubble to the space below its top edge and scroll the body, so a long agent answer
+  // is never cut off past the viewport (the bubble is position:fixed, so page scroll can't reach it) (#576).
+  const maxHeight = Math.max(140, window.innerHeight - top - 16)
+  return (
+    <div data-show-annotation-ui="" role="dialog" onClick={(event) => event.stopPropagation()} style={{ ...markBubbleShellStyle, left, top, width, maxHeight, display: "flex", flexDirection: "column" }}>
+      <div style={{ ...markBubbleHeaderStyle, flex: "0 0 auto" }}>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+          <span style={markBubbleAuthorDotStyle} />
+          <strong style={{ color: COLORS.textPrimary, font: `600 13px/1 ${FONT_STACK}` }}>Agent</strong>
+          {mark.createdAt ? <span style={{ color: COLORS.textMuted, font: `400 12px/1 ${FONT_STACK}` }}>{formatRelativeTime(mark.createdAt)}</span> : null}
+        </span>
+        <button type="button" aria-label="Close" onClick={onClose} style={markBubbleCloseStyle}>×</button>
+      </div>
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", color: COLORS.textPrimary, font: `400 13px/1.5 ${FONT_STACK}`, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+        {mark.body}
+        {!mark.anchored ? <div style={{ marginTop: 8, color: COLORS.textMuted, font: `400 12px/1.4 ${FONT_STACK}` }}>原位置已更新</div> : null}
+      </div>
+    </div>
+  )
+}
+
+function MarkBadge({ count, host, onClick }: { count: number; host: AnnotationHost; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      data-show-annotation-ui=""
+      aria-label={`${count} 条 Agent 标注待读`}
+      onClick={onClick}
+      style={{
+        position: "fixed",
+        right: 20,
+        // Standalone: clear the FAB/toolbar (bottom-right, ~52px at bottom:20). Embedded: pill is
+        // bottom-center, so bottom-right is free.
+        bottom: host === "embedded" ? 20 : 88,
+        minWidth: 44,
+        height: 44,
+        padding: "0 12px",
+        borderRadius: 999,
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 6,
+        cursor: "pointer",
+        border: `2px solid ${COLORS.surface}`,
+        background: COLORS.agent,
+        color: COLORS.onAccent,
+        font: `700 14px/1 ${FONT_STACK}`,
+        boxShadow: `0 8px 28px ${COLORS.agent}55`,
+        pointerEvents: "auto",
+        zIndex: CHROME_Z
+      }}
+    >
+      <BotIcon />
+      {count}
+    </button>
+  )
+}
+
+function MarkList({ marks, host, onOpen, onClose }: { marks: ResolvedMarkCandidate[]; host: AnnotationHost; onOpen: (mark: ResolvedMarkCandidate) => void; onClose: () => void }) {
+  return (
+    <div
+      data-show-annotation-ui=""
+      role="dialog"
+      onClick={(event) => event.stopPropagation()}
+      style={{ ...markBubbleShellStyle, right: 20, bottom: host === "embedded" ? 72 : 140, width: 320, maxHeight: "60vh", overflowY: "auto" }}
+    >
+      <div style={markBubbleHeaderStyle}>
+        <strong style={{ color: COLORS.textPrimary, font: `600 13px/1 ${FONT_STACK}` }}>Agent 标注</strong>
+        <button type="button" aria-label="Close" onClick={onClose} style={markBubbleCloseStyle}>×</button>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+        {marks.map((mark) => (
+          <button key={mark.readKey} type="button" onClick={() => onOpen(mark)} style={markListRowStyle}>
+            <span style={{ ...markListKindDotStyle, background: mark.read ? COLORS.resolved : COLORS.agent }} />
+            <span style={{ flex: 1, minWidth: 0, textAlign: "left" }}>
+              <span style={markListTargetStyle}>{mark.anchored ? mark.targetLabel : "原位置已更新"}</span>
+              <span style={markListBodyStyle}>{mark.body}</span>
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function formatRelativeTime(iso: string): string {
+  const then = new Date(iso).getTime()
+  if (Number.isNaN(then)) return ""
+  const minutes = Math.floor((Date.now() - then) / 60000)
+  if (minutes < 1) return "刚刚"
+  if (minutes < 60) return `${minutes} 分钟前`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} 小时前`
+  return `${Math.floor(hours / 24)} 天前`
+}
+
+function loadReadTokens(sessionId: string | undefined, storage: AnnotationModeStorage | undefined): Set<string> {
+  if (!storage) return new Set()
+  try {
+    const raw = storage.getItem(agentMarkReadStorageKey(sessionId))
+    if (!raw) return new Set()
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? new Set(parsed.filter((token): token is string => typeof token === "string")) : new Set()
+  } catch {
+    return new Set()
+  }
+}
+
+function writeReadToken(sessionId: string | undefined, storage: AnnotationModeStorage | undefined, token: string): void {
+  if (!storage) return
+  try {
+    const tokens = loadReadTokens(sessionId, storage)
+    if (tokens.has(token)) return
+    tokens.add(token)
+    storage.setItem(agentMarkReadStorageKey(sessionId), JSON.stringify(Array.from(tokens)))
+  } catch {
+    // Best-effort: storage may be unavailable or full. Losing read state must never break rendering.
+  }
 }
 
 export function AnnotationMarker({ rect, tone = "human", variant = "selected", label, badge, children }: AnnotationMarkerProps) {
@@ -2470,6 +2834,87 @@ const layerStyle: React.CSSProperties = {
   inset: 0,
   pointerEvents: "none",
   zIndex: AGENT_LAYER_Z
+}
+
+// ── Agent-mark bubble / badge / list chrome (dark floating, matches the overlay) ────────
+const markBubbleShellStyle: React.CSSProperties = {
+  position: "fixed",
+  boxSizing: "border-box",
+  padding: 14,
+  borderRadius: 14,
+  background: COLORS.surfacePopover,
+  border: `1px solid ${COLORS.borderStrong}`,
+  boxShadow: "0 18px 48px rgba(0, 0, 0, 0.5)",
+  backdropFilter: "blur(12px)",
+  WebkitBackdropFilter: "blur(12px)",
+  pointerEvents: "auto",
+  zIndex: CARD_Z
+}
+
+const markBubbleHeaderStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8,
+  marginBottom: 8
+}
+
+const markBubbleAuthorDotStyle: React.CSSProperties = {
+  width: 8,
+  height: 8,
+  borderRadius: 999,
+  background: COLORS.agent,
+  flex: "0 0 auto"
+}
+
+const markBubbleCloseStyle: React.CSSProperties = {
+  border: "none",
+  background: "transparent",
+  color: COLORS.textMuted,
+  font: `400 18px/1 ${FONT_STACK}`,
+  cursor: "pointer",
+  padding: 0,
+  lineHeight: 1,
+  flex: "0 0 auto"
+}
+
+const markListRowStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "flex-start",
+  gap: 8,
+  width: "100%",
+  padding: "8px 6px",
+  border: "none",
+  borderRadius: 8,
+  background: "transparent",
+  cursor: "pointer",
+  textAlign: "left"
+}
+
+const markListKindDotStyle: React.CSSProperties = {
+  width: 8,
+  height: 8,
+  marginTop: 5,
+  borderRadius: 999,
+  flex: "0 0 auto"
+}
+
+const markListTargetStyle: React.CSSProperties = {
+  display: "block",
+  color: COLORS.textPrimary,
+  font: `500 12px/1.3 ${FONT_STACK}`,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap"
+}
+
+const markListBodyStyle: React.CSSProperties = {
+  display: "block",
+  color: COLORS.textMuted,
+  font: `400 12px/1.3 ${FONT_STACK}`,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap"
 }
 
 const REGION_HANDLES = ["nw", "ne", "sw", "se"] as const

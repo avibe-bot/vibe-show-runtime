@@ -62,7 +62,7 @@ export function annotationModeStorageKey(sessionId: string | undefined): string 
 /** Minimal storage surface so tests can inject a fake without a `Storage` instance. */
 export type AnnotationModeStorage = Pick<Storage, "getItem" | "setItem">
 
-function safeLocalStorage(): AnnotationModeStorage | undefined {
+export function safeLocalStorage(): AnnotationModeStorage | undefined {
   try {
     return globalThis.localStorage ?? undefined
   } catch {
