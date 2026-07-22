@@ -43,7 +43,9 @@ import {
   type ShowEventInput
 } from "./index.js"
 import {
+  APPROVE_INTENT,
   attachAnnotationWindowApi,
+  canSubmitAnnotation,
   connectAnnotationHostBridge,
   createAnnotationController,
   fetchAnnotationAccess,
@@ -180,6 +182,10 @@ export type AnnotationOverlayLabels = {
   byElements: string
   byArea: string
   enterToSend: string
+  /** Send-button label on the approve intent's one-tap fast path. */
+  approve: string
+  /** Affordance to reveal the optional note field on the approve fast path. */
+  addNote: string
 }
 
 export const DEFAULT_ANNOTATION_LABELS: AnnotationOverlayLabels = {
@@ -203,7 +209,9 @@ export const DEFAULT_ANNOTATION_LABELS: AnnotationOverlayLabels = {
   elementCount: (count) => `${count} 个元素`,
   byElements: "按元素",
   byArea: "按区域",
-  enterToSend: "Enter 发送 · Esc 取消"
+  enterToSend: "Enter 发送 · Esc 取消",
+  approve: "批准",
+  addNote: "添加备注"
 }
 
 export type AnnotationOverlayProps = {
@@ -758,6 +766,13 @@ export function AnnotationOverlay({
   const [selectedIntent, setSelectedIntent] = React.useState<ShowAnnotationIntent | string>(
     defaultIntent ?? intentOptions[0]?.intent ?? "comment"
   )
+  // On the approve fast path the comment box is hidden by default (one-tap approve); this reveals the
+  // optional note field. Reset whenever the intent changes so switching intents never strands it open.
+  const [noteExpanded, setNoteExpanded] = React.useState(false)
+  const selectIntent = React.useCallback((intent: string) => {
+    setSelectedIntent(intent)
+    setNoteExpanded(false)
+  }, [])
   const [hover, setHover] = React.useState<{ rect: MarkAnchorRect; label?: string } | null>(null)
   const [draft, setDraft] = React.useState<AnnotationDraft | null>(null)
   const [screenshotDraft, setScreenshotDraft] = React.useState<ScreenshotDraft | null>(null)
@@ -793,41 +808,17 @@ export function AnnotationOverlay({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resetScreenshotState is a stable local
   }, [enabled, mode, available])
 
-  // Lock page scrolling while framing a screenshot so a touch drag draws the region instead of
-  // scrolling the page; fully restored on exit / mode switch / disable (mobile screenshot fix, §7).
-  // TOUCH-ONLY: a mouse drag never scrolls the page, and locking body/html overflow on desktop would
-  // remove a classic scrollbar and reflow the page BEFORE the user frames — so the capture would differ
-  // from what they saw (#408). Gated on input capability, not layout.
-  React.useEffect(() => {
-    if (!active || mode !== "screenshot" || !touchInput || typeof document === "undefined") return
-    const body = document.body
-    const html = document.documentElement
-    const previous = {
-      bodyOverflow: body.style.overflow,
-      bodyOverscroll: body.style.overscrollBehavior,
-      htmlOverflow: html.style.overflow
-    }
-    body.style.overflow = "hidden"
-    body.style.overscrollBehavior = "contain"
-    html.style.overflow = "hidden"
-    // Deliberately NOT `body { touch-action: none }`: the comment sheet is portaled under <body>, so an
-    // ancestor-level lock would also kill touch panning inside a long batch card (reaching the textarea
-    // / older items). The drag surface owns its own `touch-action: none` (screenshotCaptureStyle) and
-    // this touchmove guard is SCOPED to it — so a region drag never scrolls the page, yet the card stays
-    // scrollable (#242). Page scroll is already pinned by the overflow:hidden above.
-    const blockCaptureTouchScroll = (event: TouchEvent) => {
-      if (event.target instanceof Element && event.target.closest("[data-show-annotation-capture]")) {
-        event.preventDefault()
-      }
-    }
-    document.addEventListener("touchmove", blockCaptureTouchScroll, { passive: false })
-    return () => {
-      body.style.overflow = previous.bodyOverflow
-      body.style.overscrollBehavior = previous.bodyOverscroll
-      html.style.overflow = previous.htmlOverflow
-      document.removeEventListener("touchmove", blockCaptureTouchScroll)
-    }
-  }, [active, mode, touchInput])
+  // Page-scroll locks (see usePageScrollLock), each released automatically when its condition clears.
+  //  • Screenshot framing — TOUCH-ONLY: a mouse drag never scrolls the page, and locking body/html
+  //    overflow on a classic-scrollbar desktop would reflow the page before the user frames, so the
+  //    capture would differ from what they saw (#408). The scoped touchmove guard cancels touch scroll
+  //    starting inside the capture surface so a region drag draws instead of scrolling (§7, #242).
+  usePageScrollLock(active && mode === "screenshot" && touchInput, "[data-show-annotation-capture]")
+  //  • Smart comment card open — ALL input types: the selection box uses viewport coords, so page
+  //    scroll under an open card drifts the highlight off the element. Released on card
+  //    close/submit/cancel/Esc/退出 (each clears `draft`). Submitted annotations leave no persistent
+  //    marker, so draft-time locking fully covers it — no follow-the-element tracking needed.
+  usePageScrollLock(active && Boolean(draft))
 
   React.useEffect(() => {
     if (!active || mode !== "smart" || draft) {
@@ -968,13 +959,16 @@ export function AnnotationOverlay({
   }, [active, draft, screenshotDraft, disable])
 
   async function submit() {
-    if (!draft || !comment.trim()) return
+    // Effective note text: empty when the comment box is hidden (approve fast path, no note expanded),
+    // so switching to approve after typing under another intent never submits stale, hidden text.
+    const text = selectedIntent === APPROVE_INTENT && !noteExpanded ? "" : comment
+    if (!draft || !canSubmitAnnotation(selectedIntent, text)) return
     const baseAnnotation: ShowAnnotation = {
       scope,
       intent: selectedIntent,
       severity,
       status: "pending",
-      comment: comment.trim(),
+      comment: text.trim(),
       dispatch: true,
       anchor: draft.anchor
     }
@@ -1159,6 +1153,10 @@ export function AnnotationOverlay({
 
   const ambiguous = draft?.selection?.classification.ambiguous
   const nextItemLabel = screenshotItemSequenceRef.current + 1
+  // Approve is a one-tap fast path: the comment box is hidden (submit allowed with empty text) unless
+  // the user opts into an optional note. Every other intent shows the box and requires non-empty text.
+  const isApprove = selectedIntent === APPROVE_INTENT
+  const commentVisible = !isApprove || noteExpanded
 
   return createPortal(
     <>
@@ -1203,11 +1201,11 @@ export function AnnotationOverlay({
             onClose={() => setDraft(null)}
             footer={
               <div style={cardFooterStyle}>
-                {/* No "Enter 发送 · Esc 取消" hint on touch devices: Enter is a newline and there's no Esc. */}
-                <span style={footerHintStyle}>{touchInput ? "" : copy.enterToSend}</span>
-                <button type="button" disabled={submitting || !comment.trim()} onClick={() => void submit()} style={primaryButtonStyle}>
-                  <SendIcon />
-                  {submitting ? "…" : copy.send}
+                {/* Hint only when the comment box is shown and Enter-to-send applies (hardware keyboard). */}
+                <span style={footerHintStyle}>{commentVisible && !touchInput ? copy.enterToSend : ""}</span>
+                <button type="button" disabled={submitting || !canSubmitAnnotation(selectedIntent, comment)} onClick={() => void submit()} style={primaryButtonStyle}>
+                  {isApprove ? <IntentIcon intent={APPROVE_INTENT} /> : <SendIcon />}
+                  {submitting ? "…" : isApprove ? copy.approve : copy.send}
                 </button>
               </div>
             }
@@ -1225,23 +1223,30 @@ export function AnnotationOverlay({
                 }}>{copy.byArea}</button>
               </div>
             ) : null}
-            <IntentChips options={intentOptions} value={selectedIntent} onChange={setSelectedIntent} />
-            <textarea
-              autoFocus
-              placeholder={copy.commentPlaceholder}
-              value={comment}
-              onChange={(event) => setComment(event.target.value)}
-              onKeyDown={(event) => {
-                // Enter sends when a hardware keyboard is present (Shift+Enter for a newline); a
-                // touch device keeps Enter as a newline. Keyed on input capability, not layout, so a
-                // narrow desktop window in the sheet layout still submits on Enter.
-                if (event.key === "Enter" && !event.shiftKey && !touchInput) {
-                  event.preventDefault()
-                  void submit()
-                }
-              }}
-              style={overlayTextareaStyle}
-            />
+            <IntentChips options={intentOptions} value={selectedIntent} onChange={selectIntent} />
+            {commentVisible ? (
+              <textarea
+                autoFocus
+                placeholder={copy.commentPlaceholder}
+                value={comment}
+                onChange={(event) => setComment(event.target.value)}
+                onKeyDown={(event) => {
+                  // Enter sends when a hardware keyboard is present (Shift+Enter for a newline); a
+                  // touch device keeps Enter as a newline. Keyed on input capability, not layout, so a
+                  // narrow desktop window in the sheet layout still submits on Enter.
+                  if (event.key === "Enter" && !event.shiftKey && !touchInput) {
+                    event.preventDefault()
+                    void submit()
+                  }
+                }}
+                style={overlayTextareaStyle}
+              />
+            ) : (
+              // Approve fast path: box hidden by default; offer a minimal opt-in to add a note.
+              <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => setNoteExpanded(true)} style={addNoteButtonStyle}>
+                + {copy.addNote}
+              </button>
+            )}
             {error ? <p role="alert" style={overlayErrorStyle}>{error}</p> : null}
           </CommentSurface>
         </>
@@ -1377,7 +1382,10 @@ function IntentChips({ options, value, onChange }: { options: AnnotationIntentOp
       {options.map((option) => {
         const selected = option.intent === value
         return (
-          <button key={option.intent} type="button" aria-pressed={selected} onClick={() => onChange(option.intent)} style={selected ? intentChipActiveStyle : intentChipStyle}>
+          // onMouseDown preventDefault: don't take focus on a mouse press, so a clicked-then-unselected
+          // chip shows no lingering focus ring (renders identical to its siblings). Keyboard Tab focus
+          // is unaffected, so the ring still shows for keyboard users.
+          <button key={option.intent} type="button" aria-pressed={selected} onMouseDown={(event) => event.preventDefault()} onClick={() => onChange(option.intent)} style={selected ? intentChipActiveStyle : intentChipStyle}>
             <IntentIcon intent={option.intent} />
             {option.label}
           </button>
@@ -1579,6 +1587,45 @@ function useMediaQuery(query: string) {
 function matchMediaQuery(query: string) {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false
   return window.matchMedia(query).matches
+}
+
+/**
+ * Lock page scrolling (body/html `overflow: hidden` + `overscroll-behavior: contain`) while `active`,
+ * restoring the prior inline values on release. When `touchGuardSelector` is given, also cancel touch
+ * scrolling that originates inside a matching element (the screenshot drag surface) so a drag draws
+ * instead of scrolling — scoped, so a portaled card elsewhere stays scrollable (#242). Never sets
+ * `touch-action` on <body> for the same reason. Used for both the screenshot-framing lock (touch-only)
+ * and the smart comment-card lock (all input types); the gating lives at each call site.
+ */
+function usePageScrollLock(active: boolean, touchGuardSelector?: string) {
+  React.useEffect(() => {
+    if (!active || typeof document === "undefined") return
+    const body = document.body
+    const html = document.documentElement
+    const previous = {
+      bodyOverflow: body.style.overflow,
+      bodyOverscroll: body.style.overscrollBehavior,
+      htmlOverflow: html.style.overflow
+    }
+    body.style.overflow = "hidden"
+    body.style.overscrollBehavior = "contain"
+    html.style.overflow = "hidden"
+    let blockTouchScroll: ((event: TouchEvent) => void) | undefined
+    if (touchGuardSelector) {
+      blockTouchScroll = (event: TouchEvent) => {
+        if (event.target instanceof Element && event.target.closest(touchGuardSelector)) {
+          event.preventDefault()
+        }
+      }
+      document.addEventListener("touchmove", blockTouchScroll, { passive: false })
+    }
+    return () => {
+      body.style.overflow = previous.bodyOverflow
+      body.style.overscrollBehavior = previous.bodyOverscroll
+      html.style.overflow = previous.htmlOverflow
+      if (blockTouchScroll) document.removeEventListener("touchmove", blockTouchScroll)
+    }
+  }, [active, touchGuardSelector])
 }
 
 export function AgentMarkLayer({ events, scope, className, renderMark }: AgentMarkLayerProps) {
@@ -2002,6 +2049,17 @@ const ghostButtonStyle: React.CSSProperties = {
   color: COLORS.textPrimary,
   background: "transparent",
   borderColor: COLORS.border
+}
+
+// Minimal opt-in to add a note on the approve fast path — a quiet text affordance, not a full control.
+const addNoteButtonStyle: React.CSSProperties = {
+  alignSelf: "flex-start",
+  padding: "2px 0",
+  border: "none",
+  background: "transparent",
+  color: COLORS.textMuted,
+  font: `500 12px/1 ${FONT_STACK}`,
+  cursor: "pointer"
 }
 
 // Intent chips (评论/修改/疑问/批准).

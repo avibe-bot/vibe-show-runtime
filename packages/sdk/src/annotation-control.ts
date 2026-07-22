@@ -168,6 +168,18 @@ export function isBatchControlNewer(controlAt: string | undefined, lastCommandAt
   return lastCommandAt === undefined || controlAt > lastCommandAt
 }
 
+/** The one intent that submits with no comment text — a one-tap approval. */
+export const APPROVE_INTENT = "approve"
+
+/**
+ * Whether an annotation draft may be submitted: the `approve` intent is a zero-text fast path (an
+ * empty comment is a valid one-tap approval), every other intent requires non-empty comment text.
+ * Shared by the send button's disabled state and `submit()` so the gate can never drift between them.
+ */
+export function canSubmitAnnotation(intent: string, text: string): boolean {
+  return intent === APPROVE_INTENT || text.trim().length > 0
+}
+
 export function annotationControlActionFromMessage(data: unknown): AnnotationControlAction | undefined {
   if (!data || typeof data !== "object") return undefined
   const message = data as { type?: unknown; action?: unknown; mode?: unknown }
