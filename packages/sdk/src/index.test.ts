@@ -51,6 +51,65 @@ function markEvent(opts: {
   } as unknown as ShowEvent
 }
 
+// REAL on-wire assistant.mark.* shape from the live Lane A2 backend: mark fields live in `payload`
+// (NOT a top-level `mark`), plain notes have NO `replyTo` key, and `anchor` is often the empty {} with
+// the selector carried in `target`. This is the production shape the earlier `mark`-shaped mocks hid.
+function payloadMarkEvent(opts: {
+  target: string
+  createdAt: string
+  type?: "assistant.mark.created" | "assistant.mark.updated" | "assistant.mark.resolved"
+  scope?: string
+  body?: string
+  markId?: string
+  replyTo?: string
+  anchor?: unknown
+}): ShowEvent {
+  const type = opts.type ?? "assistant.mark.created"
+  return {
+    id: `evt_${opts.target}_${opts.createdAt}`,
+    type,
+    payload: {
+      id: opts.markId ?? "m",
+      role: "assistant",
+      scope: opts.scope ?? "default",
+      target: opts.target,
+      body: opts.body ?? "",
+      status: type === "assistant.mark.resolved" ? "resolved" : "active",
+      createdAt: opts.createdAt,
+      updatedAt: opts.createdAt,
+      resolvedAt: type === "assistant.mark.resolved" ? opts.createdAt : undefined,
+      ...(opts.replyTo ? { replyTo: opts.replyTo } : {}) // plain notes omit replyTo entirely
+    },
+    anchor: opts.anchor ?? {}, // often empty on the wire — target carries the selector
+    createdAt: opts.createdAt
+  } as unknown as ShowEvent
+}
+
+describe("real on-wire payload shape (Lane A2 integration, R5)", () => {
+  const T = (n: number) => `2026-07-23T03:00:0${n}.000Z`
+
+  it("reduces a mixed payload-shaped stream (reply + note + resolved, notes without replyTo) without throwing", () => {
+    const events = [
+      payloadMarkEvent({ target: "#card", body: "note A", markId: "m1", createdAt: T(1) }), // note — NO replyTo
+      payloadMarkEvent({ target: "ann-target", body: "reply", markId: "m2", replyTo: "evt_ann", createdAt: T(2) }),
+      payloadMarkEvent({ target: "#card", type: "assistant.mark.resolved", markId: "m1", createdAt: T(3) })
+    ]
+    const reduced = reduceAgentMarkEvents(events) // must NOT throw on notes lacking replyTo / payload shape
+    expect(reduced).toHaveLength(2)
+    const note = reduced.find((r) => r.identity === "note:default:#card")
+    expect(note?.kind).toBe("note")
+    expect(note?.resolvedByEvent).toBe(true) // resolve (m1) retires the note version
+    const reply = reduced.find((r) => r.identity === "reply:evt_ann")
+    expect(reply?.kind).toBe("reply")
+    expect(reply?.mark.body).toBe("reply") // reduced.mark exposes the extracted payload
+  })
+
+  it("resolves a payload-shaped anchorless note through its target, tolerating an empty anchor", () => {
+    const event = payloadMarkEvent({ target: "#revenue-card", body: "note", createdAt: T(1) }) // anchor {}
+    expect(resolveAgentMarkAnchor(event as never, [])).toMatchObject({ kind: "element", selector: "#revenue-card" })
+  })
+})
+
 describe("show annotation event contract", () => {
   it("preserves both user region and matched elements for element-group annotations", () => {
     const matchedElements: ShowAnchor[] = [
