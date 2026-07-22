@@ -182,13 +182,17 @@ export type AnnotationOverlayLabels = {
   byElements: string
   byArea: string
   enterToSend: string
+  // Optional so adding them is not a breaking change to the exported label type — hosts with a full
+  // localization object keep compiling; the runtime always fills them from the (complete) defaults.
   /** Send-button label on the approve intent's one-tap fast path. */
-  approve: string
+  approve?: string
   /** Affordance to reveal the optional note field on the approve fast path. */
-  addNote: string
+  addNote?: string
 }
 
-export const DEFAULT_ANNOTATION_LABELS: AnnotationOverlayLabels = {
+// Required<> so the built-in defaults must stay complete (every field, incl. the optional ones)
+// even though the public/override type marks the newest fields optional.
+export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   smart: "Smart",
   screenshot: "截图",
   exit: "Esc 退出",
@@ -734,6 +738,10 @@ export function AnnotationOverlay({
     // If a host localized `exit` but not `exitShort`, use their `exit` on touch too (avoid mixed
     // languages after upgrade); fall back to the built-in short label only when neither is provided.
     merged.exitShort = labels?.exitShort ?? labels?.exit ?? DEFAULT_ANNOTATION_LABELS.exitShort
+    // The optional approve-path labels always resolve to a string (a host may omit them, or pass
+    // undefined in a Partial), so the buttons never render blank.
+    merged.approve = labels?.approve ?? DEFAULT_ANNOTATION_LABELS.approve
+    merged.addNote = labels?.addNote ?? DEFAULT_ANNOTATION_LABELS.addNote
     return merged
   }, [labels])
   const intentOptions = intents ?? DEFAULT_ANNOTATION_INTENTS
@@ -767,12 +775,16 @@ export function AnnotationOverlay({
     defaultIntent ?? intentOptions[0]?.intent ?? "comment"
   )
   // On the approve fast path the comment box is hidden by default (one-tap approve); this reveals the
-  // optional note field. Reset whenever the intent changes so switching intents never strands it open.
+  // optional note field. Reset only when the intent actually CHANGES — re-clicking the already-active
+  // chip must not collapse an open note (which would then be submitted as empty text, #725).
   const [noteExpanded, setNoteExpanded] = React.useState(false)
   const selectIntent = React.useCallback((intent: string) => {
+    if (intent === selectedIntent) return
     setSelectedIntent(intent)
     setNoteExpanded(false)
-  }, [])
+  }, [selectedIntent])
+  // Focus target for the collapsed approve card (no textarea to autofocus) — keeps focus in the overlay.
+  const approveSendRef = React.useRef<HTMLButtonElement | null>(null)
   const [hover, setHover] = React.useState<{ rect: MarkAnchorRect; label?: string } | null>(null)
   const [draft, setDraft] = React.useState<AnnotationDraft | null>(null)
   const [screenshotDraft, setScreenshotDraft] = React.useState<ScreenshotDraft | null>(null)
@@ -819,6 +831,14 @@ export function AnnotationOverlay({
   //    close/submit/cancel/Esc/退出 (each clears `draft`). Submitted annotations leave no persistent
   //    marker, so draft-time locking fully covers it — no follow-the-element tracking needed.
   usePageScrollLock(active && Boolean(draft))
+
+  // Collapsed approve card has no textarea to autofocus; focus the primary (批准) button so keyboard
+  // stays inside the overlay — CommentSurface only guards keys that originate inside the card (#732).
+  React.useEffect(() => {
+    if (Boolean(draft) && selectedIntent === APPROVE_INTENT && !noteExpanded) {
+      approveSendRef.current?.focus()
+    }
+  }, [draft, selectedIntent, noteExpanded])
 
   React.useEffect(() => {
     if (!active || mode !== "smart" || draft) {
@@ -1203,7 +1223,7 @@ export function AnnotationOverlay({
               <div style={cardFooterStyle}>
                 {/* Hint only when the comment box is shown and Enter-to-send applies (hardware keyboard). */}
                 <span style={footerHintStyle}>{commentVisible && !touchInput ? copy.enterToSend : ""}</span>
-                <button type="button" disabled={submitting || !canSubmitAnnotation(selectedIntent, comment)} onClick={() => void submit()} style={primaryButtonStyle}>
+                <button ref={approveSendRef} type="button" disabled={submitting || !canSubmitAnnotation(selectedIntent, comment)} onClick={() => void submit()} style={primaryButtonStyle}>
                   {isApprove ? <IntentIcon intent={APPROVE_INTENT} /> : <SendIcon />}
                   {submitting ? "…" : isApprove ? copy.approve : copy.send}
                 </button>
@@ -1605,7 +1625,17 @@ function usePageScrollLock(active: boolean, touchGuardSelector?: string) {
     const previous = {
       bodyOverflow: body.style.overflow,
       bodyOverscroll: body.style.overscrollBehavior,
+      bodyPaddingRight: body.style.paddingRight,
       htmlOverflow: html.style.overflow
+    }
+    // Compensate the vertical scrollbar width with body padding BEFORE hiding overflow: removing a
+    // classic (non-overlay) scrollbar would otherwise shrink the content box and reflow the page,
+    // drifting the viewport-anchored marker/card off the just-selected element (#720). Overlay
+    // scrollbars report 0 width → no padding added (no-op, e.g. the touch screenshot path).
+    const scrollbarWidth = window.innerWidth - html.clientWidth
+    if (scrollbarWidth > 0) {
+      const currentPaddingRight = parseFloat(window.getComputedStyle(body).paddingRight) || 0
+      body.style.paddingRight = `${currentPaddingRight + scrollbarWidth}px`
     }
     body.style.overflow = "hidden"
     body.style.overscrollBehavior = "contain"
@@ -1622,6 +1652,7 @@ function usePageScrollLock(active: boolean, touchGuardSelector?: string) {
     return () => {
       body.style.overflow = previous.bodyOverflow
       body.style.overscrollBehavior = previous.bodyOverscroll
+      body.style.paddingRight = previous.bodyPaddingRight
       html.style.overflow = previous.htmlOverflow
       if (blockTouchScroll) document.removeEventListener("touchmove", blockTouchScroll)
     }
