@@ -20,6 +20,9 @@ import {
   normalizeAgentMarkEvent,
   agentMarkOf,
   eventOccurredAt,
+  normalizeShowEvent,
+  submitShowEvent,
+  reconcileReadReceipt,
   type ShowAnchor,
   type ShowEvent
 } from "./index.js"
@@ -304,6 +307,52 @@ describe("reduce timestamp/version precision (Lane R6)", () => {
     // A truly-canonical event (createdAt already the occurrence) is still a no-op fast path.
     const canonical = normalizeAgentMarkEvent(older)
     expect(canonical).toBe(older)
+  })
+})
+
+describe("read-receipt versioning + optimistic rollback (Lane R7)", () => {
+  // The stored mark exactly as it arrives on the wire (real values from the golden fixture).
+  const storedMark = agentMarkOf(GOLDEN_MARK_EVENTS[0])!
+
+  it("a resolve receipt echoes the stored updatedAt verbatim — it must not bump the version (#R7 fix1)", () => {
+    expect(storedMark.updatedAt).toBe("2026-07-22T19:24:36.452502+00:00") // birth time, as stored
+    const receipt = normalizeShowEvent({ type: "assistant.mark.resolved", mark: storedMark }, "sess") as Extract<ShowEvent, { type: "assistant.mark.resolved" }>
+    // updatedAt is the backend's optimistic-concurrency token — echoed, NOT rewritten to now.
+    expect(receipt.mark.updatedAt).toBe(storedMark.updatedAt)
+    expect(receipt.mark.createdAt).toBe(storedMark.createdAt) // createdAt unchanged too
+    expect(receipt.mark.status).toBe("resolved") // only status flips …
+    expect(typeof receipt.mark.resolvedAt).toBe("string") // … and resolvedAt is set (the receipt time)
+  })
+
+  it("a genuine update still advances updatedAt (only a receipt echoes)", () => {
+    const updated = normalizeShowEvent({ type: "assistant.mark.updated", mark: storedMark }, "sess") as Extract<ShowEvent, { type: "assistant.mark.updated" }>
+    expect(updated.mark.updatedAt).not.toBe(storedMark.updatedAt) // an update bumps the version
+  })
+
+  it("optimistic read is rolled back to UNREAD when the receipt is rejected (#R7 fix2)", () => {
+    const base = new Set<string>(["already-read"])
+    const afterRead = reconcileReadReceipt(base, "k1", "read")
+    expect(afterRead.has("k1")).toBe(true) // optimistic: marked read immediately
+    const afterReject = reconcileReadReceipt(afterRead, "k1", "rollback")
+    expect(afterReject.has("k1")).toBe(false) // version conflict ⇒ back to unread for retry
+    expect(afterReject.has("already-read")).toBe(true) // unrelated read-state untouched
+  })
+
+  it("rollback is a same-ref no-op when the key isn't in the set (idempotent)", () => {
+    const base = new Set<string>(["x"])
+    expect(reconcileReadReceipt(base, "absent", "rollback")).toBe(base)
+    expect(reconcileReadReceipt(base, "x", "read")).toBe(base) // already read ⇒ same ref
+  })
+
+  it("submitShowEvent rejects on a non-2xx receipt so the caller can roll back (mark_version_conflict)", async () => {
+    const conflict = { ok: false, status: 400, statusText: "Bad Request", json: async () => ({ code: "mark_version_conflict" }) }
+    const fetchImpl = (async () => conflict) as unknown as typeof fetch
+    await expect(
+      submitShowEvent(
+        { type: "assistant.mark.resolved", mark: storedMark },
+        { fetch: fetchImpl, writeToken: "tok", sessionId: "sess", basePath: "http://test.local/" }
+      )
+    ).rejects.toThrow()
   })
 })
 

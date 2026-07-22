@@ -685,7 +685,11 @@ export function assistantMarkEvent(
     body: mark.body.trim(),
     status: type === "assistant.mark.resolved" ? "resolved" : mark.status ?? "active",
     createdAt,
-    updatedAt: type === "assistant.mark.created" ? mark.updatedAt || createdAt : occurredAt,
+    // A `resolved` event is a READ RECEIPT: it REFERENCES the mark, it must not modify it. Echo the
+    // stored `updatedAt` verbatim — it is the backend's optimistic-concurrency version token, so
+    // rewriting it to now triggers `mark_version_conflict`. Only a genuine `updated` advances it;
+    // `created` seeds it from the birth time. (createdAt is already echoed above.)
+    updatedAt: type === "assistant.mark.updated" ? occurredAt : mark.updatedAt || createdAt,
     resolvedAt: type === "assistant.mark.resolved" ? occurredAt : mark.resolvedAt
   }
   return {
@@ -896,6 +900,27 @@ export const AGENT_MARK_READ_STORAGE_PREFIX = "avibe:mark-read:"
 
 export function agentMarkReadStorageKey(sessionId: string | undefined): string {
   return `${AGENT_MARK_READ_STORAGE_PREFIX}${sessionId ?? "default"}`
+}
+
+/**
+ * Read-state transition for an event-backed read receipt. The receipt POST is OPTIMISTIC: mark the
+ * version read immediately (`"read"`), then ROLL BACK (`"rollback"`) if the backend rejects it (non-2xx,
+ * e.g. `mark_version_conflict`) so the overlay never persists a read-state the server didn't accept —
+ * otherwise the badge diverges from cross-device truth. Pure + idempotent (returns the SAME set when
+ * already in the target state) so the optimistic/rollback pair is unit-testable without a DOM harness.
+ */
+export function reconcileReadReceipt(current: ReadonlySet<string>, readKey: string, phase: "read" | "rollback"): ReadonlySet<string> {
+  const present = current.has(readKey)
+  if (phase === "rollback") {
+    if (!present) return current
+    const next = new Set(current)
+    next.delete(readKey)
+    return next
+  }
+  if (present) return current
+  const next = new Set(current)
+  next.add(readKey)
+  return next
 }
 
 /** Cheap, stable non-cryptographic hash (djb2) — used to detect attribute-note text changes. */

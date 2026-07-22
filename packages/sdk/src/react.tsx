@@ -12,6 +12,7 @@ import {
   reduceAgentMarkEvents,
   partitionAgentMarks,
   attributeNoteReadToken,
+  reconcileReadReceipt,
   agentMarkReadStorageKey,
   agentMarkOf,
   normalizeAgentMarkEvent,
@@ -1868,7 +1869,7 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
 
   const markRead = React.useCallback((candidate: ResolvedMarkCandidate) => {
     if (readInView.has(candidate.readKey)) return
-    setReadInView((prev) => new Set(prev).add(candidate.readKey))
+    setReadInView((prev) => reconcileReadReceipt(prev, candidate.readKey, "read"))
     if (candidate.kind === "attribute-note" || !canPost) {
       // Declarative note (no event identity) or anonymous viewer (cannot POST) ⇒ localStorage only.
       writeReadToken(sessionId, storage, candidate.readKey)
@@ -1877,12 +1878,16 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
       // Empty message content ⇒ metadata-only: the runtime's recordShowEvent skips empty content, so
       // opening a bubble never re-appends the answer to chat history (#61). The bubble reads the mark
       // body directly, so the answer is still shown. Uses the normalized mark (shape-agnostic, R5).
-      void context?.submitEvent({
+      const submit = context?.submitEvent({
         type: "assistant.mark.resolved",
         mark: candidate.mark,
         anchor: candidate.event?.anchor,
         message: { role: "assistant", content: "" }
       })
+      // Optimistic read-state is only durable once the backend ACCEPTS the receipt. If the POST fails
+      // (non-2xx — e.g. `mark_version_conflict`), ROLL BACK to unread so the badge is honest and the user
+      // can retry; never persist a read-state the backend rejected (cross-device divergence otherwise).
+      void submit?.catch(() => setReadInView((prev) => reconcileReadReceipt(prev, candidate.readKey, "rollback")))
     }
   }, [readInView, canPost, sessionId, storage, context])
 
