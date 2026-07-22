@@ -120,6 +120,16 @@ describe("real on-wire payload shape (Lane A2 integration, R5)", () => {
     expect(normalized.mark.body).toBe("b")
   })
 
+  it("synthesizes the required message so renderMark callbacks reading event.message.content never throw (#3633478191)", () => {
+    const event = payloadMarkEvent({ target: "#c", body: "本区块已过时", markId: "m1", createdAt: T(1) })
+    expect((event as { message?: unknown }).message).toBeUndefined() // on-wire payload event carries no message
+    const normalized = normalizeAgentMarkEvent(event)
+    // A custom renderer that reads event.message.content (per the AssistantMarkEvent contract) is now safe.
+    expect(() => normalized.message.content.length).not.toThrow()
+    expect(normalized.message.role).toBe("assistant")
+    expect(normalized.message.content).toContain("本区块已过时")
+  })
+
   it("the reducer returns a mark-shaped event even from a payload-shaped stream (#275)", () => {
     const reduced = reduceAgentMarkEvents([payloadMarkEvent({ target: "#c", body: "b", markId: "m1", createdAt: T(1) })])
     expect(reduced[0].event.mark.body).toBe("b") // reduced.event.mark is populated, not undefined

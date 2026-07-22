@@ -738,15 +738,24 @@ function isUsableAnchor(anchor: ShowAnchor | undefined): boolean {
 
 /**
  * Normalize an `assistant.mark.*` event to the canonical `mark`-shaped `AssistantMarkEvent` — copying
- * the mark from the on-wire `payload` onto `.mark` when needed — so EVERY downstream consumer
- * (the reducer's returned event, custom `renderMark` callbacks, transcript formatting) can read
- * `event.mark` regardless of the source shape. The single normalization chokepoint for the payload/mark
- * variance; a no-op for already-`mark`-shaped events.
+ * the mark from the on-wire `payload` onto `.mark` AND synthesizing the required `message` when the
+ * on-wire event omits it — so EVERY downstream consumer (the reducer's returned event, custom
+ * `renderMark` callbacks that read `event.message.content`, transcript formatting) can read a complete
+ * `AssistantMarkEvent` regardless of the source shape. The single normalization chokepoint for the
+ * payload/mark variance; a no-op for already-canonical (`mark`-shaped WITH a message) events.
  */
 export function normalizeAgentMarkEvent(event: ShowEvent): AssistantMarkEvent {
   const mark = agentMarkOf(event)
-  if (!mark || (event as { mark?: AgentMark }).mark === mark) return event as AssistantMarkEvent
-  return { ...(event as AssistantMarkEvent), mark: mark as Required<AgentMark> }
+  const record = event as { mark?: AgentMark; message?: AssistantMarkEvent["message"] }
+  if (!mark || (record.mark === mark && record.message)) return event as AssistantMarkEvent
+  const canonical = event as AssistantMarkEvent
+  return {
+    ...canonical,
+    mark: mark as Required<AgentMark>,
+    // The live backend's payload-shaped mark events carry no `message`; synthesize it from the mark
+    // (mirroring `assistantMarkEvent`) so renderers reading `event.message.content` never throw (#3633478191).
+    message: record.message ?? { role: "assistant", content: formatAgentMarkMessage(mark as Required<AgentMark>, canonical.anchor) }
+  }
 }
 
 export type ReducedAgentMark = {
