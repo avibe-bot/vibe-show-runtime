@@ -5,6 +5,7 @@ export const DEFAULT_SHOW_ME_PATH = "__show/me"
 // Every overlay write carries the write token on BOTH surfaces (contract §5 v2): the injected
 // session token on private pages, the share-scoped token from `__show/me` on public pages.
 export const SHOW_EVENT_WRITE_TOKEN_HEADER = "X-Vibe-Show-Token"
+export * from "./local-decisions.js"
 
 export type ShowActor = "human" | "assistant" | "system"
 export type MarkRole = "human" | "assistant"

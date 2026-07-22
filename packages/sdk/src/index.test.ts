@@ -4,6 +4,8 @@ import {
   captureScreenshotRegion,
   classifyAreaSelection,
   collectElementsInArea,
+  createLocalDecisionStore,
+  DEFAULT_LOCAL_DECISIONS_STORAGE_KEY,
   formatShowEventMessage,
   humanAnnotationEvent,
   screenshotPointFromViewport,
@@ -141,6 +143,107 @@ describe("show annotation event contract", () => {
     expect(message).toContain("2. This empty area looks accidental.")
   })
 })
+
+describe("local decision store", () => {
+  it("persists decisions to local storage and exports stable JSON", () => {
+    const storage = new MemoryStorage()
+    const store = createLocalDecisionStore({
+      storage,
+      now: () => "2026-06-06T10:00:00.000Z"
+    })
+
+    store.saveDecision({
+      id: "hero-copy",
+      label: "Hero copy",
+      value: "Use a focused product headline."
+    })
+    store.saveDecision({
+      id: "theme",
+      label: "Theme",
+      value: { preset: "zinc" },
+      scope: "visual"
+    })
+
+    expect(store.loadSnapshot()).toEqual({
+      version: 1,
+      updatedAt: "2026-06-06T10:00:00.000Z",
+      decisions: [
+        {
+          id: "hero-copy",
+          label: "Hero copy",
+          value: "Use a focused product headline.",
+          createdAt: "2026-06-06T10:00:00.000Z",
+          updatedAt: "2026-06-06T10:00:00.000Z"
+        },
+        {
+          id: "theme",
+          label: "Theme",
+          scope: "visual",
+          value: { preset: "zinc" },
+          createdAt: "2026-06-06T10:00:00.000Z",
+          updatedAt: "2026-06-06T10:00:00.000Z"
+        }
+      ]
+    })
+
+    const parsed = JSON.parse(storage.getItem(DEFAULT_LOCAL_DECISIONS_STORAGE_KEY) || "{}")
+    expect(parsed.decisions).toHaveLength(2)
+    expect(store.exportDecisionsJson()).toBe(JSON.stringify(store.loadSnapshot(), null, 2))
+  })
+
+  it("updates an existing decision without duplicating it", () => {
+    const storage = new MemoryStorage()
+    const store = createLocalDecisionStore({
+      storage,
+      now: () => "2026-06-06T10:00:00.000Z"
+    })
+
+    store.saveDecision({ id: "cta", label: "CTA", value: "Start" })
+    const laterStore = createLocalDecisionStore({
+      storage,
+      now: () => "2026-06-06T10:05:00.000Z"
+    })
+    laterStore.saveDecision({ id: "cta", label: "CTA", value: "Copy JSON" })
+
+    expect(laterStore.loadSnapshot().decisions).toEqual([
+      {
+        id: "cta",
+        label: "CTA",
+        value: "Copy JSON",
+        createdAt: "2026-06-06T10:00:00.000Z",
+        updatedAt: "2026-06-06T10:05:00.000Z"
+      }
+    ])
+  })
+})
+
+class MemoryStorage implements Storage {
+  private items = new Map<string, string>()
+
+  get length() {
+    return this.items.size
+  }
+
+  clear() {
+    this.items.clear()
+  }
+
+  getItem(key: string) {
+    return this.items.get(key) ?? null
+  }
+
+  key(index: number) {
+    return Array.from(this.items.keys())[index] ?? null
+  }
+
+  removeItem(key: string) {
+    this.items.delete(key)
+  }
+
+  setItem(key: string, value: string) {
+    this.items.set(key, value)
+  }
+}
 
 class FakeDocument {}
 
