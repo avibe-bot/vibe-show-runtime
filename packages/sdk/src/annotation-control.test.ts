@@ -3,6 +3,8 @@ import {
   ANNOTATION_CONTROL_MESSAGE,
   ANNOTATION_QUERY_MESSAGE,
   ANNOTATION_STATE_MESSAGE,
+  APPROVE_INTENT,
+  canSubmitAnnotation,
   resolveWriteToken,
   annotationControlActionFromEvent,
   annotationControlActionFromMessage,
@@ -319,6 +321,22 @@ describe("initial-batch control ordering (isBatchControlNewer, round 4)", () => 
   it("never applies an undated batch control", () => {
     expect(isBatchControlNewer(undefined, undefined)).toBe(false)
     expect(isBatchControlNewer(undefined, T2)).toBe(false)
+  })
+})
+
+describe("annotation submit gating (canSubmitAnnotation, round 3 approve fast path)", () => {
+  it("allows the approve intent to submit with empty / whitespace-only text (one-tap approve)", () => {
+    expect(canSubmitAnnotation(APPROVE_INTENT, "")).toBe(true)
+    expect(canSubmitAnnotation(APPROVE_INTENT, "   ")).toBe(true)
+    expect(canSubmitAnnotation(APPROVE_INTENT, "looks good")).toBe(true) // an optional note is fine too
+  })
+
+  it("requires non-empty text for every other intent", () => {
+    for (const intent of ["comment", "change", "question"]) {
+      expect(canSubmitAnnotation(intent, "")).toBe(false)
+      expect(canSubmitAnnotation(intent, "   ")).toBe(false) // whitespace-only is not enough
+      expect(canSubmitAnnotation(intent, "needs work")).toBe(true)
+    }
   })
 })
 
