@@ -13,6 +13,8 @@ import {
   partitionAgentMarks,
   attributeNoteReadToken,
   agentMarkReadStorageKey,
+  agentMarkOf,
+  normalizeAgentMarkEvent,
   AGENT_NOTE_ATTRIBUTE,
   isMarkAnchored,
   resolveAgentMarkAnchor,
@@ -1697,18 +1699,22 @@ function LegacyAgentMarkLayer({ events, scope, className, renderMark }: AgentMar
   const marks = React.useMemo(() => {
     void tick
     if (typeof document === "undefined") return []
-    const latestByMark = new Map<string, AssistantMarkLayerEvent>()
+    // Shape-tolerant + null-safe like the default path: read the mark via agentMarkOf (event.mark OR
+    // the on-wire payload) and resolve anchors through resolveAgentMarkAnchor (R5).
+    const latestByMark = new Map<string, { event: AssistantMarkLayerEvent; mark: AgentMark }>()
     for (const event of sourceEvents) {
       if (!event.type.startsWith("assistant.mark.")) continue
-      const markEvent = event as AssistantMarkLayerEvent
-      if (scope && markAttributeName(markEvent.mark.scope) !== markAttributeName(scope)) continue
-      latestByMark.set(`${markEvent.mark.scope}:${markEvent.mark.id}`, markEvent)
+      const mark = agentMarkOf(event)
+      if (!mark) continue
+      if (scope && markAttributeName(mark.scope) !== markAttributeName(scope)) continue
+      latestByMark.set(`${mark.scope}:${mark.id}`, { event: event as AssistantMarkLayerEvent, mark })
     }
     return Array.from(latestByMark.values())
-      .map((event) => {
-        const resolved = resolveAnchor(event.anchor ?? { kind: "element", selector: event.mark.target, scope: event.mark.scope }, document)
-        if (!resolved.rect) return undefined
-        return { event, rect: resolved.rect, hidden: event.type === "assistant.mark.resolved" || event.mark.status === "resolved" }
+      .map(({ event, mark }) => {
+        const anchor = resolveAgentMarkAnchor(event, sourceEvents)
+        const resolved = anchor ? resolveAnchor(anchor, document) : undefined
+        if (!resolved?.rect) return undefined
+        return { event, rect: resolved.rect, hidden: event.type === "assistant.mark.resolved" || mark.status === "resolved" }
       })
       .filter((item): item is { event: AssistantMarkLayerEvent; rect: MarkAnchorRect; hidden: boolean } => item !== undefined && !item.hidden)
   }, [scope, sourceEvents, tick])
@@ -1717,7 +1723,9 @@ function LegacyAgentMarkLayer({ events, scope, className, renderMark }: AgentMar
   return createPortal(
     <div className={className} data-show-agent-mark-layer="" style={layerStyle}>
       {marks.map(({ event, rect }) => (
-        <React.Fragment key={event.id}>{renderMark(event, rect)}</React.Fragment>
+        // Hand the custom renderer a canonical mark-shaped event so renderers reading event.mark don't
+        // throw on a payload-shaped live event (#282).
+        <React.Fragment key={event.id}>{renderMark(normalizeAgentMarkEvent(event), rect)}</React.Fragment>
       ))}
     </div>,
     document.body
@@ -1736,6 +1744,8 @@ type MarkCandidate = {
   /** Read on a prior load (event-backed resolve, or a persisted read token) ⇒ not rendered unless re-read this view. */
   retiredAtLoad: boolean
   event?: ReducedAgentMark["event"]
+  /** Normalized mark (shape-agnostic: event.mark ?? on-wire payload) for the read-receipt POST. */
+  mark?: ReducedAgentMark["mark"]
 }
 type ResolvedMarkCandidate = MarkCandidate & { rect?: MarkAnchorRect; element?: Element; anchored: boolean; read: boolean }
 type AttributeNoteMark = { anchor: ShowAnchor; text: string }
@@ -1798,19 +1808,22 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
       // anonymous-viewer localStorage read path must hide only the exact version read, so an agent
       // re-mark (new mark id, even same body) shows again as unread rather than inheriting the prior
       // read token (#67/#288). The logged-in path is event-backed via resolvedByEvent (newest-wins).
-      const readKey = `${reduced.identity}#${reduced.event.mark.id || reduced.createdAt}`
+      // Read mark fields from the shape-agnostic reduced.mark (event.mark OR the on-wire payload) — never
+      // reduced.event.mark, which is undefined for the live backend's payload-shaped events (R5).
+      const readKey = `${reduced.identity}#${reduced.mark.id || reduced.createdAt}`
       list.push({
         readKey,
         kind: reduced.kind,
-        body: reduced.event.mark.body,
-        targetLabel: reduced.event.mark.target || (reduced.kind === "reply" ? "回应" : "标注"),
+        body: reduced.mark.body,
+        targetLabel: reduced.mark.target || (reduced.kind === "reply" ? "回应" : "标注"),
         createdAt: reduced.createdAt,
         // Canonical anchor resolution (event anchor → reply's referenced annotation anchor → target via
         // targetToAnchor, which handles the SDK mark-id form and selectors) — no hand-rolled selector (#257/#283).
         anchor: resolveAgentMarkAnchor(reduced.event, sourceEvents),
         // event-backed read (cross-device) OR an anonymous viewer's persisted (versioned) localStorage read.
         retiredAtLoad: reduced.resolvedByEvent || readTokensAtLoad.has(readKey),
-        event: reduced.event
+        event: reduced.event,
+        mark: reduced.mark
       })
     }
     for (const note of attributeNotes) {
@@ -1859,15 +1872,15 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
     if (candidate.kind === "attribute-note" || !canPost) {
       // Declarative note (no event identity) or anonymous viewer (cannot POST) ⇒ localStorage only.
       writeReadToken(sessionId, storage, candidate.readKey)
-    } else if (candidate.event) {
+    } else if (candidate.mark) {
       // Read receipt: event-backed, cross-device. Author is stamped server-side (the reading user).
       // Empty message content ⇒ metadata-only: the runtime's recordShowEvent skips empty content, so
       // opening a bubble never re-appends the answer to chat history (#61). The bubble reads the mark
-      // body directly, so the answer is still shown.
+      // body directly, so the answer is still shown. Uses the normalized mark (shape-agnostic, R5).
       void context?.submitEvent({
         type: "assistant.mark.resolved",
-        mark: candidate.event.mark,
-        anchor: candidate.event.anchor,
+        mark: candidate.mark,
+        anchor: candidate.event?.anchor,
         message: { role: "assistant", content: "" }
       })
     }

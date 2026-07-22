@@ -717,18 +717,59 @@ export function agentMarkIdentity(mark: AgentMark): string {
   return `note:${normalizeScope(mark.scope)}:${mark.target}`
 }
 
+/**
+ * The mark object of an `assistant.mark.*` event, tolerating BOTH shapes: the SDK-normalized
+ * `event.mark` and the live backend's on-wire `event.payload` (Lane A2 carries the mark fields —
+ * target/body/status/replyTo? — inside `payload`, and plain notes omit `replyTo` entirely). Returns
+ * `undefined` if neither is present, so callers stay null-safe instead of dereferencing undefined.
+ */
+export function agentMarkOf(event: ShowEvent): AgentMark | undefined {
+  const record = event as { mark?: AgentMark; payload?: AgentMark }
+  return record.mark ?? record.payload
+}
+
+/** An anchor is usable for rendering only if it carries an actual LOCATOR (selector / mark / id /
+ *  textQuote / rect) — `kind` alone is metadata that resolveAnchor cannot locate. The on-wire anchor
+ *  is often the empty `{}` (or a bare `{kind}`), in which case we fall through to the mark target. */
+function isUsableAnchor(anchor: ShowAnchor | undefined): boolean {
+  const record = anchor as Record<string, unknown> | undefined
+  return Boolean(record && (record.selector || record.mark || record.id || record.textQuote || record.rect))
+}
+
+/**
+ * Normalize an `assistant.mark.*` event to the canonical `mark`-shaped `AssistantMarkEvent` — copying
+ * the mark from the on-wire `payload` onto `.mark` AND synthesizing the required `message` when the
+ * on-wire event omits it — so EVERY downstream consumer (the reducer's returned event, custom
+ * `renderMark` callbacks that read `event.message.content`, transcript formatting) can read a complete
+ * `AssistantMarkEvent` regardless of the source shape. The single normalization chokepoint for the
+ * payload/mark variance; a no-op for already-canonical (`mark`-shaped WITH a message) events.
+ */
+export function normalizeAgentMarkEvent(event: ShowEvent): AssistantMarkEvent {
+  const mark = agentMarkOf(event)
+  const record = event as { mark?: AgentMark; message?: AssistantMarkEvent["message"] }
+  if (!mark || (record.mark === mark && record.message)) return event as AssistantMarkEvent
+  const canonical = event as AssistantMarkEvent
+  return {
+    ...canonical,
+    mark: mark as Required<AgentMark>,
+    // The live backend's payload-shaped mark events carry no `message`; synthesize it from the mark
+    // (mirroring `assistantMarkEvent`) so renderers reading `event.message.content` never throw (#3633478191).
+    message: record.message ?? { role: "assistant", content: formatAgentMarkMessage(mark as Required<AgentMark>, canonical.anchor) }
+  }
+}
+
 export type ReducedAgentMark = {
   identity: string
   kind: AgentMarkKind
   event: AssistantMarkEvent
+  /** The active version's mark, extracted shape-agnostically (event.mark ?? event.payload). */
+  mark: AgentMark
   createdAt: string
   /** The newest event in this identity is a resolve ⇒ retired on a fresh load (read-to-retire). */
   resolvedByEvent: boolean
 }
 
-function isResolveEvent(event: AssistantMarkEvent): boolean {
-  return event.type === "assistant.mark.resolved" || event.mark.status === "resolved"
-}
+type MarkVersion = { event: AssistantMarkEvent; mark: AgentMark }
 
 /**
  * Collapse a raw event stream into one entry per mark identity. Within an identity the newest
@@ -737,31 +778,39 @@ function isResolveEvent(event: AssistantMarkEvent): boolean {
  * AND authored at/after it — so a late receipt for an already-superseded older mark id never retires
  * the newer answer, and a re-mark after a resolve re-activates. Callers render a `resolvedByEvent`
  * mark only if the user re-read it in the current view (gray), never on a fresh load. Pure — no DOM.
+ *
+ * Shape-tolerant + null-safe: the mark is read via `agentMarkOf` (event.mark OR the on-wire
+ * event.payload), and an event with no mark object is skipped rather than dereferenced.
  */
 export function reduceAgentMarkEvents(events: readonly ShowEvent[], scope?: string): ReducedAgentMark[] {
-  const byIdentity = new Map<string, { versions: AssistantMarkEvent[]; resolves: AssistantMarkEvent[] }>()
+  const byIdentity = new Map<string, { versions: MarkVersion[]; resolves: MarkVersion[] }>()
   for (const event of events) {
     if (!event.type.startsWith("assistant.mark.")) continue
-    const markEvent = event as AssistantMarkEvent
-    if (scope !== undefined && normalizeScope(markEvent.mark.scope) !== normalizeScope(scope)) continue
-    const identity = agentMarkIdentity(markEvent.mark)
+    const mark = agentMarkOf(event)
+    if (!mark) continue // no mark payload on this event — nothing to render, never dereference undefined
+    if (scope !== undefined && normalizeScope(mark.scope) !== normalizeScope(scope)) continue
+    const identity = agentMarkIdentity(mark)
+    const version: MarkVersion = { event: event as AssistantMarkEvent, mark }
     const bucket = byIdentity.get(identity) ?? { versions: [], resolves: [] }
-    if (isResolveEvent(markEvent)) bucket.resolves.push(markEvent)
-    else bucket.versions.push(markEvent)
+    if (event.type === "assistant.mark.resolved" || mark.status === "resolved") bucket.resolves.push(version)
+    else bucket.versions.push(version)
     byIdentity.set(identity, bucket)
   }
   const result: ReducedAgentMark[] = []
   for (const [identity, { versions, resolves }] of byIdentity) {
     if (versions.length === 0) continue // only receipts — nothing active to render
-    const active = versions.reduce((best, event) => (event.createdAt >= best.createdAt ? event : best))
+    const active = versions.reduce((best, candidate) => (candidate.event.createdAt >= best.event.createdAt ? candidate : best))
     result.push({
       identity,
       kind: typeof active.mark.replyTo === "string" && active.mark.replyTo ? "reply" : "note",
-      event: active,
-      createdAt: active.createdAt,
+      // Return a canonical mark-shaped event so downstream readers of `reduced.event.mark` (outside
+      // the updated React path) never hit undefined on a payload-shaped live event (#275).
+      event: normalizeAgentMarkEvent(active.event),
+      mark: active.mark,
+      createdAt: active.event.createdAt,
       // Retired only when THIS active version was resolved (its own id, at/after it) — not by a stale
       // receipt for an older superseded mark id in the same identity.
-      resolvedByEvent: resolves.some((resolve) => resolve.mark.id === active.mark.id && resolve.createdAt >= active.createdAt)
+      resolvedByEvent: resolves.some((resolve) => resolve.mark.id === active.mark.id && resolve.event.createdAt >= active.event.createdAt)
     })
   }
   return result
@@ -842,14 +891,20 @@ export function isMarkAnchored(confidence: AnchorResolveResult["confidence"], ha
  * as well as plain CSS selectors — so a mark-id target is never mistaken for a tag selector.
  */
 export function resolveAgentMarkAnchor(event: AssistantMarkEvent, events: readonly ShowEvent[]): ShowAnchor | undefined {
-  if (event.anchor) return event.anchor
-  const replyTo = typeof event.mark.replyTo === "string" ? event.mark.replyTo : undefined
+  if (isUsableAnchor(event.anchor)) return event.anchor
+  const mark = agentMarkOf(event)
+  const replyTo = mark && typeof mark.replyTo === "string" ? mark.replyTo : undefined
   if (replyTo) {
     const referenced = events.find((candidate) => candidate.id === replyTo)
     const referencedAnchor = referenced && "anchor" in referenced ? (referenced as { anchor?: ShowAnchor }).anchor : undefined
-    if (referencedAnchor) return referencedAnchor
+    if (isUsableAnchor(referencedAnchor)) return referencedAnchor
   }
-  return targetToAnchor(event.mark.target, normalizeScope(event.mark.scope))
+  if (!mark) return undefined
+  const scope = normalizeScope(mark.scope)
+  // targetToAnchor handles the mark-id form (mark-<scope>-<id>) and #/./[ selectors; fall back to a
+  // plain element selector for any other target (e.g. `button`, `main > .card`) so the legacy direct-
+  // selector behavior is preserved instead of dropping the mark to the badge (#288).
+  return targetToAnchor(mark.target, scope) ?? (mark.target ? { kind: "element", scope, selector: mark.target } : undefined)
 }
 
 export function humanIntentEvent(
@@ -927,7 +982,10 @@ export function humanAnnotationEvent(
 export function formatShowEventMessage(event: ShowEvent) {
   if (event.type.startsWith("assistant.mark.")) {
     const markEvent = event as AssistantMarkEvent
-    return markEvent.message?.content ?? formatAgentMarkMessage(markEvent.mark, markEvent.anchor)
+    // Read the mark shape-agnostically (event.mark OR the on-wire payload) so transcript projection of a
+    // payload-shaped, message-less mark event does not dereference undefined (#291).
+    const mark = agentMarkOf(event)
+    return markEvent.message?.content ?? (mark ? formatAgentMarkMessage(mark as Required<AgentMark>, markEvent.anchor) : undefined)
   }
   if (event.type === "human.intent.submitted") {
     return event.message?.content ?? formatHumanIntentMessage(event.payload, event.anchor)

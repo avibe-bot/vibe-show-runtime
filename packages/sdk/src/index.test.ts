@@ -16,6 +16,8 @@ import {
   hashMarkText,
   isMarkAnchored,
   resolveAgentMarkAnchor,
+  normalizeAgentMarkEvent,
+  agentMarkOf,
   type ShowAnchor,
   type ShowEvent
 } from "./index.js"
@@ -50,6 +52,106 @@ function markEvent(opts: {
     createdAt: opts.createdAt
   } as unknown as ShowEvent
 }
+
+// REAL on-wire assistant.mark.* shape from the live Lane A2 backend: mark fields live in `payload`
+// (NOT a top-level `mark`), plain notes have NO `replyTo` key, and `anchor` is often the empty {} with
+// the selector carried in `target`. This is the production shape the earlier `mark`-shaped mocks hid.
+function payloadMarkEvent(opts: {
+  target: string
+  createdAt: string
+  type?: "assistant.mark.created" | "assistant.mark.updated" | "assistant.mark.resolved"
+  scope?: string
+  body?: string
+  markId?: string
+  replyTo?: string
+  anchor?: unknown
+}): ShowEvent {
+  const type = opts.type ?? "assistant.mark.created"
+  return {
+    id: `evt_${opts.target}_${opts.createdAt}`,
+    type,
+    payload: {
+      id: opts.markId ?? "m",
+      role: "assistant",
+      scope: opts.scope ?? "default",
+      target: opts.target,
+      body: opts.body ?? "",
+      status: type === "assistant.mark.resolved" ? "resolved" : "active",
+      createdAt: opts.createdAt,
+      updatedAt: opts.createdAt,
+      resolvedAt: type === "assistant.mark.resolved" ? opts.createdAt : undefined,
+      ...(opts.replyTo ? { replyTo: opts.replyTo } : {}) // plain notes omit replyTo entirely
+    },
+    anchor: opts.anchor ?? {}, // often empty on the wire — target carries the selector
+    createdAt: opts.createdAt
+  } as unknown as ShowEvent
+}
+
+describe("real on-wire payload shape (Lane A2 integration, R5)", () => {
+  const T = (n: number) => `2026-07-23T03:00:0${n}.000Z`
+
+  it("reduces a mixed payload-shaped stream (reply + note + resolved, notes without replyTo) without throwing", () => {
+    const events = [
+      payloadMarkEvent({ target: "#card", body: "note A", markId: "m1", createdAt: T(1) }), // note — NO replyTo
+      payloadMarkEvent({ target: "ann-target", body: "reply", markId: "m2", replyTo: "evt_ann", createdAt: T(2) }),
+      payloadMarkEvent({ target: "#card", type: "assistant.mark.resolved", markId: "m1", createdAt: T(3) })
+    ]
+    const reduced = reduceAgentMarkEvents(events) // must NOT throw on notes lacking replyTo / payload shape
+    expect(reduced).toHaveLength(2)
+    const note = reduced.find((r) => r.identity === "note:default:#card")
+    expect(note?.kind).toBe("note")
+    expect(note?.resolvedByEvent).toBe(true) // resolve (m1) retires the note version
+    const reply = reduced.find((r) => r.identity === "reply:evt_ann")
+    expect(reply?.kind).toBe("reply")
+    expect(reply?.mark.body).toBe("reply") // reduced.mark exposes the extracted payload
+  })
+
+  it("resolves a payload-shaped anchorless note through its target, tolerating an empty anchor", () => {
+    const event = payloadMarkEvent({ target: "#revenue-card", body: "note", createdAt: T(1) }) // anchor {}
+    expect(resolveAgentMarkAnchor(event as never, [])).toMatchObject({ kind: "element", selector: "#revenue-card" })
+  })
+
+  it("agentMarkOf reads the payload; normalizeAgentMarkEvent copies it onto .mark for downstream readers (#275/#282)", () => {
+    const event = payloadMarkEvent({ target: "#c", body: "b", markId: "m1", createdAt: T(1) })
+    expect((event as { mark?: unknown }).mark).toBeUndefined() // raw payload shape has no top-level mark
+    expect(agentMarkOf(event)?.target).toBe("#c")
+    const normalized = normalizeAgentMarkEvent(event)
+    expect(normalized.mark.target).toBe("#c") // downstream can now read event.mark safely
+    expect(normalized.mark.body).toBe("b")
+  })
+
+  it("synthesizes the required message so renderMark callbacks reading event.message.content never throw (#3633478191)", () => {
+    const event = payloadMarkEvent({ target: "#c", body: "本区块已过时", markId: "m1", createdAt: T(1) })
+    expect((event as { message?: unknown }).message).toBeUndefined() // on-wire payload event carries no message
+    const normalized = normalizeAgentMarkEvent(event)
+    // A custom renderer that reads event.message.content (per the AssistantMarkEvent contract) is now safe.
+    expect(() => normalized.message.content.length).not.toThrow()
+    expect(normalized.message.role).toBe("assistant")
+    expect(normalized.message.content).toContain("本区块已过时")
+  })
+
+  it("the reducer returns a mark-shaped event even from a payload-shaped stream (#275)", () => {
+    const reduced = reduceAgentMarkEvents([payloadMarkEvent({ target: "#c", body: "b", markId: "m1", createdAt: T(1) })])
+    expect(reduced[0].event.mark.body).toBe("b") // reduced.event.mark is populated, not undefined
+  })
+
+  it("does not throw formatting a payload-shaped, message-less mark event (#291)", () => {
+    const event = payloadMarkEvent({ target: "#c", body: "本区块已切换到新数据源", markId: "m1", createdAt: T(1) })
+    const message = formatShowEventMessage(event)
+    expect(typeof message).toBe("string")
+    expect(message).toContain("本区块已切换到新数据源")
+  })
+
+  it("a bare {kind} anchor is not treated as a locator — falls through to the target (#284)", () => {
+    const event = payloadMarkEvent({ target: "#chart", body: "b", createdAt: T(1), anchor: { kind: "element" } })
+    expect(resolveAgentMarkAnchor(event as never, [])).toMatchObject({ kind: "element", selector: "#chart" })
+  })
+
+  it("preserves tag-qualified selector targets via the element fallback (#288)", () => {
+    const event = payloadMarkEvent({ target: "main > .card", body: "b", createdAt: T(1) })
+    expect(resolveAgentMarkAnchor(event as never, [])).toMatchObject({ kind: "element", selector: "main > .card" })
+  })
+})
 
 describe("show annotation event contract", () => {
   it("preserves both user region and matched elements for element-group annotations", () => {
