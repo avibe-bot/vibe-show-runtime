@@ -739,8 +739,11 @@ export function agentMarkOf(event: ShowEvent): AgentMark | undefined {
  */
 export function eventOccurredAt(event: ShowEvent): string {
   const record = event as { createdAt?: unknown; created_at?: unknown }
-  if (typeof record.createdAt === "string" && record.createdAt) return record.createdAt
+  // Prefer the snake `created_at` — it is the true EVENT-level occurrence time. In a snake/camel
+  // transition an event could carry both, with the camel `createdAt` populated from the mark payload
+  // (a resolve echoes the ORIGINAL mark time); picking camel first would order by that stale timestamp.
   if (typeof record.created_at === "string" && record.created_at) return record.created_at
+  if (typeof record.createdAt === "string" && record.createdAt) return record.createdAt
   const mark = agentMarkOf(event)
   return typeof mark?.createdAt === "string" ? mark.createdAt : ""
 }
@@ -832,9 +835,16 @@ export function reduceAgentMarkEvents(events: readonly ShowEvent[], scope?: stri
       event: normalizeAgentMarkEvent(active.event),
       mark: active.mark,
       createdAt: active.event.createdAt,
-      // Retired only when THIS active version was resolved (its own id, at/after it) — not by a stale
-      // receipt for an older superseded mark id in the same identity.
-      resolvedByEvent: resolves.some((resolve) => resolve.mark.id === active.mark.id && resolve.event.createdAt >= active.event.createdAt)
+      // Retired only when THIS active version was resolved. Match on (a) the shared mark id, (b) a
+      // VERSION discriminator — the resolve payload's own `createdAt`, which echoes the specific version
+      // it targets — so when the backend reuses a mark id for a superseding create, a resolve aimed at
+      // the OLDER version cannot retire the newer one; and (c) occurrence at/after the active version.
+      resolvedByEvent: resolves.some(
+        (resolve) =>
+          resolve.mark.id === active.mark.id &&
+          resolve.mark.createdAt === active.mark.createdAt &&
+          resolve.event.createdAt >= active.event.createdAt
+      )
     })
   }
   return result

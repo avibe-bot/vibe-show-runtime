@@ -19,6 +19,7 @@ import {
   resolveAgentMarkAnchor,
   normalizeAgentMarkEvent,
   agentMarkOf,
+  eventOccurredAt,
   type ShowAnchor,
   type ShowEvent
 } from "./index.js"
@@ -33,10 +34,14 @@ function markEvent(opts: {
   markId?: string
   replyTo?: string
   status?: "active" | "resolved"
+  // Event-level OCCURRENCE time, distinct from the mark's birth `createdAt`. On the real wire a resolve
+  // keeps the version's birth `createdAt` (payload) and carries its own time at the event level; model
+  // that here so version-discriminator + occurrence ordering are exercised faithfully. Defaults to birth.
+  occurredAt?: string
 }): ShowEvent {
   const type = opts.type ?? "assistant.mark.created"
   return {
-    id: `evt_${opts.target}_${opts.createdAt}`,
+    id: `evt_${opts.target}_${opts.createdAt}_${opts.occurredAt ?? ""}`,
     type,
     mark: {
       id: opts.markId ?? "m",
@@ -50,7 +55,9 @@ function markEvent(opts: {
       ...(opts.replyTo ? { replyTo: opts.replyTo } : {})
     },
     message: { role: "assistant", content: opts.body ?? "" },
-    createdAt: opts.createdAt
+    createdAt: opts.createdAt,
+    // snake_case event-level occurrence, matching the live wire; eventOccurredAt prefers it.
+    ...(opts.occurredAt ? { created_at: opts.occurredAt } : {})
   } as unknown as ShowEvent
 }
 
@@ -66,10 +73,13 @@ function payloadMarkEvent(opts: {
   markId?: string
   replyTo?: string
   anchor?: unknown
+  // Event-level snake_case occurrence, distinct from the payload birth `createdAt` (see markEvent).
+  occurredAt?: string
 }): ShowEvent {
   const type = opts.type ?? "assistant.mark.created"
+  const occurredAt = opts.occurredAt ?? opts.createdAt
   return {
-    id: `evt_${opts.target}_${opts.createdAt}`,
+    id: `evt_${opts.target}_${opts.createdAt}_${opts.occurredAt ?? ""}`,
     type,
     payload: {
       id: opts.markId ?? "m",
@@ -78,13 +88,13 @@ function payloadMarkEvent(opts: {
       target: opts.target,
       body: opts.body ?? "",
       status: type === "assistant.mark.resolved" ? "resolved" : "active",
-      createdAt: opts.createdAt,
+      createdAt: opts.createdAt, // version BIRTH time (stable across create→resolve) — the discriminator
       updatedAt: opts.createdAt,
-      resolvedAt: type === "assistant.mark.resolved" ? opts.createdAt : undefined,
+      resolvedAt: type === "assistant.mark.resolved" ? occurredAt : undefined,
       ...(opts.replyTo ? { replyTo: opts.replyTo } : {}) // plain notes omit replyTo entirely
     },
     anchor: opts.anchor ?? {}, // often empty on the wire — target carries the selector
-    createdAt: opts.createdAt
+    created_at: occurredAt // event-level occurrence, snake_case as on the wire
   } as unknown as ShowEvent
 }
 
@@ -95,7 +105,7 @@ describe("real on-wire payload shape (Lane A2 integration, R5)", () => {
     const events = [
       payloadMarkEvent({ target: "#card", body: "note A", markId: "m1", createdAt: T(1) }), // note — NO replyTo
       payloadMarkEvent({ target: "ann-target", body: "reply", markId: "m2", replyTo: "evt_ann", createdAt: T(2) }),
-      payloadMarkEvent({ target: "#card", type: "assistant.mark.resolved", markId: "m1", createdAt: T(3) })
+      payloadMarkEvent({ target: "#card", type: "assistant.mark.resolved", markId: "m1", createdAt: T(1), occurredAt: T(3) }) // resolve echoes m1's birth, occurs later
     ]
     const reduced = reduceAgentMarkEvents(events) // must NOT throw on notes lacking replyTo / payload shape
     expect(reduced).toHaveLength(2)
@@ -197,6 +207,55 @@ describe("reduce semantics on the golden live stream (Lane R6)", () => {
       expect(typeof r.createdAt).toBe("string")
       expect(r.createdAt).not.toBe("") // event-level created_at (snake_case) must be picked up
     }
+  })
+})
+
+describe("reduce timestamp/version precision (Lane R6 round-1)", () => {
+  const T = (n: number) => `2026-07-23T05:00:0${n}.000Z`
+
+  it("prefers the snake created_at over a camel createdAt echoed from the mark payload (#3633711620)", () => {
+    // A transitional event carrying BOTH: the camel value is the stale echoed mark time, the snake value
+    // is the true occurrence. eventOccurredAt must return the snake one.
+    const event = {
+      id: "evt_both",
+      type: "assistant.mark.resolved",
+      payload: { id: "m", role: "assistant", scope: "default", target: "#x", body: "b", status: "resolved", createdAt: T(1), updatedAt: T(1), resolvedAt: T(9) },
+      anchor: {},
+      createdAt: T(1), // stale camel (echoes payload)
+      created_at: T(9) // true event occurrence
+    } as unknown as ShowEvent
+    expect(eventOccurredAt(event)).toBe(T(9))
+  })
+
+  it("a resolve for an OLDER same-id version does not retire the newer superseding version (#3633711616)", () => {
+    // Backend reuses one mark id across a supersede: v1 then v2 (newer). A resolve TARGETS v1 (its
+    // payload createdAt echoes v1's) but is recorded AFTER v2. Id + occurrence alone would wrongly retire
+    // v2; the version discriminator (resolve payload createdAt === active version createdAt) keeps v2 live.
+    const v1 = payloadMarkEvent({ target: "#blk", body: "v1", markId: "reused", createdAt: T(1) })
+    const v2 = payloadMarkEvent({ target: "#blk", body: "v2", markId: "reused", createdAt: T(2) })
+    const resolveForV1RecordedLate = {
+      id: "evt_resolve_v1",
+      type: "assistant.mark.resolved",
+      payload: { id: "reused", role: "assistant", scope: "default", target: "#blk", body: "v1", status: "resolved", createdAt: T(1), updatedAt: T(1), resolvedAt: T(3) },
+      anchor: {},
+      created_at: T(3) // occurs AFTER v2's create, but targets v1
+    } as unknown as ShowEvent
+
+    const reduced = reduceAgentMarkEvents([v1, v2, resolveForV1RecordedLate])
+    const blk = reduced.find((r) => r.mark.target === "#blk")
+    expect(blk?.mark.body).toBe("v2") // newest version is active
+    expect(blk?.resolvedByEvent).toBe(false) // the v1-targeted resolve must NOT retire v2
+
+    // Control: a resolve that DOES target v2 retires it.
+    const resolveForV2 = {
+      id: "evt_resolve_v2",
+      type: "assistant.mark.resolved",
+      payload: { id: "reused", role: "assistant", scope: "default", target: "#blk", body: "v2", status: "resolved", createdAt: T(2), updatedAt: T(2), resolvedAt: T(4) },
+      anchor: {},
+      created_at: T(4)
+    } as unknown as ShowEvent
+    const reduced2 = reduceAgentMarkEvents([v1, v2, resolveForV2])
+    expect(reduced2.find((r) => r.mark.target === "#blk")?.resolvedByEvent).toBe(true)
   })
 })
 
@@ -416,7 +475,8 @@ describe("agent-mark identity + supersede/replace (reduceAgentMarkEvents)", () =
   it("retires on read: a resolve newer than the create flags resolvedByEvent (created − resolved on replay)", () => {
     const reduced = reduceAgentMarkEvents([
       markEvent({ target: "#c", createdAt: "2026-07-23T00:00:01.000Z" }),
-      markEvent({ target: "#c", type: "assistant.mark.resolved", createdAt: "2026-07-23T00:00:03.000Z" })
+      // resolve echoes the create's birth createdAt (wire behavior) but occurs later
+      markEvent({ target: "#c", type: "assistant.mark.resolved", createdAt: "2026-07-23T00:00:01.000Z", occurredAt: "2026-07-23T00:00:03.000Z" })
     ])
     expect(reduced).toHaveLength(1)
     expect(reduced[0].resolvedByEvent).toBe(true)
@@ -460,7 +520,8 @@ describe("agent-mark identity + supersede/replace (reduceAgentMarkEvents)", () =
   it("retires the active version only when the resolve targets its own mark id", () => {
     const reduced = reduceAgentMarkEvents([
       markEvent({ target: "#c", markId: "m2", createdAt: "2026-07-23T00:00:02.000Z" }),
-      markEvent({ target: "#c", markId: "m2", type: "assistant.mark.resolved", createdAt: "2026-07-23T00:00:03.000Z" })
+      // resolve echoes m2's birth createdAt (same version) but occurs later
+      markEvent({ target: "#c", markId: "m2", type: "assistant.mark.resolved", createdAt: "2026-07-23T00:00:02.000Z", occurredAt: "2026-07-23T00:00:03.000Z" })
     ])
     expect(reduced[0].resolvedByEvent).toBe(true)
   })
