@@ -13,6 +13,7 @@ import {
   partitionAgentMarks,
   attributeNoteReadToken,
   agentMarkReadStorageKey,
+  AGENT_NOTE_ATTRIBUTE,
   isMarkAnchored,
   resolveAgentMarkAnchor,
   markAttributes,
@@ -1739,22 +1740,22 @@ type MarkCandidate = {
 type ResolvedMarkCandidate = MarkCandidate & { rect?: MarkAnchorRect; element?: Element; anchored: boolean; read: boolean }
 type AttributeNoteMark = { anchor: ShowAnchor; text: string }
 
-/** Scan the page for declarative `mark-note="<text>"` elements, re-scanning on DOM mutation (mirrors
+/** Scan the page for declarative `agent-note="<text>"` elements, re-scanning on DOM mutation (mirrors
  *  useMarkRegistry). One descriptor per element: its anchor + the note text. */
 function useAttributeNoteMarks(scope?: string): AttributeNoteMark[] {
   const [version, setVersion] = React.useState(0)
   React.useEffect(() => {
     if (typeof document === "undefined" || typeof MutationObserver === "undefined") return
     const observer = new MutationObserver(() => setVersion((value) => value + 1))
-    observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ["mark-note"] })
+    observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: [AGENT_NOTE_ATTRIBUTE] })
     return () => observer.disconnect()
   }, [])
   return React.useMemo(() => {
     void version
     if (typeof document === "undefined") return []
     const notes: AttributeNoteMark[] = []
-    for (const element of Array.from(document.querySelectorAll("[mark-note]"))) {
-      const text = (element.getAttribute("mark-note") ?? "").trim()
+    for (const element of Array.from(document.querySelectorAll(`[${AGENT_NOTE_ATTRIBUTE}]`))) {
+      const text = (element.getAttribute(AGENT_NOTE_ATTRIBUTE) ?? "").trim()
       if (!text) continue
       notes.push({ anchor: collectElementContext(element, { scope }), text })
     }

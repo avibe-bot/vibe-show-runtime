@@ -1,7 +1,11 @@
 export const DEFAULT_MARK_SCOPE = "default"
 export const MARK_ATTRIBUTE_PREFIX = "mark-"
-/** Reserved `mark-*` attribute that is a declarative agent NOTE payload, never an anchor id. */
-export const MARK_NOTE_ATTRIBUTE = "mark-note"
+/**
+ * Declarative agent-note content attribute. Lives OUTSIDE the `mark-*` anchor family on purpose
+ * (`mark-*` = WHERE / anchors, `agent-note` = WHAT / the agent's words), so it can never collide with
+ * a free-form `mark-<scope>` anchor — e.g. scope "note" stays a valid anchor scope (review #269).
+ */
+export const AGENT_NOTE_ATTRIBUTE = "agent-note"
 export const DEFAULT_SHOW_EVENTS_PATH = "__show/events"
 export const DEFAULT_SHOW_ME_PATH = "__show/me"
 // Every overlay write carries the write token on BOTH surfaces (contract §5 v2): the injected
@@ -812,7 +816,7 @@ export function hashMarkText(text: string): string {
 }
 
 /**
- * Read-state token for a declarative `mark-note`: scope + anchor identity + text hash. Editing the
+ * Read-state token for a declarative `agent-note`: scope + anchor identity + text hash. Editing the
  * note text changes the hash ⇒ a new token ⇒ the note is unread again (spec rule 1 / D4).
  */
 export function attributeNoteReadToken(scope: string | undefined, anchorId: string, text: string): string {
@@ -1789,13 +1793,10 @@ function viewport(): AnchorViewport | undefined {
 function readElementMark(element: Element, preferredScope = DEFAULT_MARK_SCOPE) {
   const preferredName = markAttributeName(preferredScope)
   const preferredValue = element.getAttribute(preferredName)
-  if (preferredValue && preferredName !== MARK_NOTE_ATTRIBUTE) {
+  if (preferredValue) {
     return { scope: preferredScope, value: preferredValue }
   }
   for (const attr of Array.from(element.attributes)) {
-    // `mark-note` is a declarative note payload, not a mark anchor — keeping it out of discovery stops
-    // note elements from being treated as anchors (and same-text notes from sharing a selector).
-    if (attr.name === MARK_NOTE_ATTRIBUTE) continue
     if (attr.name.startsWith(MARK_ATTRIBUTE_PREFIX) && attr.value) {
       return { scope: normalizeScope(attr.name.slice(MARK_ATTRIBUTE_PREFIX.length)), value: attr.value }
     }
