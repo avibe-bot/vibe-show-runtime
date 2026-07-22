@@ -776,9 +776,11 @@ export function normalizeAgentMarkEvent(event: ShowEvent): AssistantMarkEvent {
     // The live backend's payload-shaped mark events carry no `message`; synthesize it from the mark
     // (mirroring `assistantMarkEvent`) so renderers reading `event.message.content` never throw (#3633478191).
     message: record.message ?? { role: "assistant", content: formatAgentMarkMessage(mark as Required<AgentMark>, canonical.anchor) },
-    // Fill the canonical event-level `createdAt` from the on-wire `created_at` so downstream readers of
-    // `event.createdAt` (ordering, supersede, readKey) never see undefined on a live event.
-    createdAt: record.createdAt ?? eventOccurredAt(event)
+    // Always derive the canonical event-level `createdAt` from `eventOccurredAt` — the single source of
+    // truth for occurrence time (snake `created_at` first, then camel, then payload). Trusting
+    // `record.createdAt` first would let a stale camel value (echoed from the mark birth time) win over
+    // the true event occurrence when a transitional event carries both, breaking supersede/resolve order.
+    createdAt: eventOccurredAt(event)
   }
 }
 

@@ -210,7 +210,7 @@ describe("reduce semantics on the golden live stream (Lane R6)", () => {
   })
 })
 
-describe("reduce timestamp/version precision (Lane R6 round-1)", () => {
+describe("reduce timestamp/version precision (Lane R6)", () => {
   const T = (n: number) => `2026-07-23T05:00:0${n}.000Z`
 
   it("prefers the snake created_at over a camel createdAt echoed from the mark payload (#3633711620)", () => {
@@ -256,6 +256,28 @@ describe("reduce timestamp/version precision (Lane R6 round-1)", () => {
     } as unknown as ShowEvent
     const reduced2 = reduceAgentMarkEvents([v1, v2, resolveForV2])
     expect(reduced2.find((r) => r.mark.target === "#blk")?.resolvedByEvent).toBe(true)
+  })
+
+  it("normalizes createdAt from the event occurrence, not a stale camel birth, so supersede orders right (#3633812661)", () => {
+    // Both same-id versions; the SECOND has a newer occurrence (snake created_at=T4) but a STALE camel
+    // createdAt=T1 echoed from its birth. normalizeAgentMarkEvent must key on the occurrence, so the
+    // reducer supersede orders by T4 (v2 wins), not the stale camel T1.
+    const v1 = {
+      id: "e1", type: "assistant.mark.created",
+      payload: { id: "same", role: "assistant", scope: "default", target: "#b", body: "v1", status: "active", createdAt: T(2), updatedAt: T(2) },
+      anchor: {}, created_at: T(2)
+    } as unknown as ShowEvent
+    const v2StaleCamel = {
+      id: "e2", type: "assistant.mark.created",
+      payload: { id: "same", role: "assistant", scope: "default", target: "#b", body: "v2", status: "active", createdAt: T(1), updatedAt: T(1) },
+      anchor: {},
+      createdAt: T(1), // STALE camel birth (older)
+      created_at: T(4) // true event occurrence (newest)
+    } as unknown as ShowEvent
+
+    expect(normalizeAgentMarkEvent(v2StaleCamel).createdAt).toBe(T(4)) // occurrence wins, not camel T(1)
+    const reduced = reduceAgentMarkEvents([v1, v2StaleCamel])
+    expect(reduced.find((r) => r.mark.target === "#b")?.mark.body).toBe("v2") // ordered by occurrence
   })
 })
 
