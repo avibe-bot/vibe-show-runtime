@@ -696,6 +696,116 @@ export function assistantMarkEvent(
   }
 }
 
+// ── Agent-mark lifecycle helpers (Phase 2 reverse marks) — pure, DOM-free ───────────────
+
+export type AgentMarkKind = "reply" | "note"
+
+/**
+ * Identity that drives replace/supersede: a **reply** mark (payload `replyTo`) replaces the prior
+ * reply to the same annotation; a **note** mark replaces the prior note on the same target+scope.
+ * (A same-id re-emit lands in the same bucket because its target/replyTo are unchanged.)
+ */
+export function agentMarkIdentity(mark: AgentMark): string {
+  const replyTo = typeof mark.replyTo === "string" ? mark.replyTo : undefined
+  if (replyTo) return `reply:${replyTo}`
+  return `note:${normalizeScope(mark.scope)}:${mark.target}`
+}
+
+export type ReducedAgentMark = {
+  identity: string
+  kind: AgentMarkKind
+  event: AssistantMarkEvent
+  createdAt: string
+  /** The newest event in this identity is a resolve ⇒ retired on a fresh load (read-to-retire). */
+  resolvedByEvent: boolean
+}
+
+/**
+ * Collapse a raw event stream into one entry per mark identity. Within an identity the event with
+ * the greatest `createdAt` wins (replace/supersede); if that newest event is a resolve (type
+ * `assistant.mark.resolved` or `status:"resolved"`) the entry is flagged `resolvedByEvent`. Callers
+ * render a `resolvedByEvent` mark only if the user re-read it in the current view (gray), never on a
+ * fresh load. Superseded/older events are dropped. Pure — no DOM.
+ */
+export function reduceAgentMarkEvents(events: readonly ShowEvent[], scope?: string): ReducedAgentMark[] {
+  const newestByIdentity = new Map<string, AssistantMarkEvent>()
+  for (const event of events) {
+    if (!event.type.startsWith("assistant.mark.")) continue
+    const markEvent = event as AssistantMarkEvent
+    if (scope !== undefined && normalizeScope(markEvent.mark.scope) !== normalizeScope(scope)) continue
+    const identity = agentMarkIdentity(markEvent.mark)
+    const prev = newestByIdentity.get(identity)
+    if (!prev || markEvent.createdAt >= prev.createdAt) newestByIdentity.set(identity, markEvent)
+  }
+  const result: ReducedAgentMark[] = []
+  for (const [identity, event] of newestByIdentity) {
+    result.push({
+      identity,
+      kind: typeof event.mark.replyTo === "string" && event.mark.replyTo ? "reply" : "note",
+      event,
+      createdAt: event.createdAt,
+      resolvedByEvent: event.type === "assistant.mark.resolved" || event.mark.status === "resolved"
+    })
+  }
+  return result
+}
+
+export type RenderableAgentMark = { read: boolean; anchored: boolean }
+
+export type AgentMarkPartition<T> = {
+  /** Unread + anchored, capped — render as loud violet dots inline. */
+  inlineUnread: T[]
+  /** Read-this-view + anchored — render as small gray dots inline (uncapped). */
+  inlineRead: T[]
+  /** Unread + anchored beyond the cap — badge list only. */
+  overflow: T[]
+  /** Anchor resolution failed — badge list only, never guess-pinned. */
+  failed: T[]
+  /** Count of all unread active marks (the aggregate badge number). */
+  unreadCount: number
+  /** Badge is shown when something can't/shouldn't render inline (overflow or an anchor failure). */
+  showBadge: boolean
+}
+
+/**
+ * Partition resolved marks into inline dots vs the aggregate badge list. At most `cap` UNREAD anchored
+ * marks render inline; read-this-view anchored marks render inline (gray, uncapped); unread anchored
+ * beyond the cap overflow to the badge; every anchor-failed mark goes to the badge list only (never
+ * mis-pinned). Input order is preserved, so the caller controls which `cap` render inline (sort
+ * first). Pure — no DOM.
+ */
+export function partitionAgentMarks<T extends RenderableAgentMark>(marks: readonly T[], cap = 5): AgentMarkPartition<T> {
+  const anchoredUnread = marks.filter((m) => m.anchored && !m.read)
+  const inlineRead = marks.filter((m) => m.anchored && m.read)
+  const failed = marks.filter((m) => !m.anchored)
+  const inlineUnread = anchoredUnread.slice(0, cap)
+  const overflow = anchoredUnread.slice(cap)
+  const unreadCount = anchoredUnread.length + failed.filter((m) => !m.read).length
+  return { inlineUnread, inlineRead, overflow, failed, unreadCount, showBadge: overflow.length > 0 || failed.length > 0 }
+}
+
+/** localStorage key holding the set of read attribute-note tokens for a session. */
+export const AGENT_MARK_READ_STORAGE_PREFIX = "avibe:mark-read:"
+
+export function agentMarkReadStorageKey(sessionId: string | undefined): string {
+  return `${AGENT_MARK_READ_STORAGE_PREFIX}${sessionId ?? "default"}`
+}
+
+/** Cheap, stable non-cryptographic hash (djb2) — used to detect attribute-note text changes. */
+export function hashMarkText(text: string): string {
+  let hash = 5381
+  for (let i = 0; i < text.length; i += 1) hash = (Math.imul(hash, 33) + text.charCodeAt(i)) | 0
+  return (hash >>> 0).toString(36)
+}
+
+/**
+ * Read-state token for a declarative `mark-note`: scope + anchor identity + text hash. Editing the
+ * note text changes the hash ⇒ a new token ⇒ the note is unread again (spec rule 1 / D4).
+ */
+export function attributeNoteReadToken(scope: string | undefined, anchorId: string, text: string): string {
+  return `${normalizeScope(scope)}:${anchorId}#${hashMarkText(text)}`
+}
+
 export function humanIntentEvent(
   payload: HumanIntentPayload,
   anchor?: ShowAnchor,

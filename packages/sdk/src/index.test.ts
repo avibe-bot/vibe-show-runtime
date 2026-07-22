@@ -9,8 +9,45 @@ import {
   screenshotPointFromViewport,
   screenshotRectFromViewport,
   screenshotAnnotation,
-  type ShowAnchor
+  agentMarkIdentity,
+  reduceAgentMarkEvents,
+  partitionAgentMarks,
+  attributeNoteReadToken,
+  hashMarkText,
+  type ShowAnchor,
+  type ShowEvent
 } from "./index.js"
+
+// Minimal assistant.mark.* event factory for the lifecycle-helper tests (pure, no DOM).
+function markEvent(opts: {
+  target: string
+  createdAt: string
+  type?: "assistant.mark.created" | "assistant.mark.updated" | "assistant.mark.resolved"
+  scope?: string
+  body?: string
+  markId?: string
+  replyTo?: string
+  status?: "active" | "resolved"
+}): ShowEvent {
+  const type = opts.type ?? "assistant.mark.created"
+  return {
+    id: `evt_${opts.target}_${opts.createdAt}`,
+    type,
+    mark: {
+      id: opts.markId ?? "m",
+      role: "assistant",
+      scope: opts.scope ?? "default",
+      target: opts.target,
+      body: opts.body ?? "",
+      status: opts.status ?? (type === "assistant.mark.resolved" ? "resolved" : "active"),
+      createdAt: opts.createdAt,
+      updatedAt: opts.createdAt,
+      ...(opts.replyTo ? { replyTo: opts.replyTo } : {})
+    },
+    message: { role: "assistant", content: opts.body ?? "" },
+    createdAt: opts.createdAt
+  } as unknown as ShowEvent
+}
 
 describe("show annotation event contract", () => {
   it("preserves both user region and matched elements for element-group annotations", () => {
@@ -196,3 +233,122 @@ class FakeElement {
     } as DOMRect
   }
 }
+
+describe("agent-mark identity + supersede/replace (reduceAgentMarkEvents)", () => {
+  it("identifies a reply by replyTo and a note by target+scope", () => {
+    expect(agentMarkIdentity({ target: "x", replyTo: "show_evt_1" } as never)).toBe("reply:show_evt_1")
+    expect(agentMarkIdentity({ target: "#card", scope: "q3" } as never)).toBe("note:q3:#card")
+  })
+
+  it("replaces a note on the same target+scope — newest createdAt wins, older dropped", () => {
+    const reduced = reduceAgentMarkEvents([
+      markEvent({ target: "#card", body: "old", markId: "m1", createdAt: "2026-07-23T00:00:01.000Z" }),
+      markEvent({ target: "#card", body: "new", markId: "m2", createdAt: "2026-07-23T00:00:05.000Z" })
+    ])
+    expect(reduced).toHaveLength(1)
+    expect(reduced[0].event.mark.body).toBe("new")
+    expect(reduced[0].kind).toBe("note")
+  })
+
+  it("pairs reply marks by replyTo (replaces the prior reply) and keeps distinct annotations separate", () => {
+    const reduced = reduceAgentMarkEvents([
+      markEvent({ target: "a", replyTo: "evt_A", body: "first", createdAt: "2026-07-23T00:00:01.000Z" }),
+      markEvent({ target: "a", replyTo: "evt_A", body: "second", createdAt: "2026-07-23T00:00:09.000Z" }),
+      markEvent({ target: "b", replyTo: "evt_B", body: "other", createdAt: "2026-07-23T00:00:02.000Z" })
+    ])
+    expect(reduced).toHaveLength(2)
+    const paired = reduced.find((r) => r.identity === "reply:evt_A")
+    expect(paired?.event.mark.body).toBe("second")
+    expect(paired?.kind).toBe("reply")
+  })
+
+  it("retires on read: a resolve newer than the create flags resolvedByEvent (created − resolved on replay)", () => {
+    const reduced = reduceAgentMarkEvents([
+      markEvent({ target: "#c", createdAt: "2026-07-23T00:00:01.000Z" }),
+      markEvent({ target: "#c", type: "assistant.mark.resolved", createdAt: "2026-07-23T00:00:03.000Z" })
+    ])
+    expect(reduced).toHaveLength(1)
+    expect(reduced[0].resolvedByEvent).toBe(true)
+  })
+
+  it("re-marking a resolved target after the resolve makes it active again (newest is a create)", () => {
+    const reduced = reduceAgentMarkEvents([
+      markEvent({ target: "#c", createdAt: "2026-07-23T00:00:01.000Z" }),
+      markEvent({ target: "#c", type: "assistant.mark.resolved", createdAt: "2026-07-23T00:00:03.000Z" }),
+      markEvent({ target: "#c", body: "re", createdAt: "2026-07-23T00:00:05.000Z" })
+    ])
+    expect(reduced[0].resolvedByEvent).toBe(false)
+    expect(reduced[0].event.mark.body).toBe("re")
+  })
+
+  it("scopes: only same-scope marks are reduced when a scope is given", () => {
+    const reduced = reduceAgentMarkEvents(
+      [
+        markEvent({ target: "#c", scope: "q3", createdAt: "2026-07-23T00:00:01.000Z" }),
+        markEvent({ target: "#c", scope: "other", createdAt: "2026-07-23T00:00:02.000Z" })
+      ],
+      "q3"
+    )
+    expect(reduced).toHaveLength(1)
+    expect(reduced[0].identity).toBe("note:q3:#c")
+  })
+})
+
+describe("agent-mark render partition (partitionAgentMarks — cap / overflow / anchor-failure)", () => {
+  const unreadAnchored = (n: number) => Array.from({ length: n }, () => ({ read: false, anchored: true }))
+
+  it("caps inline unread at 5; the rest overflow to the badge; count is total unread", () => {
+    const part = partitionAgentMarks(unreadAnchored(7))
+    expect(part.inlineUnread).toHaveLength(5)
+    expect(part.overflow).toHaveLength(2)
+    expect(part.unreadCount).toBe(7)
+    expect(part.showBadge).toBe(true)
+  })
+
+  it("does not show the badge when everything fits inline and anchors resolve", () => {
+    const part = partitionAgentMarks(unreadAnchored(3))
+    expect(part.inlineUnread).toHaveLength(3)
+    expect(part.overflow).toHaveLength(0)
+    expect(part.showBadge).toBe(false)
+  })
+
+  it("routes every anchor-failed mark to the badge list only (never inline) and counts unread ones", () => {
+    const part = partitionAgentMarks([
+      { read: false, anchored: true },
+      { read: false, anchored: false }, // unread anchor-failure
+      { read: true, anchored: false } // read anchor-failure (still listed, not counted)
+    ])
+    expect(part.inlineUnread).toHaveLength(1)
+    expect(part.failed).toHaveLength(2)
+    expect(part.unreadCount).toBe(2) // 1 inline unread + 1 unread failed
+    expect(part.showBadge).toBe(true) // any anchor failure surfaces the badge
+  })
+
+  it("read-this-view anchored marks render inline as gray and never count toward the unread cap", () => {
+    const part = partitionAgentMarks([...unreadAnchored(5), { read: true, anchored: true }])
+    expect(part.inlineUnread).toHaveLength(5)
+    expect(part.inlineRead).toHaveLength(1)
+    expect(part.overflow).toHaveLength(0)
+    expect(part.unreadCount).toBe(5)
+  })
+})
+
+describe("attribute-note read token (localStorage hashing)", () => {
+  it("is stable for the same anchor+text and changes when the note text changes (⇒ unread again)", () => {
+    const a = attributeNoteReadToken("q3", "#card", "改用了新数据源")
+    const b = attributeNoteReadToken("q3", "#card", "改用了新数据源")
+    const c = attributeNoteReadToken("q3", "#card", "换成了另一个口径")
+    expect(a).toBe(b)
+    expect(a).not.toBe(c)
+    expect(a.startsWith("q3:#card#")).toBe(true)
+  })
+
+  it("distinguishes different anchors with the same text", () => {
+    expect(attributeNoteReadToken("q3", "#a", "same")).not.toBe(attributeNoteReadToken("q3", "#b", "same"))
+  })
+
+  it("hashMarkText is deterministic and differs on change", () => {
+    expect(hashMarkText("hello")).toBe(hashMarkText("hello"))
+    expect(hashMarkText("hello")).not.toBe(hashMarkText("hello!"))
+  })
+})
