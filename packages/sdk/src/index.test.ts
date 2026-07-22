@@ -15,6 +15,7 @@ import {
   attributeNoteReadToken,
   hashMarkText,
   isMarkAnchored,
+  resolveAgentMarkAnchor,
   type ShowAnchor,
   type ShowEvent
 } from "./index.js"
@@ -390,5 +391,36 @@ describe("mark inline-anchoring trust (isMarkAnchored — area valid, missing ro
     expect(isMarkAnchored("missing", true)).toBe(false) // stale fallback rect → badge list only
     expect(isMarkAnchored("area", false)).toBe(false)
     expect(isMarkAnchored("exact", false)).toBe(false)
+  })
+})
+
+describe("agent-mark anchor resolution (resolveAgentMarkAnchor — canonical, not hand-rolled)", () => {
+  it("prefers the event's own anchor", () => {
+    const own: ShowAnchor = { kind: "element", selector: "#own", scope: "default" }
+    const event = { ...markEvent({ target: "#other", createdAt: "t" }), anchor: own } as unknown as ShowEvent
+    expect(resolveAgentMarkAnchor(event as never, [])).toBe(own)
+  })
+
+  it("parses the SDK mark-id target form as a mark anchor, not a tag selector (#257)", () => {
+    const event = markEvent({ target: "mark-default-summary", createdAt: "t" })
+    const anchor = resolveAgentMarkAnchor(event as never, [])
+    expect(anchor).toMatchObject({ kind: "mark", id: "summary", mark: "summary" })
+  })
+
+  it("parses a plain CSS selector target as an element anchor", () => {
+    const anchor = resolveAgentMarkAnchor(markEvent({ target: "#revenue-card", createdAt: "t" }) as never, [])
+    expect(anchor).toMatchObject({ kind: "element", selector: "#revenue-card" })
+  })
+
+  it("resolves a reply mark through the referenced annotation's anchor in the stream (#283)", () => {
+    const referencedAnchor: ShowAnchor = { kind: "element", selector: "#user-picked", scope: "default" }
+    const annotation = { id: "evt_ann_1", type: "human.annotation.created", anchor: referencedAnchor, createdAt: "t0" } as unknown as ShowEvent
+    const reply = markEvent({ target: "#some-other", replyTo: "evt_ann_1", createdAt: "t1" })
+    expect(resolveAgentMarkAnchor(reply as never, [annotation])).toBe(referencedAnchor)
+  })
+
+  it("falls back to the target when a reply's referenced event is absent", () => {
+    const reply = markEvent({ target: "#fallback", replyTo: "missing_evt", createdAt: "t1" })
+    expect(resolveAgentMarkAnchor(reply as never, [])).toMatchObject({ kind: "element", selector: "#fallback" })
   })
 })

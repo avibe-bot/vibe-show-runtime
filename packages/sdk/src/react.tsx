@@ -13,8 +13,8 @@ import {
   partitionAgentMarks,
   attributeNoteReadToken,
   agentMarkReadStorageKey,
-  hashMarkText,
   isMarkAnchored,
+  resolveAgentMarkAnchor,
   markAttributes,
   markAttributeName,
   normalizeShowEvent,
@@ -1772,12 +1772,13 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
   const context = React.useContext(ShowSessionContext)
   const sourceEvents = events ?? context?.events ?? []
   const sessionId = context?.config.sessionId
-  // Gate the read-receipt POST on an ACTUAL write token, not the `available`/authenticated hint —
-  // that hint is true before the /__show/me probe populates the token, so posting then would send no
-  // X-Vibe-Show-Token and the receipt would be silently dropped (#572). No token yet ⇒ localStorage
-  // path (durable on this device, remembered on reload); when the token arrives, later reads POST.
+  // Gate the read-receipt POST on an ACTUAL write token, resolved the SAME way submitShowEvent does —
+  // the provider token OR the injected `__AVIBE_SHOW__.writeToken` runtime fallback (#276) — not the
+  // `available`/authenticated hint (true before the /__show/me probe populates a token, #572). No
+  // token ⇒ localStorage path (durable on this device); when a token exists, reads POST cross-device.
   // `canAnnotate === false` is an explicit anonymous opt-out.
-  const canPost = canAnnotate !== false && Boolean(context?.config.writeToken)
+  const writeToken = context?.config.writeToken ?? readRuntimeConfig().writeToken
+  const canPost = canAnnotate !== false && Boolean(writeToken)
   const tick = useViewportTick()
   const attributeNotes = useAttributeNoteMarks(scope)
   const storage = React.useMemo(() => safeLocalStorage(), [])
@@ -1792,20 +1793,20 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
   const candidates = React.useMemo<MarkCandidate[]>(() => {
     const list: MarkCandidate[] = []
     for (const reduced of reduceAgentMarkEvents(sourceEvents, scope)) {
-      // VERSIONED read key (identity + body hash): the anonymous-viewer localStorage read path must
-      // hide only the exact version read, so an agent supersede (new body, same identity) shows again
-      // as unread instead of inheriting the prior read token (#67). The event-backed path (logged-in)
-      // is handled by resolvedByEvent, which the reducer already recomputes from newest-wins.
-      const readKey = `${reduced.identity}#${hashMarkText(reduced.event.mark.body)}`
+      // VERSIONED read key (identity + a TRUE version: the winning mark id, else its createdAt): the
+      // anonymous-viewer localStorage read path must hide only the exact version read, so an agent
+      // re-mark (new mark id, even same body) shows again as unread rather than inheriting the prior
+      // read token (#67/#288). The logged-in path is event-backed via resolvedByEvent (newest-wins).
+      const readKey = `${reduced.identity}#${reduced.event.mark.id || reduced.createdAt}`
       list.push({
         readKey,
         kind: reduced.kind,
         body: reduced.event.mark.body,
         targetLabel: reduced.event.mark.target || (reduced.kind === "reply" ? "回应" : "标注"),
         createdAt: reduced.createdAt,
-        // Fall back to the mark target when the event carries no anchor (raw/legacy events), matching
-        // the legacy layer — an anchorless selector target still resolves inline instead of failing (#582).
-        anchor: reduced.event.anchor ?? { kind: "element", selector: reduced.event.mark.target, scope: reduced.event.mark.scope },
+        // Canonical anchor resolution (event anchor → reply's referenced annotation anchor → target via
+        // targetToAnchor, which handles the SDK mark-id form and selectors) — no hand-rolled selector (#257/#283).
+        anchor: resolveAgentMarkAnchor(reduced.event, sourceEvents),
         // event-backed read (cross-device) OR an anonymous viewer's persisted (versioned) localStorage read.
         retiredAtLoad: reduced.resolvedByEvent || readTokensAtLoad.has(readKey),
         event: reduced.event

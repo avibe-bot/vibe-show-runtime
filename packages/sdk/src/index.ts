@@ -830,6 +830,24 @@ export function isMarkAnchored(confidence: AnchorResolveResult["confidence"], ha
   return confidence !== "missing" && hasRect
 }
 
+/**
+ * The anchor to render an agent mark at, resolved through the canonical path (no hand-rolled
+ * selectors): the mark's own event `anchor` wins; else a reply mark resolves through the referenced
+ * annotation event's anchor (found by `replyTo` in the stream); else the target is parsed by
+ * `targetToAnchor`, which correctly handles the SDK mark-id form (`mark-<scope>-<id>` ⇒ a mark anchor)
+ * as well as plain CSS selectors — so a mark-id target is never mistaken for a tag selector.
+ */
+export function resolveAgentMarkAnchor(event: AssistantMarkEvent, events: readonly ShowEvent[]): ShowAnchor | undefined {
+  if (event.anchor) return event.anchor
+  const replyTo = typeof event.mark.replyTo === "string" ? event.mark.replyTo : undefined
+  if (replyTo) {
+    const referenced = events.find((candidate) => candidate.id === replyTo)
+    const referencedAnchor = referenced && "anchor" in referenced ? (referenced as { anchor?: ShowAnchor }).anchor : undefined
+    if (referencedAnchor) return referencedAnchor
+  }
+  return targetToAnchor(event.mark.target, normalizeScope(event.mark.scope))
+}
+
 export function humanIntentEvent(
   payload: HumanIntentPayload,
   anchor?: ShowAnchor,
