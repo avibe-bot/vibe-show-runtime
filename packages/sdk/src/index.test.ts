@@ -14,6 +14,7 @@ import {
   partitionAgentMarks,
   attributeNoteReadToken,
   hashMarkText,
+  isMarkAnchored,
   type ShowAnchor,
   type ShowEvent
 } from "./index.js"
@@ -350,5 +351,23 @@ describe("attribute-note read token (localStorage hashing)", () => {
   it("hashMarkText is deterministic and differs on change", () => {
     expect(hashMarkText("hello")).toBe(hashMarkText("hello"))
     expect(hashMarkText("hello")).not.toBe(hashMarkText("hello!"))
+  })
+})
+
+describe("mark inline-anchoring trust (isMarkAnchored — area valid, missing routed to list)", () => {
+  it("trusts element-backed resolutions (exact/selector/text) with a rect", () => {
+    expect(isMarkAnchored("exact", true)).toBe(true)
+    expect(isMarkAnchored("selector", true)).toBe(true)
+    expect(isMarkAnchored("text", true)).toBe(true)
+  })
+
+  it("trusts a valid area/region rect with no DOM element (reply to an area selection, #72)", () => {
+    expect(isMarkAnchored("area", true)).toBe(true)
+  })
+
+  it("never pins a missing anchor, and never pins without a rect (#69 / D6)", () => {
+    expect(isMarkAnchored("missing", true)).toBe(false) // stale fallback rect → badge list only
+    expect(isMarkAnchored("area", false)).toBe(false)
+    expect(isMarkAnchored("exact", false)).toBe(false)
   })
 })

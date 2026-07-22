@@ -13,6 +13,8 @@ import {
   partitionAgentMarks,
   attributeNoteReadToken,
   agentMarkReadStorageKey,
+  hashMarkText,
+  isMarkAnchored,
   markAttributes,
   markAttributeName,
   normalizeShowEvent,
@@ -1787,15 +1789,20 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
   const candidates = React.useMemo<MarkCandidate[]>(() => {
     const list: MarkCandidate[] = []
     for (const reduced of reduceAgentMarkEvents(sourceEvents, scope)) {
+      // VERSIONED read key (identity + body hash): the anonymous-viewer localStorage read path must
+      // hide only the exact version read, so an agent supersede (new body, same identity) shows again
+      // as unread instead of inheriting the prior read token (#67). The event-backed path (logged-in)
+      // is handled by resolvedByEvent, which the reducer already recomputes from newest-wins.
+      const readKey = `${reduced.identity}#${hashMarkText(reduced.event.mark.body)}`
       list.push({
-        readKey: reduced.identity,
+        readKey,
         kind: reduced.kind,
         body: reduced.event.mark.body,
         targetLabel: reduced.event.mark.target || (reduced.kind === "reply" ? "回应" : "标注"),
         createdAt: reduced.createdAt,
         anchor: reduced.event.anchor,
-        // event-backed read (cross-device) OR an anonymous viewer's persisted localStorage read.
-        retiredAtLoad: reduced.resolvedByEvent || readTokensAtLoad.has(reduced.identity),
+        // event-backed read (cross-device) OR an anonymous viewer's persisted (versioned) localStorage read.
+        retiredAtLoad: reduced.resolvedByEvent || readTokensAtLoad.has(readKey),
         event: reduced.event
       })
     }
@@ -1822,10 +1829,12 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
     return candidates
       .map((candidate) => {
         const anchorResult = candidate.anchor ? resolveAnchor(candidate.anchor, document) : undefined
-        // Never guess-pin: only a live element found by resolution (exact/selector/text) anchors inline.
-        // `missing`/area/no-element ⇒ anchored:false ⇒ badge list only (spec rule 4 / D6).
-        const anchored = Boolean(anchorResult?.element && anchorResult.rect)
-        return { ...candidate, rect: anchorResult?.rect, element: anchorResult?.element, anchored, read: readInView.has(candidate.readKey) }
+        // Trust any resolution except `missing` — incl. area/screenshot region rects with no element
+        // (a reply to a human area selection, #72). Only `missing` (stale fallback rect) is routed to
+        // the badge list, and its stale rect is dropped so the bubble never opens at a guessed position
+        // (#69). Never guess-pin (spec rule 4 / D6).
+        const anchored = anchorResult ? isMarkAnchored(anchorResult.confidence, Boolean(anchorResult.rect)) : false
+        return { ...candidate, rect: anchored ? anchorResult?.rect : undefined, element: anchorResult?.element, anchored, read: readInView.has(candidate.readKey) }
       })
       // Retired on a fresh load and not re-read this view ⇒ gone (created − resolved on replay).
       .filter((candidate) => !candidate.retiredAtLoad || candidate.read)
@@ -1845,7 +1854,15 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
       writeReadToken(sessionId, storage, candidate.readKey)
     } else if (candidate.event) {
       // Read receipt: event-backed, cross-device. Author is stamped server-side (the reading user).
-      void context?.submitEvent({ type: "assistant.mark.resolved", mark: candidate.event.mark, anchor: candidate.event.anchor })
+      // Empty message content ⇒ metadata-only: the runtime's recordShowEvent skips empty content, so
+      // opening a bubble never re-appends the answer to chat history (#61). The bubble reads the mark
+      // body directly, so the answer is still shown.
+      void context?.submitEvent({
+        type: "assistant.mark.resolved",
+        mark: candidate.event.mark,
+        anchor: candidate.event.anchor,
+        message: { role: "assistant", content: "" }
+      })
     }
   }, [readInView, canPost, sessionId, storage, context])
 

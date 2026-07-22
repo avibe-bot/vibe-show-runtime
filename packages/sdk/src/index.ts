@@ -1,5 +1,7 @@
 export const DEFAULT_MARK_SCOPE = "default"
 export const MARK_ATTRIBUTE_PREFIX = "mark-"
+/** Reserved `mark-*` attribute that is a declarative agent NOTE payload, never an anchor id. */
+export const MARK_NOTE_ATTRIBUTE = "mark-note"
 export const DEFAULT_SHOW_EVENTS_PATH = "__show/events"
 export const DEFAULT_SHOW_ME_PATH = "__show/me"
 // Every overlay write carries the write token on BOTH surfaces (contract §5 v2): the injected
@@ -804,6 +806,17 @@ export function hashMarkText(text: string): string {
  */
 export function attributeNoteReadToken(scope: string | undefined, anchorId: string, text: string): string {
   return `${normalizeScope(scope)}:${anchorId}#${hashMarkText(text)}`
+}
+
+/**
+ * Whether a resolved anchor is trustworthy enough to pin a mark inline. Any resolution EXCEPT
+ * `missing` (element not found) is trusted — including `area`/`element-group`/`group`/`screenshot`,
+ * which intentionally carry a deliberate region rect and no DOM element (a reply to a human
+ * area/screenshot selection). A `missing` anchor holds only a stale fallback rect and is routed to
+ * the badge list, never guess-pinned (spec rule 4 / D6).
+ */
+export function isMarkAnchored(confidence: AnchorResolveResult["confidence"], hasRect: boolean): boolean {
+  return confidence !== "missing" && hasRect
 }
 
 export function humanIntentEvent(
@@ -1747,10 +1760,13 @@ function viewport(): AnchorViewport | undefined {
 function readElementMark(element: Element, preferredScope = DEFAULT_MARK_SCOPE) {
   const preferredName = markAttributeName(preferredScope)
   const preferredValue = element.getAttribute(preferredName)
-  if (preferredValue) {
+  if (preferredValue && preferredName !== MARK_NOTE_ATTRIBUTE) {
     return { scope: preferredScope, value: preferredValue }
   }
   for (const attr of Array.from(element.attributes)) {
+    // `mark-note` is a declarative note payload, not a mark anchor — keeping it out of discovery stops
+    // note elements from being treated as anchors (and same-text notes from sharing a selector).
+    if (attr.name === MARK_NOTE_ATTRIBUTE) continue
     if (attr.name.startsWith(MARK_ATTRIBUTE_PREFIX) && attr.value) {
       return { scope: normalizeScope(attr.name.slice(MARK_ATTRIBUTE_PREFIX.length)), value: attr.value }
     }
