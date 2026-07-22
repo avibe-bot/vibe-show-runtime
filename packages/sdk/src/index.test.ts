@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs"
 import { describe, expect, it } from "vitest"
 import {
   areaAnnotation,
@@ -150,6 +151,52 @@ describe("real on-wire payload shape (Lane A2 integration, R5)", () => {
   it("preserves tag-qualified selector targets via the element fallback (#288)", () => {
     const event = payloadMarkEvent({ target: "main > .card", body: "b", createdAt: T(1) })
     expect(resolveAgentMarkAnchor(event as never, [])).toMatchObject({ kind: "element", selector: "main > .card" })
+  })
+})
+
+// GOLDEN fixture — the EXACT 7-event stream captured from the live Lane A2 regression (verbatim, not
+// retyped). Its defining trait the hand-built mocks missed: the event-level timestamp field is
+// `created_at` (snake_case), while the mark's own `createdAt` (camelCase) lives inside `payload`. If the
+// reducer keys ordering / resolve-matching on the camelCase event-level field it reads undefined for
+// EVERY event, which (a) keeps the oldest #test-block version and (b) never retires a resolved mark.
+const GOLDEN_MARK_EVENTS = JSON.parse(
+  readFileSync(new URL("./__fixtures__/real-mark-events.json", import.meta.url), "utf8")
+).events as ShowEvent[]
+
+describe("reduce semantics on the golden live stream (Lane R6)", () => {
+  it("supersede keeps the NEWEST same-id version and resolved marks are retired — exactly 2 active", () => {
+    const reduced = reduceAgentMarkEvents(GOLDEN_MARK_EVENTS)
+    // On a fresh load the badge shows only marks NOT retired by a resolve event.
+    const active = reduced.filter((r) => !r.resolvedByEvent)
+    const activeBodies = active.map((r) => r.mark.body).sort()
+
+    // Defect #1 (resolved filtering) + Defect #2 (supersede newest): exactly the reply + 第二版说明.
+    expect(activeBodies).toEqual(["第二版说明(应替换)", "验收回答:这个占位标题的问题已经处理,渐变和图标都加上了。"].sort())
+    expect(active).toHaveLength(2)
+
+    // Defect #2: the two #test-block created events share one payload.id — newest occurrence wins.
+    const testBlock = reduced.find((r) => r.mark.target === "#test-block")
+    expect(testBlock?.mark.body).toBe("第二版说明(应替换)")
+    expect(reduced.filter((r) => r.mark.target === "#test-block")).toHaveLength(1) // collapsed to one identity
+
+    // Defect #1: 临时A / 临时B each have a resolve event with the same payload.id ⇒ retired.
+    const tmpA = reduced.find((r) => r.mark.target === "#tmp-a")
+    const tmpB = reduced.find((r) => r.mark.target === "#tmp-b")
+    expect(tmpA?.resolvedByEvent).toBe(true)
+    expect(tmpB?.resolvedByEvent).toBe(true)
+
+    // The reply mark is paired + active.
+    const reply = reduced.find((r) => r.kind === "reply")
+    expect(reply?.resolvedByEvent).toBe(false)
+    expect(reply?.mark.body).toContain("验收回答")
+  })
+
+  it("exposes a real event-occurrence timestamp on the reduced mark (not undefined) for ordering/readKey", () => {
+    const reduced = reduceAgentMarkEvents(GOLDEN_MARK_EVENTS)
+    for (const r of reduced) {
+      expect(typeof r.createdAt).toBe("string")
+      expect(r.createdAt).not.toBe("") // event-level created_at (snake_case) must be picked up
+    }
   })
 })
 
