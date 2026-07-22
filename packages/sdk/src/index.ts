@@ -767,8 +767,17 @@ function isUsableAnchor(anchor: ShowAnchor | undefined): boolean {
  */
 export function normalizeAgentMarkEvent(event: ShowEvent): AssistantMarkEvent {
   const mark = agentMarkOf(event)
+  if (!mark) return event as AssistantMarkEvent
   const record = event as { mark?: AgentMark; message?: AssistantMarkEvent["message"]; createdAt?: string }
-  if (!mark || (record.mark === mark && record.message && record.createdAt)) return event as AssistantMarkEvent
+  // `eventOccurredAt` is the single source of truth for occurrence time (snake `created_at` first, then
+  // camel, then payload). Compute it up front so the fast path below can only skip work when the event
+  // is ALREADY canonical on this field too.
+  const createdAt = eventOccurredAt(event)
+  // No-op ONLY when fully canonical: mark-shaped, has a message, AND `createdAt` already equals the
+  // occurrence time. This guarantees the invariant `normalize(event).createdAt === eventOccurredAt(event)`
+  // for EVERY input — a stale camel birth paired with a newer snake `created_at` can never survive the
+  // fast path and mis-order supersede/resolve (#3633873997).
+  if (record.mark === mark && record.message && record.createdAt === createdAt) return event as AssistantMarkEvent
   const canonical = event as AssistantMarkEvent
   return {
     ...canonical,
@@ -776,11 +785,7 @@ export function normalizeAgentMarkEvent(event: ShowEvent): AssistantMarkEvent {
     // The live backend's payload-shaped mark events carry no `message`; synthesize it from the mark
     // (mirroring `assistantMarkEvent`) so renderers reading `event.message.content` never throw (#3633478191).
     message: record.message ?? { role: "assistant", content: formatAgentMarkMessage(mark as Required<AgentMark>, canonical.anchor) },
-    // Always derive the canonical event-level `createdAt` from `eventOccurredAt` — the single source of
-    // truth for occurrence time (snake `created_at` first, then camel, then payload). Trusting
-    // `record.createdAt` first would let a stale camel value (echoed from the mark birth time) win over
-    // the true event occurrence when a transitional event carries both, breaking supersede/resolve order.
-    createdAt: eventOccurredAt(event)
+    createdAt
   }
 }
 

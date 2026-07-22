@@ -279,6 +279,32 @@ describe("reduce timestamp/version precision (Lane R6)", () => {
     const reduced = reduceAgentMarkEvents([v1, v2StaleCamel])
     expect(reduced.find((r) => r.mark.target === "#b")?.mark.body).toBe("v2") // ordered by occurrence
   })
+
+  it("recomputes createdAt on the canonical fast path — a stale camel birth can't survive it (#3633873997)", () => {
+    // ALREADY mark-shaped WITH a message (fast-path eligible), but camel createdAt=T1 is a stale birth and
+    // snake created_at=T4 is the true occurrence. The fast path must recompute to T4, not return T1.
+    const canonicalButStale = {
+      id: "e_stale", type: "assistant.mark.created",
+      mark: { id: "same", role: "assistant", scope: "default", target: "#z", body: "new", status: "active", createdAt: T(1), updatedAt: T(1) },
+      message: { role: "assistant", content: "new" },
+      createdAt: T(1), // stale camel birth
+      created_at: T(4) // true occurrence
+    } as unknown as ShowEvent
+    expect(normalizeAgentMarkEvent(canonicalButStale).createdAt).toBe(T(4))
+
+    const older = {
+      id: "e_old", type: "assistant.mark.created",
+      mark: { id: "same", role: "assistant", scope: "default", target: "#z", body: "old", status: "active", createdAt: T(2), updatedAt: T(2) },
+      message: { role: "assistant", content: "old" },
+      createdAt: T(2), created_at: T(2)
+    } as unknown as ShowEvent
+    const reduced = reduceAgentMarkEvents([older, canonicalButStale])
+    expect(reduced.find((r) => r.mark.target === "#z")?.mark.body).toBe("new") // ordered by occurrence T4, not stale T1
+
+    // A truly-canonical event (createdAt already the occurrence) is still a no-op fast path.
+    const canonical = normalizeAgentMarkEvent(older)
+    expect(canonical).toBe(older)
+  })
 })
 
 describe("show annotation event contract", () => {
