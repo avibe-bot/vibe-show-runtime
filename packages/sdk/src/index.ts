@@ -722,31 +722,42 @@ export type ReducedAgentMark = {
   resolvedByEvent: boolean
 }
 
+function isResolveEvent(event: AssistantMarkEvent): boolean {
+  return event.type === "assistant.mark.resolved" || event.mark.status === "resolved"
+}
+
 /**
- * Collapse a raw event stream into one entry per mark identity. Within an identity the event with
- * the greatest `createdAt` wins (replace/supersede); if that newest event is a resolve (type
- * `assistant.mark.resolved` or `status:"resolved"`) the entry is flagged `resolvedByEvent`. Callers
- * render a `resolvedByEvent` mark only if the user re-read it in the current view (gray), never on a
- * fresh load. Superseded/older events are dropped. Pure — no DOM.
+ * Collapse a raw event stream into one entry per mark identity. Within an identity the newest
+ * CREATE/UPDATE (by `createdAt`) is the active version (replace/supersede). It is flagged
+ * `resolvedByEvent` only when a resolve (read receipt) targets that active version — same `mark.id`
+ * AND authored at/after it — so a late receipt for an already-superseded older mark id never retires
+ * the newer answer, and a re-mark after a resolve re-activates. Callers render a `resolvedByEvent`
+ * mark only if the user re-read it in the current view (gray), never on a fresh load. Pure — no DOM.
  */
 export function reduceAgentMarkEvents(events: readonly ShowEvent[], scope?: string): ReducedAgentMark[] {
-  const newestByIdentity = new Map<string, AssistantMarkEvent>()
+  const byIdentity = new Map<string, { versions: AssistantMarkEvent[]; resolves: AssistantMarkEvent[] }>()
   for (const event of events) {
     if (!event.type.startsWith("assistant.mark.")) continue
     const markEvent = event as AssistantMarkEvent
     if (scope !== undefined && normalizeScope(markEvent.mark.scope) !== normalizeScope(scope)) continue
     const identity = agentMarkIdentity(markEvent.mark)
-    const prev = newestByIdentity.get(identity)
-    if (!prev || markEvent.createdAt >= prev.createdAt) newestByIdentity.set(identity, markEvent)
+    const bucket = byIdentity.get(identity) ?? { versions: [], resolves: [] }
+    if (isResolveEvent(markEvent)) bucket.resolves.push(markEvent)
+    else bucket.versions.push(markEvent)
+    byIdentity.set(identity, bucket)
   }
   const result: ReducedAgentMark[] = []
-  for (const [identity, event] of newestByIdentity) {
+  for (const [identity, { versions, resolves }] of byIdentity) {
+    if (versions.length === 0) continue // only receipts — nothing active to render
+    const active = versions.reduce((best, event) => (event.createdAt >= best.createdAt ? event : best))
     result.push({
       identity,
-      kind: typeof event.mark.replyTo === "string" && event.mark.replyTo ? "reply" : "note",
-      event,
-      createdAt: event.createdAt,
-      resolvedByEvent: event.type === "assistant.mark.resolved" || event.mark.status === "resolved"
+      kind: typeof active.mark.replyTo === "string" && active.mark.replyTo ? "reply" : "note",
+      event: active,
+      createdAt: active.createdAt,
+      // Retired only when THIS active version was resolved (its own id, at/after it) — not by a stale
+      // receipt for an older superseded mark id in the same identity.
+      resolvedByEvent: resolves.some((resolve) => resolve.mark.id === active.mark.id && resolve.createdAt >= active.createdAt)
     })
   }
   return result

@@ -1772,9 +1772,12 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
   const context = React.useContext(ShowSessionContext)
   const sourceEvents = events ?? context?.events ?? []
   const sessionId = context?.config.sessionId
-  // §5 v2: a write token exists iff the viewer can annotate. Anonymous viewers keep read state in
-  // localStorage only (never POST). Explicit prop wins (threaded from the overlay's `available`).
-  const canPost = canAnnotate ?? Boolean(context?.config.writeToken)
+  // Gate the read-receipt POST on an ACTUAL write token, not the `available`/authenticated hint —
+  // that hint is true before the /__show/me probe populates the token, so posting then would send no
+  // X-Vibe-Show-Token and the receipt would be silently dropped (#572). No token yet ⇒ localStorage
+  // path (durable on this device, remembered on reload); when the token arrives, later reads POST.
+  // `canAnnotate === false` is an explicit anonymous opt-out.
+  const canPost = canAnnotate !== false && Boolean(context?.config.writeToken)
   const tick = useViewportTick()
   const attributeNotes = useAttributeNoteMarks(scope)
   const storage = React.useMemo(() => safeLocalStorage(), [])
@@ -1800,7 +1803,9 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
         body: reduced.event.mark.body,
         targetLabel: reduced.event.mark.target || (reduced.kind === "reply" ? "回应" : "标注"),
         createdAt: reduced.createdAt,
-        anchor: reduced.event.anchor,
+        // Fall back to the mark target when the event carries no anchor (raw/legacy events), matching
+        // the legacy layer — an anchorless selector target still resolves inline instead of failing (#582).
+        anchor: reduced.event.anchor ?? { kind: "element", selector: reduced.event.mark.target, scope: reduced.event.mark.scope },
         // event-backed read (cross-device) OR an anonymous viewer's persisted (versioned) localStorage read.
         retiredAtLoad: reduced.resolvedByEvent || readTokensAtLoad.has(readKey),
         event: reduced.event
@@ -1935,9 +1940,12 @@ function MarkBubble({ mark, onClose }: { mark: ResolvedMarkCandidate; onClose: (
   const rect = mark.rect
   const left = rect ? Math.min(window.innerWidth - width - 12, Math.max(12, rect.x)) : Math.max(12, (window.innerWidth - width) / 2)
   const top = rect ? Math.min(window.innerHeight - 180, Math.max(12, rect.y + rect.height + 12)) : Math.max(12, window.innerHeight / 2 - 90)
+  // Cap the fixed bubble to the space below its top edge and scroll the body, so a long agent answer
+  // is never cut off past the viewport (the bubble is position:fixed, so page scroll can't reach it) (#576).
+  const maxHeight = Math.max(140, window.innerHeight - top - 16)
   return (
-    <div data-show-annotation-ui="" role="dialog" onClick={(event) => event.stopPropagation()} style={{ ...markBubbleShellStyle, left, top, width }}>
-      <div style={markBubbleHeaderStyle}>
+    <div data-show-annotation-ui="" role="dialog" onClick={(event) => event.stopPropagation()} style={{ ...markBubbleShellStyle, left, top, width, maxHeight, display: "flex", flexDirection: "column" }}>
+      <div style={{ ...markBubbleHeaderStyle, flex: "0 0 auto" }}>
         <span style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0 }}>
           <span style={markBubbleAuthorDotStyle} />
           <strong style={{ color: COLORS.textPrimary, font: `600 13px/1 ${FONT_STACK}` }}>Agent</strong>
@@ -1945,8 +1953,10 @@ function MarkBubble({ mark, onClose }: { mark: ResolvedMarkCandidate; onClose: (
         </span>
         <button type="button" aria-label="Close" onClick={onClose} style={markBubbleCloseStyle}>×</button>
       </div>
-      <div style={{ color: COLORS.textPrimary, font: `400 13px/1.5 ${FONT_STACK}`, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{mark.body}</div>
-      {!mark.anchored ? <div style={{ marginTop: 8, color: COLORS.textMuted, font: `400 12px/1.4 ${FONT_STACK}` }}>原位置已更新</div> : null}
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", color: COLORS.textPrimary, font: `400 13px/1.5 ${FONT_STACK}`, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+        {mark.body}
+        {!mark.anchored ? <div style={{ marginTop: 8, color: COLORS.textMuted, font: `400 12px/1.4 ${FONT_STACK}` }}>原位置已更新</div> : null}
+      </div>
     </div>
   )
 }

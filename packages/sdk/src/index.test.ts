@@ -293,6 +293,27 @@ describe("agent-mark identity + supersede/replace (reduceAgentMarkEvents)", () =
     expect(reduced).toHaveLength(1)
     expect(reduced[0].identity).toBe("note:q3:#c")
   })
+
+  it("does NOT let a late resolve for an older mark id retire the newer active version (#569)", () => {
+    const reduced = reduceAgentMarkEvents([
+      markEvent({ target: "#c", markId: "m1", body: "old", createdAt: "2026-07-23T00:00:01.000Z" }),
+      markEvent({ target: "#c", markId: "m2", body: "new", createdAt: "2026-07-23T00:00:02.000Z" }),
+      // receipt for the OLD m1 arrives late (viewer read m1 before m2 synced)
+      markEvent({ target: "#c", markId: "m1", type: "assistant.mark.resolved", createdAt: "2026-07-23T00:00:03.000Z" })
+    ])
+    expect(reduced).toHaveLength(1)
+    expect(reduced[0].event.mark.id).toBe("m2") // newest create is the active version
+    expect(reduced[0].event.mark.body).toBe("new")
+    expect(reduced[0].resolvedByEvent).toBe(false) // the receipt resolved m1, not the active m2
+  })
+
+  it("retires the active version only when the resolve targets its own mark id", () => {
+    const reduced = reduceAgentMarkEvents([
+      markEvent({ target: "#c", markId: "m2", createdAt: "2026-07-23T00:00:02.000Z" }),
+      markEvent({ target: "#c", markId: "m2", type: "assistant.mark.resolved", createdAt: "2026-07-23T00:00:03.000Z" })
+    ])
+    expect(reduced[0].resolvedByEvent).toBe(true)
+  })
 })
 
 describe("agent-mark render partition (partitionAgentMarks — cap / overflow / anchor-failure)", () => {
