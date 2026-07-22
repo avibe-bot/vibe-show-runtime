@@ -1,0 +1,200 @@
+{
+ "events": [
+  {
+   "id": "show_evt_22c66c0b740d4107",
+   "session_id": "sestajnvbucmv",
+   "type": "assistant.mark.created",
+   "actor": "assistant",
+   "scope": "default",
+   "anchor": {
+    "kind": "element",
+    "scope": "default",
+    "selector": "div > div > div > div > h1",
+    "domPath": "html[0]/body[1]/div[0]/div[0]/main[0]/div[0]/div[0]/div[0]/div[1]/h1[0]",
+    "text": "Building your Show Page",
+    "textQuote": "Building your Show Page",
+    "rect": {
+     "x": 409,
+     "y": 273,
+     "width": 382,
+     "height": 28
+    },
+    "viewport": {
+     "width": 1200,
+     "height": 752,
+     "scrollX": 0,
+     "scrollY": 0
+    },
+    "source": "element",
+    "label": "Building your Show Page",
+    "element": {
+     "tagName": "h1",
+     "className": "text-lg font-semibold tracking-tight",
+     "text": "Building your Show Page",
+     "nearbyText": "Your agent is turning this session into a visual page. It will appear here automatically once it is ready. Building your Show PageYour agent is turning this session into a visual page. It will appear here automatically once it is ready.",
+     "nearbyElements": [
+      {
+       "selector": "div > div > div > div > p",
+       "label": "Your agent is turning this session into a visual page. It will appear here autom",
+       "text": "Your agent is turning this session into a visual page. It will appear here automatically once it is ready.",
+       "rect": {
+        "x": 409,
+        "y": 307,
+        "width": 382,
+        "height": 40
+       }
+      }
+     ],
+     "isFixed": false
+    }
+   },
+   "payload": {
+    "id": "mark_f3563252fc37f96d",
+    "role": "assistant",
+    "scope": "default",
+    "target": "div > div > div > div > h1",
+    "body": "验收回答:这个占位标题的问题已经处理,渐变和图标都加上了。",
+    "status": "active",
+    "createdAt": "2026-07-22T19:24:36.452502+00:00",
+    "updatedAt": "2026-07-22T19:24:36.452502+00:00",
+    "resolvedAt": null,
+    "replyTo": "show_evt_d8eae8da-d88e-48c8-83ed-e023a31199b2"
+   },
+   "transcript_text": "[agent-mark:default:created] div > div > div > div > h1\n\n验收回答:这个占位标题的问题已经处理,渐变和图标都加上了。\n\nAnchor: div > div > div > div > h1\nText: Building your Show Page",
+   "message_id": "msg_0065738170814bdb6dfdcaa",
+   "created_at": "2026-07-22T19:24:36.451630+00:00"
+  },
+  {
+   "id": "show_evt_9a6dee35d00f4112",
+   "session_id": "sestajnvbucmv",
+   "type": "assistant.mark.created",
+   "actor": "assistant",
+   "scope": "default",
+   "anchor": {},
+   "payload": {
+    "id": "mark_e9947a57cac901a6",
+    "role": "assistant",
+    "scope": "default",
+    "target": "#test-block",
+    "body": "第一版说明",
+    "status": "active",
+    "createdAt": "2026-07-22T19:24:36.818549+00:00",
+    "updatedAt": "2026-07-22T19:24:36.818549+00:00",
+    "resolvedAt": null
+   },
+   "transcript_text": "[agent-mark:default:created] #test-block\n\n第一版说明",
+   "message_id": "msg_0065738170da4366caf5fc9",
+   "created_at": "2026-07-22T19:24:36.817841+00:00"
+  },
+  {
+   "id": "show_evt_63e19f1f67f94faa",
+   "session_id": "sestajnvbucmv",
+   "type": "assistant.mark.created",
+   "actor": "assistant",
+   "scope": "default",
+   "anchor": {},
+   "payload": {
+    "id": "mark_e9947a57cac901a6",
+    "role": "assistant",
+    "scope": "default",
+    "target": "#test-block",
+    "body": "第二版说明(应替换)",
+    "status": "active",
+    "createdAt": "2026-07-22T19:24:37.131782+00:00",
+    "updatedAt": "2026-07-22T19:24:37.131782+00:00",
+    "resolvedAt": null
+   },
+   "transcript_text": "[agent-mark:default:created] #test-block\n\n第二版说明(应替换)",
+   "message_id": "msg_006573817126bc00927f954",
+   "created_at": "2026-07-22T19:24:37.131033+00:00"
+  },
+  {
+   "id": "show_evt_134cac7c34d64f79",
+   "session_id": "sestajnvbucmv",
+   "type": "assistant.mark.created",
+   "actor": "assistant",
+   "scope": "default",
+   "anchor": {},
+   "payload": {
+    "id": "mark_bb4694fb88b76042",
+    "role": "assistant",
+    "scope": "default",
+    "target": "#tmp-a",
+    "body": "临时A",
+    "status": "active",
+    "createdAt": "2026-07-22T19:25:02.143050+00:00",
+    "updatedAt": "2026-07-22T19:25:02.143050+00:00",
+    "resolvedAt": null
+   },
+   "transcript_text": "[agent-mark:default:created] #tmp-a\n\n临时A",
+   "message_id": "msg_00657381890104ae9db9a69",
+   "created_at": "2026-07-22T19:25:02.142282+00:00"
+  },
+  {
+   "id": "show_evt_f6bc248328cd4dc5",
+   "session_id": "sestajnvbucmv",
+   "type": "assistant.mark.created",
+   "actor": "assistant",
+   "scope": "default",
+   "anchor": {},
+   "payload": {
+    "id": "mark_81e6113f4786094c",
+    "role": "assistant",
+    "scope": "default",
+    "target": "#tmp-b",
+    "body": "临时B",
+    "status": "active",
+    "createdAt": "2026-07-22T19:25:02.502024+00:00",
+    "updatedAt": "2026-07-22T19:25:02.502024+00:00",
+    "resolvedAt": null
+   },
+   "transcript_text": "[agent-mark:default:created] #tmp-b\n\n临时B",
+   "message_id": "msg_006573818958a32f7e48844",
+   "created_at": "2026-07-22T19:25:02.501190+00:00"
+  },
+  {
+   "id": "show_evt_7b0450b48dc74897",
+   "session_id": "sestajnvbucmv",
+   "type": "assistant.mark.resolved",
+   "actor": "assistant",
+   "scope": "default",
+   "anchor": {},
+   "payload": {
+    "id": "mark_bb4694fb88b76042",
+    "role": "assistant",
+    "scope": "default",
+    "target": "#tmp-a",
+    "body": "临时A",
+    "status": "resolved",
+    "createdAt": "2026-07-22T19:25:02.143050+00:00",
+    "updatedAt": "2026-07-22T19:25:02.143050+00:00",
+    "resolvedAt": "2026-07-22T19:25:02.913593+00:00"
+   },
+   "transcript_text": "[agent-mark:default:resolved] #tmp-a\n\n临时A",
+   "message_id": "msg_0065738189bd1a1e73ae1c2",
+   "created_at": "2026-07-22T19:25:02.912034+00:00"
+  },
+  {
+   "id": "show_evt_0100d9f249be48a1",
+   "session_id": "sestajnvbucmv",
+   "type": "assistant.mark.resolved",
+   "actor": "assistant",
+   "scope": "default",
+   "anchor": {},
+   "payload": {
+    "id": "mark_81e6113f4786094c",
+    "role": "assistant",
+    "scope": "default",
+    "target": "#tmp-b",
+    "body": "临时B",
+    "status": "resolved",
+    "createdAt": "2026-07-22T19:25:02.502024+00:00",
+    "updatedAt": "2026-07-22T19:25:02.502024+00:00",
+    "resolvedAt": "2026-07-22T19:25:02.940865+00:00"
+   },
+   "transcript_text": "[agent-mark:default:resolved] #tmp-b\n\n临时B",
+   "message_id": "msg_0065738189c3d471271078f",
+   "created_at": "2026-07-22T19:25:02.938714+00:00"
+  }
+ ]
+}

@@ -728,6 +728,26 @@ export function agentMarkOf(event: ShowEvent): AgentMark | undefined {
   return record.mark ?? record.payload
 }
 
+/**
+ * The EVENT-OCCURRENCE time of an `assistant.mark.*` event — the ordering / supersede / resolve key.
+ * Tolerates BOTH the SDK camelCase `createdAt` and the live backend's on-wire snake_case `created_at`
+ * (the event-level field is `created_at`; the mark's own `createdAt` lives inside `payload`), then
+ * falls back to the payload `createdAt`. Keying on the wrong field name collapses every comparison to
+ * `undefined >= undefined` (false), which keeps the OLDEST same-id version and never lets a resolve
+ * retire its mark — the two live-regression defects this closes. Note: for a resolve event the payload
+ * `createdAt` echoes the ORIGINAL mark's time, so the event-level occurrence time must win over it.
+ */
+export function eventOccurredAt(event: ShowEvent): string {
+  const record = event as { createdAt?: unknown; created_at?: unknown }
+  // Prefer the snake `created_at` — it is the true EVENT-level occurrence time. In a snake/camel
+  // transition an event could carry both, with the camel `createdAt` populated from the mark payload
+  // (a resolve echoes the ORIGINAL mark time); picking camel first would order by that stale timestamp.
+  if (typeof record.created_at === "string" && record.created_at) return record.created_at
+  if (typeof record.createdAt === "string" && record.createdAt) return record.createdAt
+  const mark = agentMarkOf(event)
+  return typeof mark?.createdAt === "string" ? mark.createdAt : ""
+}
+
 /** An anchor is usable for rendering only if it carries an actual LOCATOR (selector / mark / id /
  *  textQuote / rect) — `kind` alone is metadata that resolveAnchor cannot locate. The on-wire anchor
  *  is often the empty `{}` (or a bare `{kind}`), in which case we fall through to the mark target. */
@@ -742,19 +762,30 @@ function isUsableAnchor(anchor: ShowAnchor | undefined): boolean {
  * on-wire event omits it — so EVERY downstream consumer (the reducer's returned event, custom
  * `renderMark` callbacks that read `event.message.content`, transcript formatting) can read a complete
  * `AssistantMarkEvent` regardless of the source shape. The single normalization chokepoint for the
- * payload/mark variance; a no-op for already-canonical (`mark`-shaped WITH a message) events.
+ * payload/mark variance AND the event-level snake_case↔camelCase divergence (`created_at`→`createdAt`);
+ * a no-op for already-canonical (`mark`-shaped WITH a message AND a camelCase `createdAt`) events.
  */
 export function normalizeAgentMarkEvent(event: ShowEvent): AssistantMarkEvent {
   const mark = agentMarkOf(event)
-  const record = event as { mark?: AgentMark; message?: AssistantMarkEvent["message"] }
-  if (!mark || (record.mark === mark && record.message)) return event as AssistantMarkEvent
+  if (!mark) return event as AssistantMarkEvent
+  const record = event as { mark?: AgentMark; message?: AssistantMarkEvent["message"]; createdAt?: string }
+  // `eventOccurredAt` is the single source of truth for occurrence time (snake `created_at` first, then
+  // camel, then payload). Compute it up front so the fast path below can only skip work when the event
+  // is ALREADY canonical on this field too.
+  const createdAt = eventOccurredAt(event)
+  // No-op ONLY when fully canonical: mark-shaped, has a message, AND `createdAt` already equals the
+  // occurrence time. This guarantees the invariant `normalize(event).createdAt === eventOccurredAt(event)`
+  // for EVERY input — a stale camel birth paired with a newer snake `created_at` can never survive the
+  // fast path and mis-order supersede/resolve (#3633873997).
+  if (record.mark === mark && record.message && record.createdAt === createdAt) return event as AssistantMarkEvent
   const canonical = event as AssistantMarkEvent
   return {
     ...canonical,
     mark: mark as Required<AgentMark>,
     // The live backend's payload-shaped mark events carry no `message`; synthesize it from the mark
     // (mirroring `assistantMarkEvent`) so renderers reading `event.message.content` never throw (#3633478191).
-    message: record.message ?? { role: "assistant", content: formatAgentMarkMessage(mark as Required<AgentMark>, canonical.anchor) }
+    message: record.message ?? { role: "assistant", content: formatAgentMarkMessage(mark as Required<AgentMark>, canonical.anchor) },
+    createdAt
   }
 }
 
@@ -790,7 +821,10 @@ export function reduceAgentMarkEvents(events: readonly ShowEvent[], scope?: stri
     if (!mark) continue // no mark payload on this event — nothing to render, never dereference undefined
     if (scope !== undefined && normalizeScope(mark.scope) !== normalizeScope(scope)) continue
     const identity = agentMarkIdentity(mark)
-    const version: MarkVersion = { event: event as AssistantMarkEvent, mark }
+    // Normalize UP FRONT so every version carries a canonical event-level `createdAt` (from the on-wire
+    // `created_at`) — the ordering / supersede / resolve comparisons below then read a real timestamp
+    // instead of undefined. `version.mark` stays the same object `agentMarkOf` returned.
+    const version: MarkVersion = { event: normalizeAgentMarkEvent(event), mark }
     const bucket = byIdentity.get(identity) ?? { versions: [], resolves: [] }
     if (event.type === "assistant.mark.resolved" || mark.status === "resolved") bucket.resolves.push(version)
     else bucket.versions.push(version)
@@ -808,9 +842,16 @@ export function reduceAgentMarkEvents(events: readonly ShowEvent[], scope?: stri
       event: normalizeAgentMarkEvent(active.event),
       mark: active.mark,
       createdAt: active.event.createdAt,
-      // Retired only when THIS active version was resolved (its own id, at/after it) — not by a stale
-      // receipt for an older superseded mark id in the same identity.
-      resolvedByEvent: resolves.some((resolve) => resolve.mark.id === active.mark.id && resolve.event.createdAt >= active.event.createdAt)
+      // Retired only when THIS active version was resolved. Match on (a) the shared mark id, (b) a
+      // VERSION discriminator — the resolve payload's own `createdAt`, which echoes the specific version
+      // it targets — so when the backend reuses a mark id for a superseding create, a resolve aimed at
+      // the OLDER version cannot retire the newer one; and (c) occurrence at/after the active version.
+      resolvedByEvent: resolves.some(
+        (resolve) =>
+          resolve.mark.id === active.mark.id &&
+          resolve.mark.createdAt === active.mark.createdAt &&
+          resolve.event.createdAt >= active.event.createdAt
+      )
     })
   }
   return result
