@@ -728,11 +728,25 @@ export function agentMarkOf(event: ShowEvent): AgentMark | undefined {
   return record.mark ?? record.payload
 }
 
-/** An anchor is usable for rendering only if it actually carries locating info — the on-wire anchor is
- *  often the empty `{}`, in which case we fall through to the mark target instead of returning it. */
+/** An anchor is usable for rendering only if it carries an actual LOCATOR (selector / mark / id /
+ *  textQuote / rect) — `kind` alone is metadata that resolveAnchor cannot locate. The on-wire anchor
+ *  is often the empty `{}` (or a bare `{kind}`), in which case we fall through to the mark target. */
 function isUsableAnchor(anchor: ShowAnchor | undefined): boolean {
   const record = anchor as Record<string, unknown> | undefined
-  return Boolean(record && (record.kind || record.selector || record.mark || record.id || record.textQuote || record.rect))
+  return Boolean(record && (record.selector || record.mark || record.id || record.textQuote || record.rect))
+}
+
+/**
+ * Normalize an `assistant.mark.*` event to the canonical `mark`-shaped `AssistantMarkEvent` — copying
+ * the mark from the on-wire `payload` onto `.mark` when needed — so EVERY downstream consumer
+ * (the reducer's returned event, custom `renderMark` callbacks, transcript formatting) can read
+ * `event.mark` regardless of the source shape. The single normalization chokepoint for the payload/mark
+ * variance; a no-op for already-`mark`-shaped events.
+ */
+export function normalizeAgentMarkEvent(event: ShowEvent): AssistantMarkEvent {
+  const mark = agentMarkOf(event)
+  if (!mark || (event as { mark?: AgentMark }).mark === mark) return event as AssistantMarkEvent
+  return { ...(event as AssistantMarkEvent), mark: mark as Required<AgentMark> }
 }
 
 export type ReducedAgentMark = {
@@ -780,7 +794,9 @@ export function reduceAgentMarkEvents(events: readonly ShowEvent[], scope?: stri
     result.push({
       identity,
       kind: typeof active.mark.replyTo === "string" && active.mark.replyTo ? "reply" : "note",
-      event: active.event,
+      // Return a canonical mark-shaped event so downstream readers of `reduced.event.mark` (outside
+      // the updated React path) never hit undefined on a payload-shaped live event (#275).
+      event: normalizeAgentMarkEvent(active.event),
       mark: active.mark,
       createdAt: active.event.createdAt,
       // Retired only when THIS active version was resolved (its own id, at/after it) — not by a stale
@@ -875,7 +891,11 @@ export function resolveAgentMarkAnchor(event: AssistantMarkEvent, events: readon
     if (isUsableAnchor(referencedAnchor)) return referencedAnchor
   }
   if (!mark) return undefined
-  return targetToAnchor(mark.target, normalizeScope(mark.scope))
+  const scope = normalizeScope(mark.scope)
+  // targetToAnchor handles the mark-id form (mark-<scope>-<id>) and #/./[ selectors; fall back to a
+  // plain element selector for any other target (e.g. `button`, `main > .card`) so the legacy direct-
+  // selector behavior is preserved instead of dropping the mark to the badge (#288).
+  return targetToAnchor(mark.target, scope) ?? (mark.target ? { kind: "element", scope, selector: mark.target } : undefined)
 }
 
 export function humanIntentEvent(
@@ -953,7 +973,10 @@ export function humanAnnotationEvent(
 export function formatShowEventMessage(event: ShowEvent) {
   if (event.type.startsWith("assistant.mark.")) {
     const markEvent = event as AssistantMarkEvent
-    return markEvent.message?.content ?? formatAgentMarkMessage(markEvent.mark, markEvent.anchor)
+    // Read the mark shape-agnostically (event.mark OR the on-wire payload) so transcript projection of a
+    // payload-shaped, message-less mark event does not dereference undefined (#291).
+    const mark = agentMarkOf(event)
+    return markEvent.message?.content ?? (mark ? formatAgentMarkMessage(mark as Required<AgentMark>, markEvent.anchor) : undefined)
   }
   if (event.type === "human.intent.submitted") {
     return event.message?.content ?? formatHumanIntentMessage(event.payload, event.anchor)

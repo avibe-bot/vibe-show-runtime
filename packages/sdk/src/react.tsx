@@ -14,6 +14,7 @@ import {
   attributeNoteReadToken,
   agentMarkReadStorageKey,
   agentMarkOf,
+  normalizeAgentMarkEvent,
   AGENT_NOTE_ATTRIBUTE,
   isMarkAnchored,
   resolveAgentMarkAnchor,
@@ -1722,7 +1723,9 @@ function LegacyAgentMarkLayer({ events, scope, className, renderMark }: AgentMar
   return createPortal(
     <div className={className} data-show-agent-mark-layer="" style={layerStyle}>
       {marks.map(({ event, rect }) => (
-        <React.Fragment key={event.id}>{renderMark(event, rect)}</React.Fragment>
+        // Hand the custom renderer a canonical mark-shaped event so renderers reading event.mark don't
+        // throw on a payload-shaped live event (#282).
+        <React.Fragment key={event.id}>{renderMark(normalizeAgentMarkEvent(event), rect)}</React.Fragment>
       ))}
     </div>,
     document.body

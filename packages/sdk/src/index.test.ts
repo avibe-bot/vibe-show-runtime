@@ -16,6 +16,8 @@ import {
   hashMarkText,
   isMarkAnchored,
   resolveAgentMarkAnchor,
+  normalizeAgentMarkEvent,
+  agentMarkOf,
   type ShowAnchor,
   type ShowEvent
 } from "./index.js"
@@ -107,6 +109,37 @@ describe("real on-wire payload shape (Lane A2 integration, R5)", () => {
   it("resolves a payload-shaped anchorless note through its target, tolerating an empty anchor", () => {
     const event = payloadMarkEvent({ target: "#revenue-card", body: "note", createdAt: T(1) }) // anchor {}
     expect(resolveAgentMarkAnchor(event as never, [])).toMatchObject({ kind: "element", selector: "#revenue-card" })
+  })
+
+  it("agentMarkOf reads the payload; normalizeAgentMarkEvent copies it onto .mark for downstream readers (#275/#282)", () => {
+    const event = payloadMarkEvent({ target: "#c", body: "b", markId: "m1", createdAt: T(1) })
+    expect((event as { mark?: unknown }).mark).toBeUndefined() // raw payload shape has no top-level mark
+    expect(agentMarkOf(event)?.target).toBe("#c")
+    const normalized = normalizeAgentMarkEvent(event)
+    expect(normalized.mark.target).toBe("#c") // downstream can now read event.mark safely
+    expect(normalized.mark.body).toBe("b")
+  })
+
+  it("the reducer returns a mark-shaped event even from a payload-shaped stream (#275)", () => {
+    const reduced = reduceAgentMarkEvents([payloadMarkEvent({ target: "#c", body: "b", markId: "m1", createdAt: T(1) })])
+    expect(reduced[0].event.mark.body).toBe("b") // reduced.event.mark is populated, not undefined
+  })
+
+  it("does not throw formatting a payload-shaped, message-less mark event (#291)", () => {
+    const event = payloadMarkEvent({ target: "#c", body: "本区块已切换到新数据源", markId: "m1", createdAt: T(1) })
+    const message = formatShowEventMessage(event)
+    expect(typeof message).toBe("string")
+    expect(message).toContain("本区块已切换到新数据源")
+  })
+
+  it("a bare {kind} anchor is not treated as a locator — falls through to the target (#284)", () => {
+    const event = payloadMarkEvent({ target: "#chart", body: "b", createdAt: T(1), anchor: { kind: "element" } })
+    expect(resolveAgentMarkAnchor(event as never, [])).toMatchObject({ kind: "element", selector: "#chart" })
+  })
+
+  it("preserves tag-qualified selector targets via the element fallback (#288)", () => {
+    const event = payloadMarkEvent({ target: "main > .card", body: "b", createdAt: T(1) })
+    expect(resolveAgentMarkAnchor(event as never, [])).toMatchObject({ kind: "element", selector: "main > .card" })
   })
 })
 
