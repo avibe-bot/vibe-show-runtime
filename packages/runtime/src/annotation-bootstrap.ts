@@ -78,11 +78,15 @@ export async function serveAnnotationBootstrap(appPath: string, response: Server
   }
   response.statusCode = 200
   response.setHeader("content-type", "text/javascript; charset=utf-8")
-  // The entry filename is stable across releases (so a runtime upgrade must be able to refresh it):
-  // revalidate it often. Chunks are content-hashed, so they're safe to cache immutably.
+  // The entry filename is STABLE across releases, so ANY positive max-age is a deploy-blindness window:
+  // browsers — and Cloudflare on the public tunnel, since the header is `public` — keep serving the old
+  // bundle for the whole max-age after a deploy (owner hit this: three deploys, zero visible change).
+  // Serve the entry `no-store` (matching the session module's dev-server semantics) so every load fetches
+  // the current bundle; restore strong immutable caching once content-addressed chunking (avibe#950) gives
+  // the entry a hashed URL. Content-hashed chunks already carry a hash in the name, so they stay immutable.
   response.setHeader(
     "cache-control",
-    name === ANNOTATION_BOOTSTRAP_ENTRY ? "public, max-age=300, must-revalidate" : "public, max-age=31536000, immutable"
+    name === ANNOTATION_BOOTSTRAP_ENTRY ? "no-store" : "public, max-age=31536000, immutable"
   )
   response.end(body)
   return true

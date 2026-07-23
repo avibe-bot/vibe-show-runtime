@@ -340,6 +340,13 @@ try {
   if (annotationBootstrap.status !== 200 || !(annotationBootstrap.headers.get("content-type") || "").includes("javascript")) {
     throw new Error(`Expected annotation bootstrap served as JS, got ${annotationBootstrap.status} ${annotationBootstrap.headers.get("content-type")}`)
   }
+  // The entry URL is STABLE across releases, so any positive max-age hides a deploy for that window
+  // (browsers + Cloudflare on the public tunnel). It must be `no-store` until content-addressed chunking
+  // (avibe#950) gives it a hashed URL; content-hashed chunks stay immutable (asserted for vendor above).
+  const annotationBootstrapCacheControl = annotationBootstrap.headers.get("cache-control") || ""
+  if (!annotationBootstrapCacheControl.includes("no-store") || /max-age=[1-9]/.test(annotationBootstrapCacheControl)) {
+    throw new Error(`Expected the stable annotation bootstrap entry to be no-store for deploy visibility, got "${annotationBootstrapCacheControl}"`)
+  }
   if (!/from\s*"react"/.test(annotationBootstrapBody) || !/from\s*"react-dom\/client"/.test(annotationBootstrapBody)) {
     throw new Error("Expected the annotation bootstrap to keep react / react-dom/client bare for the import map")
   }
