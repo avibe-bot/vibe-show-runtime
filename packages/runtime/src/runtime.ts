@@ -1227,11 +1227,21 @@ function importGlobSpecifiers(source: string) {
       tokens[index + 1]?.value === "." &&
       tokens[index + 2]?.value === "meta" &&
       tokens[index + 3]?.value === "." &&
-      tokens[index + 4]?.value === "glob" &&
-      tokens[index + 5]?.value === "(" &&
-      tokens[index + 6]?.kind === "string"
+      tokens[index + 4]?.value === "glob"
     ) {
-      specifiers.push(tokens[index + 6].value)
+      let cursor = index + 5
+      if (tokens[cursor]?.value === "<") {
+        let depth = 0
+        do {
+          const value = tokens[cursor]?.value
+          if (value === "<") depth += 1
+          if (value === ">") depth -= 1
+          cursor += 1
+        } while (cursor < tokens.length && depth > 0)
+      }
+      if (tokens[cursor]?.value === "(" && tokens[cursor + 1]?.kind === "string") {
+        specifiers.push(tokens[cursor + 1].value)
+      }
     }
   }
   return specifiers
@@ -1436,11 +1446,23 @@ async function sourceFilesUnder(root: string) {
 }
 
 function globMatches(pattern: string, value: string) {
-  const regex = new RegExp(`^${pattern.split(/(\*\*)|(\*)/g).filter(Boolean).map((part) => {
-    if (part === "**") return ".*"
-    if (part === "*") return "[^/]*"
-    return escapeRegExp(part)
-  }).join("")}$`)
+  let expression = ""
+  for (let index = 0; index < pattern.length;) {
+    if (pattern.startsWith("**/", index)) {
+      expression += "(?:.*/)?"
+      index += 3
+    } else if (pattern.startsWith("**", index)) {
+      expression += ".*"
+      index += 2
+    } else if (pattern[index] === "*") {
+      expression += "[^/]*"
+      index += 1
+    } else {
+      expression += escapeRegExp(pattern[index])
+      index += 1
+    }
+  }
+  const regex = new RegExp(`^${expression}$`)
   return regex.test(value)
 }
 

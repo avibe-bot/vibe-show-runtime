@@ -180,7 +180,18 @@ await symlink(".env", join(root, "smoke", "public", "linked-env.txt"))
 await mkdir(join(root, "managed-git"), { recursive: true })
 await writeFile(join(root, "managed-git", ".git"), "gitdir: /tmp/private-show-gitdir\n")
 await mkdir(join(root, "legacy", "src"), { recursive: true })
-const legacyApp = "export default function App() { return <main>Existing workspace</main> }\n"
+const legacyApp = `import { useSyncExternalStore } from "react"
+
+function subscribe(onChange) {
+  window.addEventListener("hashchange", onChange)
+  return () => window.removeEventListener("hashchange", onChange)
+}
+
+export default function App() {
+  const route = useSyncExternalStore(subscribe, () => window.location.hash || "#/", () => "#/")
+  return <main>Existing hash workspace: {route}</main>
+}
+`
 await writeFile(join(root, "legacy", "src", "App.tsx"), legacyApp)
 await symlink(join(staleDependencyRoot, "node_modules"), join(root, "smoke", "node_modules"), "junction")
 const runtime = await startShowRuntimeServer({ workspaceRoot: root, cacheRoot, fallbackDelaySeconds: 30 })
@@ -209,6 +220,10 @@ try {
   }
   if ((await readFile(join(root, "legacy", "src", "App.tsx"), "utf8")) !== legacyApp) {
     throw new Error("Expected an existing workspace app to stay byte-identical")
+  }
+  const legacyHashEntry = await fetch(`${runtime.url}/sessions/legacy/app/#/existing`)
+  if (legacyHashEntry.status !== 200 || !(await legacyHashEntry.text()).includes('/show/legacy/src/main.tsx')) {
+    throw new Error("Expected an existing hash workspace to keep loading from its entry URL")
   }
   try {
     await access(join(root, "legacy", "src", "router.tsx"))
@@ -292,6 +307,16 @@ try {
   const historyRouteBody = await historyRoute.text()
   if (historyRoute.status !== 200 || !historyRouteBody.includes('/show/smoke/src/main.tsx')) {
     throw new Error(`Expected a deep History route to serve transformed entry HTML, got ${historyRoute.status}`)
+  }
+  const deepHmrClientUrl = historyRouteBody.match(/src="(\/show\/smoke\/@id\/[^"]+)"/)?.[1]
+  const deepHmrClientPath = deepHmrClientUrl?.replace(/^\/show\/smoke\//, "/sessions/smoke/app/")
+  const deepHmrClient = deepHmrClientPath ? await fetch(`${runtime.url}${deepHmrClientPath}`) : undefined
+  if (!deepHmrClientUrl || !deepHmrClient || deepHmrClient.status !== 200) {
+    throw new Error(`Expected deep History HTML to use a base-rooted HMR client, got ${deepHmrClientUrl ?? "missing"}`)
+  }
+  const apiaryRoute = await fetch(`${runtime.url}/sessions/smoke/app/apiary`)
+  if (apiaryRoute.status !== 200 || !(await apiaryRoute.text()).includes('/show/smoke/src/main.tsx')) {
+    throw new Error(`Expected a route beginning with api to bypass the reserved API segment, got ${apiaryRoute.status}`)
   }
   const missingAsset = await fetch(`${runtime.url}/sessions/smoke/app/assets/missing.js`, {
     headers: { accept: "text/html" }
@@ -482,7 +507,7 @@ import rawExample from "./raw-example.ts?raw"
 import type {} from "missing-export-type-package"
 import { type InlineMissingType } from "missing-inline-type-only-package"
 export { type InlineMissingExportType } from "missing-inline-export-type-only-package"
-const eagerPages = import.meta.glob("./pages/*.tsx", { eager: true })
+const eagerPages = import.meta.glob<{ default: unknown }>("./pages/**/*.tsx", { eager: true })
 // import "missing-commented-only-package"
 /* import "missing-block-comment-only-package" */
 const snippet = 'import "missing-string-only-package"'

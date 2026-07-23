@@ -349,14 +349,13 @@ export function useRoutePath(): string {
 function routeUrl(to: string): URL {
   const normalizedTo = to.startsWith("/") ? to : "/" + to
   const route = new URL(normalizedTo, window.location.origin)
-  const target = new URL(window.location.href)
-  const embed = target.searchParams.get("vibe-embed")
+  const current = new URL(window.location.href)
+  const target = new URL(basePath(), window.location.origin)
+  const embed = current.searchParams.get("vibe-embed")
   target.pathname = basePath() + route.pathname.replace(/^\\/+/, "")
-  if (route.search) {
-    target.search = route.search
-    if (embed && !target.searchParams.has("vibe-embed")) target.searchParams.set("vibe-embed", embed)
-  }
-  if (route.hash) target.hash = route.hash
+  target.search = route.search
+  if (embed && !target.searchParams.has("vibe-embed")) target.searchParams.set("vibe-embed", embed)
+  target.hash = route.hash
   return target
 }
 

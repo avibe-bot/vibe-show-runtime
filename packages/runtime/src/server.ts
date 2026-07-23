@@ -187,7 +187,7 @@ async function routeRequest(
       return
     }
 
-    if (appPath.startsWith("/api")) {
+    if (appPath === "/api" || appPath.startsWith("/api/")) {
       if (!session.vite) {
         sendJson(response, 503, { error: "Session not ready", status })
         return
