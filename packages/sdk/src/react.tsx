@@ -1457,6 +1457,13 @@ function useDraggable(element: "fab" | "badge", sessionId: string | undefined, r
   // clamp the bottom clearance on resize so a down-anchored element never re-clips its shadow (#3637621027).
   const heightRef = React.useRef(restingHeight)
 
+  // Reload the placement when the element/session changes — the useState initializer runs only on the
+  // first mount, so a SPA that swaps `sessionId` on a reused provider would otherwise keep the prior
+  // session's placement and write it into the new session's key, defeating per-session storage (#3637761504).
+  React.useEffect(() => {
+    setPlacement(readStoredFloatPlacement(element, sessionId, storage) ?? null)
+  }, [element, sessionId, storage])
+
   // On resize keep the element on-screen by clamping only the vertical offset; the edge is preserved.
   React.useEffect(() => {
     if (typeof window === "undefined") return
