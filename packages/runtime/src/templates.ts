@@ -32,7 +32,7 @@ export async function ensureSessionTemplate(workspace: string, uiPackageName: st
   const freshWorkspace = !(await fileExists(appPath))
   await writeIfMissing(join(workspace, "index.html"), indexHtml())
   await writeIfMissing(join(workspace, "src", "show-runtime-config.ts"), showRuntimeConfigTs())
-  await writeIfMissing(join(workspace, "src", "main.tsx"), mainTsx())
+  await writeIfMissing(join(workspace, "src", "main.tsx"), mainTsx(freshWorkspace))
   await writeIfMissing(appPath, appTsx())
   if (freshWorkspace) {
     await mkdir(join(workspace, "src", "pages"), { recursive: true })
@@ -151,14 +151,8 @@ function indexHtml() {
 `
 }
 
-function mainTsx() {
-  return `import React from "react"
-import { createRoot } from "react-dom/client"
-import "@avibe/show-ui/styles.css"
-import "./styles.css"
-import "./show-runtime-config"
-import App from "./App"
-
+function mainTsx(includeLegacyHashRedirect: boolean) {
+  const legacyHashRedirect = includeLegacyHashRedirect ? `
 function redirectLegacyHashRoute() {
   if (!window.location.hash.startsWith("#/")) return
   const configuredBase = globalThis.__AVIBE_SHOW__?.basePath || "/"
@@ -174,6 +168,15 @@ function redirectLegacyHashRoute() {
 }
 
 redirectLegacyHashRoute()
+` : ""
+
+  return `import React from "react"
+import { createRoot } from "react-dom/client"
+import "@avibe/show-ui/styles.css"
+import "./styles.css"
+import "./show-runtime-config"
+import App from "./App"
+${legacyHashRedirect}
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

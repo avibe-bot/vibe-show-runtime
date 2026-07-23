@@ -221,6 +221,10 @@ try {
   if ((await readFile(join(root, "legacy", "src", "App.tsx"), "utf8")) !== legacyApp) {
     throw new Error("Expected an existing workspace app to stay byte-identical")
   }
+  const legacyMain = await readFile(join(root, "legacy", "src", "main.tsx"), "utf8")
+  if (legacyMain.includes("redirectLegacyHashRoute")) {
+    throw new Error("Expected an existing hash workspace not to receive the fresh-scaffold hash redirect")
+  }
   const legacyHashEntry = await fetch(`${runtime.url}/sessions/legacy/app/#/existing`)
   if (legacyHashEntry.status !== 200 || !(await legacyHashEntry.text()).includes('/show/legacy/src/main.tsx')) {
     throw new Error("Expected an existing hash workspace to keep loading from its entry URL")
