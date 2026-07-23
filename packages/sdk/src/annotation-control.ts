@@ -97,11 +97,14 @@ export function writeStoredAnnotationMode(
   }
 }
 
-// ── Standalone FAB visibility via URL hash (owner-frozen #mark / #unmark) ────────────────
-// Default: FAB visible. `#unmark` hides it, `#mark` shows it; the hash acts as a ONE-TIME switch whose
-// choice persists per session, so a later hash-free load honors the stored choice. Standalone host only.
-export const ANNOTATION_FAB_HASH_SHOW = "#mark"
-export const ANNOTATION_FAB_HASH_HIDE = "#unmark"
+// ── Standalone FAB visibility via URL QUERY PARAM (owner-frozen mark / unmark) ────────────
+// Default: FAB visible. `?unmark` hides it, `?mark` shows it (bare-presence). A query param — NOT the
+// hash — because the Show Page hash router owns `#/…` routes and a `#unmark` collided with it (404s).
+// The param is a ONE-TIME switch: read at overlay boot, persisted per session, then stripped from the URL
+// (history.replaceState) so the URL returns clean and a later param-free load honors the stored choice.
+// Standalone host only; coexists with `?vibe-embed=1` (the embedded host ignores these entirely).
+export const ANNOTATION_FAB_PARAM_SHOW = "mark"
+export const ANNOTATION_FAB_PARAM_HIDE = "unmark"
 export const ANNOTATION_FAB_VISIBLE_STORAGE_PREFIX = "avibe:fab-visible:"
 
 export function fabVisibleStorageKey(sessionId: string | undefined): string {
@@ -109,18 +112,23 @@ export function fabVisibleStorageKey(sessionId: string | undefined): string {
 }
 
 /**
- * Resolve whether the standalone FAB is visible. Precedence: an explicit hash WINS and dictates what to
- * persist (`persist` = the boolean to write, so the switch survives a later hash-free load); with no hash
- * we honor the stored choice, else default visible (`persist: null` ⇒ write nothing). Pure; the caller
- * owns storage + the hashchange listener.
+ * Resolve whether the standalone FAB is visible from the URL search string. Precedence: an explicit
+ * `?unmark` / `?mark` (bare presence) WINS and dictates what to persist (`persist` = the boolean to write,
+ * so the switch survives a later param-free load); else honor the stored choice; else default visible
+ * (`persist: null` ⇒ write nothing). Pure; the caller reads `location.search`, persists, and strips the param.
  */
 export function resolveFabVisibility(
-  hash: string | undefined,
+  search: string | undefined,
   stored: boolean | undefined
 ): { visible: boolean; persist: boolean | null } {
-  const normalized = (hash ?? "").trim().toLowerCase()
-  if (normalized === ANNOTATION_FAB_HASH_SHOW) return { visible: true, persist: true }
-  if (normalized === ANNOTATION_FAB_HASH_HIDE) return { visible: false, persist: false }
+  let params: URLSearchParams | undefined
+  try {
+    params = new URLSearchParams(search ?? "") // tolerates a leading "?" and a bare key (no value)
+  } catch {
+    params = undefined
+  }
+  if (params?.has(ANNOTATION_FAB_PARAM_HIDE)) return { visible: false, persist: false }
+  if (params?.has(ANNOTATION_FAB_PARAM_SHOW)) return { visible: true, persist: true }
   return { visible: stored ?? true, persist: null }
 }
 
@@ -137,17 +145,44 @@ export function readStoredFabVisible(
   }
 }
 
+/**
+ * Persist the FAB visibility choice. Returns whether it was actually stored: `false` when no storage
+ * exists or `setItem` throws (private-mode / quota). The caller uses this to decide whether the URL flag
+ * is now durable enough to strip — if the write failed, `?mark` / `?unmark` must stay in the URL so a
+ * reload still carries the intent.
+ */
 export function writeStoredFabVisible(
   sessionId: string | undefined,
   visible: boolean,
   storage: AnnotationModeStorage | undefined = safeLocalStorage()
-): void {
-  if (!storage) return
+): boolean {
+  if (!storage) return false
   try {
     storage.setItem(fabVisibleStorageKey(sessionId), visible ? "1" : "0")
+    return true
   } catch {
     // Best-effort — losing the visibility memory must never break the overlay.
+    return false
   }
+}
+
+/**
+ * Remove ONLY the overlay's own `mark` / `unmark` flag from a raw `location.search`, leaving every other
+ * parameter byte-for-byte intact. We split on `&` and drop the tokens whose KEY is ours, rather than
+ * round-tripping through `URLSearchParams.toString()` — that round-trip re-encodes existing escapes and
+ * rewrites bare flags (`?debug` → `?debug=`), mutating query strings the host app may read raw. Matches a
+ * full key token only, so `?foo=mark` is untouched. Returns the search WITHOUT a leading "?" ("" if empty).
+ */
+export function stripFabParamsFromSearch(search: string | undefined): string {
+  const raw = (search ?? "").replace(/^\?/, "")
+  if (!raw) return ""
+  return raw
+    .split("&")
+    .filter((pair) => {
+      const key = pair.split("=")[0]
+      return key !== ANNOTATION_FAB_PARAM_SHOW && key !== ANNOTATION_FAB_PARAM_HIDE
+    })
+    .join("&")
 }
 
 // ── Draggable edge-snapping floating chrome (FAB / agent badge) ──────────────────────────
