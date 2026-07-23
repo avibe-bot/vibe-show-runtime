@@ -67,8 +67,7 @@ import {
   resolveFabVisibility,
   readStoredFabVisible,
   writeStoredFabVisible,
-  ANNOTATION_FAB_PARAM_SHOW,
-  ANNOTATION_FAB_PARAM_HIDE,
+  stripFabParamsFromSearch,
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
   snapToNearestEdge,
@@ -1406,15 +1405,22 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined) {
   React.useEffect(() => {
     if (host !== "standalone" || typeof window === "undefined") return
     const resolved = resolveFabVisibility(window.location.search, readStoredFabVisible(sessionId, storage))
-    if (resolved.persist !== null) writeStoredFabVisible(sessionId, resolved.persist, storage)
     setVisible(resolved.visible)
+    if (resolved.persist === null) return // no ?mark/?unmark this load → nothing to persist or strip
+    // Strip the one-time flag ONLY once the choice is durable: if the write failed (no storage / quota),
+    // leave ?mark/?unmark in the URL so a reload still carries the intent instead of silently reverting.
+    if (!writeStoredFabVisible(sessionId, resolved.persist, storage)) return
     try {
-      const url = new URL(window.location.href)
-      if (url.searchParams.has(ANNOTATION_FAB_PARAM_SHOW) || url.searchParams.has(ANNOTATION_FAB_PARAM_HIDE)) {
-        url.searchParams.delete(ANNOTATION_FAB_PARAM_SHOW)
-        url.searchParams.delete(ANNOTATION_FAB_PARAM_HIDE)
-        const query = url.searchParams.toString()
-        window.history.replaceState(null, "", `${url.pathname}${query ? `?${query}` : ""}${url.hash}`)
+      const stripped = stripFabParamsFromSearch(window.location.search)
+      const nextSearch = stripped ? `?${stripped}` : ""
+      if (nextSearch !== window.location.search) {
+        // Drop ONLY our flag: keep the app's other query params (surgical string strip, no re-encode) and
+        // its existing history.state (a history router may keep location keys / scroll data there).
+        window.history.replaceState(
+          window.history.state,
+          "",
+          `${window.location.pathname}${nextSearch}${window.location.hash}`
+        )
       }
     } catch {
       /* best-effort — a blocked replaceState / URL parse must not break visibility */

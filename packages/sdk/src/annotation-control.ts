@@ -145,17 +145,44 @@ export function readStoredFabVisible(
   }
 }
 
+/**
+ * Persist the FAB visibility choice. Returns whether it was actually stored: `false` when no storage
+ * exists or `setItem` throws (private-mode / quota). The caller uses this to decide whether the URL flag
+ * is now durable enough to strip — if the write failed, `?mark` / `?unmark` must stay in the URL so a
+ * reload still carries the intent.
+ */
 export function writeStoredFabVisible(
   sessionId: string | undefined,
   visible: boolean,
   storage: AnnotationModeStorage | undefined = safeLocalStorage()
-): void {
-  if (!storage) return
+): boolean {
+  if (!storage) return false
   try {
     storage.setItem(fabVisibleStorageKey(sessionId), visible ? "1" : "0")
+    return true
   } catch {
     // Best-effort — losing the visibility memory must never break the overlay.
+    return false
   }
+}
+
+/**
+ * Remove ONLY the overlay's own `mark` / `unmark` flag from a raw `location.search`, leaving every other
+ * parameter byte-for-byte intact. We split on `&` and drop the tokens whose KEY is ours, rather than
+ * round-tripping through `URLSearchParams.toString()` — that round-trip re-encodes existing escapes and
+ * rewrites bare flags (`?debug` → `?debug=`), mutating query strings the host app may read raw. Matches a
+ * full key token only, so `?foo=mark` is untouched. Returns the search WITHOUT a leading "?" ("" if empty).
+ */
+export function stripFabParamsFromSearch(search: string | undefined): string {
+  const raw = (search ?? "").replace(/^\?/, "")
+  if (!raw) return ""
+  return raw
+    .split("&")
+    .filter((pair) => {
+      const key = pair.split("=")[0]
+      return key !== ANNOTATION_FAB_PARAM_SHOW && key !== ANNOTATION_FAB_PARAM_HIDE
+    })
+    .join("&")
 }
 
 // ── Draggable edge-snapping floating chrome (FAB / agent badge) ──────────────────────────
