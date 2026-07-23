@@ -67,7 +67,8 @@ import {
   resolveFabVisibility,
   readStoredFabVisible,
   writeStoredFabVisible,
-  ANNOTATION_FAB_HASH_SHOW,
+  ANNOTATION_FAB_PARAM_SHOW,
+  ANNOTATION_FAB_PARAM_HIDE,
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
   snapToNearestEdge,
@@ -243,8 +244,8 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   enterToSend: "Enter 发送 · Esc 取消",
   approve: "批准",
   addNote: "添加备注",
-  fabTip: "点选元素或截图,把意见直接发给 Agent;链接加 #unmark 可隐藏本按钮",
-  fabHiddenToast: "已隐藏,链接加 #mark 可恢复"
+  fabTip: "点选元素或截图,把意见直接发给 Agent;链接加 ?unmark 可隐藏本按钮",
+  fabHiddenToast: "已隐藏,链接加 ?mark 可恢复"
 }
 
 export type AnnotationOverlayProps = {
@@ -1389,37 +1390,40 @@ export function modePillLabel(
   return touchInput ? labels.smart : `${labels.annotating} · ${labels.smart}`
 }
 
-/** Standalone-only FAB visibility from the frozen #mark / #unmark hash: an explicit hash flips it AND
- *  persists the choice (one-time switch), a hash-free load honors the stored choice, and hashchange is
- *  live. Embedded host is always visible. `hide()` is the ✕ button (≡ #unmark, persisted). */
+/** Standalone-only FAB visibility from the frozen ?mark / ?unmark query param: an explicit param flips it
+ *  AND persists the choice, then is stripped from the URL at boot (one-time switch); a param-free load
+ *  honors the stored choice. Query param, not the hash, so it never collides with the Show Page hash
+ *  router. Embedded host is always visible. `hide()` is the ✕ button (≡ ?unmark, persisted). */
 function useFabVisibility(host: AnnotationHost, sessionId: string | undefined) {
   const storage = React.useMemo(() => safeLocalStorage(), [])
   const [visible, setVisible] = React.useState<boolean>(() => {
     if (host !== "standalone" || typeof window === "undefined") return true
-    return resolveFabVisibility(window.location.hash, readStoredFabVisible(sessionId, storage)).visible
+    return resolveFabVisibility(window.location.search, readStoredFabVisible(sessionId, storage)).visible
   })
+  // Read the ?mark / ?unmark switch ONCE at boot: apply it, persist the choice, then STRIP the param via
+  // replaceState so the URL returns clean — keeping any other query params AND the hash route (#/…) intact,
+  // since the Show Page hash router owns the hash. It's a one-time switch, so there is no ongoing listener.
   React.useEffect(() => {
     if (host !== "standalone" || typeof window === "undefined") return
-    const apply = () => {
-      const resolved = resolveFabVisibility(window.location.hash, readStoredFabVisible(sessionId, storage))
-      if (resolved.persist !== null) writeStoredFabVisible(sessionId, resolved.persist, storage)
-      setVisible(resolved.visible)
+    const resolved = resolveFabVisibility(window.location.search, readStoredFabVisible(sessionId, storage))
+    if (resolved.persist !== null) writeStoredFabVisible(sessionId, resolved.persist, storage)
+    setVisible(resolved.visible)
+    try {
+      const url = new URL(window.location.href)
+      if (url.searchParams.has(ANNOTATION_FAB_PARAM_SHOW) || url.searchParams.has(ANNOTATION_FAB_PARAM_HIDE)) {
+        url.searchParams.delete(ANNOTATION_FAB_PARAM_SHOW)
+        url.searchParams.delete(ANNOTATION_FAB_PARAM_HIDE)
+        const query = url.searchParams.toString()
+        window.history.replaceState(null, "", `${url.pathname}${query ? `?${query}` : ""}${url.hash}`)
+      }
+    } catch {
+      /* best-effort — a blocked replaceState / URL parse must not break visibility */
     }
-    apply() // persist a hash present at load, once
-    window.addEventListener("hashchange", apply)
-    return () => window.removeEventListener("hashchange", apply)
   }, [host, sessionId, storage])
   const hide = React.useCallback(() => {
+    // ✕ affordance: persist hidden + hide. The URL is already param-clean (stripped at boot), so there is
+    // nothing to neutralize — the stored preference wins on the next param-free load.
     writeStoredFabVisible(sessionId, false, storage)
-    // If the URL still carries the #mark recovery hash, strip it so the persisted hide survives a reload —
-    // otherwise resolveFabVisibility would let the explicit #mark win over storage and re-show (#3637621025).
-    if (typeof window !== "undefined" && window.location.hash.trim().toLowerCase() === ANNOTATION_FAB_HASH_SHOW) {
-      try {
-        window.history.replaceState(null, "", window.location.pathname + window.location.search)
-      } catch {
-        /* best-effort — a blocked replaceState must not break hiding */
-      }
-    }
     setVisible(false)
   }, [sessionId, storage])
   return { visible, hide }

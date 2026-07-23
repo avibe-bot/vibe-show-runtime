@@ -462,19 +462,21 @@ describe("uniform write-token resolution (contract §5 v2)", () => {
   })
 })
 
-describe("standalone FAB visibility via #mark / #unmark (Lane R10)", () => {
-  it("a hash WINS and dictates what to persist (one-time switch)", () => {
-    expect(resolveFabVisibility("#unmark", undefined)).toEqual({ visible: false, persist: false })
-    expect(resolveFabVisibility("#mark", undefined)).toEqual({ visible: true, persist: true })
-    // hash overrides a conflicting stored choice AND re-persists it.
-    expect(resolveFabVisibility("#mark", false)).toEqual({ visible: true, persist: true })
-    expect(resolveFabVisibility("#UNMARK", true)).toEqual({ visible: false, persist: false }) // case-insensitive
+describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R11)", () => {
+  it("a query param WINS (bare presence) and dictates what to persist (one-time switch)", () => {
+    expect(resolveFabVisibility("?unmark", undefined)).toEqual({ visible: false, persist: false })
+    expect(resolveFabVisibility("?mark", undefined)).toEqual({ visible: true, persist: true })
+    // param overrides a conflicting stored choice AND re-persists it; coexists with other params.
+    expect(resolveFabVisibility("?mark", false)).toEqual({ visible: true, persist: true })
+    expect(resolveFabVisibility("?vibe-embed=1&unmark", true)).toEqual({ visible: false, persist: false })
+    expect(resolveFabVisibility("unmark", undefined)).toEqual({ visible: false, persist: false }) // no leading '?'
   })
 
-  it("no hash honors the stored choice, else defaults visible, and persists nothing new", () => {
+  it("no param honors the stored choice, else defaults visible, and persists nothing new", () => {
     expect(resolveFabVisibility("", undefined)).toEqual({ visible: true, persist: null }) // default visible
     expect(resolveFabVisibility(undefined, false)).toEqual({ visible: false, persist: null })
-    expect(resolveFabVisibility("#other", true)).toEqual({ visible: true, persist: null }) // unknown hash ignored
+    expect(resolveFabVisibility("?other=1", true)).toEqual({ visible: true, persist: null }) // unknown param ignored
+    expect(resolveFabVisibility("#/some/hash-route", undefined)).toEqual({ visible: true, persist: null }) // a hash route is NOT a param
   })
 
   it("persisted visibility round-trips as 1/0 and ignores garbage", () => {
