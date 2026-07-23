@@ -1355,6 +1355,20 @@ type AnnotationChromeProps = {
   onSetMode?: (mode: AnnotationMode) => void
 }
 
+/**
+ * The embedded mode pill's label. On coarse-pointer (touch) viewports the '标注模式 · ' prefix and the
+ * long screenshot hint are dropped to just the mode name (`Smart` / `截图`) so the pill stays on ONE line
+ * even at 320px; desktop keeps the full copy. Pure so the mobile-vs-desktop choice is unit-testable.
+ */
+export function modePillLabel(
+  mode: AnnotationMode,
+  touchInput: boolean,
+  labels: Pick<Required<AnnotationOverlayLabels>, "annotating" | "smart" | "screenshot" | "screenshotHint">
+): string {
+  if (mode === "screenshot") return touchInput ? labels.screenshot : labels.screenshotHint
+  return touchInput ? labels.smart : `${labels.annotating} · ${labels.smart}`
+}
+
 function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, onEnable, onDisable, onSetMode }: AnnotationChromeProps) {
   // No "Esc" wording on touch devices (no hardware Esc); the exit affordance is always tappable. Keyed
   // on input capability, not layout, so a narrow desktop window still shows the clickable "Esc" label.
@@ -1368,7 +1382,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
       <div data-show-annotation-ui="" style={modePillStyle} onClick={(event) => event.stopPropagation()}>
         <span style={{ ...modePillDotStyle, background: COLORS.human }} />
         <span style={modePillLabelStyle}>
-          {mode === "screenshot" ? labels.screenshotHint : `${labels.annotating} · ${labels.smart}`}
+          {modePillLabel(mode, touchInput, labels as Required<AnnotationOverlayLabels>)}
         </span>
         <button type="button" style={modePillExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
       </div>
@@ -2672,11 +2686,18 @@ const toolbarExitStyle: React.CSSProperties = {
 // Embedded mode pill (bottom-center status indicator).
 const modePillStyle: React.CSSProperties = {
   position: "fixed",
-  left: "50%",
+  // Center via full-viewport containing block + auto margins, NOT `left:50%`: a fixed element at
+  // left:50% with no width caps its shrink-to-fit available width at ~50vw, which forced the pill to
+  // wrap to two lines on phones. left:0/right:0 + margin auto + fit-content lets it size to its content
+  // (capped by maxWidth) and stay centered. `nowrap` keeps it on ONE line always (owner iPhone report).
+  left: 0,
+  right: 0,
   bottom: 20,
-  transform: "translateX(-50%)",
+  margin: "0 auto",
+  width: "fit-content",
+  maxWidth: "calc(100vw - 24px)",
   zIndex: CHROME_Z,
-  display: "inline-flex",
+  display: "flex",
   alignItems: "center",
   gap: 8,
   padding: "8px 14px",
@@ -2687,17 +2708,20 @@ const modePillStyle: React.CSSProperties = {
   boxShadow: "0 16px 44px rgba(4, 4, 10, 0.55)",
   backdropFilter: "blur(16px)",
   WebkitBackdropFilter: "blur(16px)",
-  font: `600 13px/1 ${FONT_STACK}`
+  font: `600 13px/1 ${FONT_STACK}`,
+  whiteSpace: "nowrap"
 }
 
 const modePillDotStyle: React.CSSProperties = {
   width: 8,
   height: 8,
-  borderRadius: 999
+  borderRadius: 999,
+  flexShrink: 0
 }
 
 const modePillLabelStyle: React.CSSProperties = {
-  color: COLORS.textPrimary
+  color: COLORS.textPrimary,
+  whiteSpace: "nowrap"
 }
 
 const modePillExitStyle: React.CSSProperties = {
@@ -2710,7 +2734,10 @@ const modePillExitStyle: React.CSSProperties = {
   fontWeight: 500,
   fontSize: 12,
   cursor: "pointer",
-  fontFamily: FONT_STACK
+  fontFamily: FONT_STACK,
+  // Never let the exit label break vertically (退/出 stacked) when space is tight.
+  whiteSpace: "nowrap",
+  flexShrink: 0
 }
 
 // Standalone login hint (anonymous public visitor; FAB hidden).
