@@ -64,6 +64,14 @@ import {
   isLiveControlEvent,
   resolveWriteToken,
   safeLocalStorage,
+  resolveFabVisibility,
+  readStoredFabVisible,
+  writeStoredFabVisible,
+  readStoredFloatPosition,
+  writeStoredFloatPosition,
+  snapToNearestEdge,
+  exceedsDragThreshold,
+  type FloatPosition,
   type AnnotationController,
   type AnnotationHost,
   type AnnotationModeStorage
@@ -201,6 +209,10 @@ export type AnnotationOverlayLabels = {
   approve?: string
   /** Affordance to reveal the optional note field on the approve fast path. */
   addNote?: string
+  /** One-line tip shown by the toolbar '?' affordance. */
+  fabTip?: string
+  /** Toast shown after the '✕' affordance hides the FAB. */
+  fabHiddenToast?: string
 }
 
 // Required<> so the built-in defaults must stay complete (every field, incl. the optional ones)
@@ -228,7 +240,9 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   byArea: "按区域",
   enterToSend: "Enter 发送 · Esc 取消",
   approve: "批准",
-  addNote: "添加备注"
+  addNote: "添加备注",
+  fabTip: "点选元素或截图,把意见直接发给 Agent;链接加 #unmark 可隐藏本按钮",
+  fabHiddenToast: "已隐藏,链接加 #mark 可恢复"
 }
 
 export type AnnotationOverlayProps = {
@@ -761,6 +775,8 @@ export function AnnotationOverlay({
     // undefined in a Partial), so the buttons never render blank.
     merged.approve = labels?.approve ?? DEFAULT_ANNOTATION_LABELS.approve
     merged.addNote = labels?.addNote ?? DEFAULT_ANNOTATION_LABELS.addNote
+    merged.fabTip = labels?.fabTip ?? DEFAULT_ANNOTATION_LABELS.fabTip
+    merged.fabHiddenToast = labels?.fabHiddenToast ?? DEFAULT_ANNOTATION_LABELS.fabHiddenToast
     return merged
   }, [labels])
   const intentOptions = intents ?? DEFAULT_ANNOTATION_INTENTS
@@ -1206,6 +1222,7 @@ export function AnnotationOverlay({
         mode={mode}
         touchInput={touchInput}
         labels={copy}
+        sessionId={context?.config.sessionId}
         onEnable={enable}
         onDisable={disable}
         onSetMode={changeMode}
@@ -1350,6 +1367,7 @@ type AnnotationChromeProps = {
   mode: AnnotationMode
   touchInput: boolean
   labels: AnnotationOverlayLabels
+  sessionId?: string
   onEnable?: (mode?: AnnotationMode) => void
   onDisable?: () => void
   onSetMode?: (mode: AnnotationMode) => void
@@ -1369,10 +1387,151 @@ export function modePillLabel(
   return touchInput ? labels.smart : `${labels.annotating} · ${labels.smart}`
 }
 
-function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, onEnable, onDisable, onSetMode }: AnnotationChromeProps) {
+/** Standalone-only FAB visibility from the frozen #mark / #unmark hash: an explicit hash flips it AND
+ *  persists the choice (one-time switch), a hash-free load honors the stored choice, and hashchange is
+ *  live. Embedded host is always visible. `hide()` is the ✕ button (≡ #unmark, persisted). */
+function useFabVisibility(host: AnnotationHost, sessionId: string | undefined) {
+  const storage = React.useMemo(() => safeLocalStorage(), [])
+  const [visible, setVisible] = React.useState<boolean>(() => {
+    if (host !== "standalone" || typeof window === "undefined") return true
+    return resolveFabVisibility(window.location.hash, readStoredFabVisible(sessionId, storage)).visible
+  })
+  React.useEffect(() => {
+    if (host !== "standalone" || typeof window === "undefined") return
+    const apply = () => {
+      const resolved = resolveFabVisibility(window.location.hash, readStoredFabVisible(sessionId, storage))
+      if (resolved.persist !== null) writeStoredFabVisible(sessionId, resolved.persist, storage)
+      setVisible(resolved.visible)
+    }
+    apply() // persist a hash present at load, once
+    window.addEventListener("hashchange", apply)
+    return () => window.removeEventListener("hashchange", apply)
+  }, [host, sessionId, storage])
+  const hide = React.useCallback(() => {
+    writeStoredFabVisible(sessionId, false, storage)
+    setVisible(false)
+  }, [sessionId, storage])
+  return { visible, hide }
+}
+
+// A touch above the old 20px: a down-biased drop shadow needs clearance from the viewport bottom or its
+// lower half is clipped (owner mobile report). This inset is the floating-chrome margin AND the drag
+// bottom bound, so the shadow renders fully at the resting position and at any snapped position.
+const FLOAT_INSET = 26
+
+type DraggableResult = {
+  style: React.CSSProperties
+  dragging: boolean
+  pointerHandlers: Pick<React.DOMAttributes<HTMLElement>, "onPointerDown" | "onPointerMove" | "onPointerUp" | "onPointerCancel">
+  /** Call at the start of onClick: returns true (and consumes) when the gesture was a drag, not a click. */
+  consumeDragClick: () => boolean
+}
+
+/**
+ * Unified pointer drag (mouse + touch) with a 6px click-vs-drag threshold. While dragging the element
+ * follows the pointer; on release it SNAPS to the nearest vertical edge and the position persists per
+ * element+session. A restored/again-resized position is re-snapped to the current viewport so it can
+ * never end up off-screen. `touch-action:none` keeps a touch-drag from scrolling the page.
+ */
+function useDraggable(element: "fab" | "badge", sessionId: string | undefined, size: { width: number; height: number }): DraggableResult {
+  const storage = React.useMemo(() => safeLocalStorage(), [])
+  const [pos, setPos] = React.useState<FloatPosition | null>(() => readStoredFloatPosition(element, sessionId, storage) ?? null)
+  const [dragging, setDragging] = React.useState(false)
+  const gesture = React.useRef<{ startX: number; startY: number; originLeft: number; originTop: number; moved: boolean } | null>(null)
+  const draggedRef = React.useRef(false)
+
+  // Keep a restored/edge-snapped position valid across viewport resizes (right-edge stays right, etc.).
+  React.useEffect(() => {
+    if (typeof window === "undefined") return
+    const resnap = () =>
+      setPos((prev) => (prev ? pick(snapToNearestEdge(prev, size, { width: window.innerWidth, height: window.innerHeight }, FLOAT_INSET, { bottom: window.innerHeight - FLOAT_INSET })) : prev))
+    resnap()
+    window.addEventListener("resize", resnap)
+    return () => window.removeEventListener("resize", resnap)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [size.width, size.height])
+
+  const onPointerDown = (event: React.PointerEvent<HTMLElement>) => {
+    if (event.button !== 0 && event.pointerType === "mouse") return // primary mouse button / any touch-pen
+    // Reset the drag flag at the START of every gesture. A touch drag usually fires NO click on release,
+    // so clearing on `consumeDragClick` alone would leave the flag set and suppress the next real tap.
+    draggedRef.current = false
+    const rect = event.currentTarget.getBoundingClientRect()
+    gesture.current = { startX: event.clientX, startY: event.clientY, originLeft: rect.left, originTop: rect.top, moved: false }
+    try { event.currentTarget.setPointerCapture(event.pointerId) } catch { /* capture is best-effort */ }
+  }
+  const onPointerMove = (event: React.PointerEvent<HTMLElement>) => {
+    const g = gesture.current
+    if (!g) return
+    const dx = event.clientX - g.startX
+    const dy = event.clientY - g.startY
+    if (!g.moved && !exceedsDragThreshold(dx, dy)) return
+    g.moved = true
+    if (!dragging) setDragging(true)
+    setPos({ left: g.originLeft + dx, top: g.originTop + dy })
+    event.preventDefault()
+  }
+  const finish = (event: React.PointerEvent<HTMLElement>) => {
+    const g = gesture.current
+    gesture.current = null
+    try { event.currentTarget.releasePointerCapture(event.pointerId) } catch { /* best-effort */ }
+    if (g?.moved) {
+      draggedRef.current = true
+      // Measure the ACTUAL element size at release (the badge width varies with the count) so the
+      // right-edge snap lands flush rather than at a nominal offset.
+      const rect = event.currentTarget.getBoundingClientRect()
+      const snapped = snapToNearestEdge(
+        { left: g.originLeft + (event.clientX - g.startX), top: g.originTop + (event.clientY - g.startY) },
+        { width: rect.width, height: rect.height },
+        { width: window.innerWidth, height: window.innerHeight },
+        FLOAT_INSET,
+        { bottom: window.innerHeight - FLOAT_INSET }
+      )
+      setPos(pick(snapped))
+      writeStoredFloatPosition(element, sessionId, pick(snapped), storage)
+    }
+    setDragging(false)
+  }
+  const consumeDragClick = () => {
+    if (draggedRef.current) {
+      draggedRef.current = false
+      return true
+    }
+    return false
+  }
+  const style: React.CSSProperties = pos
+    ? { left: pos.left, top: pos.top, right: "auto", bottom: "auto", touchAction: "none" }
+    : { touchAction: "none" }
+  return { style, dragging, pointerHandlers: { onPointerDown, onPointerMove, onPointerUp: finish, onPointerCancel: finish }, consumeDragClick }
+}
+
+/** Strip the `edge` discriminator off a snap result down to a bare {left, top}. */
+function pick(snapped: FloatPosition & { edge: "left" | "right" }): FloatPosition {
+  return { left: snapped.left, top: snapped.top }
+}
+
+function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, sessionId, onEnable, onDisable, onSetMode }: AnnotationChromeProps) {
   // No "Esc" wording on touch devices (no hardware Esc); the exit affordance is always tappable. Keyed
   // on input capability, not layout, so a narrow desktop window still shows the clickable "Esc" label.
   const exitLabel = touchInput ? labels.exitShort : labels.exit
+  // Hooks must be unconditional (called before the host/availability early returns below).
+  const fabVisibility = useFabVisibility(host, sessionId)
+  const fabDrag = useDraggable("fab", sessionId, FAB_SIZE)
+  const [toast, setToast] = React.useState<string | null>(null)
+  const toastTimer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  React.useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
+  const flashToast = React.useCallback((message: string) => {
+    setToast(message)
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast(null), 3200)
+  }, [])
+  // ✕ affordance: hide the FAB (≡ #unmark, persisted) and confirm with a brief toast so the user knows
+  // how to bring it back. Also disables an active session so nothing is left capturing.
+  const hideFab = React.useCallback(() => {
+    onDisable?.()
+    fabVisibility.hide()
+    if (labels.fabHiddenToast) flashToast(labels.fabHiddenToast)
+  }, [onDisable, fabVisibility, flashToast, labels.fabHiddenToast])
 
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
@@ -1399,23 +1558,68 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     )
   }
 
+  // Collapsed FAB = the draggable "toolbar collapsed form"; hidden by #unmark / the ✕ button (standalone
+  // only). The toast still renders below even when the FAB is hidden, so the ✕ confirmation is visible.
+  let content: React.ReactNode = null
   if (!enabled) {
-    return (
-      <button type="button" data-show-annotation-ui="" aria-label={labels.annotating} style={fabStyle} onClick={() => onEnable?.()}>
+    content = fabVisibility.visible ? (
+      <button
+        type="button"
+        data-show-annotation-ui=""
+        aria-label={labels.annotating}
+        style={{ ...fabStyle, ...fabDrag.style }}
+        {...fabDrag.pointerHandlers}
+        onClick={() => {
+          if (fabDrag.consumeDragClick()) return // a drag, not a click — don't open
+          onEnable?.()
+        }}
+      >
         <AnnotateIcon />
       </button>
+    ) : null
+  } else {
+    content = (
+      <div data-show-annotation-ui="" style={toolbarStyle} onClick={(event) => event.stopPropagation()}>
+        <button type="button" aria-label={exitLabel} style={toolbarIndicatorStyle} onClick={() => onDisable?.()}>
+          <AnnotateIcon />
+        </button>
+        <ModeTab active={mode === "smart"} onClick={() => onSetMode?.("smart")} icon={<SparkleIcon />} label={labels.smart} />
+        <ModeTab active={mode === "screenshot"} onClick={() => onSetMode?.("screenshot")} icon={<CameraIcon />} label={labels.screenshot} />
+        <button type="button" style={toolbarExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
+        {/* Trailing subtle affordances: '?' one-line tip, '✕' hide (≡ #unmark). */}
+        <ToolbarHelp tip={labels.fabTip ?? ""} touchInput={touchInput} />
+        <button type="button" aria-label={labels.fabHiddenToast ?? "hide"} style={toolbarGlyphButtonStyle} onClick={hideFab}>✕</button>
+      </div>
     )
   }
 
   return (
-    <div data-show-annotation-ui="" style={toolbarStyle} onClick={(event) => event.stopPropagation()}>
-      <button type="button" aria-label={exitLabel} style={toolbarIndicatorStyle} onClick={() => onDisable?.()}>
-        <AnnotateIcon />
+    <>
+      {content}
+      {toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null}
+    </>
+  )
+}
+
+/** Subtle '?' affordance on the toolbar: hover (mouse) or tap (touch) reveals a one-line tip. */
+function ToolbarHelp({ tip, touchInput }: { tip: string; touchInput: boolean }) {
+  const [open, setOpen] = React.useState(false)
+  if (!tip) return null
+  return (
+    <span style={{ position: "relative", display: "inline-flex" }}>
+      <button
+        type="button"
+        aria-label={tip}
+        style={toolbarGlyphButtonStyle}
+        onPointerEnter={() => { if (!touchInput) setOpen(true) }}
+        onPointerLeave={() => { if (!touchInput) setOpen(false) }}
+        onClick={() => { if (touchInput) setOpen((value) => !value) }}
+        onBlur={() => setOpen(false)}
+      >
+        ?
       </button>
-      <ModeTab active={mode === "smart"} onClick={() => onSetMode?.("smart")} icon={<SparkleIcon />} label={labels.smart} />
-      <ModeTab active={mode === "screenshot"} onClick={() => onSetMode?.("screenshot")} icon={<CameraIcon />} label={labels.screenshot} />
-      <button type="button" style={toolbarExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
-    </div>
+      {open ? <span role="tooltip" style={toolbarHelpTipStyle}>{tip}</span> : null}
+    </span>
   )
 }
 
@@ -1933,7 +2137,7 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
         candidate.rect ? <MarkDot key={candidate.readKey} rect={candidate.rect} read onClick={() => openMark(candidate)} /> : null
       )}
       {flashed?.rect ? <AnnotationMarker rect={flashed.rect} tone="assistant" variant="selected" /> : null}
-      {partition.showBadge ? <MarkBadge count={partition.unreadCount} host={host} onClick={() => setListOpen((value) => !value)} /> : null}
+      {partition.showBadge ? <MarkBadge count={partition.unreadCount} host={host} sessionId={sessionId} onClick={() => setListOpen((value) => !value)} /> : null}
       {listOpen ? <MarkList marks={rendered} host={host} onOpen={openFromList} onClose={() => setListOpen(false)} /> : null}
       {expanded ? <MarkBubble mark={expanded} onClose={() => setExpandedKey(null)} /> : null}
     </div>,
@@ -1996,38 +2200,23 @@ function MarkBubble({ mark, onClose }: { mark: ResolvedMarkCandidate; onClose: (
   )
 }
 
-function MarkBadge({ count, host, onClick }: { count: number; host: AnnotationHost; onClick: () => void }) {
+function MarkBadge({ count, host, sessionId, onClick }: { count: number; host: AnnotationHost; sessionId?: string; onClick: () => void }) {
+  const drag = useDraggable("badge", sessionId, BADGE_SIZE)
   return (
     <button
       type="button"
       data-show-annotation-ui=""
       aria-label={`${count} 条 Agent 标注待读`}
-      onClick={onClick}
-      style={{
-        position: "fixed",
-        right: 20,
-        // Standalone: clear the FAB/toolbar (bottom-right, ~52px at bottom:20). Embedded: pill is
-        // bottom-center, so bottom-right is free.
-        bottom: host === "embedded" ? 20 : 88,
-        minWidth: 44,
-        height: 44,
-        padding: "0 12px",
-        borderRadius: 999,
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 6,
-        cursor: "pointer",
-        border: `2px solid ${COLORS.surface}`,
-        background: COLORS.agent,
-        color: COLORS.onAccent,
-        font: `700 14px/1 ${FONT_STACK}`,
-        boxShadow: `0 8px 28px ${COLORS.agent}55`,
-        pointerEvents: "auto",
-        zIndex: CHROME_Z
+      {...drag.pointerHandlers}
+      onClick={() => {
+        if (drag.consumeDragClick()) return // a drag, not a tap — don't open the list
+        onClick()
       }}
+      // Default bottom-right (clear of the bottom-center pill); a saved/dragged position overrides it.
+      style={{ ...markBadgeBaseStyle, bottom: host === "embedded" ? 26 : 92, ...drag.style }}
     >
       <BotIcon />
-      {count}
+      <span style={{ fontVariantNumeric: "tabular-nums" }}>{count}</span>
     </button>
   )
 }
@@ -2604,8 +2793,8 @@ const markerChipStyle: React.CSSProperties = {
 // Standalone FAB (collapsed).
 const fabStyle: React.CSSProperties = {
   position: "fixed",
-  right: 20,
-  bottom: 20,
+  right: 26,
+  bottom: 26,
   zIndex: CHROME_Z,
   width: 52,
   height: 52,
@@ -2615,7 +2804,9 @@ const fabStyle: React.CSSProperties = {
   color: COLORS.human,
   background: COLORS.surfacePopover,
   border: `1px solid ${COLORS.border}`,
-  boxShadow: "0 16px 44px rgba(4, 4, 10, 0.55)",
+  // Softer, less down-biased than the card shadow so it renders fully near the viewport bottom edge
+  // rather than being clipped in half (owner mobile report).
+  boxShadow: "0 8px 28px rgba(4, 4, 10, 0.5)",
   cursor: "pointer",
   backdropFilter: "blur(16px)",
   WebkitBackdropFilter: "blur(16px)"
@@ -2624,8 +2815,8 @@ const fabStyle: React.CSSProperties = {
 // Standalone pill toolbar (expanded).
 const toolbarStyle: React.CSSProperties = {
   position: "fixed",
-  right: 20,
-  bottom: 20,
+  right: 26,
+  bottom: 26,
   zIndex: CHROME_Z,
   display: "flex",
   alignItems: "center",
@@ -2635,7 +2826,7 @@ const toolbarStyle: React.CSSProperties = {
   color: COLORS.textPrimary,
   background: COLORS.surfacePopover,
   border: `1px solid ${COLORS.border}`,
-  boxShadow: "0 16px 44px rgba(4, 4, 10, 0.55)",
+  boxShadow: "0 8px 28px rgba(4, 4, 10, 0.5)",
   backdropFilter: "blur(16px)",
   WebkitBackdropFilter: "blur(16px)"
 }
@@ -2681,6 +2872,87 @@ const toolbarExitStyle: React.CSSProperties = {
   background: "transparent",
   font: `500 12px/1 ${FONT_STACK}`,
   cursor: "pointer"
+}
+
+const FAB_SIZE = { width: 52, height: 52 }
+
+// Subtle trailing '?' / '✕' glyph buttons on the expanded toolbar (muted, consistent with the chrome).
+const toolbarGlyphButtonStyle: React.CSSProperties = {
+  width: 28,
+  height: 28,
+  display: "grid",
+  placeItems: "center",
+  borderRadius: 999,
+  border: 0,
+  color: COLORS.textMuted,
+  background: "transparent",
+  font: `600 13px/1 ${FONT_STACK}`,
+  cursor: "pointer"
+}
+
+const toolbarHelpTipStyle: React.CSSProperties = {
+  position: "absolute",
+  bottom: "calc(100% + 10px)",
+  right: 0,
+  maxWidth: 240,
+  padding: "8px 10px",
+  borderRadius: 10,
+  background: COLORS.surfacePopover,
+  border: `1px solid ${COLORS.border}`,
+  color: COLORS.textPrimary,
+  font: `500 12px/1.4 ${FONT_STACK}`,
+  boxShadow: "0 12px 32px rgba(4, 4, 10, 0.5)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  zIndex: CARD_Z,
+  pointerEvents: "none"
+}
+
+const toastStyle: React.CSSProperties = {
+  position: "fixed",
+  left: 0,
+  right: 0,
+  bottom: 88,
+  margin: "0 auto",
+  width: "fit-content",
+  maxWidth: "calc(100vw - 24px)",
+  padding: "10px 16px",
+  borderRadius: 999,
+  background: COLORS.surfacePopover,
+  border: `1px solid ${COLORS.border}`,
+  color: COLORS.textPrimary,
+  font: `500 13px/1.4 ${FONT_STACK}`,
+  boxShadow: "0 16px 44px rgba(4, 4, 10, 0.55)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  zIndex: CARD_Z,
+  textAlign: "center"
+}
+
+const BADGE_SIZE = { width: 64, height: 48 }
+
+// Violet agent-mark badge — soft violet glow, tabular count, sized/weighted to match the FAB family.
+const markBadgeBaseStyle: React.CSSProperties = {
+  position: "fixed",
+  right: 20,
+  minWidth: 48,
+  height: 48,
+  padding: "0 14px",
+  borderRadius: 999,
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 6,
+  cursor: "pointer",
+  border: "1px solid rgba(124, 91, 255, 0.5)",
+  background: COLORS.agent,
+  color: COLORS.onAccent,
+  font: `700 15px/1 ${FONT_STACK}`,
+  // Soft violet glow: a low-offset drop + a faint ring, so it reads as a glow and isn't clipped at the
+  // viewport bottom edge (matches the FAB shadow treatment).
+  boxShadow: "0 6px 24px rgba(124, 91, 255, 0.42), 0 0 0 3px rgba(124, 91, 255, 0.14)",
+  pointerEvents: "auto",
+  zIndex: CHROME_Z
 }
 
 // Embedded mode pill (bottom-center status indicator).

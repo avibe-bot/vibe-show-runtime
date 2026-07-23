@@ -25,6 +25,14 @@ import {
   readStoredAnnotationMode,
   showAnnotationMeUrl,
   writeStoredAnnotationMode,
+  resolveFabVisibility,
+  readStoredFabVisible,
+  writeStoredFabVisible,
+  snapToNearestEdge,
+  exceedsDragThreshold,
+  readStoredFloatPosition,
+  writeStoredFloatPosition,
+  floatPositionStorageKey,
   type AnnotationControlState,
   type AnnotationModeStorage,
   type RuntimeConfig,
@@ -451,5 +459,70 @@ describe("uniform write-token resolution (contract §5 v2)", () => {
   it("resolves no token when writes are not allowed", () => {
     expect(resolveWriteToken({ sessionId: "ses_1" }, { authenticated: false, canAnnotate: false })).toBeUndefined()
     expect(resolveWriteToken({ sessionId: "ses_1" }, undefined)).toBeUndefined()
+  })
+})
+
+describe("standalone FAB visibility via #mark / #unmark (Lane R10)", () => {
+  it("a hash WINS and dictates what to persist (one-time switch)", () => {
+    expect(resolveFabVisibility("#unmark", undefined)).toEqual({ visible: false, persist: false })
+    expect(resolveFabVisibility("#mark", undefined)).toEqual({ visible: true, persist: true })
+    // hash overrides a conflicting stored choice AND re-persists it.
+    expect(resolveFabVisibility("#mark", false)).toEqual({ visible: true, persist: true })
+    expect(resolveFabVisibility("#UNMARK", true)).toEqual({ visible: false, persist: false }) // case-insensitive
+  })
+
+  it("no hash honors the stored choice, else defaults visible, and persists nothing new", () => {
+    expect(resolveFabVisibility("", undefined)).toEqual({ visible: true, persist: null }) // default visible
+    expect(resolveFabVisibility(undefined, false)).toEqual({ visible: false, persist: null })
+    expect(resolveFabVisibility("#other", true)).toEqual({ visible: true, persist: null }) // unknown hash ignored
+  })
+
+  it("persisted visibility round-trips as 1/0 and ignores garbage", () => {
+    const storage = memoryStorage()
+    writeStoredFabVisible("ses_1", false, storage)
+    expect(readStoredFabVisible("ses_1", storage)).toBe(false)
+    writeStoredFabVisible("ses_1", true, storage)
+    expect(readStoredFabVisible("ses_1", storage)).toBe(true)
+    expect(readStoredFabVisible("ses_absent", storage)).toBeUndefined()
+  })
+})
+
+describe("draggable floating chrome: snap + threshold + position storage (Lane R10)", () => {
+  const vp = { width: 400, height: 800 }
+
+  it("exceedsDragThreshold: <6px is a click, ≥6px is a drag", () => {
+    expect(exceedsDragThreshold(3, 3)).toBe(false) // hypot ~4.24
+    expect(exceedsDragThreshold(6, 0)).toBe(true)
+    expect(exceedsDragThreshold(0, 8)).toBe(true)
+  })
+
+  it("snaps to the NEAREST vertical edge, keeping the FAB off the center pill", () => {
+    const size = { width: 52, height: 52 }
+    const left = snapToNearestEdge({ left: 40, top: 300 }, size, vp, 20)
+    expect(left.edge).toBe("left")
+    expect(left.left).toBe(20) // inset from left
+    const right = snapToNearestEdge({ left: 300, top: 300 }, size, vp, 20)
+    expect(right.edge).toBe("right")
+    expect(right.left).toBe(400 - 52 - 20) // inset from right
+    expect(left.top).toBe(300) // vertical kept
+  })
+
+  it("clamps the vertical position within bounds (never off-screen / into a reserved zone)", () => {
+    const size = { width: 52, height: 52 }
+    const high = snapToNearestEdge({ left: 10, top: -100 }, size, vp, 20)
+    expect(high.top).toBe(20) // clamped to top inset
+    const low = snapToNearestEdge({ left: 10, top: 5000 }, size, vp, 20, { bottom: 760 })
+    expect(low.top).toBe(760 - 52) // clamped so it fits above the reserved bottom bound
+  })
+
+  it("float position round-trips per element + session; garbage ⇒ undefined", () => {
+    const storage = memoryStorage()
+    writeStoredFloatPosition("fab", "ses_1", { left: 20, top: 120 }, storage)
+    writeStoredFloatPosition("badge", "ses_1", { left: 328, top: 400 }, storage)
+    expect(readStoredFloatPosition("fab", "ses_1", storage)).toEqual({ left: 20, top: 120 })
+    expect(readStoredFloatPosition("badge", "ses_1", storage)).toEqual({ left: 328, top: 400 }) // independent
+    expect(readStoredFloatPosition("fab", "ses_2", storage)).toBeUndefined() // per session
+    storage.setItem(floatPositionStorageKey("fab", "ses_1"), "not json")
+    expect(readStoredFloatPosition("fab", "ses_1", storage)).toBeUndefined()
   })
 })
