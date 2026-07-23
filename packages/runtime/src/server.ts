@@ -145,7 +145,7 @@ async function routeRequest(
       return
     }
 
-    if (appPath.startsWith("/__show/events")) {
+    if (isShowEndpointPath(appPath, "events")) {
       if (request.method === "GET") {
         if (parsed.query.stream === "1") {
           const stream = eventStreams.subscribe(sessionId, response, streamAfterId(request, parsed.query.after_id))
@@ -175,7 +175,7 @@ async function routeRequest(
       return
     }
 
-    if (appPath.startsWith("/__show/messages")) {
+    if (isShowEndpointPath(appPath, "messages")) {
       sendJson(response, 200, { messages: runtime.listSessionMessages(sessionId) })
       return
     }
@@ -272,6 +272,10 @@ function isSpaRoutePath(appPath: string, method: string | undefined) {
   if (first === "api" || first === "__show") return false
   const last = segments.at(-1) ?? ""
   return !last.includes(".")
+}
+
+function isShowEndpointPath(appPath: string, endpoint: "events" | "messages") {
+  return appPath === `/__show/${endpoint}`
 }
 
 type ShowEventRequest = {

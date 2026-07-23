@@ -338,6 +338,13 @@ try {
   if (unknownReservedPath.status !== 404 || (await unknownReservedPath.text()).includes("<html")) {
     throw new Error(`Expected an unknown __show path to stay 404, got ${unknownReservedPath.status}`)
   }
+  for (const nearPrefix of ["events-debug", "messages.json", "events/", "me2"]) {
+    const response = await fetch(`${runtime.url}/sessions/smoke/app/__show/${nearPrefix}`)
+    const body = await response.text()
+    if (response.status !== 404 || body.includes('"events"') || body.includes('"messages"')) {
+      throw new Error(`Expected near-prefix __show path ${nearPrefix} to stay 404, got ${response.status}: ${body}`)
+    }
+  }
   const scaffoldRouter = await readFile(join(root, "smoke", "src", "router.tsx"), "utf8")
   const scaffoldMain = await readFile(join(root, "smoke", "src", "main.tsx"), "utf8")
   const scaffoldHome = await readFile(join(root, "smoke", "src", "pages", "index.tsx"), "utf8")
