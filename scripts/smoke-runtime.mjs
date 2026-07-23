@@ -307,6 +307,9 @@ try {
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
     throw new Error("Expected app HTML asset URLs to stay under /show/<session>/")
   }
+  if (!app.includes('<base href="/show/smoke/" />')) {
+    throw new Error(`Expected transformed entry HTML to root relative URLs at the injected runtime base, got ${app.match(/<base[^>]*>/)?.[0] ?? "no base element"}`)
+  }
   const explicitEntry = await fetch(`${runtime.url}/sessions/smoke/app/index.html`)
   if (explicitEntry.status !== 200 || !(await explicitEntry.text()).includes('/show/smoke/src/main.tsx')) {
     throw new Error(`Expected the explicit index.html entry URL to stay servable, got ${explicitEntry.status}`)
@@ -326,8 +329,14 @@ try {
   if (apiaryRoute.status !== 200 || !(await apiaryRoute.text()).includes('/show/smoke/src/main.tsx')) {
     throw new Error(`Expected a route beginning with api to bypass the reserved API segment, got ${apiaryRoute.status}`)
   }
-  const missingAsset = await fetch(`${runtime.url}/sessions/smoke/app/assets/missing.js`, {
+  const dottedHistoryRoute = await fetch(`${runtime.url}/sessions/smoke/app/users/alice@example.com`, {
     headers: { accept: "text/html" }
+  })
+  if (dottedHistoryRoute.status !== 200 || !(await dottedHistoryRoute.text()).includes('/show/smoke/src/main.tsx')) {
+    throw new Error(`Expected a dotted History route navigation to serve transformed entry HTML, got ${dottedHistoryRoute.status}`)
+  }
+  const missingAsset = await fetch(`${runtime.url}/sessions/smoke/app/assets/missing.js`, {
+    headers: { accept: "application/javascript" }
   })
   if (missingAsset.status !== 404 || (await missingAsset.text()).includes("<html")) {
     throw new Error(`Expected a missing asset path to stay 404, got ${missingAsset.status}`)
@@ -353,6 +362,9 @@ try {
   }
   if (!scaffoldRouter.includes("segment.name !== safeDecode(parts[index])")) {
     throw new Error("Expected the fresh scaffold router to decode static URL segments before matching")
+  }
+  if (!scaffoldRouter.includes('routePath === "/index.html" ? "/" : routePath')) {
+    throw new Error("Expected the fresh scaffold router to map the explicit entry URL to its home route")
   }
   if (!scaffoldMain.includes("redirectLegacyHashRoute") || !scaffoldMain.includes('startsWith("#/")')) {
     throw new Error("Expected the fresh scaffold entry to redirect legacy hash routes")

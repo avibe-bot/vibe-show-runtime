@@ -141,6 +141,7 @@ function indexHtml() {
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="%BASE_URL%" />
     <title>Vibe Show</title>
   </head>
   <body>
@@ -337,7 +338,8 @@ function readRoutePath(): string {
   const base = basePath()
   const pathname = window.location.pathname
   if (!pathname.startsWith(base)) return "/"
-  return normalizeRoutePath("/" + pathname.slice(base.length))
+  const routePath = normalizeRoutePath("/" + pathname.slice(base.length))
+  return routePath === "/index.html" ? "/" : routePath
 }
 
 function subscribe(onChange: () => void): () => void {

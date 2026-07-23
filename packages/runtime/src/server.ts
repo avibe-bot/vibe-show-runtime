@@ -231,7 +231,7 @@ async function routeRequest(
         response.end(error instanceof Error ? error.message : String(error))
         return
       }
-      if (!isSpaRoutePath(appPath, request.method)) {
+      if (!isSpaRoutePath(appPath, request)) {
         sendNotFound(response)
         return
       }
@@ -257,8 +257,8 @@ async function routeRequest(
   sendJson(response, 404, { error: "Not found" })
 }
 
-function isSpaRoutePath(appPath: string, method: string | undefined) {
-  if (method !== "GET" && method !== "HEAD") return false
+function isSpaRoutePath(appPath: string, request: IncomingMessage) {
+  if (request.method !== "GET" && request.method !== "HEAD") return false
   let normalized = appPath
   try {
     normalized = decodeURIComponent(normalized)
@@ -271,7 +271,15 @@ function isSpaRoutePath(appPath: string, method: string | undefined) {
   const first = segments[0]
   if (first === "api" || first === "__show") return false
   const last = segments.at(-1) ?? ""
-  return !last.includes(".")
+  if (!last.includes(".")) return true
+
+  // A dotted final segment can be either an asset or a route parameter (for
+  // example an email address). Vite already served real files above. For a miss,
+  // the browser's document accept header is the remaining signal that this is a
+  // navigation and should receive the entry document; script/style/image fetches
+  // keep their non-HTML accept headers and stay 404.
+  const accept = Array.isArray(request.headers.accept) ? request.headers.accept[0] : request.headers.accept
+  return typeof accept === "string" && accept.toLowerCase().includes("text/html")
 }
 
 function isShowEndpointPath(appPath: string, endpoint: "events" | "messages") {
