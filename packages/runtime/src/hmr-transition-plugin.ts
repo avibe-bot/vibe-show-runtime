@@ -6,9 +6,13 @@ const resolvedClientModuleId = `\0${clientModuleId}`
 
 export function showHmrTransitionPlugin(options: { fallbackDelaySeconds?: number } = {}): Plugin {
   const fallbackDelaySeconds = options.fallbackDelaySeconds
+  let base = "/"
   return {
     name: "avibe-show-hmr-transition",
     apply: "serve",
+    configResolved(config) {
+      base = config.base.endsWith("/") ? config.base : `${config.base}/`
+    },
     resolveId(id) {
       if (id === clientModuleId) return resolvedClientModuleId
       return null
@@ -30,7 +34,7 @@ export function showHmrTransitionPlugin(options: { fallbackDelaySeconds?: number
           tag: "script",
           attrs: {
             type: "module",
-            src: `./@id/__x00__${clientModuleId}`
+            src: `${base}@id/__x00__${clientModuleId}`
           },
           injectTo: "head"
         }

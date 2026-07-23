@@ -1,4 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
+import { readFile } from "node:fs/promises"
+import { join } from "node:path"
 import { parse } from "node:url"
 import type { AddressInfo } from "node:net"
 import { isAgentOnlyShowEventType, isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type ShowEventInput } from "@avibe/show-sdk"
@@ -143,7 +145,7 @@ async function routeRequest(
       return
     }
 
-    if (appPath.startsWith("/__show/events")) {
+    if (isShowEndpointPath(appPath, "events")) {
       if (request.method === "GET") {
         if (parsed.query.stream === "1") {
           const stream = eventStreams.subscribe(sessionId, response, streamAfterId(request, parsed.query.after_id))
@@ -173,12 +175,19 @@ async function routeRequest(
       return
     }
 
-    if (appPath.startsWith("/__show/messages")) {
+    if (isShowEndpointPath(appPath, "messages")) {
       sendJson(response, 200, { messages: runtime.listSessionMessages(sessionId) })
       return
     }
 
-    if (appPath.startsWith("/api")) {
+    // Every `__show/*` path is runtime-owned. Known endpoints were handled above;
+    // unknown ones must stay 404 instead of falling through to the page router.
+    if (appPath === "/__show" || appPath.startsWith("/__show/")) {
+      sendNotFound(response)
+      return
+    }
+
+    if (appPath === "/api" || appPath.startsWith("/api/")) {
       if (!session.vite) {
         sendJson(response, 503, { error: "Session not ready", status })
         return
@@ -216,19 +225,65 @@ async function routeRequest(
         state: session.state
       })
     })
-    vite.middlewares(request, response, (error?: unknown) => {
+    vite.middlewares(request, response, async (error?: unknown) => {
       if (error) {
         response.statusCode = 500
         response.end(error instanceof Error ? error.message : String(error))
         return
       }
-      response.statusCode = 404
-      response.end("Not found")
+      if (!isSpaRoutePath(appPath, request)) {
+        sendNotFound(response)
+        return
+      }
+
+      // Vite already had first refusal, so extensionless public files and other
+      // real assets keep priority. Only a route-shaped miss gets the transformed
+      // entry document; `appType: custom` intentionally leaves this decision here.
+      try {
+        const source = await readFile(join(session.workspace, "index.html"), "utf8")
+        const html = await vite.transformIndexHtml(`${appPath}${appSearch}`, source)
+        response.statusCode = 200
+        response.setHeader("content-type", "text/html; charset=utf-8")
+        response.setHeader("cache-control", "no-cache")
+        response.end(request.method === "HEAD" ? undefined : html)
+      } catch (fallbackError) {
+        response.statusCode = 500
+        response.end(fallbackError instanceof Error ? fallbackError.message : String(fallbackError))
+      }
     })
     return
   }
 
   sendJson(response, 404, { error: "Not found" })
+}
+
+function isSpaRoutePath(appPath: string, request: IncomingMessage) {
+  if (request.method !== "GET" && request.method !== "HEAD") return false
+  let normalized = appPath
+  try {
+    normalized = decodeURIComponent(normalized)
+  } catch {
+    // Keep the encoded form. Vite already rejected it, and the conservative
+    // last-segment check below will still avoid common asset extensions.
+  }
+  if (normalized === "/" || normalized === "/index.html") return true
+  const segments = normalized.split("/").filter(Boolean)
+  const first = segments[0]
+  if (first === "api" || first === "__show") return false
+  const last = segments.at(-1) ?? ""
+  if (!last.includes(".")) return true
+
+  // A dotted final segment can be either an asset or a route parameter (for
+  // example an email address). Vite already served real files above. For a miss,
+  // the browser's document accept header is the remaining signal that this is a
+  // navigation and should receive the entry document; script/style/image fetches
+  // keep their non-HTML accept headers and stay 404.
+  const accept = Array.isArray(request.headers.accept) ? request.headers.accept[0] : request.headers.accept
+  return typeof accept === "string" && accept.toLowerCase().includes("text/html")
+}
+
+function isShowEndpointPath(appPath: string, endpoint: "events" | "messages") {
+  return appPath === `/__show/${endpoint}`
 }
 
 type ShowEventRequest = {
@@ -361,6 +416,12 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown) {
   response.statusCode = statusCode
   response.setHeader("content-type", "application/json")
   response.end(JSON.stringify(body))
+}
+
+function sendNotFound(response: ServerResponse) {
+  response.statusCode = 404
+  response.setHeader("content-type", "text/plain; charset=utf-8")
+  response.end("Not found")
 }
 
 function logRequestTiming(

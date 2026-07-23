@@ -179,6 +179,20 @@ await symlink("../.git/HEAD", join(root, "smoke", "public", "linked-git-head.txt
 await symlink(".env", join(root, "smoke", "public", "linked-env.txt"))
 await mkdir(join(root, "managed-git"), { recursive: true })
 await writeFile(join(root, "managed-git", ".git"), "gitdir: /tmp/private-show-gitdir\n")
+await mkdir(join(root, "legacy", "src"), { recursive: true })
+const legacyApp = `import { useSyncExternalStore } from "react"
+
+function subscribe(onChange) {
+  window.addEventListener("hashchange", onChange)
+  return () => window.removeEventListener("hashchange", onChange)
+}
+
+export default function App() {
+  const route = useSyncExternalStore(subscribe, () => window.location.hash || "#/", () => "#/")
+  return <main>Existing hash workspace: {route}</main>
+}
+`
+await writeFile(join(root, "legacy", "src", "App.tsx"), legacyApp)
 await symlink(join(staleDependencyRoot, "node_modules"), join(root, "smoke", "node_modules"), "junction")
 const runtime = await startShowRuntimeServer({ workspaceRoot: root, cacheRoot, fallbackDelaySeconds: 30 })
 
@@ -190,15 +204,36 @@ try {
 }
 `)
 
-  const [ensure, secondEnsure] = await Promise.all([
+  const [ensure, secondEnsure, existingWorkspaceEnsure] = await Promise.all([
     fetch(`${runtime.url}/sessions/smoke/ensure`, { method: "POST" }).then((res) => res.json()),
-    fetch(`${runtime.url}/sessions/smoke-two/ensure`, { method: "POST" }).then((res) => res.json())
+    fetch(`${runtime.url}/sessions/smoke-two/ensure`, { method: "POST" }).then((res) => res.json()),
+    fetch(`${runtime.url}/sessions/legacy/ensure`, { method: "POST" }).then((res) => res.json())
   ])
   if (ensure.state !== "active") {
     throw new Error(`Expected active session, got ${ensure.state}`)
   }
   if (secondEnsure.state !== "active") {
     throw new Error(`Expected second active session, got ${secondEnsure.state}`)
+  }
+  if (existingWorkspaceEnsure.state !== "active") {
+    throw new Error(`Expected legacy active session, got ${existingWorkspaceEnsure.state}`)
+  }
+  if ((await readFile(join(root, "legacy", "src", "App.tsx"), "utf8")) !== legacyApp) {
+    throw new Error("Expected an existing workspace app to stay byte-identical")
+  }
+  const legacyMain = await readFile(join(root, "legacy", "src", "main.tsx"), "utf8")
+  if (legacyMain.includes("redirectLegacyHashRoute")) {
+    throw new Error("Expected an existing hash workspace not to receive the fresh-scaffold hash redirect")
+  }
+  const legacyHashEntry = await fetch(`${runtime.url}/sessions/legacy/app/#/existing`)
+  if (legacyHashEntry.status !== 200 || !(await legacyHashEntry.text()).includes('/show/legacy/src/main.tsx')) {
+    throw new Error("Expected an existing hash workspace to keep loading from its entry URL")
+  }
+  try {
+    await access(join(root, "legacy", "src", "router.tsx"))
+    throw new Error("Expected an existing workspace not to receive the new router scaffold")
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error
   }
   const smokeVite = runtime.runtime.getSession("smoke")?.vite
   const expectedDenyPatterns = ["**/.git", "**/.git/**", "**/.env", "**/.env.*", "**/*.pem", "**/*.crt", "**/*.key"]
@@ -271,6 +306,71 @@ try {
   }
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
     throw new Error("Expected app HTML asset URLs to stay under /show/<session>/")
+  }
+  if (!app.includes('<base href="/show/smoke/" />')) {
+    throw new Error(`Expected transformed entry HTML to root relative URLs at the injected runtime base, got ${app.match(/<base[^>]*>/)?.[0] ?? "no base element"}`)
+  }
+  const explicitEntry = await fetch(`${runtime.url}/sessions/smoke/app/index.html`)
+  if (explicitEntry.status !== 200 || !(await explicitEntry.text()).includes('/show/smoke/src/main.tsx')) {
+    throw new Error(`Expected the explicit index.html entry URL to stay servable, got ${explicitEntry.status}`)
+  }
+  const historyRoute = await fetch(`${runtime.url}/sessions/smoke/app/reports/daily?vibe-embed=1`)
+  const historyRouteBody = await historyRoute.text()
+  if (historyRoute.status !== 200 || !historyRouteBody.includes('/show/smoke/src/main.tsx')) {
+    throw new Error(`Expected a deep History route to serve transformed entry HTML, got ${historyRoute.status}`)
+  }
+  const deepHmrClientUrl = historyRouteBody.match(/src="(\/show\/smoke\/@id\/[^"]+)"/)?.[1]
+  const deepHmrClientPath = deepHmrClientUrl?.replace(/^\/show\/smoke\//, "/sessions/smoke/app/")
+  const deepHmrClient = deepHmrClientPath ? await fetch(`${runtime.url}${deepHmrClientPath}`) : undefined
+  if (!deepHmrClientUrl || !deepHmrClient || deepHmrClient.status !== 200) {
+    throw new Error(`Expected deep History HTML to use a base-rooted HMR client, got ${deepHmrClientUrl ?? "missing"}`)
+  }
+  const apiaryRoute = await fetch(`${runtime.url}/sessions/smoke/app/apiary`)
+  if (apiaryRoute.status !== 200 || !(await apiaryRoute.text()).includes('/show/smoke/src/main.tsx')) {
+    throw new Error(`Expected a route beginning with api to bypass the reserved API segment, got ${apiaryRoute.status}`)
+  }
+  const dottedHistoryRoute = await fetch(`${runtime.url}/sessions/smoke/app/users/alice@example.com`, {
+    headers: { accept: "text/html" }
+  })
+  if (dottedHistoryRoute.status !== 200 || !(await dottedHistoryRoute.text()).includes('/show/smoke/src/main.tsx')) {
+    throw new Error(`Expected a dotted History route navigation to serve transformed entry HTML, got ${dottedHistoryRoute.status}`)
+  }
+  const missingAsset = await fetch(`${runtime.url}/sessions/smoke/app/assets/missing.js`, {
+    headers: { accept: "application/javascript" }
+  })
+  if (missingAsset.status !== 404 || (await missingAsset.text()).includes("<html")) {
+    throw new Error(`Expected a missing asset path to stay 404, got ${missingAsset.status}`)
+  }
+  const unknownReservedPath = await fetch(`${runtime.url}/sessions/smoke/app/__show/unknown`, {
+    headers: { accept: "text/html" }
+  })
+  if (unknownReservedPath.status !== 404 || (await unknownReservedPath.text()).includes("<html")) {
+    throw new Error(`Expected an unknown __show path to stay 404, got ${unknownReservedPath.status}`)
+  }
+  for (const nearPrefix of ["events-debug", "messages.json", "events/", "me2"]) {
+    const response = await fetch(`${runtime.url}/sessions/smoke/app/__show/${nearPrefix}`)
+    const body = await response.text()
+    if (response.status !== 404 || body.includes('"events"') || body.includes('"messages"')) {
+      throw new Error(`Expected near-prefix __show path ${nearPrefix} to stay 404, got ${response.status}: ${body}`)
+    }
+  }
+  const scaffoldRouter = await readFile(join(root, "smoke", "src", "router.tsx"), "utf8")
+  const scaffoldMain = await readFile(join(root, "smoke", "src", "main.tsx"), "utf8")
+  const scaffoldHome = await readFile(join(root, "smoke", "src", "pages", "index.tsx"), "utf8")
+  if (!scaffoldRouter.includes("popstate") || scaffoldRouter.includes("hashchange") || !scaffoldRouter.includes("__AVIBE_SHOW__?.basePath")) {
+    throw new Error("Expected the fresh scaffold router to use History mode with the injected base path")
+  }
+  if (!scaffoldRouter.includes("segment.name !== safeDecode(parts[index])")) {
+    throw new Error("Expected the fresh scaffold router to decode static URL segments before matching")
+  }
+  if (!scaffoldRouter.includes('routePath === "/index.html" ? "/" : routePath')) {
+    throw new Error("Expected the fresh scaffold router to map the explicit entry URL to its home route")
+  }
+  if (!scaffoldMain.includes("redirectLegacyHashRoute") || !scaffoldMain.includes('startsWith("#/")')) {
+    throw new Error("Expected the fresh scaffold entry to redirect legacy hash routes")
+  }
+  if (!scaffoldHome.includes('baseUrl.pathname.endsWith("/")')) {
+    throw new Error("Expected the fresh scaffold handler URL to normalize a slashless injected base path")
   }
   const visibleAsset = await fetch(`${runtime.url}/sessions/smoke/app/visible.txt`)
   if (visibleAsset.status !== 200 || (await visibleAsset.text()) !== "visible public asset\n") {
@@ -448,7 +548,7 @@ import rawExample from "./raw-example.ts?raw"
 import type {} from "missing-export-type-package"
 import { type InlineMissingType } from "missing-inline-type-only-package"
 export { type InlineMissingExportType } from "missing-inline-export-type-only-package"
-const eagerPages = import.meta.glob("./pages/*.tsx", { eager: true })
+const eagerPages = import.meta.glob<{ default: () => JSX.Element }>("./pages/**/*.tsx", { eager: true })
 // import "missing-commented-only-package"
 /* import "missing-block-comment-only-package" */
 const snippet = 'import "missing-string-only-package"'
