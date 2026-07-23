@@ -67,11 +67,12 @@ import {
   resolveFabVisibility,
   readStoredFabVisible,
   writeStoredFabVisible,
-  readStoredFloatPosition,
-  writeStoredFloatPosition,
+  readStoredFloatPlacement,
+  writeStoredFloatPlacement,
   snapToNearestEdge,
   exceedsDragThreshold,
   type FloatPosition,
+  type FloatPlacement,
   type AnnotationController,
   type AnnotationHost,
   type AnnotationModeStorage
@@ -1433,23 +1434,24 @@ type DraggableResult = {
  * element+session. A restored/again-resized position is re-snapped to the current viewport so it can
  * never end up off-screen. `touch-action:none` keeps a touch-drag from scrolling the page.
  */
-function useDraggable(element: "fab" | "badge", sessionId: string | undefined, size: { width: number; height: number }): DraggableResult {
+function useDraggable(element: "fab" | "badge", sessionId: string | undefined): DraggableResult {
   const storage = React.useMemo(() => safeLocalStorage(), [])
-  const [pos, setPos] = React.useState<FloatPosition | null>(() => readStoredFloatPosition(element, sessionId, storage) ?? null)
+  // Persist the snapped EDGE + vertical offset, NOT an absolute left — so a right placement survives a
+  // viewport resize / a mobile→desktop reload, and a wider element (the toolbar) reuses it width-independently.
+  const [placement, setPlacement] = React.useState<FloatPlacement | null>(() => readStoredFloatPlacement(element, sessionId, storage) ?? null)
+  const [dragPos, setDragPos] = React.useState<FloatPosition | null>(null)
   const [dragging, setDragging] = React.useState(false)
   const gesture = React.useRef<{ startX: number; startY: number; originLeft: number; originTop: number; moved: boolean } | null>(null)
   const draggedRef = React.useRef(false)
 
-  // Keep a restored/edge-snapped position valid across viewport resizes (right-edge stays right, etc.).
+  // On resize keep the element on-screen by clamping only the vertical offset; the edge is preserved.
   React.useEffect(() => {
     if (typeof window === "undefined") return
-    const resnap = () =>
-      setPos((prev) => (prev ? pick(snapToNearestEdge(prev, size, { width: window.innerWidth, height: window.innerHeight }, FLOAT_INSET, { bottom: window.innerHeight - FLOAT_INSET })) : prev))
-    resnap()
-    window.addEventListener("resize", resnap)
-    return () => window.removeEventListener("resize", resnap)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [size.width, size.height])
+    const clampTop = () => setPlacement((prev) => (prev ? { edge: prev.edge, top: Math.min(Math.max(FLOAT_INSET, prev.top), Math.max(FLOAT_INSET, window.innerHeight - FLOAT_INSET - 44)) } : prev))
+    clampTop()
+    window.addEventListener("resize", clampTop)
+    return () => window.removeEventListener("resize", clampTop)
+  }, [])
 
   const onPointerDown = (event: React.PointerEvent<HTMLElement>) => {
     if (event.button !== 0 && event.pointerType === "mouse") return // primary mouse button / any touch-pen
@@ -1468,7 +1470,7 @@ function useDraggable(element: "fab" | "badge", sessionId: string | undefined, s
     if (!g.moved && !exceedsDragThreshold(dx, dy)) return
     g.moved = true
     if (!dragging) setDragging(true)
-    setPos({ left: g.originLeft + dx, top: g.originTop + dy })
+    setDragPos({ left: g.originLeft + dx, top: g.originTop + dy })
     event.preventDefault()
   }
   const finish = (event: React.PointerEvent<HTMLElement>) => {
@@ -1487,9 +1489,11 @@ function useDraggable(element: "fab" | "badge", sessionId: string | undefined, s
         FLOAT_INSET,
         { bottom: window.innerHeight - FLOAT_INSET }
       )
-      setPos(pick(snapped))
-      writeStoredFloatPosition(element, sessionId, pick(snapped), storage)
+      const next: FloatPlacement = { edge: snapped.edge, top: snapped.top }
+      setPlacement(next)
+      writeStoredFloatPlacement(element, sessionId, next, storage)
     }
+    setDragPos(null)
     setDragging(false)
   }
   const consumeDragClick = () => {
@@ -1499,15 +1503,14 @@ function useDraggable(element: "fab" | "badge", sessionId: string | undefined, s
     }
     return false
   }
-  const style: React.CSSProperties = pos
-    ? { left: pos.left, top: pos.top, right: "auto", bottom: "auto", touchAction: "none" }
-    : { touchAction: "none" }
+  // While dragging: follow the pointer (absolute). At rest: EDGE-anchored (inset from the chosen side)
+  // so the FAB and the wider expanded toolbar share the placement without either overflowing off-screen.
+  const style: React.CSSProperties = dragPos
+    ? { left: dragPos.left, top: dragPos.top, right: "auto", bottom: "auto", touchAction: "none" }
+    : placement
+      ? { top: placement.top, bottom: "auto", touchAction: "none", ...(placement.edge === "left" ? { left: FLOAT_INSET, right: "auto" } : { right: FLOAT_INSET, left: "auto" }) }
+      : { touchAction: "none" }
   return { style, dragging, pointerHandlers: { onPointerDown, onPointerMove, onPointerUp: finish, onPointerCancel: finish }, consumeDragClick }
-}
-
-/** Strip the `edge` discriminator off a snap result down to a bare {left, top}. */
-function pick(snapped: FloatPosition & { edge: "left" | "right" }): FloatPosition {
-  return { left: snapped.left, top: snapped.top }
 }
 
 function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, sessionId, onEnable, onDisable, onSetMode }: AnnotationChromeProps) {
@@ -1516,7 +1519,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   const exitLabel = touchInput ? labels.exitShort : labels.exit
   // Hooks must be unconditional (called before the host/availability early returns below).
   const fabVisibility = useFabVisibility(host, sessionId)
-  const fabDrag = useDraggable("fab", sessionId, FAB_SIZE)
+  const fabDrag = useDraggable("fab", sessionId)
   const [toast, setToast] = React.useState<string | null>(null)
   const toastTimer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   React.useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
@@ -1532,6 +1535,11 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     fabVisibility.hide()
     if (labels.fabHiddenToast) flashToast(labels.fabHiddenToast)
   }, [onDisable, fabVisibility, flashToast, labels.fabHiddenToast])
+  // If the hash flips to #unmark (or the ✕ fires) WHILE a session is active, the hide switch must also
+  // stop capture — not just hide the collapsed FAB — so the documented switch works mid-session (#3637478399).
+  React.useEffect(() => {
+    if (host === "standalone" && !fabVisibility.visible && enabled) onDisable?.()
+  }, [host, fabVisibility.visible, enabled, onDisable])
 
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
@@ -1558,11 +1566,14 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     )
   }
 
-  // Collapsed FAB = the draggable "toolbar collapsed form"; hidden by #unmark / the ✕ button (standalone
-  // only). The toast still renders below even when the FAB is hidden, so the ✕ confirmation is visible.
+  // Standalone chrome. The hash / ✕ hide switch gates the WHOLE chrome — collapsed FAB AND expanded
+  // toolbar — not just the FAB, so #unmark works mid-session (#3637478399); the disable effect above
+  // stops capture too. The toast still renders below even when hidden so the ✕ confirmation shows.
   let content: React.ReactNode = null
-  if (!enabled) {
-    content = fabVisibility.visible ? (
+  if (!fabVisibility.visible) {
+    content = null
+  } else if (!enabled) {
+    content = (
       <button
         type="button"
         data-show-annotation-ui=""
@@ -1576,15 +1587,17 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
       >
         <AnnotateIcon />
       </button>
-    ) : null
+    )
   } else {
     content = (
-      <div data-show-annotation-ui="" style={toolbarStyle} onClick={(event) => event.stopPropagation()}>
+      // Reuse the FAB's edge placement so the toolbar stays where the user moved it (#3637478393); clamp
+      // its width and use icon-only mode tabs on touch so every control stays on-screen at ~320px (#3637478390).
+      <div data-show-annotation-ui="" style={{ ...toolbarStyle, ...fabDrag.style, maxWidth: "calc(100vw - 52px)" }} onClick={(event) => event.stopPropagation()}>
         <button type="button" aria-label={exitLabel} style={toolbarIndicatorStyle} onClick={() => onDisable?.()}>
           <AnnotateIcon />
         </button>
-        <ModeTab active={mode === "smart"} onClick={() => onSetMode?.("smart")} icon={<SparkleIcon />} label={labels.smart} />
-        <ModeTab active={mode === "screenshot"} onClick={() => onSetMode?.("screenshot")} icon={<CameraIcon />} label={labels.screenshot} />
+        <ModeTab active={mode === "smart"} onClick={() => onSetMode?.("smart")} icon={<SparkleIcon />} label={labels.smart} compact={touchInput} />
+        <ModeTab active={mode === "screenshot"} onClick={() => onSetMode?.("screenshot")} icon={<CameraIcon />} label={labels.screenshot} compact={touchInput} />
         <button type="button" style={toolbarExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
         {/* Trailing subtle affordances: '?' one-line tip, '✕' hide (≡ #unmark). */}
         <ToolbarHelp tip={labels.fabTip ?? ""} touchInput={touchInput} />
@@ -1623,11 +1636,13 @@ function ToolbarHelp({ tip, touchInput }: { tip: string; touchInput: boolean }) 
   )
 }
 
-function ModeTab({ active, onClick, icon, label }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string }) {
+function ModeTab({ active, onClick, icon, label, compact }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string; compact?: boolean }) {
+  // Compact (touch / narrow): icon-only with the label as the accessible name, so the toolbar's controls
+  // fit within a ~320px viewport (#3637478390).
   return (
-    <button type="button" aria-pressed={active} onClick={onClick} style={active ? modeTabActiveStyle : modeTabStyle}>
+    <button type="button" aria-pressed={active} aria-label={compact ? label : undefined} onClick={onClick} style={active ? modeTabActiveStyle : modeTabStyle}>
       {icon}
-      {label}
+      {compact ? null : label}
     </button>
   )
 }
@@ -2201,7 +2216,7 @@ function MarkBubble({ mark, onClose }: { mark: ResolvedMarkCandidate; onClose: (
 }
 
 function MarkBadge({ count, host, sessionId, onClick }: { count: number; host: AnnotationHost; sessionId?: string; onClick: () => void }) {
-  const drag = useDraggable("badge", sessionId, BADGE_SIZE)
+  const drag = useDraggable("badge", sessionId)
   return (
     <button
       type="button"
@@ -2874,8 +2889,6 @@ const toolbarExitStyle: React.CSSProperties = {
   cursor: "pointer"
 }
 
-const FAB_SIZE = { width: 52, height: 52 }
-
 // Subtle trailing '?' / '✕' glyph buttons on the expanded toolbar (muted, consistent with the chrome).
 const toolbarGlyphButtonStyle: React.CSSProperties = {
   width: 28,
@@ -2928,8 +2941,6 @@ const toastStyle: React.CSSProperties = {
   zIndex: CARD_Z,
   textAlign: "center"
 }
-
-const BADGE_SIZE = { width: 64, height: 48 }
 
 // Violet agent-mark badge — soft violet glow, tabular count, sized/weighted to match the FAB family.
 const markBadgeBaseStyle: React.CSSProperties = {

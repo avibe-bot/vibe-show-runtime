@@ -156,6 +156,12 @@ export const ANNOTATION_FLOAT_POSITION_STORAGE_PREFIX = "avibe:float-pos:"
 export const DRAG_ACTIVATION_THRESHOLD = 6
 
 export type FloatPosition = { left: number; top: number }
+/**
+ * The PERSISTED placement of a draggable floating element: the snapped edge + a vertical offset — NOT an
+ * absolute `left`. Storing the edge keeps a right-snapped element on the right across viewport resizes
+ * and lets a wider variant (the expanded toolbar) reuse the same placement width-independently.
+ */
+export type FloatPlacement = { edge: "left" | "right"; top: number }
 
 export function floatPositionStorageKey(element: string, sessionId: string | undefined): string {
   return `${ANNOTATION_FLOAT_POSITION_STORAGE_PREFIX}${element}:${sessionId ?? "default"}`
@@ -187,33 +193,35 @@ export function snapToNearestEdge(
   return { left, top, edge }
 }
 
-export function readStoredFloatPosition(
+export function readStoredFloatPlacement(
   element: string,
   sessionId: string | undefined,
   storage: AnnotationModeStorage | undefined = safeLocalStorage()
-): FloatPosition | undefined {
+): FloatPlacement | undefined {
   if (!storage) return undefined
   try {
     const raw = storage.getItem(floatPositionStorageKey(element, sessionId))
     if (!raw) return undefined
-    const parsed = JSON.parse(raw) as Partial<FloatPosition>
-    return typeof parsed?.left === "number" && typeof parsed?.top === "number" ? { left: parsed.left, top: parsed.top } : undefined
+    const parsed = JSON.parse(raw) as Partial<FloatPlacement>
+    return (parsed?.edge === "left" || parsed?.edge === "right") && typeof parsed?.top === "number"
+      ? { edge: parsed.edge, top: parsed.top }
+      : undefined
   } catch {
     return undefined
   }
 }
 
-export function writeStoredFloatPosition(
+export function writeStoredFloatPlacement(
   element: string,
   sessionId: string | undefined,
-  position: FloatPosition,
+  placement: FloatPlacement,
   storage: AnnotationModeStorage | undefined = safeLocalStorage()
 ): void {
   if (!storage) return
   try {
-    storage.setItem(floatPositionStorageKey(element, sessionId), JSON.stringify(position))
+    storage.setItem(floatPositionStorageKey(element, sessionId), JSON.stringify(placement))
   } catch {
-    // Best-effort — losing a saved position must never break the overlay.
+    // Best-effort — losing a saved placement must never break the overlay.
   }
 }
 

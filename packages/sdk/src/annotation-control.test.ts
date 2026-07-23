@@ -30,8 +30,8 @@ import {
   writeStoredFabVisible,
   snapToNearestEdge,
   exceedsDragThreshold,
-  readStoredFloatPosition,
-  writeStoredFloatPosition,
+  readStoredFloatPlacement,
+  writeStoredFloatPlacement,
   floatPositionStorageKey,
   type AnnotationControlState,
   type AnnotationModeStorage,
@@ -515,14 +515,16 @@ describe("draggable floating chrome: snap + threshold + position storage (Lane R
     expect(low.top).toBe(760 - 52) // clamped so it fits above the reserved bottom bound
   })
 
-  it("float position round-trips per element + session; garbage ⇒ undefined", () => {
+  it("float PLACEMENT (edge + top) round-trips per element + session; garbage ⇒ undefined", () => {
     const storage = memoryStorage()
-    writeStoredFloatPosition("fab", "ses_1", { left: 20, top: 120 }, storage)
-    writeStoredFloatPosition("badge", "ses_1", { left: 328, top: 400 }, storage)
-    expect(readStoredFloatPosition("fab", "ses_1", storage)).toEqual({ left: 20, top: 120 })
-    expect(readStoredFloatPosition("badge", "ses_1", storage)).toEqual({ left: 328, top: 400 }) // independent
-    expect(readStoredFloatPosition("fab", "ses_2", storage)).toBeUndefined() // per session
+    writeStoredFloatPlacement("fab", "ses_1", { edge: "left", top: 120 }, storage)
+    writeStoredFloatPlacement("badge", "ses_1", { edge: "right", top: 400 }, storage)
+    expect(readStoredFloatPlacement("fab", "ses_1", storage)).toEqual({ edge: "left", top: 120 })
+    expect(readStoredFloatPlacement("badge", "ses_1", storage)).toEqual({ edge: "right", top: 400 }) // independent
+    expect(readStoredFloatPlacement("fab", "ses_2", storage)).toBeUndefined() // per session
     storage.setItem(floatPositionStorageKey("fab", "ses_1"), "not json")
-    expect(readStoredFloatPosition("fab", "ses_1", storage)).toBeUndefined()
+    expect(readStoredFloatPlacement("fab", "ses_1", storage)).toBeUndefined()
+    storage.setItem(floatPositionStorageKey("fab", "ses_1"), JSON.stringify({ left: 20, top: 5 })) // old shape, no edge
+    expect(readStoredFloatPlacement("fab", "ses_1", storage)).toBeUndefined() // rejects malformed / legacy
   })
 })
