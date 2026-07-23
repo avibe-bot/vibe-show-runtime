@@ -308,7 +308,7 @@ function matchRoute(path: string): { route: Route | null; params: Record<string,
     for (let index = 0; index < parts.length; index++) {
       const segment = route.segments[index]
       if (segment.dynamic) params[segment.name] = safeDecode(parts[index])
-      else if (segment.name !== parts[index]) {
+      else if (segment.name !== safeDecode(parts[index])) {
         matched = false
         break
       }
@@ -402,7 +402,9 @@ import { Link } from "../router"
 
 function apiUrl(path: string) {
   const base = globalThis.__AVIBE_SHOW__?.basePath || "/"
-  return new URL(path.replace(/^\\/+/, ""), new URL(base, window.location.origin)).toString()
+  const baseUrl = new URL(base, window.location.origin)
+  if (!baseUrl.pathname.endsWith("/")) baseUrl.pathname += "/"
+  return new URL(path.replace(/^\\/+/, ""), baseUrl).toString()
 }
 
 export default function HomePage() {

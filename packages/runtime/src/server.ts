@@ -266,6 +266,7 @@ function isSpaRoutePath(appPath: string, method: string | undefined) {
     // Keep the encoded form. Vite already rejected it, and the conservative
     // last-segment check below will still avoid common asset extensions.
   }
+  if (normalized === "/" || normalized === "/index.html") return true
   const segments = normalized.split("/").filter(Boolean)
   const first = segments[0]
   if (first === "api" || first === "__show") return false

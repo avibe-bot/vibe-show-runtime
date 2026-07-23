@@ -1235,7 +1235,9 @@ function importGlobSpecifiers(source: string) {
         do {
           const value = tokens[cursor]?.value
           if (value === "<") depth += 1
-          if (value === ">") depth -= 1
+          // The tokenizer emits the arrow in `() => JSX.Element` as `=` then
+          // `>`. That `>` is part of the function type, not the generic close.
+          if (value === ">" && tokens[cursor - 1]?.value !== "=") depth -= 1
           cursor += 1
         } while (cursor < tokens.length && depth > 0)
       }

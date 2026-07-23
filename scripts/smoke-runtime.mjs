@@ -307,6 +307,10 @@ try {
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
     throw new Error("Expected app HTML asset URLs to stay under /show/<session>/")
   }
+  const explicitEntry = await fetch(`${runtime.url}/sessions/smoke/app/index.html`)
+  if (explicitEntry.status !== 200 || !(await explicitEntry.text()).includes('/show/smoke/src/main.tsx')) {
+    throw new Error(`Expected the explicit index.html entry URL to stay servable, got ${explicitEntry.status}`)
+  }
   const historyRoute = await fetch(`${runtime.url}/sessions/smoke/app/reports/daily?vibe-embed=1`)
   const historyRouteBody = await historyRoute.text()
   if (historyRoute.status !== 200 || !historyRouteBody.includes('/show/smoke/src/main.tsx')) {
@@ -336,11 +340,18 @@ try {
   }
   const scaffoldRouter = await readFile(join(root, "smoke", "src", "router.tsx"), "utf8")
   const scaffoldMain = await readFile(join(root, "smoke", "src", "main.tsx"), "utf8")
+  const scaffoldHome = await readFile(join(root, "smoke", "src", "pages", "index.tsx"), "utf8")
   if (!scaffoldRouter.includes("popstate") || scaffoldRouter.includes("hashchange") || !scaffoldRouter.includes("__AVIBE_SHOW__?.basePath")) {
     throw new Error("Expected the fresh scaffold router to use History mode with the injected base path")
   }
+  if (!scaffoldRouter.includes("segment.name !== safeDecode(parts[index])")) {
+    throw new Error("Expected the fresh scaffold router to decode static URL segments before matching")
+  }
   if (!scaffoldMain.includes("redirectLegacyHashRoute") || !scaffoldMain.includes('startsWith("#/")')) {
     throw new Error("Expected the fresh scaffold entry to redirect legacy hash routes")
+  }
+  if (!scaffoldHome.includes('baseUrl.pathname.endsWith("/")')) {
+    throw new Error("Expected the fresh scaffold handler URL to normalize a slashless injected base path")
   }
   const visibleAsset = await fetch(`${runtime.url}/sessions/smoke/app/visible.txt`)
   if (visibleAsset.status !== 200 || (await visibleAsset.text()) !== "visible public asset\n") {
@@ -511,7 +522,7 @@ import rawExample from "./raw-example.ts?raw"
 import type {} from "missing-export-type-package"
 import { type InlineMissingType } from "missing-inline-type-only-package"
 export { type InlineMissingExportType } from "missing-inline-export-type-only-package"
-const eagerPages = import.meta.glob<{ default: unknown }>("./pages/**/*.tsx", { eager: true })
+const eagerPages = import.meta.glob<{ default: () => JSX.Element }>("./pages/**/*.tsx", { eager: true })
 // import "missing-commented-only-package"
 /* import "missing-block-comment-only-package" */
 const snippet = 'import "missing-string-only-package"'
