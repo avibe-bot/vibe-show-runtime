@@ -217,7 +217,7 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   cancel: "取消",
   retake: "重新截图",
   addComment: "添加评论",
-  sendBatch: (count) => `发送 ${count} 条评论`,
+  sendBatch: (count) => (count > 0 ? `发送 ${count} 条评论` : "发送评论"),
   screenshotTitle: (count) => (count ? `截图 1 · ${count} 条评论` : "截图 1"),
   commentPlaceholder: "写下你的反馈…",
   screenshotCommentPlaceholder: "点击截图内任意位置，添加下一条编号评论…",
@@ -1242,7 +1242,7 @@ export function AnnotationOverlay({
               <div style={cardFooterStyle}>
                 {/* Hint only when the comment box is shown and Enter-to-send applies (hardware keyboard). */}
                 <span style={footerHintStyle}>{commentVisible && !touchInput ? copy.enterToSend : ""}</span>
-                <button ref={approveSendRef} type="button" disabled={submitting || !canSubmitAnnotation(selectedIntent, comment)} onClick={() => void submit()} style={primaryButtonStyle}>
+                <button ref={approveSendRef} type="button" disabled={submitting || !canSubmitAnnotation(selectedIntent, comment)} onClick={() => void submit()} style={disabledButtonStyle(primaryButtonStyle, submitting || !canSubmitAnnotation(selectedIntent, comment))}>
                   {isApprove ? <IntentIcon intent={APPROVE_INTENT} /> : <SendIcon />}
                   {submitting ? "…" : isApprove ? copy.approve : copy.send}
                 </button>
@@ -1306,6 +1306,7 @@ export function AnnotationOverlay({
           <CommentSurface
             anchorRect={screenshotDraft.region}
             cramped={cramped}
+            width={SCREENSHOT_CARD_WIDTH}
             onClose={() => resetScreenshotState()}
             footer={
               <ScreenshotBatchFooter
@@ -1448,7 +1449,7 @@ function AnchorChip({ label }: { label: string }) {
  * Capped height with a scrollable body and a PINNED footer, so a long anchor label / comment list
  * can never push the send row off-screen (mobile overflow fix, §4).
  */
-function CommentSurface({ anchorRect, cramped, onClose, footer, children }: { anchorRect: MarkAnchorRect; cramped: boolean; onClose: () => void; footer?: React.ReactNode; children: React.ReactNode }) {
+function CommentSurface({ anchorRect, cramped, onClose, footer, children, width = COMMENT_CARD_WIDTH }: { anchorRect: MarkAnchorRect; cramped: boolean; onClose: () => void; footer?: React.ReactNode; children: React.ReactNode; width?: number }) {
   // Keyboard isolation: keep keys typed in the card from reaching host-page shortcuts (`/`, arrows,
   // Cmd/Ctrl+K, …). Escape stays overlay-owned → cancel the card. Enter-to-send is handled on the
   // smart textarea before this bubble-phase guard stops propagation.
@@ -1478,9 +1479,9 @@ function CommentSurface({ anchorRect, cramped, onClose, footer, children }: { an
     )
   }
   const top = Math.min(window.innerHeight - 260, Math.max(12, anchorRect.y + anchorRect.height + 10))
-  const left = Math.min(window.innerWidth - COMMENT_CARD_WIDTH - 12, Math.max(12, anchorRect.x))
+  const left = Math.min(window.innerWidth - width - 12, Math.max(12, anchorRect.x))
   return (
-    <div data-show-annotation-ui="" role="dialog" style={{ ...popoverStyle, top, left }} onClick={(event) => event.stopPropagation()} {...keyGuard}>
+    <div data-show-annotation-ui="" role="dialog" style={{ ...popoverStyle, top, left, width }} onClick={(event) => event.stopPropagation()} {...keyGuard}>
       {inner}
     </div>
   )
@@ -1580,8 +1581,8 @@ function ScreenshotBatchFooter({ draft, comment, submitting, labels, onAddCommen
         {labels.retake}
       </button>
       <div style={{ display: "flex", gap: 8 }}>
-        <button type="button" disabled={!comment.trim()} onClick={onAddComment} style={ghostButtonStyle}>{labels.addComment}</button>
-        <button type="button" disabled={submitting || draft.items.length === 0} onClick={onSend} style={primaryButtonStyle}>
+        <button type="button" disabled={!comment.trim()} onClick={onAddComment} style={disabledButtonStyle(ghostButtonStyle, !comment.trim())}>{labels.addComment}</button>
+        <button type="button" disabled={submitting || draft.items.length === 0} onClick={onSend} style={disabledButtonStyle(primaryButtonStyle, submitting || draft.items.length === 0)}>
           <SendIcon />
           {submitting ? "…" : labels.sendBatch(draft.items.length)}
         </button>
@@ -2309,6 +2310,10 @@ const COLORS = {
 
 const FONT_STACK = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
 const COMMENT_CARD_WIDTH = 340
+// The screenshot batch card carries a THREE-button footer (retake / add / send) + a numbered comment
+// list, so its desktop popover is wider than the single-action smart card (design frames ≥ 420px). On
+// narrow/touch viewports both fall back to the same full-width bottom sheet (CommentSurface `cramped`).
+const SCREENSHOT_CARD_WIDTH = 440
 
 // z-index bands, all near the top of the 32-bit range so the overlay sits above host page chrome.
 const CAPTURE_Z = 2147482500
@@ -2440,7 +2445,27 @@ const overlayButtonBase: React.CSSProperties = {
   border: `1px solid transparent`,
   borderRadius: 12,
   font: `600 13px/1 ${FONT_STACK}`,
-  cursor: "pointer"
+  cursor: "pointer",
+  // Footer labels ("重新截图" / "添加评论" / "发送 N 条评论") must stay on ONE line — wrapping them was the
+  // owner-reported symptom on the narrow screenshot card. Widening the card gives them room to sit inline.
+  whiteSpace: "nowrap"
+}
+
+/**
+ * Overlay buttons use inline styles (no stylesheet for `:disabled`), so the DISABLED look must be applied
+ * explicitly. A disabled action reads as clearly dimmed/gray — never the bright mint of an enabled send
+ * (owner feedback: "发送 0 条评论" looked enabled). Returns the base unchanged when enabled (same ref).
+ */
+export function disabledButtonStyle(base: React.CSSProperties, disabled: boolean): React.CSSProperties {
+  if (!disabled) return base
+  return {
+    ...base,
+    color: COLORS.textMuted,
+    background: COLORS.surfaceRaised,
+    borderColor: COLORS.border,
+    boxShadow: "none",
+    cursor: "not-allowed"
+  }
 }
 
 const primaryButtonStyle: React.CSSProperties = {
