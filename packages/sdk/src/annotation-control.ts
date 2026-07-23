@@ -97,6 +97,134 @@ export function writeStoredAnnotationMode(
   }
 }
 
+// ── Standalone FAB visibility via URL hash (owner-frozen #mark / #unmark) ────────────────
+// Default: FAB visible. `#unmark` hides it, `#mark` shows it; the hash acts as a ONE-TIME switch whose
+// choice persists per session, so a later hash-free load honors the stored choice. Standalone host only.
+export const ANNOTATION_FAB_HASH_SHOW = "#mark"
+export const ANNOTATION_FAB_HASH_HIDE = "#unmark"
+export const ANNOTATION_FAB_VISIBLE_STORAGE_PREFIX = "avibe:fab-visible:"
+
+export function fabVisibleStorageKey(sessionId: string | undefined): string {
+  return `${ANNOTATION_FAB_VISIBLE_STORAGE_PREFIX}${sessionId ?? "default"}`
+}
+
+/**
+ * Resolve whether the standalone FAB is visible. Precedence: an explicit hash WINS and dictates what to
+ * persist (`persist` = the boolean to write, so the switch survives a later hash-free load); with no hash
+ * we honor the stored choice, else default visible (`persist: null` ⇒ write nothing). Pure; the caller
+ * owns storage + the hashchange listener.
+ */
+export function resolveFabVisibility(
+  hash: string | undefined,
+  stored: boolean | undefined
+): { visible: boolean; persist: boolean | null } {
+  const normalized = (hash ?? "").trim().toLowerCase()
+  if (normalized === ANNOTATION_FAB_HASH_SHOW) return { visible: true, persist: true }
+  if (normalized === ANNOTATION_FAB_HASH_HIDE) return { visible: false, persist: false }
+  return { visible: stored ?? true, persist: null }
+}
+
+export function readStoredFabVisible(
+  sessionId: string | undefined,
+  storage: AnnotationModeStorage | undefined = safeLocalStorage()
+): boolean | undefined {
+  if (!storage) return undefined
+  try {
+    const value = storage.getItem(fabVisibleStorageKey(sessionId))
+    return value === "1" ? true : value === "0" ? false : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function writeStoredFabVisible(
+  sessionId: string | undefined,
+  visible: boolean,
+  storage: AnnotationModeStorage | undefined = safeLocalStorage()
+): void {
+  if (!storage) return
+  try {
+    storage.setItem(fabVisibleStorageKey(sessionId), visible ? "1" : "0")
+  } catch {
+    // Best-effort — losing the visibility memory must never break the overlay.
+  }
+}
+
+// ── Draggable edge-snapping floating chrome (FAB / agent badge) ──────────────────────────
+export const ANNOTATION_FLOAT_POSITION_STORAGE_PREFIX = "avibe:float-pos:"
+/** Movement (px) before a pointer gesture counts as a drag rather than a click. */
+export const DRAG_ACTIVATION_THRESHOLD = 6
+
+export type FloatPosition = { left: number; top: number }
+/**
+ * The PERSISTED placement of a draggable floating element: the snapped edge + a vertical offset — NOT an
+ * absolute `left`. Storing the edge keeps a right-snapped element on the right across viewport resizes
+ * and lets a wider variant (the expanded toolbar) reuse the same placement width-independently.
+ */
+export type FloatPlacement = { edge: "left" | "right"; top: number }
+
+export function floatPositionStorageKey(element: string, sessionId: string | undefined): string {
+  return `${ANNOTATION_FLOAT_POSITION_STORAGE_PREFIX}${element}:${sessionId ?? "default"}`
+}
+
+/** A pointer gesture is a DRAG once it moves past the threshold; below it, it's a click (open/toggle). */
+export function exceedsDragThreshold(dx: number, dy: number, threshold: number = DRAG_ACTIVATION_THRESHOLD): boolean {
+  return Math.hypot(dx, dy) >= threshold
+}
+
+/**
+ * Snap a dragged floating element to the NEAREST vertical edge (left/right) at `inset`, keeping its
+ * vertical position clamped within `[bounds.top, bounds.bottom]` (defaults to the inset margins). Edge
+ * snapping keeps both elements off the bottom-center pill horizontally. Pure — no DOM.
+ */
+export function snapToNearestEdge(
+  pos: FloatPosition,
+  size: { width: number; height: number },
+  viewport: { width: number; height: number },
+  inset: number,
+  bounds?: { top?: number; bottom?: number }
+): FloatPosition & { edge: "left" | "right" } {
+  const centerX = pos.left + size.width / 2
+  const edge: "left" | "right" = centerX < viewport.width / 2 ? "left" : "right"
+  const left = edge === "left" ? inset : Math.max(inset, viewport.width - size.width - inset)
+  const minTop = bounds?.top ?? inset
+  const maxTop = Math.max(minTop, (bounds?.bottom ?? viewport.height - inset) - size.height)
+  const top = Math.min(maxTop, Math.max(minTop, pos.top))
+  return { left, top, edge }
+}
+
+export function readStoredFloatPlacement(
+  element: string,
+  sessionId: string | undefined,
+  storage: AnnotationModeStorage | undefined = safeLocalStorage()
+): FloatPlacement | undefined {
+  if (!storage) return undefined
+  try {
+    const raw = storage.getItem(floatPositionStorageKey(element, sessionId))
+    if (!raw) return undefined
+    const parsed = JSON.parse(raw) as Partial<FloatPlacement>
+    return (parsed?.edge === "left" || parsed?.edge === "right") && typeof parsed?.top === "number"
+      ? { edge: parsed.edge, top: parsed.top }
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function writeStoredFloatPlacement(
+  element: string,
+  sessionId: string | undefined,
+  placement: FloatPlacement,
+  storage: AnnotationModeStorage | undefined = safeLocalStorage()
+): void {
+  if (!storage) return
+  try {
+    storage.setItem(floatPositionStorageKey(element, sessionId), JSON.stringify(placement))
+  } catch {
+    // Best-effort — losing a saved placement must never break the overlay.
+  }
+}
+
 /**
  * Pure state transition. `enable` with no explicit mode falls back to the remembered mode, then the
  * current mode, then the default. `set-mode` never changes `enabled`; `available` is only ever
