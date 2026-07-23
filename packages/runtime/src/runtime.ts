@@ -469,6 +469,12 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       allowedRoots: fsAllow
     }
     const viteConfig = {
+      // The outer runtime owns the Show Page SPA fallback. Vite's default `spa`
+      // middleware also rewrites missing assets and reserved paths to index.html,
+      // which makes a typo such as `missing.js` look like a successful document
+      // response. `custom` keeps Vite's real-file and transform middleware while
+      // letting server.ts retry only route-shaped misses against the entry HTML.
+      appType: "custom",
       base: basePath,
       root: session.workspace,
       cacheDir,

@@ -1,4 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
+import { readFile } from "node:fs/promises"
+import { join } from "node:path"
 import { parse } from "node:url"
 import type { AddressInfo } from "node:net"
 import { isAgentOnlyShowEventType, isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type ShowEventInput } from "@avibe/show-sdk"
@@ -178,6 +180,13 @@ async function routeRequest(
       return
     }
 
+    // Every `__show/*` path is runtime-owned. Known endpoints were handled above;
+    // unknown ones must stay 404 instead of falling through to the page router.
+    if (appPath === "/__show" || appPath.startsWith("/__show/")) {
+      sendNotFound(response)
+      return
+    }
+
     if (appPath.startsWith("/api")) {
       if (!session.vite) {
         sendJson(response, 503, { error: "Session not ready", status })
@@ -216,19 +225,52 @@ async function routeRequest(
         state: session.state
       })
     })
-    vite.middlewares(request, response, (error?: unknown) => {
+    vite.middlewares(request, response, async (error?: unknown) => {
       if (error) {
         response.statusCode = 500
         response.end(error instanceof Error ? error.message : String(error))
         return
       }
-      response.statusCode = 404
-      response.end("Not found")
+      if (!isSpaRoutePath(appPath, request.method)) {
+        sendNotFound(response)
+        return
+      }
+
+      // Vite already had first refusal, so extensionless public files and other
+      // real assets keep priority. Only a route-shaped miss gets the transformed
+      // entry document; `appType: custom` intentionally leaves this decision here.
+      try {
+        const source = await readFile(join(session.workspace, "index.html"), "utf8")
+        const html = await vite.transformIndexHtml(`${appPath}${appSearch}`, source)
+        response.statusCode = 200
+        response.setHeader("content-type", "text/html; charset=utf-8")
+        response.setHeader("cache-control", "no-cache")
+        response.end(request.method === "HEAD" ? undefined : html)
+      } catch (fallbackError) {
+        response.statusCode = 500
+        response.end(fallbackError instanceof Error ? fallbackError.message : String(fallbackError))
+      }
     })
     return
   }
 
   sendJson(response, 404, { error: "Not found" })
+}
+
+function isSpaRoutePath(appPath: string, method: string | undefined) {
+  if (method !== "GET" && method !== "HEAD") return false
+  let normalized = appPath
+  try {
+    normalized = decodeURIComponent(normalized)
+  } catch {
+    // Keep the encoded form. Vite already rejected it, and the conservative
+    // last-segment check below will still avoid common asset extensions.
+  }
+  const segments = normalized.split("/").filter(Boolean)
+  const first = segments[0]
+  if (first === "api" || first === "__show") return false
+  const last = segments.at(-1) ?? ""
+  return !last.includes(".")
 }
 
 type ShowEventRequest = {
@@ -361,6 +403,12 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown) {
   response.statusCode = statusCode
   response.setHeader("content-type", "application/json")
   response.end(JSON.stringify(body))
+}
+
+function sendNotFound(response: ServerResponse) {
+  response.statusCode = 404
+  response.setHeader("content-type", "text/plain; charset=utf-8")
+  response.end("Not found")
 }
 
 function logRequestTiming(

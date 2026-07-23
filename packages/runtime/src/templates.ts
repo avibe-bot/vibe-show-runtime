@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { access, mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
 const DEFAULT_UI_PACKAGE = "@avibe/show-ui"
@@ -28,12 +28,30 @@ const BOM = "\ufeff"
 export async function ensureSessionTemplate(workspace: string, uiPackageName: string = DEFAULT_UI_PACKAGE) {
   await mkdir(join(workspace, "src"), { recursive: true })
   await mkdir(join(workspace, "api"), { recursive: true })
+  const appPath = join(workspace, "src", "App.tsx")
+  const freshWorkspace = !(await fileExists(appPath))
   await writeIfMissing(join(workspace, "index.html"), indexHtml())
   await writeIfMissing(join(workspace, "src", "show-runtime-config.ts"), showRuntimeConfigTs())
   await writeIfMissing(join(workspace, "src", "main.tsx"), mainTsx())
-  await writeIfMissing(join(workspace, "src", "App.tsx"), appTsx())
+  await writeIfMissing(appPath, appTsx())
+  if (freshWorkspace) {
+    await mkdir(join(workspace, "src", "pages"), { recursive: true })
+    await writeIfMissing(join(workspace, "src", "router.tsx"), routerTsx())
+    await writeIfMissing(join(workspace, "src", "pages", "index.tsx"), homePageTsx())
+    await writeIfMissing(join(workspace, "src", "pages", "second.tsx"), secondPageTsx())
+  }
   await writeIfMissing(join(workspace, "src", "styles.css"), stylesCss(uiPackageName))
   await ensureEntryImports(join(workspace, "src", "styles.css"), uiPackageName)
+}
+
+async function fileExists(path: string) {
+  try {
+    await access(path)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false
+    throw error
+  }
 }
 
 /**
@@ -141,6 +159,22 @@ import "./styles.css"
 import "./show-runtime-config"
 import App from "./App"
 
+function redirectLegacyHashRoute() {
+  if (!window.location.hash.startsWith("#/")) return
+  const configuredBase = globalThis.__AVIBE_SHOW__?.basePath || "/"
+  const basePathname = new URL(configuredBase, window.location.origin).pathname
+  const baseParts = basePathname.split("/").filter(Boolean)
+  const base = baseParts.length ? "/" + baseParts.join("/") + "/" : "/"
+  const legacy = new URL(window.location.hash.slice(1), window.location.origin)
+  const target = new URL(window.location.href)
+  target.pathname = base + legacy.pathname.replace(/^\\/+/, "")
+  for (const [key, value] of legacy.searchParams) target.searchParams.set(key, value)
+  target.hash = legacy.hash
+  window.history.replaceState(window.history.state, "", target)
+}
+
+redirectLegacyHashRoute()
+
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <App />
@@ -177,25 +211,225 @@ globalThis.__AVIBE_SHOW__ = {
 }
 
 function appTsx() {
-  return `import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { ThemeProvider } from "@avibe/show-ui/theme"
+  return `import { ThemeProvider } from "@avibe/show-ui/theme"
+import { RouterView } from "./router"
 
 export default function App() {
   return (
     <ThemeProvider preset="zinc">
       <main className="page">
-        <Card>
-          <CardHeader>
-            <CardTitle>Vibe Show Runtime</CardTitle>
-            <CardDescription>This session is served by the managed service runtime.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Button onClick={() => void fetch("./api/health")}>Call handler</Button>
-          </CardContent>
-        </Card>
+        <RouterView />
       </main>
     </ThemeProvider>
+  )
+}
+`
+}
+
+function routerTsx() {
+  return `import type { ComponentType, MouseEvent, ReactNode } from "react"
+import { useSyncExternalStore } from "react"
+
+export type PageProps = {
+  params: Record<string, string>
+}
+
+type PageModule = { default: ComponentType<PageProps> }
+type Segment = { name: string; dynamic: boolean }
+type Route = {
+  path: string
+  segments: Segment[]
+  Component: ComponentType<PageProps>
+}
+
+const PAGES_PREFIX = "./pages/"
+const PAGE_SUFFIX = ".tsx"
+const modules = import.meta.glob<PageModule>("./pages/**/*.tsx", { eager: true })
+
+function filePathToRoute(file: string): string | null {
+  const relative = file.slice(PAGES_PREFIX.length, file.length - PAGE_SUFFIX.length)
+  const parts = relative.split("/")
+  if (parts[parts.length - 1] === "index") parts.pop()
+  if (parts.some((part) => part.startsWith("_"))) return null
+  const path = parts
+    .map((part) => (part.startsWith("[") && part.endsWith("]") ? ":" + part.slice(1, -1) : part))
+    .join("/")
+  return path ? "/" + path : "/"
+}
+
+function toSegments(path: string): Segment[] {
+  if (path === "/") return []
+  return path.slice(1).split("/").map((part) =>
+    part.startsWith(":")
+      ? { name: part.slice(1), dynamic: true }
+      : { name: part, dynamic: false }
+  )
+}
+
+function routeSpecificity(segments: Segment[]): string {
+  return segments.map((segment) => (segment.dynamic ? "1" : "0")).join("")
+}
+
+function isRenderablePage(value: unknown): value is ComponentType<PageProps> {
+  return typeof value === "function" || (typeof value === "object" && value !== null && "$$typeof" in value)
+}
+
+export const routes: Route[] = Object.entries(modules)
+  .map(([file, mod]): Route | null => {
+    const path = filePathToRoute(file)
+    if (!path || !isRenderablePage(mod.default)) return null
+    return { path, segments: toSegments(path), Component: mod.default }
+  })
+  .filter((route): route is Route => route !== null)
+  .sort((a, b) => {
+    const specA = routeSpecificity(a.segments)
+    const specB = routeSpecificity(b.segments)
+    if (specA !== specB) return specA < specB ? -1 : 1
+    return a.path.localeCompare(b.path)
+  })
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+function matchRoute(path: string): { route: Route | null; params: Record<string, string> } {
+  const parts = path === "/" ? [] : path.slice(1).split("/")
+  for (const route of routes) {
+    if (route.segments.length !== parts.length) continue
+    const params: Record<string, string> = {}
+    let matched = true
+    for (let index = 0; index < parts.length; index++) {
+      const segment = route.segments[index]
+      if (segment.dynamic) params[segment.name] = safeDecode(parts[index])
+      else if (segment.name !== parts[index]) {
+        matched = false
+        break
+      }
+    }
+    if (matched) return { route, params }
+  }
+  return { route: null, params: {} }
+}
+
+function basePath(): string {
+  const configured = globalThis.__AVIBE_SHOW__?.basePath
+  const fallback = window.location.pathname.match(/^\\/(?:show|p)\\/[^/]+\\//)?.[0] || "/"
+  const pathname = new URL(configured || fallback, window.location.origin).pathname
+  const parts = pathname.split("/").filter(Boolean)
+  return parts.length ? "/" + parts.join("/") + "/" : "/"
+}
+
+function normalizeRoutePath(path: string): string {
+  const withLeadingSlash = path.startsWith("/") ? path : "/" + path
+  return withLeadingSlash.length > 1 && withLeadingSlash.endsWith("/")
+    ? withLeadingSlash.slice(0, -1)
+    : withLeadingSlash
+}
+
+function readRoutePath(): string {
+  const base = basePath()
+  const pathname = window.location.pathname
+  if (!pathname.startsWith(base)) return "/"
+  return normalizeRoutePath("/" + pathname.slice(base.length))
+}
+
+function subscribe(onChange: () => void): () => void {
+  window.addEventListener("popstate", onChange)
+  return () => window.removeEventListener("popstate", onChange)
+}
+
+export function useRoutePath(): string {
+  return useSyncExternalStore(subscribe, readRoutePath, () => "/")
+}
+
+function routeUrl(to: string): URL {
+  const normalizedTo = to.startsWith("/") ? to : "/" + to
+  const route = new URL(normalizedTo, window.location.origin)
+  const target = new URL(window.location.href)
+  const embed = target.searchParams.get("vibe-embed")
+  target.pathname = basePath() + route.pathname.replace(/^\\/+/, "")
+  if (route.search) {
+    target.search = route.search
+    if (embed && !target.searchParams.has("vibe-embed")) target.searchParams.set("vibe-embed", embed)
+  }
+  if (route.hash) target.hash = route.hash
+  return target
+}
+
+export function navigate(to: string): void {
+  const target = routeUrl(to)
+  window.history.pushState({}, "", target)
+  window.dispatchEvent(new PopStateEvent("popstate"))
+}
+
+export function Link({ to, className, children }: { to: string; className?: string; children: ReactNode }) {
+  function onClick(event: MouseEvent<HTMLAnchorElement>) {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+    event.preventDefault()
+    navigate(to)
+  }
+  return <a href={routeUrl(to).toString()} className={className} onClick={onClick}>{children}</a>
+}
+
+export function RouterView() {
+  const path = useRoutePath()
+  const { route, params } = matchRoute(path)
+  if (!route) {
+    return (
+      <div className="rounded-lg border border-border bg-card p-6 text-card-foreground">
+        <h1 className="text-lg font-semibold">Page not found</h1>
+        <p className="mt-2 text-sm text-muted-foreground">No route matches {path}.</p>
+        <p className="mt-4 text-sm"><Link className="font-medium underline" to="/">Back to Home</Link></p>
+      </div>
+    )
+  }
+  const Page = route.Component
+  return <Page params={params} />
+}
+`
+}
+
+function homePageTsx() {
+  return `import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Link } from "../router"
+
+function apiUrl(path: string) {
+  const base = globalThis.__AVIBE_SHOW__?.basePath || "/"
+  return new URL(path.replace(/^\\/+/, ""), new URL(base, window.location.origin)).toString()
+}
+
+export default function HomePage() {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Vibe Show Runtime</CardTitle>
+        <CardDescription>This session is served by the managed service runtime.</CardDescription>
+      </CardHeader>
+      <CardContent className="flex items-center gap-3">
+        <Button onClick={() => void fetch(apiUrl("api/health"))}>Call handler</Button>
+        <Link className="text-sm underline" to="/second">Open second page</Link>
+      </CardContent>
+    </Card>
+  )
+}
+`
+}
+
+function secondPageTsx() {
+  return `import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Link } from "../router"
+
+export default function SecondPage() {
+  return (
+    <Card>
+      <CardHeader><CardTitle>A second page</CardTitle></CardHeader>
+      <CardContent><Link className="text-sm underline" to="/">Back to Home</Link></CardContent>
+    </Card>
   )
 }
 `

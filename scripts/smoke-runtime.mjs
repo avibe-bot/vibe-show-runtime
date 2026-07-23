@@ -179,6 +179,9 @@ await symlink("../.git/HEAD", join(root, "smoke", "public", "linked-git-head.txt
 await symlink(".env", join(root, "smoke", "public", "linked-env.txt"))
 await mkdir(join(root, "managed-git"), { recursive: true })
 await writeFile(join(root, "managed-git", ".git"), "gitdir: /tmp/private-show-gitdir\n")
+await mkdir(join(root, "legacy", "src"), { recursive: true })
+const legacyApp = "export default function App() { return <main>Existing workspace</main> }\n"
+await writeFile(join(root, "legacy", "src", "App.tsx"), legacyApp)
 await symlink(join(staleDependencyRoot, "node_modules"), join(root, "smoke", "node_modules"), "junction")
 const runtime = await startShowRuntimeServer({ workspaceRoot: root, cacheRoot, fallbackDelaySeconds: 30 })
 
@@ -190,15 +193,28 @@ try {
 }
 `)
 
-  const [ensure, secondEnsure] = await Promise.all([
+  const [ensure, secondEnsure, existingWorkspaceEnsure] = await Promise.all([
     fetch(`${runtime.url}/sessions/smoke/ensure`, { method: "POST" }).then((res) => res.json()),
-    fetch(`${runtime.url}/sessions/smoke-two/ensure`, { method: "POST" }).then((res) => res.json())
+    fetch(`${runtime.url}/sessions/smoke-two/ensure`, { method: "POST" }).then((res) => res.json()),
+    fetch(`${runtime.url}/sessions/legacy/ensure`, { method: "POST" }).then((res) => res.json())
   ])
   if (ensure.state !== "active") {
     throw new Error(`Expected active session, got ${ensure.state}`)
   }
   if (secondEnsure.state !== "active") {
     throw new Error(`Expected second active session, got ${secondEnsure.state}`)
+  }
+  if (existingWorkspaceEnsure.state !== "active") {
+    throw new Error(`Expected legacy active session, got ${existingWorkspaceEnsure.state}`)
+  }
+  if ((await readFile(join(root, "legacy", "src", "App.tsx"), "utf8")) !== legacyApp) {
+    throw new Error("Expected an existing workspace app to stay byte-identical")
+  }
+  try {
+    await access(join(root, "legacy", "src", "router.tsx"))
+    throw new Error("Expected an existing workspace not to receive the new router scaffold")
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error
   }
   const smokeVite = runtime.runtime.getSession("smoke")?.vite
   const expectedDenyPatterns = ["**/.git", "**/.git/**", "**/.env", "**/.env.*", "**/*.pem", "**/*.crt", "**/*.key"]
@@ -271,6 +287,31 @@ try {
   }
   if (!app.includes('/show/smoke/@vite/client') || !app.includes('/show/smoke/src/main.tsx')) {
     throw new Error("Expected app HTML asset URLs to stay under /show/<session>/")
+  }
+  const historyRoute = await fetch(`${runtime.url}/sessions/smoke/app/reports/daily?vibe-embed=1`)
+  const historyRouteBody = await historyRoute.text()
+  if (historyRoute.status !== 200 || !historyRouteBody.includes('/show/smoke/src/main.tsx')) {
+    throw new Error(`Expected a deep History route to serve transformed entry HTML, got ${historyRoute.status}`)
+  }
+  const missingAsset = await fetch(`${runtime.url}/sessions/smoke/app/assets/missing.js`, {
+    headers: { accept: "text/html" }
+  })
+  if (missingAsset.status !== 404 || (await missingAsset.text()).includes("<html")) {
+    throw new Error(`Expected a missing asset path to stay 404, got ${missingAsset.status}`)
+  }
+  const unknownReservedPath = await fetch(`${runtime.url}/sessions/smoke/app/__show/unknown`, {
+    headers: { accept: "text/html" }
+  })
+  if (unknownReservedPath.status !== 404 || (await unknownReservedPath.text()).includes("<html")) {
+    throw new Error(`Expected an unknown __show path to stay 404, got ${unknownReservedPath.status}`)
+  }
+  const scaffoldRouter = await readFile(join(root, "smoke", "src", "router.tsx"), "utf8")
+  const scaffoldMain = await readFile(join(root, "smoke", "src", "main.tsx"), "utf8")
+  if (!scaffoldRouter.includes("popstate") || scaffoldRouter.includes("hashchange") || !scaffoldRouter.includes("__AVIBE_SHOW__?.basePath")) {
+    throw new Error("Expected the fresh scaffold router to use History mode with the injected base path")
+  }
+  if (!scaffoldMain.includes("redirectLegacyHashRoute") || !scaffoldMain.includes('startsWith("#/")')) {
+    throw new Error("Expected the fresh scaffold entry to redirect legacy hash routes")
   }
   const visibleAsset = await fetch(`${runtime.url}/sessions/smoke/app/visible.txt`)
   if (visibleAsset.status !== 200 || (await visibleAsset.text()) !== "visible public asset\n") {
