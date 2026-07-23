@@ -33,13 +33,16 @@ export async function ensureSessionTemplate(workspace: string, uiPackageName: st
   await writeIfMissing(join(workspace, "index.html"), indexHtml())
   await writeIfMissing(join(workspace, "src", "show-runtime-config.ts"), showRuntimeConfigTs())
   await writeIfMissing(join(workspace, "src", "main.tsx"), mainTsx(freshWorkspace))
-  await writeIfMissing(appPath, appTsx())
   if (freshWorkspace) {
     await mkdir(join(workspace, "src", "pages"), { recursive: true })
+    // App imports the router, so publish it last. If scaffolding is interrupted,
+    // App remains absent and the next warm still recognizes a fresh workspace;
+    // once App exists, every generated dependency it references already exists.
     await writeIfMissing(join(workspace, "src", "router.tsx"), routerTsx())
     await writeIfMissing(join(workspace, "src", "pages", "index.tsx"), homePageTsx())
     await writeIfMissing(join(workspace, "src", "pages", "second.tsx"), secondPageTsx())
   }
+  await writeIfMissing(appPath, appTsx())
   await writeIfMissing(join(workspace, "src", "styles.css"), stylesCss(uiPackageName))
   await ensureEntryImports(join(workspace, "src", "styles.css"), uiPackageName)
 }
