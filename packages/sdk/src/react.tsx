@@ -67,6 +67,7 @@ import {
   resolveFabVisibility,
   readStoredFabVisible,
   writeStoredFabVisible,
+  ANNOTATION_FAB_HASH_SHOW,
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
   snapToNearestEdge,
@@ -1410,6 +1411,15 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined) {
   }, [host, sessionId, storage])
   const hide = React.useCallback(() => {
     writeStoredFabVisible(sessionId, false, storage)
+    // If the URL still carries the #mark recovery hash, strip it so the persisted hide survives a reload —
+    // otherwise resolveFabVisibility would let the explicit #mark win over storage and re-show (#3637621025).
+    if (typeof window !== "undefined" && window.location.hash.trim().toLowerCase() === ANNOTATION_FAB_HASH_SHOW) {
+      try {
+        window.history.replaceState(null, "", window.location.pathname + window.location.search)
+      } catch {
+        /* best-effort — a blocked replaceState must not break hiding */
+      }
+    }
     setVisible(false)
   }, [sessionId, storage])
   return { visible, hide }
@@ -1434,7 +1444,7 @@ type DraggableResult = {
  * element+session. A restored/again-resized position is re-snapped to the current viewport so it can
  * never end up off-screen. `touch-action:none` keeps a touch-drag from scrolling the page.
  */
-function useDraggable(element: "fab" | "badge", sessionId: string | undefined): DraggableResult {
+function useDraggable(element: "fab" | "badge", sessionId: string | undefined, restingHeight: number): DraggableResult {
   const storage = React.useMemo(() => safeLocalStorage(), [])
   // Persist the snapped EDGE + vertical offset, NOT an absolute left — so a right placement survives a
   // viewport resize / a mobile→desktop reload, and a wider element (the toolbar) reuses it width-independently.
@@ -1443,11 +1453,14 @@ function useDraggable(element: "fab" | "badge", sessionId: string | undefined): 
   const [dragging, setDragging] = React.useState(false)
   const gesture = React.useRef<{ startX: number; startY: number; originLeft: number; originTop: number; moved: boolean } | null>(null)
   const draggedRef = React.useRef(false)
+  // The element's actual height (FAB 52 / badge 48, refined from the measured rect once dragged) — used to
+  // clamp the bottom clearance on resize so a down-anchored element never re-clips its shadow (#3637621027).
+  const heightRef = React.useRef(restingHeight)
 
   // On resize keep the element on-screen by clamping only the vertical offset; the edge is preserved.
   React.useEffect(() => {
     if (typeof window === "undefined") return
-    const clampTop = () => setPlacement((prev) => (prev ? { edge: prev.edge, top: Math.min(Math.max(FLOAT_INSET, prev.top), Math.max(FLOAT_INSET, window.innerHeight - FLOAT_INSET - 44)) } : prev))
+    const clampTop = () => setPlacement((prev) => (prev ? { edge: prev.edge, top: Math.min(Math.max(FLOAT_INSET, prev.top), Math.max(FLOAT_INSET, window.innerHeight - FLOAT_INSET - heightRef.current)) } : prev))
     clampTop()
     window.addEventListener("resize", clampTop)
     return () => window.removeEventListener("resize", clampTop)
@@ -1459,6 +1472,7 @@ function useDraggable(element: "fab" | "badge", sessionId: string | undefined): 
     // so clearing on `consumeDragClick` alone would leave the flag set and suppress the next real tap.
     draggedRef.current = false
     const rect = event.currentTarget.getBoundingClientRect()
+    heightRef.current = rect.height
     gesture.current = { startX: event.clientX, startY: event.clientY, originLeft: rect.left, originTop: rect.top, moved: false }
     try { event.currentTarget.setPointerCapture(event.pointerId) } catch { /* capture is best-effort */ }
   }
@@ -1519,7 +1533,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   const exitLabel = touchInput ? labels.exitShort : labels.exit
   // Hooks must be unconditional (called before the host/availability early returns below).
   const fabVisibility = useFabVisibility(host, sessionId)
-  const fabDrag = useDraggable("fab", sessionId)
+  const fabDrag = useDraggable("fab", sessionId, 52) // FAB is 52px tall
   const [toast, setToast] = React.useState<string | null>(null)
   const toastTimer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   React.useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
@@ -1556,6 +1570,14 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     )
   }
 
+  // The hash / ✕ hide switch gates ALL standalone chrome — the collapsed FAB, the expanded toolbar, AND
+  // the anonymous login hint below — so #unmark hides everything, not just the FAB (#3637621031 /
+  // #3637478399); the disable effect above stops capture too. The toast still renders so the ✕
+  // confirmation shows even after the chrome is hidden.
+  if (!fabVisibility.visible) {
+    return toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null
+  }
+
   // Standalone tab: anonymous public visitors can't write — hide the FAB, show a quiet login hint.
   if (!available) {
     return (
@@ -1566,13 +1588,10 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     )
   }
 
-  // Standalone chrome. The hash / ✕ hide switch gates the WHOLE chrome — collapsed FAB AND expanded
-  // toolbar — not just the FAB, so #unmark works mid-session (#3637478399); the disable effect above
-  // stops capture too. The toast still renders below even when hidden so the ✕ confirmation shows.
+  // Standalone chrome (visible + available). The collapsed FAB is the draggable form; enabling expands
+  // the toolbar, which reuses the FAB's edge placement.
   let content: React.ReactNode = null
-  if (!fabVisibility.visible) {
-    content = null
-  } else if (!enabled) {
+  if (!enabled) {
     content = (
       <button
         type="button"
@@ -2216,7 +2235,7 @@ function MarkBubble({ mark, onClose }: { mark: ResolvedMarkCandidate; onClose: (
 }
 
 function MarkBadge({ count, host, sessionId, onClick }: { count: number; host: AnnotationHost; sessionId?: string; onClick: () => void }) {
-  const drag = useDraggable("badge", sessionId)
+  const drag = useDraggable("badge", sessionId, 48) // badge is 48px tall
   return (
     <button
       type="button"
