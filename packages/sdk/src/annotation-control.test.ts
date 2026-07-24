@@ -29,6 +29,8 @@ import {
   readStoredFabVisible,
   writeStoredFabVisible,
   stripFabParamsFromSearch,
+  isEditableTarget,
+  shouldToggleFabShortcut,
   snapToNearestEdge,
   exceedsDragThreshold,
   readStoredFloatPlacement,
@@ -516,6 +518,35 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
     expect(stripFabParamsFromSearch("?a=%20b&mark=1")).toBe("a=%20b")
     // Matches the KEY only — `mark`/`unmark` as a value is untouched.
     expect(stripFabParamsFromSearch("?foo=mark")).toBe("foo=mark")
+  })
+})
+
+describe("Alt+M FAB toggle shortcut guard (Lane R12)", () => {
+  it("isEditableTarget: true for input / textarea / select / contenteditable, false otherwise", () => {
+    expect(isEditableTarget({ tagName: "INPUT" })).toBe(true)
+    expect(isEditableTarget({ tagName: "textarea" })).toBe(true) // case-insensitive
+    expect(isEditableTarget({ tagName: "SELECT" })).toBe(true)
+    expect(isEditableTarget({ isContentEditable: true })).toBe(true) // also true for its descendants
+    expect(isEditableTarget({ tagName: "DIV" })).toBe(false)
+    expect(isEditableTarget({ tagName: "BUTTON" })).toBe(false)
+    expect(isEditableTarget(null)).toBe(false)
+    expect(isEditableTarget(undefined)).toBe(false)
+  })
+
+  it("fires only on Alt+M with Alt the SOLE modifier, matched by key OR code, outside editable fields", () => {
+    const alt = (over: Record<string, unknown> = {}) => ({ key: "m", code: "KeyM", altKey: true, ...over })
+    expect(shouldToggleFabShortcut(alt(), { tagName: "BODY" })).toBe(true)
+    expect(shouldToggleFabShortcut(alt({ key: "M" }), null)).toBe(true) // uppercase key
+    // macOS ⌥M emits key "µ"; the physical code still identifies the M key
+    expect(shouldToggleFabShortcut({ key: "µ", code: "KeyM", altKey: true }, null)).toBe(true)
+    expect(shouldToggleFabShortcut(alt(), { tagName: "INPUT" })).toBe(false) // typing in a field
+    expect(shouldToggleFabShortcut(alt(), { isContentEditable: true })).toBe(false)
+    expect(shouldToggleFabShortcut(alt({ ctrlKey: true }), null)).toBe(false) // extra modifier
+    expect(shouldToggleFabShortcut(alt({ metaKey: true }), null)).toBe(false)
+    expect(shouldToggleFabShortcut(alt({ shiftKey: true }), null)).toBe(false)
+    expect(shouldToggleFabShortcut({ key: "m", code: "KeyM", altKey: false }, null)).toBe(false) // no Alt
+    expect(shouldToggleFabShortcut({ key: "k", code: "KeyK", altKey: true }, null)).toBe(false) // wrong key
+    expect(shouldToggleFabShortcut(alt({ repeat: true }), null)).toBe(false) // auto-repeat while held
   })
 })
 

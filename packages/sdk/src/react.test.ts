@@ -4,6 +4,20 @@ import { DEFAULT_ANNOTATION_LABELS, disabledButtonStyle, modePillLabel } from ".
 // Overlay uses inline styles (no `:disabled` stylesheet), so the disabled LOOK is applied explicitly.
 // These pure assertions run in CI (the browser layout check does not), locking the visual contract the
 // owner flagged: a disabled send must read dimmed/gray, never the bright mint of an enabled action.
+describe("FAB tip / hidden-toast copy teaches Alt+M, not query-param jargon (Lane R12)", () => {
+  it("names Alt+M with the macOS ⌥M form and drops the ?mark / ?unmark wording", () => {
+    // Static, platform-neutral copy: spells both "Alt+M" and the macOS "⌥M" so a single default string is
+    // correct on every platform (no navigator-sniffing that would make the default env-dependent).
+    for (const copy of [DEFAULT_ANNOTATION_LABELS.fabTip, DEFAULT_ANNOTATION_LABELS.fabHiddenToast]) {
+      expect(copy).toContain("Alt+M")
+      expect(copy).toContain("⌥M")
+    }
+    // query params stay the programmatic path but must no longer be the user-facing copy
+    expect(DEFAULT_ANNOTATION_LABELS.fabTip).not.toContain("?unmark")
+    expect(DEFAULT_ANNOTATION_LABELS.fabHiddenToast).not.toContain("?mark")
+  })
+})
+
 describe("screenshot comment card polish (Lane R8)", () => {
   const primary = { color: "#080812", background: "#5BFFA0", boxShadow: "0 8px 24px x", cursor: "pointer" }
 

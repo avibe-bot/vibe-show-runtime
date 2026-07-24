@@ -185,6 +185,38 @@ export function stripFabParamsFromSearch(search: string | undefined): string {
     .join("&")
 }
 
+// ── Standalone FAB visibility keyboard shortcut (Alt+M / ⌥M) ──────────────────────────────
+// Alt+M toggles the FAB the same way ?mark/?unmark and the ✕ button do (standalone host only). Alt is the
+// SOLE modifier. macOS Option+M emits key "µ" in some layouts, so we match the physical `code === "KeyM"`
+// as well as the character — the residual µ-in-a-custom-editor collision is accepted by the owner and, as
+// defense in depth, the toggle never fires while an editable element is focused.
+export const ANNOTATION_FAB_SHORTCUT_KEY = "m"
+
+/** Whether an event target is a text-editable element (typing there must not trigger the shortcut). */
+export function isEditableTarget(target: unknown): boolean {
+  if (!target || typeof target !== "object") return false
+  const element = target as { tagName?: string; isContentEditable?: boolean }
+  if (element.isContentEditable === true) return true // also true for descendants of a contenteditable
+  const tag = (element.tagName ?? "").toUpperCase()
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT"
+}
+
+/**
+ * Whether a keydown should toggle FAB visibility: Alt+M (macOS ⌥M) with Alt as the ONLY modifier, matched
+ * by character OR physical `code` (macOS ⌥M yields "µ"), not an auto-repeat, and focus not in an editable
+ * element. Pure, so the modifier-exclusivity + editable-focus guard is unit-tested without a DOM.
+ */
+export function shouldToggleFabShortcut(
+  event: { key: string; code?: string; altKey: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; repeat?: boolean },
+  target: unknown
+): boolean {
+  if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false // Alt is the ONLY modifier
+  if (event.repeat) return false // holding the combo must not flip-flop visibility
+  const matchesKey = (event.key ?? "").toLowerCase() === ANNOTATION_FAB_SHORTCUT_KEY || event.code === "KeyM"
+  if (!matchesKey) return false
+  return !isEditableTarget(target)
+}
+
 // ── Draggable edge-snapping floating chrome (FAB / agent badge) ──────────────────────────
 export const ANNOTATION_FLOAT_POSITION_STORAGE_PREFIX = "avibe:float-pos:"
 /** Movement (px) before a pointer gesture counts as a drag rather than a click. */
