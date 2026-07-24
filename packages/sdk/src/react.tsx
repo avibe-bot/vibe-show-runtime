@@ -68,6 +68,7 @@ import {
   readStoredFabVisible,
   writeStoredFabVisible,
   stripFabParamsFromSearch,
+  shouldToggleFabShortcut,
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
   snapToNearestEdge,
@@ -243,8 +244,8 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   enterToSend: "Enter 发送 · Esc 取消",
   approve: "批准",
   addNote: "添加备注",
-  fabTip: "点选元素或截图,把意见直接发给 Agent;链接加 ?unmark 可隐藏本按钮",
-  fabHiddenToast: "已隐藏,链接加 ?mark 可恢复"
+  fabTip: "点选元素或截图,把意见直接发给 Agent;按 Shift+M 显示/隐藏本按钮",
+  fabHiddenToast: "已隐藏,按 Shift+M 恢复"
 }
 
 export type AnnotationOverlayProps = {
@@ -1432,7 +1433,12 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined) {
     writeStoredFabVisible(sessionId, false, storage)
     setVisible(false)
   }, [sessionId, storage])
-  return { visible, hide }
+  const show = React.useCallback(() => {
+    // Shift+M reveal: persist visible (same store as ?mark) so it survives a reload.
+    writeStoredFabVisible(sessionId, true, storage)
+    setVisible(true)
+  }, [sessionId, storage])
+  return { visible, hide, show }
 }
 
 // A touch above the old 20px: a down-biased drop shadow needs clearance from the viewport bottom or its
@@ -1571,6 +1577,25 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   React.useEffect(() => {
     if (host === "standalone" && !fabVisibility.visible && enabled) onDisable?.()
   }, [host, fabVisibility.visible, enabled, onDisable])
+  // Shift+M toggles the FAB (standalone only), mirroring ?mark/?unmark and the ✕ button. Registered at the
+  // document level so it works even while the collapsed FAB is hidden; the pure guard blocks it while the
+  // user is typing or holding another modifier. Revealing from hidden re-surfaces the tip so the toggle is
+  // rediscoverable, and hiding routes through hideFab so an active capture session is stopped too.
+  React.useEffect(() => {
+    if (host !== "standalone" || typeof document === "undefined") return
+    function onKeyDown(event: KeyboardEvent) {
+      if (!shouldToggleFabShortcut(event, event.target)) return
+      event.preventDefault()
+      if (fabVisibility.visible) {
+        hideFab()
+      } else {
+        fabVisibility.show()
+        if (labels.fabTip) flashToast(labels.fabTip)
+      }
+    }
+    document.addEventListener("keydown", onKeyDown)
+    return () => document.removeEventListener("keydown", onKeyDown)
+  }, [host, fabVisibility, hideFab, flashToast, labels.fabTip])
 
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
@@ -2943,7 +2968,12 @@ const toolbarHelpTipStyle: React.CSSProperties = {
   position: "absolute",
   bottom: "calc(100% + 10px)",
   right: 0,
-  maxWidth: 240,
+  // Size to the content's natural width, then wrap at a sane measure — without `max-content` the box
+  // shrink-fits its tiny positioning context and collapses into a 2–4-char vertical strip. Cap ~280px but
+  // never exceed the viewport, so the tip stays readable and on-screen at ~320px (owner mobile report).
+  width: "max-content",
+  maxWidth: "min(280px, calc(100vw - 24px))",
+  whiteSpace: "normal",
   padding: "8px 10px",
   borderRadius: 10,
   background: COLORS.surfacePopover,

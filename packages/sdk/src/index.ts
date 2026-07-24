@@ -1372,6 +1372,47 @@ export function selectCaptureStrategy(strategies: ScreenshotCaptureStrategy[]): 
   return strategies.find((strategy) => strategy.isAvailable())
 }
 
+/** The default solid backdrop painted behind a capture when the page itself resolves to none (browsers paint white). */
+export const DEFAULT_CAPTURE_BACKDROP = "#ffffff"
+
+/** Alpha (0–1) of a CSS color string. Computed styles are always `rgb()`/`rgba()`; hex + named handled for safety. */
+function cssColorAlpha(color: string): number {
+  const rgba = /^rgba?\(([^)]+)\)$/i.exec(color)
+  if (rgba) {
+    const parts = rgba[1].split(",").map((part) => part.trim())
+    if (parts.length >= 4) {
+      const alpha = Number.parseFloat(parts[3])
+      return Number.isFinite(alpha) ? alpha : 1
+    }
+    return 1 // rgb() with no alpha channel is fully opaque
+  }
+  const hex = /^#([0-9a-f]{3,8})$/i.exec(color)
+  if (hex) {
+    const digits = hex[1]
+    if (digits.length === 4) return Number.parseInt(digits[3] + digits[3], 16) / 255 // #rgba
+    if (digits.length === 8) return Number.parseInt(digits.slice(6, 8), 16) / 255 // #rrggbbaa
+    return 1 // #rgb / #rrggbb
+  }
+  return 1 // a named color that isn't "transparent" (filtered by the caller) is opaque
+}
+
+/**
+ * Resolve the solid color that sits BEHIND a capture region, given the computed `background-color`s of the
+ * region's covering element and its ancestors (nearest-first, up to the document root). snapDOM renders
+ * only the target subtree, so a region whose own element is transparent (the page white lives on an
+ * ancestor) comes back transparent → shown black on the dark overlay. Compositing the render over this
+ * backdrop makes small and large regions produce identical backgrounds. Returns the first FULLY OPAQUE
+ * background (semi-transparent layers blend over it, so they don't stop the search); `fallback` when none.
+ */
+export function resolveBackdropColor(backgroundColors: readonly string[], fallback = DEFAULT_CAPTURE_BACKDROP): string {
+  for (const raw of backgroundColors) {
+    const color = (raw ?? "").trim()
+    if (!color || color === "transparent") continue
+    if (cssColorAlpha(color) >= 1) return color
+  }
+  return fallback
+}
+
 /**
  * The default capture pipeline: same-origin snapDOM render first (works on iOS Safari, which lacks
  * `getDisplayMedia`), then `getDisplayMedia` as a desktop-only fallback.
@@ -1488,6 +1529,20 @@ function pickSnapdomCaptureTarget(region: MarkAnchorRect): { element: Element; r
   return { element: root, rect: rootRect }
 }
 
+/** Computed `background-color`s from `element` up to the document root (nearest-first) — the backdrop chain. */
+function collectBackgroundColors(element: Element): string[] {
+  if (typeof getComputedStyle !== "function") return []
+  const colors: string[] = []
+  const root = element.ownerDocument?.documentElement
+  let current: Element | null = element
+  while (current) {
+    colors.push(getComputedStyle(current).backgroundColor)
+    if (current === root) break
+    current = current.parentElement
+  }
+  return colors
+}
+
 function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<SnapdomModule> = importSnapdom): ScreenshotCaptureStrategy {
   return {
     name: "snapdom",
@@ -1497,6 +1552,13 @@ function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<Snap
       // Render the smallest element that fully contains the region rather than the whole document,
       // so a small selection on a very long / virtualized page doesn't materialize a huge canvas.
       const { element, rect } = pickSnapdomCaptureTarget(region)
+      // snapDOM renders only the target subtree. If the region's covering element is transparent (the
+      // page's white lives on an ancestor), the crop comes back transparent → shown black on the dark
+      // overlay; enlarging the region escalates the target to an ancestor that carries the background, so
+      // small and large regions disagreed. Resolve the nearest OPAQUE ancestor background and paint it
+      // behind the render so every region composites onto the same backdrop (owner acceptance: a small
+      // region inside a white card on a white page captures white, not black).
+      const backdrop = resolveBackdropColor(collectBackgroundColors(element))
       // Exclude the overlay chrome so the render is clean page pixels, never the dimmer/toolbar/markers.
       const source = await renderSnapdomCanvas(module, element, OVERLAY_CHROME_SELECTORS)
       // `rect` is the captured element's viewport rect, so the region maps to it directly (no scroll
@@ -1511,6 +1573,9 @@ function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<Snap
       if (!context) {
         throw new Error("Canvas capture context is unavailable")
       }
+      // Composite over the resolved backdrop so a transparent render never reads as black.
+      context.fillStyle = backdrop
+      context.fillRect(0, 0, width, height)
       context.drawImage(
         source,
         (region.x - rect.x) * ratioX,

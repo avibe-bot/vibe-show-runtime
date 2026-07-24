@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest"
 import {
   captureScreenshotRegion,
   constrainCaptureDimensions,
+  DEFAULT_CAPTURE_BACKDROP,
+  resolveBackdropColor,
   defaultCaptureStrategies,
   screenshotCaptureScale,
   screenshotPointFromViewport,
@@ -31,6 +33,32 @@ function fakeStrategy(
   }
   return strategy
 }
+
+describe("resolveBackdropColor (capture composites over the nearest opaque ancestor bg)", () => {
+  it("returns the nearest FULLY-OPAQUE background, skipping transparent ancestors", () => {
+    // small region: its own element is transparent, the white lives on an ancestor → resolve the white
+    expect(resolveBackdropColor(["rgba(0, 0, 0, 0)", "rgb(255, 255, 255)"])).toBe("rgb(255, 255, 255)")
+    expect(resolveBackdropColor(["transparent", "rgb(20, 20, 30)"])).toBe("rgb(20, 20, 30)")
+    // nearest-first: the covering element's own opaque bg wins over an ancestor's
+    expect(resolveBackdropColor(["rgb(10, 10, 10)", "rgb(255, 255, 255)"])).toBe("rgb(10, 10, 10)")
+  })
+
+  it("skips semi-transparent layers — they blend over the solid backdrop behind them", () => {
+    expect(resolveBackdropColor(["rgba(255, 0, 0, 0.5)", "rgb(255, 255, 255)"])).toBe("rgb(255, 255, 255)")
+  })
+
+  it("falls back to white when the whole chain is transparent (browsers paint white)", () => {
+    expect(resolveBackdropColor(["rgba(0, 0, 0, 0)", "transparent", ""])).toBe(DEFAULT_CAPTURE_BACKDROP)
+    expect(resolveBackdropColor([])).toBe("#ffffff")
+    expect(resolveBackdropColor([], "rgb(1, 2, 3)")).toBe("rgb(1, 2, 3)") // custom fallback
+  })
+
+  it("handles opaque hex / #rrggbbaa alpha / named colors", () => {
+    expect(resolveBackdropColor(["#ffffff"])).toBe("#ffffff")
+    expect(resolveBackdropColor(["#00000000", "#123"])).toBe("#123") // 8-digit alpha 00 → skip, then opaque
+    expect(resolveBackdropColor(["white"])).toBe("white")
+  })
+})
 
 describe("constrainCaptureDimensions", () => {
   it("leaves within-bound dimensions untouched", () => {
