@@ -1560,12 +1560,18 @@ function pickSnapdomCaptureTarget(region: MarkAnchorRect): { element: Element; r
   return { element: target, rect: rectFromDomRect(target.getBoundingClientRect()) }
 }
 
-/** Computed `background-color`s from `element` up to the document root (nearest-first) — the backdrop chain. */
+/**
+ * Computed `background-color`s BEHIND the render target — its ancestors, nearest-first, up to the document
+ * root. Starts at the target's parent, NOT the target: snapDOM already paints the target's own background,
+ * so the composite prefill must be what shows through the target's transparent pixels (rounded corners,
+ * clip-path, `opacity`). Prefilling with the target's own color would square off its corners or composite
+ * its opacity over itself instead of the page behind it.
+ */
 function collectBackgroundColors(element: Element): string[] {
   if (typeof getComputedStyle !== "function") return []
   const colors: string[] = []
   const root = element.ownerDocument?.documentElement
-  let current: Element | null = element
+  let current: Element | null = element.parentElement
   while (current) {
     colors.push(getComputedStyle(current).backgroundColor)
     if (current === root) break
