@@ -185,35 +185,6 @@ export function stripFabParamsFromSearch(search: string | undefined): string {
     .join("&")
 }
 
-// ── Standalone FAB visibility keyboard shortcut (Shift+M) ─────────────────────────────────
-// Shift+M toggles the FAB the same way ?mark/?unmark and the ✕ button do (standalone host only). It must
-// NOT fire while the user is typing in an editable element, nor when another modifier is held, so it never
-// hijacks a host-page shortcut or a capital "M" typed into a field. Query params stay the programmatic path.
-export const ANNOTATION_FAB_SHORTCUT_KEY = "m"
-
-/** Whether an event target is a text-editable element (typing there must not trigger the shortcut). */
-export function isEditableTarget(target: unknown): boolean {
-  if (!target || typeof target !== "object") return false
-  const element = target as { tagName?: string; isContentEditable?: boolean }
-  if (element.isContentEditable === true) return true // also true for descendants of a contenteditable
-  const tag = (element.tagName ?? "").toUpperCase()
-  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT"
-}
-
-/**
- * Whether a keydown should toggle FAB visibility: Shift+M with Shift as the ONLY modifier, not an
- * auto-repeat, and focus not in an editable element. Pure, so the focus-guard is unit-tested without a DOM.
- */
-export function shouldToggleFabShortcut(
-  event: { key: string; shiftKey: boolean; ctrlKey?: boolean; altKey?: boolean; metaKey?: boolean; repeat?: boolean },
-  target: unknown
-): boolean {
-  if (!event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return false // Shift only
-  if (event.repeat) return false // holding the key must not flip-flop visibility
-  if ((event.key ?? "").toLowerCase() !== ANNOTATION_FAB_SHORTCUT_KEY) return false
-  return !isEditableTarget(target)
-}
-
 // ── Draggable edge-snapping floating chrome (FAB / agent badge) ──────────────────────────
 export const ANNOTATION_FLOAT_POSITION_STORAGE_PREFIX = "avibe:float-pos:"
 /** Movement (px) before a pointer gesture counts as a drag rather than a click. */

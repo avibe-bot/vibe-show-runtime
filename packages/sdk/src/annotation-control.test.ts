@@ -29,8 +29,6 @@ import {
   readStoredFabVisible,
   writeStoredFabVisible,
   stripFabParamsFromSearch,
-  isEditableTarget,
-  shouldToggleFabShortcut,
   snapToNearestEdge,
   exceedsDragThreshold,
   readStoredFloatPlacement,
@@ -518,33 +516,6 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
     expect(stripFabParamsFromSearch("?a=%20b&mark=1")).toBe("a=%20b")
     // Matches the KEY only — `mark`/`unmark` as a value is untouched.
     expect(stripFabParamsFromSearch("?foo=mark")).toBe("foo=mark")
-  })
-})
-
-describe("Shift+M FAB toggle shortcut guard (Lane R12)", () => {
-  it("isEditableTarget: true for input / textarea / select / contenteditable, false otherwise", () => {
-    expect(isEditableTarget({ tagName: "INPUT" })).toBe(true)
-    expect(isEditableTarget({ tagName: "textarea" })).toBe(true) // case-insensitive
-    expect(isEditableTarget({ tagName: "SELECT" })).toBe(true)
-    expect(isEditableTarget({ isContentEditable: true })).toBe(true) // also true for its descendants
-    expect(isEditableTarget({ tagName: "DIV" })).toBe(false)
-    expect(isEditableTarget({ tagName: "BUTTON" })).toBe(false)
-    expect(isEditableTarget(null)).toBe(false)
-    expect(isEditableTarget(undefined)).toBe(false)
-  })
-
-  it("fires only on Shift+M with Shift as the sole modifier, outside editable fields, non-repeat", () => {
-    const evt = (over: Record<string, unknown> = {}) => ({ key: "M", shiftKey: true, ...over })
-    expect(shouldToggleFabShortcut(evt(), { tagName: "BODY" })).toBe(true)
-    expect(shouldToggleFabShortcut({ key: "m", shiftKey: true }, null)).toBe(true) // lowercase key too
-    expect(shouldToggleFabShortcut(evt(), { tagName: "INPUT" })).toBe(false) // typing in a field
-    expect(shouldToggleFabShortcut(evt(), { isContentEditable: true })).toBe(false)
-    expect(shouldToggleFabShortcut(evt({ ctrlKey: true }), null)).toBe(false) // extra modifier
-    expect(shouldToggleFabShortcut(evt({ metaKey: true }), null)).toBe(false)
-    expect(shouldToggleFabShortcut(evt({ altKey: true }), null)).toBe(false)
-    expect(shouldToggleFabShortcut({ key: "M", shiftKey: false }, null)).toBe(false) // no Shift
-    expect(shouldToggleFabShortcut({ key: "K", shiftKey: true }, null)).toBe(false) // wrong key
-    expect(shouldToggleFabShortcut(evt({ repeat: true }), null)).toBe(false) // auto-repeat while held
   })
 })
 
