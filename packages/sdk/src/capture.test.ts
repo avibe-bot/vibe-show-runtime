@@ -4,7 +4,7 @@ import {
   constrainCaptureDimensions,
   DEFAULT_CAPTURE_BACKDROP,
   resolveBackdropColor,
-  isPaintedBackground,
+  needsSubtreeRender,
   defaultCaptureStrategies,
   screenshotCaptureScale,
   screenshotPointFromViewport,
@@ -61,19 +61,24 @@ describe("resolveBackdropColor (capture composites over the nearest opaque ances
   })
 })
 
-describe("isPaintedBackground (promote the snapDOM target to a painting ancestor)", () => {
-  it("true for a visible background-color (opaque OR translucent) or a background-image/gradient", () => {
-    expect(isPaintedBackground("rgb(255, 255, 255)", "none")).toBe(true) // opaque tint
-    expect(isPaintedBackground("rgba(255, 0, 0, 0.5)", "none")).toBe(true) // translucent tint still paints
-    expect(isPaintedBackground("rgba(0, 0, 0, 0)", "linear-gradient(#fff, #000)")).toBe(true) // gradient
-    expect(isPaintedBackground("transparent", 'url("bg.png")')).toBe(true) // image
+describe("needsSubtreeRender (promote only for backgrounds a flat prefill can't reproduce)", () => {
+  it("true for an image/gradient or a TRANSLUCENT tint", () => {
+    expect(needsSubtreeRender("rgba(255, 0, 0, 0.5)", "none")).toBe(true) // translucent tint
+    expect(needsSubtreeRender("rgba(0, 0, 0, 0)", "linear-gradient(#fff, #000)")).toBe(true) // gradient
+    expect(needsSubtreeRender("transparent", 'url("bg.png")')).toBe(true) // image
   })
 
-  it("false when nothing is painted (fully transparent color, no image)", () => {
-    expect(isPaintedBackground("rgba(0, 0, 0, 0)", "none")).toBe(false)
-    expect(isPaintedBackground("transparent", "none")).toBe(false)
-    expect(isPaintedBackground("", undefined)).toBe(false)
-    expect(isPaintedBackground(undefined, undefined)).toBe(false)
+  it("FALSE for an opaque solid color — reproduced exactly by the composite, so body/html is never re-rendered", () => {
+    expect(needsSubtreeRender("rgb(255, 255, 255)", "none")).toBe(false) // opaque white page background
+    expect(needsSubtreeRender("rgb(20, 20, 30)", "none")).toBe(false)
+    expect(needsSubtreeRender("#123456", "none")).toBe(false)
+  })
+
+  it("false when nothing is painted (fully transparent, no image)", () => {
+    expect(needsSubtreeRender("rgba(0, 0, 0, 0)", "none")).toBe(false)
+    expect(needsSubtreeRender("transparent", "none")).toBe(false)
+    expect(needsSubtreeRender("", undefined)).toBe(false)
+    expect(needsSubtreeRender(undefined, undefined)).toBe(false)
   })
 })
 

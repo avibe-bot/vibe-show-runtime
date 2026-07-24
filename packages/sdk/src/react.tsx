@@ -1682,25 +1682,30 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
  * and clamp the offset within a margin. Returns a FIXED (viewport-coordinate) style; pure, so it's unit-tested.
  */
 export function tooltipPlacement(
-  button: { left: number; right: number; top: number },
+  button: { left: number; right: number; top: number; bottom: number },
   viewport: { width: number; height: number },
-  opts: { margin?: number; preferredMaxWidth?: number } = {}
+  opts: { margin?: number; preferredMaxWidth?: number; estimatedHeight?: number } = {}
 ): React.CSSProperties {
   const margin = opts.margin ?? 12
   const preferred = opts.preferredMaxWidth ?? 280
-  const bottom = Math.round(viewport.height - button.top + 10) // tip's bottom edge sits 10px above the button
+  const estimatedHeight = opts.estimatedHeight ?? 96 // conservative tip height for the above/below flip
+  // Horizontal: open toward the roomier side, cap the (border-box) width to that space, clamp within a margin.
   const spaceLeft = button.right - margin // room from the viewport's left margin to the button's right edge
   const spaceRight = viewport.width - button.left - margin
+  let horizontal: React.CSSProperties
   if (spaceRight >= spaceLeft) {
-    // Open rightward (left-aligned near the button), clamped so the box stays within the right margin.
     const maxWidth = Math.max(0, Math.min(preferred, spaceRight))
-    const left = Math.max(margin, Math.min(button.left, viewport.width - maxWidth - margin))
-    return { position: "fixed", left: Math.round(left), bottom, maxWidth: Math.round(maxWidth) }
+    horizontal = { left: Math.round(Math.max(margin, Math.min(button.left, viewport.width - maxWidth - margin))), maxWidth: Math.round(maxWidth) }
+  } else {
+    const maxWidth = Math.max(0, Math.min(preferred, spaceLeft))
+    horizontal = { right: Math.round(Math.max(margin, viewport.width - button.right)), maxWidth: Math.round(maxWidth) }
   }
-  // Open leftward (right-aligned to the button), clamped so the box stays within the left margin.
-  const maxWidth = Math.max(0, Math.min(preferred, spaceLeft))
-  const right = Math.max(margin, viewport.width - button.right)
-  return { position: "fixed", right: Math.round(right), bottom, maxWidth: Math.round(maxWidth) }
+  // Vertical: open above the button, but flip BELOW when there isn't room above (top-docked toolbar) so the tip
+  // never clips off the top. Uses a conservative height estimate since the tip's real height isn't known yet.
+  const vertical: React.CSSProperties = button.top - margin >= estimatedHeight
+    ? { bottom: Math.round(viewport.height - button.top + 10) }
+    : { top: Math.round(button.bottom + 10) }
+  return { position: "fixed", ...vertical, ...horizontal }
 }
 
 /** Subtle '?' affordance on the toolbar: hover (mouse) or tap (touch) reveals a short tip. */
@@ -1717,7 +1722,10 @@ function ToolbarHelp({ tip, touchInput }: { tip: string; touchInput: boolean }) 
     }
     const rect = button.getBoundingClientRect()
     setPlacement(
-      tooltipPlacement({ left: rect.left, right: rect.right, top: rect.top }, { width: window.innerWidth, height: window.innerHeight })
+      tooltipPlacement(
+        { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom },
+        { width: window.innerWidth, height: window.innerHeight }
+      )
     )
   }, [])
   const closeTip = React.useCallback(() => setPlacement(null), [])
@@ -3013,6 +3021,9 @@ const toolbarHelpTipStyle: React.CSSProperties = {
   // Visual only — position, offset, and maxWidth come from tooltipPlacement() (fixed + viewport-clamped, so
   // the tip can't spill off-screen). `max-content` sizes to the text so a short tip doesn't stretch, while the
   // placement's maxWidth wraps a long tip at a sane measure instead of the old shrink-fit vertical strip.
+  // border-box so the placement's maxWidth INCLUDES padding + border — otherwise the 20px padding widens the
+  // real box past the clamped space and the tip starts off-screen again on a right-docked 320px toolbar.
+  boxSizing: "border-box",
   width: "max-content",
   whiteSpace: "normal",
   padding: "8px 10px",
