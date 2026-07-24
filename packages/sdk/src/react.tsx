@@ -1745,7 +1745,15 @@ function ToolbarHelp({ tip, touchInput }: { tip: string; touchInput: boolean }) 
       >
         ?
       </button>
-      {open ? <span role="tooltip" style={{ ...toolbarHelpTipStyle, ...placement }}>{tip}</span> : null}
+      {open && typeof document !== "undefined"
+        ? createPortal(
+            // Portal to <body> so the fixed-position tip escapes the toolbar's backdrop-filter containing
+            // block — otherwise `position: fixed` resolves against the filtered toolbar, not the viewport,
+            // and the viewport-derived clamp lands off-screen. data-show-annotation-ui keeps it out of captures.
+            <span role="tooltip" data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>{tip}</span>,
+            document.body
+          )
+        : null}
     </span>
   )
 }
