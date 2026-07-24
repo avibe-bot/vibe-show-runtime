@@ -5,6 +5,7 @@ import {
   DEFAULT_CAPTURE_BACKDROP,
   resolveBackdropColor,
   needsSubtreeRender,
+  isOpaqueBackground,
   defaultCaptureStrategies,
   screenshotCaptureScale,
   screenshotPointFromViewport,
@@ -79,6 +80,22 @@ describe("needsSubtreeRender (promote only for backgrounds a flat prefill can't 
     expect(needsSubtreeRender("transparent", "none")).toBe(false)
     expect(needsSubtreeRender("", undefined)).toBe(false)
     expect(needsSubtreeRender(undefined, undefined)).toBe(false)
+  })
+})
+
+describe("isOpaqueBackground (a fully-opaque ancestor blocks everything behind — the promote target)", () => {
+  it("true only for a fully-opaque background-color", () => {
+    expect(isOpaqueBackground("rgb(255, 255, 255)")).toBe(true)
+    expect(isOpaqueBackground("rgba(20, 20, 30, 1)")).toBe(true)
+    expect(isOpaqueBackground("#123456")).toBe(true)
+  })
+
+  it("false for translucent / transparent / empty", () => {
+    expect(isOpaqueBackground("rgba(255, 0, 0, 0.5)")).toBe(false) // translucent → doesn't fully block
+    expect(isOpaqueBackground("rgba(0, 0, 0, 0)")).toBe(false)
+    expect(isOpaqueBackground("transparent")).toBe(false)
+    expect(isOpaqueBackground("")).toBe(false)
+    expect(isOpaqueBackground(undefined)).toBe(false)
   })
 })
 
