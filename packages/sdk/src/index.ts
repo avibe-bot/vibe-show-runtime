@@ -1414,6 +1414,18 @@ export function resolveBackdropColor(backgroundColors: readonly string[], fallba
 }
 
 /**
+ * Whether an element actually PAINTS a background the user can see — a non-transparent background-color
+ * (any alpha > 0) OR a background-image/gradient. snapDOM renders only the target subtree, so a flat color
+ * composite can reproduce a translucent tint but NOT an image/gradient; the capture must promote its render
+ * target up to such an ancestor to keep that backdrop. Pure (takes the two computed values) so it's testable.
+ */
+export function isPaintedBackground(backgroundColor: string | undefined, backgroundImage: string | undefined): boolean {
+  if (backgroundImage && backgroundImage !== "none") return true
+  const color = (backgroundColor ?? "").trim()
+  return color !== "" && color !== "transparent" && cssColorAlpha(color) > 0
+}
+
+/**
  * The default capture pipeline: same-origin snapDOM render first (works on iOS Safari, which lacks
  * `getDisplayMedia`), then `getDisplayMedia` as a desktop-only fallback.
  */
@@ -1492,10 +1504,11 @@ async function withOverlayChromeHidden<T>(run: () => Promise<T>): Promise<T> {
 }
 
 /**
- * The smallest element to hand snapDOM so a small selection doesn't force a full-document render.
- * Walk up from the region's center element to the nearest ancestor whose viewport rect fully
- * contains the region; fall back to `document.documentElement`. Returns the element and its rect
- * (viewport-relative), which the caller uses to crop the region out of the rendered canvas.
+ * Choose the element to hand snapDOM for a region capture. Walk up from the region's center element to the
+ * minimal covering element (nearest ancestor whose viewport rect fully contains the region), then promote
+ * to the nearest ancestor that actually PAINTS a background, so the render includes the visible backdrop
+ * (tint / gradient / image) rather than an isolated transparent descendant. Returns that element and its
+ * viewport rect, which the caller uses to crop the region out of the rendered canvas.
  */
 function pickSnapdomCaptureTarget(region: MarkAnchorRect): { element: Element; rect: MarkAnchorRect } {
   const root = document.documentElement
@@ -1508,6 +1521,8 @@ function pickSnapdomCaptureTarget(region: MarkAnchorRect): { element: Element; r
   // renders the overlay div and the screenshot comes back blank/dim.
   const stack = typeof document.elementsFromPoint === "function" ? document.elementsFromPoint(centerX, centerY) : []
   let current: Element | null = stack.find((element) => !isShowOverlayElement(element)) ?? document.body ?? root
+  // 1. The minimal covering element: the nearest ancestor whose rect fully contains the region.
+  let cover: Element | null = null
   while (current && current !== root) {
     if (isShowOverlayElement(current)) {
       current = current.parentElement
@@ -1522,11 +1537,27 @@ function pickSnapdomCaptureTarget(region: MarkAnchorRect): { element: Element; r
       rect.x + rect.width >= region.x + region.width &&
       rect.y + rect.height >= region.y + region.height
     ) {
-      return { element: current, rect }
+      cover = current
+      break
     }
     current = current.parentElement
   }
-  return { element: root, rect: rootRect }
+  if (!cover) return { element: root, rect: rootRect }
+  // 2. Promote from the covering element up to the nearest ancestor that actually PAINTS a background
+  //    (translucent tint, gradient, or image), capped at the document root, so snapDOM renders the backdrop
+  //    the user sees rather than an isolated transparent descendant — which would crop to black or drop the
+  //    ancestor's tint/image. Falls back to the covering element when nothing up the chain paints one (the
+  //    flat-color composite then supplies the backdrop). A bigger target still contains the region, so the
+  //    crop math is unchanged; the trade is a larger render, bounded to the nearest painted ancestor.
+  let target: Element = cover
+  for (let element: Element | null = cover; element; element = element.parentElement) {
+    if (hasPaintedBackground(element)) {
+      target = element
+      break
+    }
+    if (element === root) break
+  }
+  return { element: target, rect: rectFromDomRect(target.getBoundingClientRect()) }
 }
 
 /** Computed `background-color`s from `element` up to the document root (nearest-first) — the backdrop chain. */
@@ -1543,21 +1574,27 @@ function collectBackgroundColors(element: Element): string[] {
   return colors
 }
 
+/** DOM sibling of {@link isPaintedBackground}: whether the element's computed style paints a visible backdrop. */
+function hasPaintedBackground(element: Element): boolean {
+  if (typeof getComputedStyle !== "function") return false
+  const style = getComputedStyle(element)
+  return isPaintedBackground(style.backgroundColor, style.backgroundImage)
+}
+
 function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<SnapdomModule> = importSnapdom): ScreenshotCaptureStrategy {
   return {
     name: "snapdom",
     isAvailable: () => typeof document !== "undefined" && typeof HTMLCanvasElement !== "undefined",
     async capture(region) {
       const module = await loadSnapdom()
-      // Render the smallest element that fully contains the region rather than the whole document,
-      // so a small selection on a very long / virtualized page doesn't materialize a huge canvas.
+      // Target the minimal covering element, promoted up to the nearest ancestor that paints a background
+      // (see pickSnapdomCaptureTarget) so snapDOM captures the visible backdrop — tint, gradient, or image.
       const { element, rect } = pickSnapdomCaptureTarget(region)
-      // snapDOM renders only the target subtree. If the region's covering element is transparent (the
-      // page's white lives on an ancestor), the crop comes back transparent → shown black on the dark
-      // overlay; enlarging the region escalates the target to an ancestor that carries the background, so
-      // small and large regions disagreed. Resolve the nearest OPAQUE ancestor background and paint it
-      // behind the render so every region composites onto the same backdrop (owner acceptance: a small
-      // region inside a white card on a white page captures white, not black).
+      // Also paint the nearest OPAQUE ancestor color BEHIND the render: the promoted target may itself be
+      // translucent (or nothing up the chain paints), and snapDOM renders only that subtree, so without an
+      // opaque base a transparent/semi-transparent render would read as black. This makes small and large
+      // regions composite onto the same backdrop (owner acceptance: a small region inside a white card on a
+      // white page captures white; a translucent/gradient card keeps its tint instead of going black).
       const backdrop = resolveBackdropColor(collectBackgroundColors(element))
       // Exclude the overlay chrome so the render is clean page pixels, never the dimmer/toolbar/markers.
       const source = await renderSnapdomCanvas(module, element, OVERLAY_CHROME_SELECTORS)

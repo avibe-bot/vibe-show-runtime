@@ -1675,24 +1675,69 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   )
 }
 
-/** Subtle '?' affordance on the toolbar: hover (mouse) or tap (touch) reveals a one-line tip. */
+/**
+ * Place the '?' tooltip so it stays fully on-screen. The '?' button is not flush with the viewport edge
+ * (the ✕ button + toolbar padding sit beside it), so a fixed-width popover anchored to the button can spill
+ * off-screen at ~320px. Open toward whichever side has more room, cap the width to that space (≤ preferred),
+ * and clamp the offset within a margin. Returns a FIXED (viewport-coordinate) style; pure, so it's unit-tested.
+ */
+export function tooltipPlacement(
+  button: { left: number; right: number; top: number },
+  viewport: { width: number; height: number },
+  opts: { margin?: number; preferredMaxWidth?: number } = {}
+): React.CSSProperties {
+  const margin = opts.margin ?? 12
+  const preferred = opts.preferredMaxWidth ?? 280
+  const bottom = Math.round(viewport.height - button.top + 10) // tip's bottom edge sits 10px above the button
+  const spaceLeft = button.right - margin // room from the viewport's left margin to the button's right edge
+  const spaceRight = viewport.width - button.left - margin
+  if (spaceRight >= spaceLeft) {
+    // Open rightward (left-aligned near the button), clamped so the box stays within the right margin.
+    const maxWidth = Math.max(0, Math.min(preferred, spaceRight))
+    const left = Math.max(margin, Math.min(button.left, viewport.width - maxWidth - margin))
+    return { position: "fixed", left: Math.round(left), bottom, maxWidth: Math.round(maxWidth) }
+  }
+  // Open leftward (right-aligned to the button), clamped so the box stays within the left margin.
+  const maxWidth = Math.max(0, Math.min(preferred, spaceLeft))
+  const right = Math.max(margin, viewport.width - button.right)
+  return { position: "fixed", right: Math.round(right), bottom, maxWidth: Math.round(maxWidth) }
+}
+
+/** Subtle '?' affordance on the toolbar: hover (mouse) or tap (touch) reveals a short tip. */
 function ToolbarHelp({ tip, touchInput }: { tip: string; touchInput: boolean }) {
-  const [open, setOpen] = React.useState(false)
+  const btnRef = React.useRef<HTMLButtonElement>(null)
+  // Placement is measured on open; null means closed. Fixed-positioned off the button's viewport rect so
+  // the tip never spills off a ~320px screen regardless of where the draggable toolbar is docked.
+  const [placement, setPlacement] = React.useState<React.CSSProperties | null>(null)
+  const openTip = React.useCallback(() => {
+    const button = btnRef.current
+    if (!button || typeof window === "undefined") {
+      setPlacement({})
+      return
+    }
+    const rect = button.getBoundingClientRect()
+    setPlacement(
+      tooltipPlacement({ left: rect.left, right: rect.right, top: rect.top }, { width: window.innerWidth, height: window.innerHeight })
+    )
+  }, [])
+  const closeTip = React.useCallback(() => setPlacement(null), [])
   if (!tip) return null
+  const open = placement !== null
   return (
     <span style={{ position: "relative", display: "inline-flex" }}>
       <button
+        ref={btnRef}
         type="button"
         aria-label={tip}
         style={toolbarGlyphButtonStyle}
-        onPointerEnter={() => { if (!touchInput) setOpen(true) }}
-        onPointerLeave={() => { if (!touchInput) setOpen(false) }}
-        onClick={() => { if (touchInput) setOpen((value) => !value) }}
-        onBlur={() => setOpen(false)}
+        onPointerEnter={() => { if (!touchInput) openTip() }}
+        onPointerLeave={() => { if (!touchInput) closeTip() }}
+        onClick={() => { if (touchInput) (open ? closeTip() : openTip()) }}
+        onBlur={closeTip}
       >
         ?
       </button>
-      {open ? <span role="tooltip" style={toolbarHelpTipStyle}>{tip}</span> : null}
+      {open ? <span role="tooltip" style={{ ...toolbarHelpTipStyle, ...placement }}>{tip}</span> : null}
     </span>
   )
 }
@@ -2965,14 +3010,10 @@ const toolbarGlyphButtonStyle: React.CSSProperties = {
 }
 
 const toolbarHelpTipStyle: React.CSSProperties = {
-  position: "absolute",
-  bottom: "calc(100% + 10px)",
-  right: 0,
-  // Size to the content's natural width, then wrap at a sane measure — without `max-content` the box
-  // shrink-fits its tiny positioning context and collapses into a 2–4-char vertical strip. Cap ~280px but
-  // never exceed the viewport, so the tip stays readable and on-screen at ~320px (owner mobile report).
+  // Visual only — position, offset, and maxWidth come from tooltipPlacement() (fixed + viewport-clamped, so
+  // the tip can't spill off-screen). `max-content` sizes to the text so a short tip doesn't stretch, while the
+  // placement's maxWidth wraps a long tip at a sane measure instead of the old shrink-fit vertical strip.
   width: "max-content",
-  maxWidth: "min(280px, calc(100vw - 24px))",
   whiteSpace: "normal",
   padding: "8px 10px",
   borderRadius: 10,

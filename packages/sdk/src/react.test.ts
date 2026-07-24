@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { DEFAULT_ANNOTATION_LABELS, disabledButtonStyle, modePillLabel } from "./react.js"
+import { DEFAULT_ANNOTATION_LABELS, disabledButtonStyle, modePillLabel, tooltipPlacement } from "./react.js"
 
 // Overlay uses inline styles (no `:disabled` stylesheet), so the disabled LOOK is applied explicitly.
 // These pure assertions run in CI (the browser layout check does not), locking the visual contract the
@@ -15,6 +15,36 @@ describe("FAB tip / hidden-toast copy teaches Alt+M, not query-param jargon (Lan
     // query params stay the programmatic path but must no longer be the user-facing copy
     expect(DEFAULT_ANNOTATION_LABELS.fabTip).not.toContain("?unmark")
     expect(DEFAULT_ANNOTATION_LABELS.fabHiddenToast).not.toContain("?mark")
+  })
+})
+
+describe("'?' tooltip placement stays within the viewport (Lane R12 round 2)", () => {
+  const vp = { width: 320, height: 640 }
+  const margin = 12
+
+  it("opens leftward and stays on-screen when the ? button is near the right edge", () => {
+    // Default right-docked toolbar at 320px: ? button ~[229,257] with the ✕ + padding to its right.
+    const p = tooltipPlacement({ left: 229, right: 257, top: 560 }, vp)
+    expect(p.position).toBe("fixed")
+    expect(p).toHaveProperty("right")
+    const width = p.maxWidth as number
+    const leftEdge = vp.width - (p.right as number) - width // left edge of the tip
+    expect(leftEdge).toBeGreaterThanOrEqual(margin - 1) // clamped on-screen (allow rounding)
+    expect(width).toBeGreaterThan(60) // no longer the 2–4-char vertical strip
+  })
+
+  it("opens rightward and stays on-screen when the ? button is near the left edge", () => {
+    const p = tooltipPlacement({ left: 8, right: 36, top: 560 }, vp)
+    expect(p).toHaveProperty("left")
+    expect(p.left as number).toBeGreaterThanOrEqual(margin)
+    expect((p.left as number) + (p.maxWidth as number)).toBeLessThanOrEqual(vp.width - margin + 1)
+  })
+
+  it("caps at the preferred max width on a wide desktop viewport", () => {
+    const p = tooltipPlacement({ left: 900, right: 928, top: 60 }, { width: 1440, height: 900 })
+    expect(p.maxWidth).toBe(280)
+    // tip's bottom edge sits 10px above the button top
+    expect(p.bottom).toBe(900 - 60 + 10)
   })
 })
 

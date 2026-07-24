@@ -4,6 +4,7 @@ import {
   constrainCaptureDimensions,
   DEFAULT_CAPTURE_BACKDROP,
   resolveBackdropColor,
+  isPaintedBackground,
   defaultCaptureStrategies,
   screenshotCaptureScale,
   screenshotPointFromViewport,
@@ -57,6 +58,22 @@ describe("resolveBackdropColor (capture composites over the nearest opaque ances
     expect(resolveBackdropColor(["#ffffff"])).toBe("#ffffff")
     expect(resolveBackdropColor(["#00000000", "#123"])).toBe("#123") // 8-digit alpha 00 → skip, then opaque
     expect(resolveBackdropColor(["white"])).toBe("white")
+  })
+})
+
+describe("isPaintedBackground (promote the snapDOM target to a painting ancestor)", () => {
+  it("true for a visible background-color (opaque OR translucent) or a background-image/gradient", () => {
+    expect(isPaintedBackground("rgb(255, 255, 255)", "none")).toBe(true) // opaque tint
+    expect(isPaintedBackground("rgba(255, 0, 0, 0.5)", "none")).toBe(true) // translucent tint still paints
+    expect(isPaintedBackground("rgba(0, 0, 0, 0)", "linear-gradient(#fff, #000)")).toBe(true) // gradient
+    expect(isPaintedBackground("transparent", 'url("bg.png")')).toBe(true) // image
+  })
+
+  it("false when nothing is painted (fully transparent color, no image)", () => {
+    expect(isPaintedBackground("rgba(0, 0, 0, 0)", "none")).toBe(false)
+    expect(isPaintedBackground("transparent", "none")).toBe(false)
+    expect(isPaintedBackground("", undefined)).toBe(false)
+    expect(isPaintedBackground(undefined, undefined)).toBe(false)
   })
 })
 
