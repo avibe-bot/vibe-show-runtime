@@ -1806,6 +1806,7 @@ export function tooltipPlacement(
 function ToolbarHelp({ tip, hideLabel, onHide }: { tip: string; hideLabel: string; onHide: () => void }) {
   const btnRef = React.useRef<HTMLButtonElement>(null)
   const popRef = React.useRef<HTMLDivElement>(null)
+  const hideRowRef = React.useRef<HTMLButtonElement>(null)
   // Placement is measured on open; null means closed. Fixed-positioned off the button's viewport rect so the
   // popup never spills off a ~320px screen regardless of where the draggable toolbar is docked.
   const [placement, setPlacement] = React.useState<React.CSSProperties | null>(null)
@@ -1849,6 +1850,15 @@ function ToolbarHelp({ tip, hideLabel, onHide }: { tip: string; hideLabel: strin
     document.addEventListener("keydown", onKeyDown, true)
     return () => document.removeEventListener("keydown", onKeyDown, true)
   }, [open, closeTip])
+  // Move focus INTO the dialog on open: the hide row is portaled to end-of-body, so a keyboard Tab from the
+  // trigger would otherwise skip it and land on 退出. Restore focus to whatever was focused (the trigger) on
+  // close/unmount, so keyboard focus doesn't get stranded on document.body.
+  React.useEffect(() => {
+    if (!open || typeof document === "undefined") return
+    const previouslyFocused = document.activeElement as HTMLElement | null
+    hideRowRef.current?.focus()
+    return () => previouslyFocused?.focus?.()
+  }, [open])
   // No early return on an empty tip: the '?' now owns the hide action, so it must always render — a host that
   // suppresses the tip copy still needs a way to hide the FAB.
   return (
@@ -1867,7 +1877,7 @@ function ToolbarHelp({ tip, hideLabel, onHide }: { tip: string; hideLabel: strin
         ? createPortal(
             <div ref={popRef} role="dialog" data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>
               {tip ? <div style={helpTipTextStyle}>{tip}</div> : null}
-              <button type="button" style={helpHideRowStyle} onClick={() => { closeTip(); onHide() }}>
+              <button ref={hideRowRef} type="button" style={helpHideRowStyle} onClick={() => { closeTip(); onHide() }}>
                 <EyeOffIcon />
                 <span>{hideLabel}</span>
               </button>
