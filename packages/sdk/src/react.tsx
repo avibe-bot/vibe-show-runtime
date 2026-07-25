@@ -1306,7 +1306,7 @@ export function AnnotationOverlay({
                     void submit()
                   }
                 }}
-                style={overlayTextareaStyle}
+                style={touchInput ? overlayTextareaTouchStyle : overlayTextareaStyle}
               />
             ) : (
               // Approve fast path: box hidden by default; offer a minimal opt-in to add a note.
@@ -1744,10 +1744,11 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
         <ModeTab active={mode === "smart"} onClick={() => onSetMode?.("smart")} icon={<SparkleIcon />} label={labels.smart} compact={touchInput} />
         <ModeTab active={mode === "screenshot"} onClick={() => onSetMode?.("screenshot")} icon={<CameraIcon />} label={labels.screenshot} compact={touchInput} />
         <span aria-hidden="true" style={toolbarDividerStyle} />
-        <button type="button" style={toolbarExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
         {/* '?' popup holds the one-line tip AND a deliberate red "hide" row — the ✕ used to sit next to 退出
-            and read as a second "close", so hiding is now a two-step (tap ? → tap the red row). */}
+            and read as a second "close", so hiding is now a two-step (tap ? → tap the red row). 退出 sits at
+            the far right (owner mobile order) so the row reads [toggle][Smart][截图][divider][?][退出]. */}
         <ToolbarHelp tip={labels.fabTip ?? ""} hideLabel={labels.hideAction ?? DEFAULT_ANNOTATION_LABELS.hideAction} onHide={hideFab} />
+        <button type="button" style={toolbarExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
       </div>
     )
   }
@@ -2019,6 +2020,7 @@ type ScreenshotBatchCardProps = {
 
 /** Scrollable body of the screenshot batch card (header, preview, numbered comment list, input). */
 function ScreenshotBatchBody({ draft, comment, labels, onCommentChange, onRemoveItem }: Pick<ScreenshotBatchCardProps, "draft" | "comment" | "labels" | "onCommentChange" | "onRemoveItem">) {
+  const touchInput = useTouchInput() // ≥16px input font on touch so iOS doesn't focus-zoom the send button off-screen
   return (
     <>
       <div style={batchHeaderStyle}>
@@ -2041,7 +2043,7 @@ function ScreenshotBatchBody({ draft, comment, labels, onCommentChange, onRemove
         placeholder={labels.screenshotCommentPlaceholder}
         value={comment}
         onChange={(event) => onCommentChange(event.target.value)}
-        style={overlayTextareaStyle}
+        style={touchInput ? overlayTextareaTouchStyle : overlayTextareaStyle}
       />
     </>
   )
@@ -2875,6 +2877,14 @@ const overlayTextareaStyle: React.CSSProperties = {
   outline: "none",
   boxSizing: "border-box",
   width: "100%"
+}
+
+// iOS auto-zooms the page when a focused input's font-size is < 16px, pushing the send button off-screen. On
+// touch / coarse-pointer viewports use ≥16px to remove that trigger (line-height nudged for the larger text);
+// desktop keeps the compact 13px. We fix the INPUT, not the page's viewport meta (disabling zoom harms a11y).
+const overlayTextareaTouchStyle: React.CSSProperties = {
+  ...overlayTextareaStyle,
+  font: `16px/1.4 ${FONT_STACK}`
 }
 
 const cardFooterStyle: React.CSSProperties = {
