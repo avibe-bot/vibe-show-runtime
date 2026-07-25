@@ -1,20 +1,32 @@
 import { describe, expect, it } from "vitest"
-import { DEFAULT_ANNOTATION_LABELS, disabledButtonStyle, modePillLabel, tooltipPlacement } from "./react.js"
+import { DEFAULT_ANNOTATION_LABELS, disabledButtonStyle, modePillLabel, tooltipPlacement, edgeHandleAnchor } from "./react.js"
 
 // Overlay uses inline styles (no `:disabled` stylesheet), so the disabled LOOK is applied explicitly.
 // These pure assertions run in CI (the browser layout check does not), locking the visual contract the
 // owner flagged: a disabled send must read dimmed/gray, never the bright mint of an enabled action.
-describe("FAB tip / hidden-toast copy teaches Alt+M, not query-param jargon (Lane R12)", () => {
-  it("names Alt+M with the macOS ⌥M form and drops the ?mark / ?unmark wording", () => {
-    // Static, platform-neutral copy: spells both "Alt+M" and the macOS "⌥M" so a single default string is
-    // correct on every platform (no navigator-sniffing that would make the default env-dependent).
+describe("FAB tip / hidden-toast copy leads with the edge handle, Alt+M secondary (Lane R12/R13)", () => {
+  it("names the edge handle as the primary recovery, keeps Alt+M (⌥M) as the desktop shortcut, no query jargon", () => {
     for (const copy of [DEFAULT_ANNOTATION_LABELS.fabTip, DEFAULT_ANNOTATION_LABELS.fabHiddenToast]) {
-      expect(copy).toContain("Alt+M")
-      expect(copy).toContain("⌥M")
+      expect(copy).toContain("把手") // R13: the edge handle is THE cross-platform recovery, mentioned first
+      expect(copy).toContain("Alt+M") // desktop shortcut retained
+      expect(copy).toContain("⌥M") // macOS glyph retained (static, platform-neutral copy)
     }
-    // query params stay the programmatic path but must no longer be the user-facing copy
+    // query params stay the programmatic path but must not be the user-facing copy
     expect(DEFAULT_ANNOTATION_LABELS.fabTip).not.toContain("?unmark")
     expect(DEFAULT_ANNOTATION_LABELS.fabHiddenToast).not.toContain("?mark")
+  })
+})
+
+describe("edgeHandleAnchor: places the hidden-FAB recovery grabber at the last snapped edge (Lane R13)", () => {
+  it("pins to a stored placement's edge + vertical offset, inner corners rounded", () => {
+    expect(edgeHandleAnchor({ edge: "left", top: 120 })).toEqual({ left: 0, borderRadius: "0 8px 8px 0", top: 120 })
+    expect(edgeHandleAnchor({ edge: "right", top: 240 })).toEqual({ right: 0, borderRadius: "8px 0 0 8px", top: 240 })
+  })
+
+  it("defaults to the right edge, vertically centered, when the FAB was never dragged", () => {
+    for (const p of [null, undefined]) {
+      expect(edgeHandleAnchor(p)).toEqual({ right: 0, borderRadius: "8px 0 0 8px", top: "calc(50% - 24px)" })
+    }
   })
 })
 

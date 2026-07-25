@@ -216,6 +216,8 @@ export type AnnotationOverlayLabels = {
   fabTip?: string
   /** Toast shown after the '✕' affordance hides the FAB. */
   fabHiddenToast?: string
+  /** Accessible name for the edge-handle grabber that restores a hidden FAB. */
+  restoreHandle?: string
 }
 
 // Required<> so the built-in defaults must stay complete (every field, incl. the optional ones)
@@ -244,8 +246,9 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   enterToSend: "Enter 发送 · Esc 取消",
   approve: "批准",
   addNote: "添加备注",
-  fabTip: "点选元素或截图，把意见直接发给 Agent；按 Alt+M 显示/隐藏本按钮（macOS 为 ⌥M）",
-  fabHiddenToast: "已隐藏，按 Alt+M 恢复（macOS ⌥M）"
+  fabTip: "点选元素或截图，把意见直接发给 Agent；隐藏后轻点边缘把手可恢复（桌面 Alt+M，macOS ⌥M）",
+  fabHiddenToast: "已隐藏，轻点边缘把手可恢复（桌面 Alt+M，macOS ⌥M）",
+  restoreHandle: "显示标注按钮"
 }
 
 export type AnnotationOverlayProps = {
@@ -780,6 +783,7 @@ export function AnnotationOverlay({
     merged.addNote = labels?.addNote ?? DEFAULT_ANNOTATION_LABELS.addNote
     merged.fabTip = labels?.fabTip ?? DEFAULT_ANNOTATION_LABELS.fabTip
     merged.fabHiddenToast = labels?.fabHiddenToast ?? DEFAULT_ANNOTATION_LABELS.fabHiddenToast
+    merged.restoreHandle = labels?.restoreHandle ?? DEFAULT_ANNOTATION_LABELS.restoreHandle
     return merged
   }, [labels])
   const intentOptions = intents ?? DEFAULT_ANNOTATION_INTENTS
@@ -1441,6 +1445,41 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined) {
   return { visible, hide, show }
 }
 
+/**
+ * Position the edge-handle grabber at the FAB's last snapped edge. Pure so the edge/default logic is
+ * unit-tested: an existing placement pins the handle to that edge + vertical offset; with none it defaults
+ * to the right edge, vertically centered. The inner corners (facing into the viewport) are rounded.
+ */
+export function edgeHandleAnchor(placement: FloatPlacement | null | undefined): React.CSSProperties {
+  const side: React.CSSProperties =
+    (placement?.edge ?? "right") === "left" ? { left: 0, borderRadius: "0 8px 8px 0" } : { right: 0, borderRadius: "8px 0 0 8px" }
+  const vertical: React.CSSProperties = placement ? { top: placement.top } : { top: "calc(50% - 24px)" }
+  return { ...side, ...vertical }
+}
+
+/**
+ * The minimal grabber left at the screen edge when the FAB is hidden — the PRIMARY cross-platform recovery
+ * path, and the ONLY one on touch (where Alt+M doesn't exist). A ~5px strip at the FAB's last snapped edge;
+ * tapping it restores the FAB (same persistence). Barely visible at rest, a touch stronger on hover / press.
+ */
+function FabEdgeHandle({ sessionId, label, onRestore }: { sessionId: string | undefined; label: string; onRestore: () => void }) {
+  const storage = React.useMemo(() => safeLocalStorage(), [])
+  const placement = React.useMemo(() => readStoredFloatPlacement("fab", sessionId, storage) ?? null, [sessionId, storage])
+  const [active, setActive] = React.useState(false)
+  return (
+    <button
+      type="button"
+      data-show-annotation-ui=""
+      aria-label={label}
+      style={{ ...fabEdgeHandleStyle, ...edgeHandleAnchor(placement), opacity: active ? 0.55 : 0.2, width: active ? 7 : 5 }}
+      onPointerEnter={() => setActive(true)}
+      onPointerLeave={() => setActive(false)}
+      onPointerDown={() => setActive(true)}
+      onClick={onRestore}
+    />
+  )
+}
+
 // A touch above the old 20px: a down-biased drop shadow needs clearance from the viewport bottom or its
 // lower half is clipped (owner mobile report). This inset is the floating-chrome margin AND the drag
 // bottom bound, so the shadow renders fully at the resting position and at any snapped position.
@@ -1617,7 +1656,17 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // #3637478399); the disable effect above stops capture too. The toast still renders so the ✕
   // confirmation shows even after the chrome is hidden.
   if (!fabVisibility.visible) {
-    return toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null
+    // Hidden FAB: leave a minimal edge-handle grabber (standalone) — the PRIMARY recovery path, and the ONLY
+    // one on touch, where Alt+M doesn't exist. Tapping it restores the FAB. The toast still renders so the
+    // ✕ / Alt+M confirmation shows even after the chrome is hidden.
+    return (
+      <>
+        {host === "standalone" ? (
+          <FabEdgeHandle sessionId={sessionId} label={labels.restoreHandle ?? DEFAULT_ANNOTATION_LABELS.restoreHandle} onRestore={fabVisibility.show} />
+        ) : null}
+        {toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null}
+      </>
+    )
   }
 
   // Standalone tab: anonymous public visitors can't write — hide the FAB, show a quiet login hint.
@@ -2947,6 +2996,21 @@ const fabStyle: React.CSSProperties = {
   cursor: "pointer",
   backdropFilter: "blur(16px)",
   WebkitBackdropFilter: "blur(16px)"
+}
+
+// The hidden-FAB recovery grabber: a thin mint strip flush to the last snapped edge. Width/top/border-radius/
+// opacity come from edgeHandleAnchor() + the hover/press state; kept intentionally faint at rest.
+const fabEdgeHandleStyle: React.CSSProperties = {
+  position: "fixed",
+  height: 48,
+  padding: 0,
+  border: 0,
+  background: COLORS.human,
+  cursor: "pointer",
+  zIndex: CHROME_Z,
+  touchAction: "manipulation",
+  WebkitTapHighlightColor: "transparent",
+  transition: "opacity 140ms ease, width 140ms ease"
 }
 
 // Standalone pill toolbar (expanded).
