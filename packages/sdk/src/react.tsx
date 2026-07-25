@@ -1482,12 +1482,13 @@ export function edgeHandleAnchor(
  * path, and the ONLY one on touch (where Alt+M doesn't exist). A ~5px strip at the FAB's last snapped edge;
  * tapping it restores the FAB (same persistence). Barely visible at rest, a touch stronger on hover / press.
  */
-function FabEdgeHandle({ sessionId, label, placement, onRestore }: { sessionId: string | undefined; label: string; placement: FloatPlacement | null; onRestore: () => void }) {
+function FabEdgeHandle({ sessionId, label, placement, touchInput, autoFocus, onRestore }: { sessionId: string | undefined; label: string; placement: FloatPlacement | null; touchInput: boolean; autoFocus: boolean; onRestore: () => void }) {
   const storage = React.useMemo(() => safeLocalStorage(), [])
   const stored = React.useMemo(() => readStoredFloatPlacement("fab", sessionId, storage) ?? null, [sessionId, storage])
   // Prefer the FAB's LIVE placement (from useDraggable): a drag whose storage write failed still moved the FAB
   // in memory, so re-reading storage here would strand the handle at a stale edge. Fall back to the stored value.
   const resolved = placement ?? stored
+  const btnRef = React.useRef<HTMLButtonElement>(null)
   const [active, setActive] = React.useState(false)
   // Track the viewport height so a stored top is re-clamped on resize/rotate and the handle can't drift off-screen.
   const [viewportHeight, setViewportHeight] = React.useState<number | undefined>(() => (typeof window !== "undefined" ? window.innerHeight : undefined))
@@ -1497,17 +1498,29 @@ function FabEdgeHandle({ sessionId, label, placement, onRestore }: { sessionId: 
     window.addEventListener("resize", onResize)
     return () => window.removeEventListener("resize", onResize)
   }, [])
+  // After a user-initiated hide the ? trigger unmounts with the toolbar; move focus to this recovery handle so
+  // keyboard focus lands on the (only) way back rather than collapsing to <body>. Never on initial page load.
+  React.useEffect(() => { if (autoFocus) btnRef.current?.focus() }, [autoFocus])
+  const anchor = edgeHandleAnchor(resolved, viewportHeight)
+  const edge = resolved?.edge ?? "right"
+  const visualWidth = active ? 7 : 5
+  // The BUTTON is a transparent hit target — ~44px wide on touch so the handle is actually tappable (it is the
+  // only recovery control on mobile); a thin mint strip sits flush to the screen edge inside it. A real box, not
+  // a pseudo-element, because elementFromPoint (and taps) ignore pseudo-elements. Desktop keeps hit == visual.
   return (
     <button
+      ref={btnRef}
       type="button"
       data-show-annotation-ui=""
       aria-label={label}
-      style={{ ...fabEdgeHandleStyle, ...edgeHandleAnchor(resolved, viewportHeight), opacity: active ? 0.55 : 0.2, width: active ? 7 : 5 }}
+      style={{ ...fabEdgeHandleStyle, top: anchor.top, ...(edge === "left" ? { left: 0, justifyContent: "flex-start" } : { right: 0, justifyContent: "flex-end" }), width: touchInput ? 44 : visualWidth }}
       onPointerEnter={() => setActive(true)}
       onPointerLeave={() => setActive(false)}
       onPointerDown={() => setActive(true)}
       onClick={onRestore}
-    />
+    >
+      <span aria-hidden="true" style={{ ...fabEdgeHandleVisualStyle, width: visualWidth, borderRadius: anchor.borderRadius, opacity: active ? 0.55 : 0.2 }} />
+    </button>
   )
 }
 
@@ -1639,7 +1652,10 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   }, [])
   // ✕ affordance: hide the FAB (≡ #unmark, persisted) and confirm with a brief toast so the user knows
   // how to bring it back. Also disables an active session so nothing is left capturing.
+  // Set when a USER action hides the FAB, so the recovery handle grabs focus on mount (never on initial load).
+  const focusHandleRef = React.useRef(false)
   const hideFab = React.useCallback(() => {
+    focusHandleRef.current = true
     onDisable?.()
     fabVisibility.hide()
     if (labels.fabHiddenToast) flashToast(labels.fabHiddenToast)
@@ -1697,7 +1713,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
         {host === "standalone" && available ? (
           // Only when the viewer can actually annotate — an anonymous viewer's FAB is a login hint, not the
           // real FAB, so a recovery handle there would restore to nothing useful. Prefer the live drag placement.
-          <FabEdgeHandle sessionId={sessionId} label={labels.restoreHandle ?? DEFAULT_ANNOTATION_LABELS.restoreHandle} placement={fabDrag.placement} onRestore={fabVisibility.show} />
+          <FabEdgeHandle sessionId={sessionId} label={labels.restoreHandle ?? DEFAULT_ANNOTATION_LABELS.restoreHandle} placement={fabDrag.placement} touchInput={touchInput} autoFocus={focusHandleRef.current} onRestore={fabVisibility.show} />
         ) : null}
         {toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null}
       </>
@@ -1885,7 +1901,7 @@ function ToolbarHelp({ tip, hideLabel, onHide }: { tip: string; hideLabel: strin
         ? createPortal(
             <div ref={popRef} role="dialog" aria-label={tip || hideLabel} data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>
               {tip ? <div style={helpTipTextStyle}>{tip}</div> : null}
-              <button ref={hideRowRef} type="button" style={helpHideRowStyle} onClick={() => { closeTip(); onHide() }}>
+              <button ref={hideRowRef} type="button" style={helpHideRowStyle} onClick={() => { restoreFocusRef.current = false; closeTip(); onHide() }}>
                 <EyeOffIcon />
                 <span>{hideLabel}</span>
               </button>
@@ -3104,11 +3120,20 @@ const fabEdgeHandleStyle: React.CSSProperties = {
   height: 48,
   padding: 0,
   border: 0,
-  background: COLORS.human,
+  background: "transparent", // the visible strip is the inner span; the button is the (wider on touch) hit target
   cursor: "pointer",
   zIndex: CHROME_Z,
   touchAction: "manipulation",
   WebkitTapHighlightColor: "transparent",
+  display: "flex",
+  alignItems: "stretch",
+  transition: "width 140ms ease"
+}
+
+// The thin mint strip inside the (transparent) hit button — flush to the screen edge, height fills the button.
+const fabEdgeHandleVisualStyle: React.CSSProperties = {
+  background: COLORS.human,
+  pointerEvents: "none",
   transition: "opacity 140ms ease, width 140ms ease"
 }
 
