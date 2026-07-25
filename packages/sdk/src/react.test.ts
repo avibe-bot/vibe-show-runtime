@@ -1,5 +1,13 @@
-import { describe, expect, it } from "vitest"
-import { DEFAULT_ANNOTATION_LABELS, disabledButtonStyle, modePillLabel, tooltipPlacement, edgeHandleAnchor } from "./react.js"
+import { describe, expect, it, vi } from "vitest"
+import {
+  DEFAULT_ANNOTATION_LABELS,
+  disabledButtonStyle,
+  modePillLabel,
+  tooltipPlacement,
+  edgeHandleAnchor,
+  createChromeFocusController,
+  TOUCH_CAPABLE_QUERY
+} from "./react.js"
 
 // Overlay uses inline styles (no `:disabled` stylesheet), so the disabled LOOK is applied explicitly.
 // These pure assertions run in CI (the browser layout check does not), locking the visual contract the
@@ -18,6 +26,66 @@ describe("FAB copy leads with the edge handle; '?' popup owns the hide action (L
 
   it("the '?' popup hide row carries a distinct destructive label (no longer a bare ✕)", () => {
     expect(DEFAULT_ANNOTATION_LABELS.hideAction).toBe("隐藏标注按钮")
+  })
+
+  it("the '?' trigger has a fallback accessible name for when a host suppresses the tip copy", () => {
+    // With an empty fabTip the trigger's aria-label falls back to this so a screen reader never reads bare '?'.
+    expect(DEFAULT_ANNOTATION_LABELS.helpTrigger).toBe("帮助")
+  })
+})
+
+// The edge-handle hit box is sized by touch CAPABILITY, not the primary-pointer flag that drives
+// keyboard/layout behavior — otherwise a mouse-primary hybrid (laptop + touchscreen) keeps a 5px target it
+// can still finger-tap. Lock the media-query choice in CI so a refactor can't quietly revert to `pointer:`.
+describe("touch-capability query sizes the recovery handle hit box (Lane R13)", () => {
+  it("keys on any-pointer (device HAS a coarse pointer), not the primary hover/pointer signal", () => {
+    expect(TOUCH_CAPABLE_QUERY).toContain("any-pointer: coarse")
+    expect(TOUCH_CAPABLE_QUERY).not.toContain("hover") // must NOT be the primary-pointer layout query
+  })
+})
+
+// One focus-succession mechanism covers BOTH chrome swaps (hide→handle, restore→FAB): the successor control
+// claims focus on mount so a keyboard user is never dropped on <body>. The DOM wiring is browser-verified;
+// this locks the pure state machine — armed once, consumed once, never fires unarmed (e.g. initial load).
+describe("createChromeFocusController: focus follows the control that replaces the one in use (Lane R13)", () => {
+  it("focuses the next mounted control exactly once after a request, then disarms", () => {
+    const c = createChromeFocusController()
+    const first = { focus: vi.fn() }
+    const second = { focus: vi.fn() }
+    c.request()
+    c.claim(first)
+    expect(first.focus).toHaveBeenCalledTimes(1)
+    // A second mount without a new request (e.g. a re-render) must not steal focus back.
+    c.claim(second)
+    expect(second.focus).not.toHaveBeenCalled()
+  })
+
+  it("never focuses without a request — so a stored-hidden FAB can't autofocus its handle on page load", () => {
+    const c = createChromeFocusController()
+    const node = { focus: vi.fn() }
+    c.claim(node)
+    expect(node.focus).not.toHaveBeenCalled()
+  })
+
+  it("a null node (the outgoing control unmounting) is a no-op and keeps the request armed for the successor", () => {
+    const c = createChromeFocusController()
+    const successor = { focus: vi.fn() }
+    c.request()
+    c.claim(null) // outgoing control detaches first
+    c.claim(successor) // incoming control mounts
+    expect(successor.focus).toHaveBeenCalledTimes(1)
+  })
+
+  it("re-arms for each swap: a fresh request focuses the next control again", () => {
+    const c = createChromeFocusController()
+    const a = { focus: vi.fn() }
+    const b = { focus: vi.fn() }
+    c.request()
+    c.claim(a)
+    c.request()
+    c.claim(b)
+    expect(a.focus).toHaveBeenCalledTimes(1)
+    expect(b.focus).toHaveBeenCalledTimes(1)
   })
 })
 
