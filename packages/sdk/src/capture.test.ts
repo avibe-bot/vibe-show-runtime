@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from "vitest"
 import {
   captureScreenshotRegion,
   constrainCaptureDimensions,
+  DEFAULT_CAPTURE_BACKDROP,
+  resolveBackdropColor,
+  needsSubtreeRender,
+  isOpaqueBackground,
   defaultCaptureStrategies,
   screenshotCaptureScale,
   screenshotPointFromViewport,
@@ -31,6 +35,69 @@ function fakeStrategy(
   }
   return strategy
 }
+
+describe("resolveBackdropColor (capture composites over the nearest opaque ancestor bg)", () => {
+  it("returns the nearest FULLY-OPAQUE background, skipping transparent ancestors", () => {
+    // small region: its own element is transparent, the white lives on an ancestor → resolve the white
+    expect(resolveBackdropColor(["rgba(0, 0, 0, 0)", "rgb(255, 255, 255)"])).toBe("rgb(255, 255, 255)")
+    expect(resolveBackdropColor(["transparent", "rgb(20, 20, 30)"])).toBe("rgb(20, 20, 30)")
+    // nearest-first: the covering element's own opaque bg wins over an ancestor's
+    expect(resolveBackdropColor(["rgb(10, 10, 10)", "rgb(255, 255, 255)"])).toBe("rgb(10, 10, 10)")
+  })
+
+  it("skips semi-transparent layers — they blend over the solid backdrop behind them", () => {
+    expect(resolveBackdropColor(["rgba(255, 0, 0, 0.5)", "rgb(255, 255, 255)"])).toBe("rgb(255, 255, 255)")
+  })
+
+  it("falls back to white when the whole chain is transparent (browsers paint white)", () => {
+    expect(resolveBackdropColor(["rgba(0, 0, 0, 0)", "transparent", ""])).toBe(DEFAULT_CAPTURE_BACKDROP)
+    expect(resolveBackdropColor([])).toBe("#ffffff")
+    expect(resolveBackdropColor([], "rgb(1, 2, 3)")).toBe("rgb(1, 2, 3)") // custom fallback
+  })
+
+  it("handles opaque hex / #rrggbbaa alpha / named colors", () => {
+    expect(resolveBackdropColor(["#ffffff"])).toBe("#ffffff")
+    expect(resolveBackdropColor(["#00000000", "#123"])).toBe("#123") // 8-digit alpha 00 → skip, then opaque
+    expect(resolveBackdropColor(["white"])).toBe("white")
+  })
+})
+
+describe("needsSubtreeRender (promote only for backgrounds a flat prefill can't reproduce)", () => {
+  it("true for an image/gradient or a TRANSLUCENT tint", () => {
+    expect(needsSubtreeRender("rgba(255, 0, 0, 0.5)", "none")).toBe(true) // translucent tint
+    expect(needsSubtreeRender("rgba(0, 0, 0, 0)", "linear-gradient(#fff, #000)")).toBe(true) // gradient
+    expect(needsSubtreeRender("transparent", 'url("bg.png")')).toBe(true) // image
+  })
+
+  it("FALSE for an opaque solid color — reproduced exactly by the composite, so body/html is never re-rendered", () => {
+    expect(needsSubtreeRender("rgb(255, 255, 255)", "none")).toBe(false) // opaque white page background
+    expect(needsSubtreeRender("rgb(20, 20, 30)", "none")).toBe(false)
+    expect(needsSubtreeRender("#123456", "none")).toBe(false)
+  })
+
+  it("false when nothing is painted (fully transparent, no image)", () => {
+    expect(needsSubtreeRender("rgba(0, 0, 0, 0)", "none")).toBe(false)
+    expect(needsSubtreeRender("transparent", "none")).toBe(false)
+    expect(needsSubtreeRender("", undefined)).toBe(false)
+    expect(needsSubtreeRender(undefined, undefined)).toBe(false)
+  })
+})
+
+describe("isOpaqueBackground (a fully-opaque ancestor blocks everything behind — the promote target)", () => {
+  it("true only for a fully-opaque background-color", () => {
+    expect(isOpaqueBackground("rgb(255, 255, 255)")).toBe(true)
+    expect(isOpaqueBackground("rgba(20, 20, 30, 1)")).toBe(true)
+    expect(isOpaqueBackground("#123456")).toBe(true)
+  })
+
+  it("false for translucent / transparent / empty", () => {
+    expect(isOpaqueBackground("rgba(255, 0, 0, 0.5)")).toBe(false) // translucent → doesn't fully block
+    expect(isOpaqueBackground("rgba(0, 0, 0, 0)")).toBe(false)
+    expect(isOpaqueBackground("transparent")).toBe(false)
+    expect(isOpaqueBackground("")).toBe(false)
+    expect(isOpaqueBackground(undefined)).toBe(false)
+  })
+})
 
 describe("constrainCaptureDimensions", () => {
   it("leaves within-bound dimensions untouched", () => {

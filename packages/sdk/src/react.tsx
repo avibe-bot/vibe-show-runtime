@@ -68,6 +68,7 @@ import {
   readStoredFabVisible,
   writeStoredFabVisible,
   stripFabParamsFromSearch,
+  shouldToggleFabShortcut,
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
   snapToNearestEdge,
@@ -243,8 +244,8 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   enterToSend: "Enter 发送 · Esc 取消",
   approve: "批准",
   addNote: "添加备注",
-  fabTip: "点选元素或截图,把意见直接发给 Agent;链接加 ?unmark 可隐藏本按钮",
-  fabHiddenToast: "已隐藏,链接加 ?mark 可恢复"
+  fabTip: "点选元素或截图，把意见直接发给 Agent；按 Alt+M 显示/隐藏本按钮（macOS 为 ⌥M）",
+  fabHiddenToast: "已隐藏，按 Alt+M 恢复（macOS ⌥M）"
 }
 
 export type AnnotationOverlayProps = {
@@ -1432,7 +1433,12 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined) {
     writeStoredFabVisible(sessionId, false, storage)
     setVisible(false)
   }, [sessionId, storage])
-  return { visible, hide }
+  const show = React.useCallback(() => {
+    // Alt+M reveal: persist visible (same store as ?mark) so it survives a reload.
+    writeStoredFabVisible(sessionId, true, storage)
+    setVisible(true)
+  }, [sessionId, storage])
+  return { visible, hide, show }
 }
 
 // A touch above the old 20px: a down-biased drop shadow needs clearance from the viewport bottom or its
@@ -1571,6 +1577,25 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   React.useEffect(() => {
     if (host === "standalone" && !fabVisibility.visible && enabled) onDisable?.()
   }, [host, fabVisibility.visible, enabled, onDisable])
+  // Alt+M (macOS ⌥M) toggles the FAB (standalone only), mirroring ?mark/?unmark and the ✕ button.
+  // Registered at the document level so it works even while the collapsed FAB is hidden; the pure guard
+  // blocks it while the user is typing or holding another modifier. Revealing from hidden re-surfaces the
+  // tip so the toggle is rediscoverable, and hiding routes through hideFab so an active capture stops too.
+  React.useEffect(() => {
+    if (host !== "standalone" || typeof document === "undefined") return
+    function onKeyDown(event: KeyboardEvent) {
+      if (!shouldToggleFabShortcut(event, event.target)) return
+      event.preventDefault()
+      if (fabVisibility.visible) {
+        hideFab()
+      } else {
+        fabVisibility.show()
+        if (labels.fabTip) flashToast(labels.fabTip)
+      }
+    }
+    document.addEventListener("keydown", onKeyDown)
+    return () => document.removeEventListener("keydown", onKeyDown)
+  }, [host, fabVisibility, hideFab, flashToast, labels.fabTip])
 
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
@@ -1650,24 +1675,85 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   )
 }
 
-/** Subtle '?' affordance on the toolbar: hover (mouse) or tap (touch) reveals a one-line tip. */
+/**
+ * Place the '?' tooltip so it stays fully on-screen. The '?' button is not flush with the viewport edge
+ * (the ✕ button + toolbar padding sit beside it), so a fixed-width popover anchored to the button can spill
+ * off-screen at ~320px. Open toward whichever side has more room, cap the width to that space (≤ preferred),
+ * and clamp the offset within a margin. Returns a FIXED (viewport-coordinate) style; pure, so it's unit-tested.
+ */
+export function tooltipPlacement(
+  button: { left: number; right: number; top: number; bottom: number },
+  viewport: { width: number; height: number },
+  opts: { margin?: number; preferredMaxWidth?: number; estimatedHeight?: number } = {}
+): React.CSSProperties {
+  const margin = opts.margin ?? 12
+  const preferred = opts.preferredMaxWidth ?? 280
+  const estimatedHeight = opts.estimatedHeight ?? 96 // conservative tip height for the above/below flip
+  // Horizontal: open toward the roomier side, cap the (border-box) width to that space, clamp within a margin.
+  const spaceLeft = button.right - margin // room from the viewport's left margin to the button's right edge
+  const spaceRight = viewport.width - button.left - margin
+  let horizontal: React.CSSProperties
+  if (spaceRight >= spaceLeft) {
+    const maxWidth = Math.max(0, Math.min(preferred, spaceRight))
+    horizontal = { left: Math.round(Math.max(margin, Math.min(button.left, viewport.width - maxWidth - margin))), maxWidth: Math.round(maxWidth) }
+  } else {
+    const maxWidth = Math.max(0, Math.min(preferred, spaceLeft))
+    horizontal = { right: Math.round(Math.max(margin, viewport.width - button.right)), maxWidth: Math.round(maxWidth) }
+  }
+  // Vertical: open above the button, but flip BELOW when there isn't room above (top-docked toolbar) so the tip
+  // never clips off the top. Uses a conservative height estimate since the tip's real height isn't known yet.
+  const vertical: React.CSSProperties = button.top - margin >= estimatedHeight
+    ? { bottom: Math.round(viewport.height - button.top + 10) }
+    : { top: Math.round(button.bottom + 10) }
+  return { position: "fixed", ...vertical, ...horizontal }
+}
+
+/** Subtle '?' affordance on the toolbar: hover (mouse) or tap (touch) reveals a short tip. */
 function ToolbarHelp({ tip, touchInput }: { tip: string; touchInput: boolean }) {
-  const [open, setOpen] = React.useState(false)
+  const btnRef = React.useRef<HTMLButtonElement>(null)
+  // Placement is measured on open; null means closed. Fixed-positioned off the button's viewport rect so
+  // the tip never spills off a ~320px screen regardless of where the draggable toolbar is docked.
+  const [placement, setPlacement] = React.useState<React.CSSProperties | null>(null)
+  const openTip = React.useCallback(() => {
+    const button = btnRef.current
+    if (!button || typeof window === "undefined") {
+      setPlacement({})
+      return
+    }
+    const rect = button.getBoundingClientRect()
+    setPlacement(
+      tooltipPlacement(
+        { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom },
+        { width: window.innerWidth, height: window.innerHeight }
+      )
+    )
+  }, [])
+  const closeTip = React.useCallback(() => setPlacement(null), [])
   if (!tip) return null
+  const open = placement !== null
   return (
     <span style={{ position: "relative", display: "inline-flex" }}>
       <button
+        ref={btnRef}
         type="button"
         aria-label={tip}
         style={toolbarGlyphButtonStyle}
-        onPointerEnter={() => { if (!touchInput) setOpen(true) }}
-        onPointerLeave={() => { if (!touchInput) setOpen(false) }}
-        onClick={() => { if (touchInput) setOpen((value) => !value) }}
-        onBlur={() => setOpen(false)}
+        onPointerEnter={() => { if (!touchInput) openTip() }}
+        onPointerLeave={() => { if (!touchInput) closeTip() }}
+        onClick={() => { if (touchInput) (open ? closeTip() : openTip()) }}
+        onBlur={closeTip}
       >
         ?
       </button>
-      {open ? <span role="tooltip" style={toolbarHelpTipStyle}>{tip}</span> : null}
+      {open && typeof document !== "undefined"
+        ? createPortal(
+            // Portal to <body> so the fixed-position tip escapes the toolbar's backdrop-filter containing
+            // block — otherwise `position: fixed` resolves against the filtered toolbar, not the viewport,
+            // and the viewport-derived clamp lands off-screen. data-show-annotation-ui keeps it out of captures.
+            <span role="tooltip" data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>{tip}</span>,
+            document.body
+          )
+        : null}
     </span>
   )
 }
@@ -2940,10 +3026,14 @@ const toolbarGlyphButtonStyle: React.CSSProperties = {
 }
 
 const toolbarHelpTipStyle: React.CSSProperties = {
-  position: "absolute",
-  bottom: "calc(100% + 10px)",
-  right: 0,
-  maxWidth: 240,
+  // Visual only — position, offset, and maxWidth come from tooltipPlacement() (fixed + viewport-clamped, so
+  // the tip can't spill off-screen). `max-content` sizes to the text so a short tip doesn't stretch, while the
+  // placement's maxWidth wraps a long tip at a sane measure instead of the old shrink-fit vertical strip.
+  // border-box so the placement's maxWidth INCLUDES padding + border — otherwise the 20px padding widens the
+  // real box past the clamped space and the tip starts off-screen again on a right-docked 320px toolbar.
+  boxSizing: "border-box",
+  width: "max-content",
+  whiteSpace: "normal",
   padding: "8px 10px",
   borderRadius: 10,
   background: COLORS.surfacePopover,

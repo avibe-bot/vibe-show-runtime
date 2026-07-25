@@ -1372,6 +1372,74 @@ export function selectCaptureStrategy(strategies: ScreenshotCaptureStrategy[]): 
   return strategies.find((strategy) => strategy.isAvailable())
 }
 
+/** The default solid backdrop painted behind a capture when the page itself resolves to none (browsers paint white). */
+export const DEFAULT_CAPTURE_BACKDROP = "#ffffff"
+
+/** Alpha (0–1) of a CSS color string. Computed styles are always `rgb()`/`rgba()`; hex + named handled for safety. */
+function cssColorAlpha(color: string): number {
+  const rgba = /^rgba?\(([^)]+)\)$/i.exec(color)
+  if (rgba) {
+    const parts = rgba[1].split(",").map((part) => part.trim())
+    if (parts.length >= 4) {
+      const alpha = Number.parseFloat(parts[3])
+      return Number.isFinite(alpha) ? alpha : 1
+    }
+    return 1 // rgb() with no alpha channel is fully opaque
+  }
+  const hex = /^#([0-9a-f]{3,8})$/i.exec(color)
+  if (hex) {
+    const digits = hex[1]
+    if (digits.length === 4) return Number.parseInt(digits[3] + digits[3], 16) / 255 // #rgba
+    if (digits.length === 8) return Number.parseInt(digits.slice(6, 8), 16) / 255 // #rrggbbaa
+    return 1 // #rgb / #rrggbb
+  }
+  return 1 // a named color that isn't "transparent" (filtered by the caller) is opaque
+}
+
+/**
+ * Resolve the solid color that sits BEHIND a capture region, given the computed `background-color`s of the
+ * region's covering element and its ancestors (nearest-first, up to the document root). snapDOM renders
+ * only the target subtree, so a region whose own element is transparent (the page white lives on an
+ * ancestor) comes back transparent → shown black on the dark overlay. Compositing the render over this
+ * backdrop makes small and large regions produce identical backgrounds. Returns the first FULLY OPAQUE
+ * background (semi-transparent layers blend over it, so they don't stop the search); `fallback` when none.
+ */
+export function resolveBackdropColor(backgroundColors: readonly string[], fallback = DEFAULT_CAPTURE_BACKDROP): string {
+  for (const raw of backgroundColors) {
+    const color = (raw ?? "").trim()
+    if (!color || color === "transparent") continue
+    if (cssColorAlpha(color) >= 1) return color
+  }
+  return fallback
+}
+
+/**
+ * Whether an element's background must be RENDERED as a subtree to reproduce it — i.e. a background-image
+ * or gradient, or a TRANSLUCENT color (0 < alpha < 1). An opaque solid color is reproduced exactly by the
+ * flat composite prefill, so it does NOT need rendering (promoting to it — e.g. the page's body/html — would
+ * re-render the whole document for a tiny selection). snapDOM renders only the target subtree, so the capture
+ * promotes its target up to the nearest LOCAL ancestor for which this is true. Pure, so it's unit-testable.
+ */
+export function needsSubtreeRender(backgroundColor: string | undefined, backgroundImage: string | undefined): boolean {
+  if (backgroundImage && backgroundImage !== "none") return true // an image/gradient can't be a flat prefill
+  const color = (backgroundColor ?? "").trim()
+  if (color === "" || color === "transparent") return false
+  const alpha = cssColorAlpha(color)
+  return alpha > 0 && alpha < 1 // a translucent tint needs rendering; an opaque solid is reproduced by composite
+}
+
+/**
+ * Whether an element's background-color is fully OPAQUE (alpha ≥ 1). Such an ancestor blocks everything
+ * behind it, so rendering it captures every layer visible inside the region (nested tints, gradients,
+ * images, shaped children) — the capture promotes its target to the nearest such ancestor (below body/html).
+ * Only the color matters for "blocks what's behind"; an image on top is captured by rendering regardless.
+ */
+export function isOpaqueBackground(backgroundColor: string | undefined): boolean {
+  const color = (backgroundColor ?? "").trim()
+  if (color === "" || color === "transparent") return false
+  return cssColorAlpha(color) >= 1
+}
+
 /**
  * The default capture pipeline: same-origin snapDOM render first (works on iOS Safari, which lacks
  * `getDisplayMedia`), then `getDisplayMedia` as a desktop-only fallback.
@@ -1451,10 +1519,12 @@ async function withOverlayChromeHidden<T>(run: () => Promise<T>): Promise<T> {
 }
 
 /**
- * The smallest element to hand snapDOM so a small selection doesn't force a full-document render.
- * Walk up from the region's center element to the nearest ancestor whose viewport rect fully
- * contains the region; fall back to `document.documentElement`. Returns the element and its rect
- * (viewport-relative), which the caller uses to crop the region out of the rendered canvas.
+ * Choose the element to hand snapDOM for a region capture. Walk up from the region's center element to the
+ * minimal covering element (nearest ancestor whose viewport rect fully contains the region), then promote to
+ * the nearest OPAQUE-background ancestor (it blocks everything behind, so its render holds every visible layer)
+ * or, failing that, the highest non-flat local ancestor — capped below body/documentElement so a small
+ * selection never re-renders the whole document. Returns the element and its viewport rect, which the caller
+ * uses to crop the region out of the rendered canvas.
  */
 function pickSnapdomCaptureTarget(region: MarkAnchorRect): { element: Element; rect: MarkAnchorRect } {
   const root = document.documentElement
@@ -1467,6 +1537,8 @@ function pickSnapdomCaptureTarget(region: MarkAnchorRect): { element: Element; r
   // renders the overlay div and the screenshot comes back blank/dim.
   const stack = typeof document.elementsFromPoint === "function" ? document.elementsFromPoint(centerX, centerY) : []
   let current: Element | null = stack.find((element) => !isShowOverlayElement(element)) ?? document.body ?? root
+  // 1. The minimal covering element: the nearest ancestor whose rect fully contains the region.
+  let cover: Element | null = null
   while (current && current !== root) {
     if (isShowOverlayElement(current)) {
       current = current.parentElement
@@ -1481,11 +1553,66 @@ function pickSnapdomCaptureTarget(region: MarkAnchorRect): { element: Element; r
       rect.x + rect.width >= region.x + region.width &&
       rect.y + rect.height >= region.y + region.height
     ) {
-      return { element: current, rect }
+      cover = current
+      break
     }
     current = current.parentElement
   }
-  return { element: root, rect: rootRect }
+  if (!cover) return { element: root, rect: rootRect }
+  // 2. Promote to render the visible backdrop WITHOUT ever re-rendering the whole document. Walk up from the
+  //    covering element (below body/documentElement) and either:
+  //      - stop at the nearest OPAQUE-background ancestor — it blocks everything behind, so rendering it
+  //        captures every layer visible in the region (nested tints, gradients, images, shaped children); or
+  //      - if none is opaque, render the HIGHEST non-flat local ancestor (gradient / image / translucent),
+  //        which contains the whole local non-flat stack, and let the flat composite supply the opaque base.
+  //    A plain page (only flat/transparent locals) keeps the small covering target — no whole-document render.
+  //    Residual (documented): a NON-flat background on body/documentElement itself, behind a translucent or
+  //    clipped target, falls back to the flat composite; reproducing it would require rendering the document.
+  const body = document.body
+  let opaqueLocal: Element | null = null
+  let highestNonFlatLocal: Element | null = null
+  for (let element: Element | null = cover; element && element !== root && element !== body; element = element.parentElement) {
+    if (hasNonFlatBackground(element)) highestNonFlatLocal = element
+    if (hasOpaqueBackground(element)) {
+      opaqueLocal = element // an opaque ancestor blocks everything above it — stop climbing
+      break
+    }
+  }
+  const target: Element = opaqueLocal ?? highestNonFlatLocal ?? cover
+  return { element: target, rect: rectFromDomRect(target.getBoundingClientRect()) }
+}
+
+/**
+ * Computed `background-color`s BEHIND the render target — its ancestors, nearest-first, up to the document
+ * root. Starts at the target's parent, NOT the target: snapDOM already paints the target's own background,
+ * so the composite prefill must be what shows through the target's transparent pixels (rounded corners,
+ * clip-path, `opacity`). Prefilling with the target's own color would square off its corners or composite
+ * its opacity over itself instead of the page behind it.
+ */
+function collectBackgroundColors(element: Element): string[] {
+  if (typeof getComputedStyle !== "function") return []
+  const colors: string[] = []
+  const root = element.ownerDocument?.documentElement
+  let current: Element | null = element.parentElement
+  while (current) {
+    colors.push(getComputedStyle(current).backgroundColor)
+    if (current === root) break
+    current = current.parentElement
+  }
+  return colors
+}
+
+/** DOM sibling of {@link needsSubtreeRender}: whether the element's computed background must be rendered. */
+function hasNonFlatBackground(element: Element): boolean {
+  if (typeof getComputedStyle !== "function") return false
+  const style = getComputedStyle(element)
+  return needsSubtreeRender(style.backgroundColor, style.backgroundImage)
+}
+
+/** DOM sibling of {@link isOpaqueBackground}: whether the element's computed background-color fully blocks behind. */
+function hasOpaqueBackground(element: Element): boolean {
+  if (typeof getComputedStyle !== "function") return false
+  return isOpaqueBackground(getComputedStyle(element).backgroundColor)
 }
 
 function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<SnapdomModule> = importSnapdom): ScreenshotCaptureStrategy {
@@ -1494,9 +1621,16 @@ function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<Snap
     isAvailable: () => typeof document !== "undefined" && typeof HTMLCanvasElement !== "undefined",
     async capture(region) {
       const module = await loadSnapdom()
-      // Render the smallest element that fully contains the region rather than the whole document,
-      // so a small selection on a very long / virtualized page doesn't materialize a huge canvas.
+      // Target the minimal covering element, promoted to the nearest opaque ancestor (or highest non-flat
+      // local; see pickSnapdomCaptureTarget) so snapDOM captures the full visible backdrop — nested tints,
+      // gradients, images — without ever re-rendering the whole document.
       const { element, rect } = pickSnapdomCaptureTarget(region)
+      // Also paint the nearest OPAQUE ancestor color BEHIND the render: the promoted target may itself be
+      // translucent (or nothing up the chain paints), and snapDOM renders only that subtree, so without an
+      // opaque base a transparent/semi-transparent render would read as black. This makes small and large
+      // regions composite onto the same backdrop (owner acceptance: a small region inside a white card on a
+      // white page captures white; a translucent/gradient card keeps its tint instead of going black).
+      const backdrop = resolveBackdropColor(collectBackgroundColors(element))
       // Exclude the overlay chrome so the render is clean page pixels, never the dimmer/toolbar/markers.
       const source = await renderSnapdomCanvas(module, element, OVERLAY_CHROME_SELECTORS)
       // `rect` is the captured element's viewport rect, so the region maps to it directly (no scroll
@@ -1511,6 +1645,9 @@ function snapdomCaptureStrategy(maxEdge: number, loadSnapdom: () => Promise<Snap
       if (!context) {
         throw new Error("Canvas capture context is unavailable")
       }
+      // Composite over the resolved backdrop so a transparent render never reads as black.
+      context.fillStyle = backdrop
+      context.fillRect(0, 0, width, height)
       context.drawImage(
         source,
         (region.x - rect.x) * ratioX,
