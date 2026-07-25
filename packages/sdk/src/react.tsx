@@ -1786,13 +1786,16 @@ export function tooltipPlacement(
     const maxWidth = Math.max(0, Math.min(preferred, spaceLeft))
     horizontal = { right: Math.round(Math.max(margin, viewport.width - button.right)), maxWidth: Math.round(maxWidth) }
   }
-  // Vertical: open above the button, but flip BELOW when there isn't room above (top-docked toolbar) so the
-  // popup never clips off the top. Also cap maxHeight to the room on the chosen side (paired with overflowY on
-  // the popup) so a taller-than-estimated popup — extra action row or long localized copy — can't overflow a
-  // short viewport in either direction.
-  const vertical: React.CSSProperties = button.top - margin >= estimatedHeight
-    ? { bottom: Math.round(viewport.height - button.top + 10), maxHeight: Math.max(0, Math.round(button.top - 10 - margin)) }
-    : { top: Math.round(button.bottom + 10), maxHeight: Math.max(0, Math.round(viewport.height - button.bottom - 10 - margin)) }
+  // Vertical: open above by default, but flip to whichever side actually has room. Enough room above → above;
+  // else enough room below → below; else (both cramped on a short/resized viewport) the side with MORE space.
+  // maxHeight is capped to the chosen side's room (paired with the popup's overflowY) so a taller-than-estimated
+  // popup — extra action row or long localized copy — can't overflow the viewport in either direction.
+  const spaceAbove = button.top - margin
+  const spaceBelow = viewport.height - button.bottom - margin
+  const openAbove = spaceAbove >= estimatedHeight ? true : spaceBelow >= estimatedHeight ? false : spaceAbove >= spaceBelow
+  const vertical: React.CSSProperties = openAbove
+    ? { bottom: Math.round(viewport.height - button.top + 10), maxHeight: Math.max(0, Math.round(spaceAbove - 10)) }
+    : { top: Math.round(button.bottom + 10), maxHeight: Math.max(0, Math.round(spaceBelow - 10)) }
   return { position: "fixed", ...vertical, ...horizontal }
 }
 
@@ -1807,6 +1810,7 @@ function ToolbarHelp({ tip, hideLabel, onHide }: { tip: string; hideLabel: strin
   const btnRef = React.useRef<HTMLButtonElement>(null)
   const popRef = React.useRef<HTMLDivElement>(null)
   const hideRowRef = React.useRef<HTMLButtonElement>(null)
+  const restoreFocusRef = React.useRef(true) // false when dismissed by an outside click, so that target keeps focus
   // Placement is measured on open; null means closed. Fixed-positioned off the button's viewport rect so the
   // popup never spills off a ~320px screen regardless of where the draggable toolbar is docked.
   const [placement, setPlacement] = React.useState<React.CSSProperties | null>(null)
@@ -1832,6 +1836,7 @@ function ToolbarHelp({ tip, hideLabel, onHide }: { tip: string; hideLabel: strin
     function onDocPointerDown(event: PointerEvent) {
       const target = event.target as Node | null
       if ((target && btnRef.current?.contains(target)) || (target && popRef.current?.contains(target))) return
+      restoreFocusRef.current = false // dismissed by an outside interaction — let that target keep its focus
       closeTip()
     }
     document.addEventListener("pointerdown", onDocPointerDown, true)
@@ -1855,9 +1860,12 @@ function ToolbarHelp({ tip, hideLabel, onHide }: { tip: string; hideLabel: strin
   // close/unmount, so keyboard focus doesn't get stranded on document.body.
   React.useEffect(() => {
     if (!open || typeof document === "undefined") return
+    restoreFocusRef.current = true
     const previouslyFocused = document.activeElement as HTMLElement | null
     hideRowRef.current?.focus()
-    return () => previouslyFocused?.focus?.()
+    // Restore focus to the trigger on a keyboard/programmatic close (Escape, toggle); NOT when dismissed by an
+    // outside click, which already moved focus to whatever the user clicked.
+    return () => { if (restoreFocusRef.current) previouslyFocused?.focus?.() }
   }, [open])
   // No early return on an empty tip: the '?' now owns the hide action, so it must always render — a host that
   // suppresses the tip copy still needs a way to hide the FAB.
@@ -1875,7 +1883,7 @@ function ToolbarHelp({ tip, hideLabel, onHide }: { tip: string; hideLabel: strin
       </button>
       {open && typeof document !== "undefined"
         ? createPortal(
-            <div ref={popRef} role="dialog" data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>
+            <div ref={popRef} role="dialog" aria-label={tip || hideLabel} data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>
               {tip ? <div style={helpTipTextStyle}>{tip}</div> : null}
               <button ref={hideRowRef} type="button" style={helpHideRowStyle} onClick={() => { closeTip(); onHide() }}>
                 <EyeOffIcon />

@@ -79,6 +79,17 @@ describe("'?' tooltip placement stays within the viewport (Lane R12 round 2/3)",
     expect(p).not.toHaveProperty("bottom")
     expect(p.maxHeight).toBe(640 - 58 - 10 - 12) // capped to the room below (finding 6)
   })
+
+  it("picks the side with MORE room when neither has the estimated height (short viewport)", () => {
+    // 200px viewport, button [90,118]: spaceAbove 78 > spaceBelow 70, both < 120 → open ABOVE (the roomier side)
+    const above = tooltipPlacement({ left: 100, right: 128, top: 90, bottom: 118 }, { width: 320, height: 200 })
+    expect(above).toHaveProperty("bottom")
+    expect(above).not.toHaveProperty("top")
+    // 130px viewport, button [30,58]: spaceAbove 18 < spaceBelow 60, both < 120 → open BELOW (the roomier side)
+    const below = tooltipPlacement({ left: 100, right: 128, top: 30, bottom: 58 }, { width: 320, height: 130 })
+    expect(below).toHaveProperty("top")
+    expect(below).not.toHaveProperty("bottom")
+  })
 })
 
 describe("screenshot comment card polish (Lane R8)", () => {
