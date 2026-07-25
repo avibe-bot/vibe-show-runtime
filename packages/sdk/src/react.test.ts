@@ -1,20 +1,112 @@
-import { describe, expect, it } from "vitest"
-import { DEFAULT_ANNOTATION_LABELS, disabledButtonStyle, modePillLabel, tooltipPlacement } from "./react.js"
+import { describe, expect, it, vi } from "vitest"
+import {
+  DEFAULT_ANNOTATION_LABELS,
+  disabledButtonStyle,
+  modePillLabel,
+  tooltipPlacement,
+  edgeHandleAnchor,
+  createChromeFocusController,
+  TOUCH_CAPABLE_QUERY
+} from "./react.js"
 
 // Overlay uses inline styles (no `:disabled` stylesheet), so the disabled LOOK is applied explicitly.
 // These pure assertions run in CI (the browser layout check does not), locking the visual contract the
 // owner flagged: a disabled send must read dimmed/gray, never the bright mint of an enabled action.
-describe("FAB tip / hidden-toast copy teaches Alt+M, not query-param jargon (Lane R12)", () => {
-  it("names Alt+M with the macOS ⌥M form and drops the ?mark / ?unmark wording", () => {
-    // Static, platform-neutral copy: spells both "Alt+M" and the macOS "⌥M" so a single default string is
-    // correct on every platform (no navigator-sniffing that would make the default env-dependent).
+describe("FAB copy leads with the edge handle; '?' popup owns the hide action (Lane R12/R13)", () => {
+  it("both the tip and the hidden toast name the edge handle + Alt+M, with no query-param jargon", () => {
     for (const copy of [DEFAULT_ANNOTATION_LABELS.fabTip, DEFAULT_ANNOTATION_LABELS.fabHiddenToast]) {
-      expect(copy).toContain("Alt+M")
-      expect(copy).toContain("⌥M")
+      expect(copy).toContain("把手") // the edge handle is THE cross-platform recovery, mentioned first
+      expect(copy).toContain("Alt+M") // desktop shortcut retained
     }
-    // query params stay the programmatic path but must no longer be the user-facing copy
+    expect(DEFAULT_ANNOTATION_LABELS.fabTip).toContain("⌥M") // macOS glyph kept in the (longer) tip
+    // query params stay the programmatic path but must not be the user-facing copy
     expect(DEFAULT_ANNOTATION_LABELS.fabTip).not.toContain("?unmark")
     expect(DEFAULT_ANNOTATION_LABELS.fabHiddenToast).not.toContain("?mark")
+  })
+
+  it("the '?' popup hide row carries a distinct destructive label (no longer a bare ✕)", () => {
+    expect(DEFAULT_ANNOTATION_LABELS.hideAction).toBe("隐藏标注按钮")
+  })
+
+  it("the '?' trigger has a fallback accessible name for when a host suppresses the tip copy", () => {
+    // With an empty fabTip the trigger's aria-label falls back to this so a screen reader never reads bare '?'.
+    expect(DEFAULT_ANNOTATION_LABELS.helpTrigger).toBe("帮助")
+  })
+})
+
+// The edge-handle hit box is sized by touch CAPABILITY, not the primary-pointer flag that drives
+// keyboard/layout behavior — otherwise a mouse-primary hybrid (laptop + touchscreen) keeps a 5px target it
+// can still finger-tap. Lock the media-query choice in CI so a refactor can't quietly revert to `pointer:`.
+describe("touch-capability query sizes the recovery handle hit box (Lane R13)", () => {
+  it("keys on any-pointer (device HAS a coarse pointer), not the primary hover/pointer signal", () => {
+    expect(TOUCH_CAPABLE_QUERY).toContain("any-pointer: coarse")
+    expect(TOUCH_CAPABLE_QUERY).not.toContain("hover") // must NOT be the primary-pointer layout query
+  })
+})
+
+// One focus-succession mechanism covers BOTH chrome swaps (hide→handle, restore→FAB): the successor control
+// claims focus on mount so a keyboard user is never dropped on <body>. The DOM wiring is browser-verified;
+// this locks the pure state machine — armed once, consumed once, never fires unarmed (e.g. initial load).
+describe("createChromeFocusController: focus follows the control that replaces the one in use (Lane R13)", () => {
+  it("focuses the next mounted control exactly once after a request, then disarms", () => {
+    const c = createChromeFocusController()
+    const first = { focus: vi.fn() }
+    const second = { focus: vi.fn() }
+    c.request()
+    c.claim(first)
+    expect(first.focus).toHaveBeenCalledTimes(1)
+    // A second mount without a new request (e.g. a re-render) must not steal focus back.
+    c.claim(second)
+    expect(second.focus).not.toHaveBeenCalled()
+  })
+
+  it("never focuses without a request — so a stored-hidden FAB can't autofocus its handle on page load", () => {
+    const c = createChromeFocusController()
+    const node = { focus: vi.fn() }
+    c.claim(node)
+    expect(node.focus).not.toHaveBeenCalled()
+  })
+
+  it("a null node (the outgoing control unmounting) is a no-op and keeps the request armed for the successor", () => {
+    const c = createChromeFocusController()
+    const successor = { focus: vi.fn() }
+    c.request()
+    c.claim(null) // outgoing control detaches first
+    c.claim(successor) // incoming control mounts
+    expect(successor.focus).toHaveBeenCalledTimes(1)
+  })
+
+  it("re-arms for each swap: a fresh request focuses the next control again", () => {
+    const c = createChromeFocusController()
+    const a = { focus: vi.fn() }
+    const b = { focus: vi.fn() }
+    c.request()
+    c.claim(a)
+    c.request()
+    c.claim(b)
+    expect(a.focus).toHaveBeenCalledTimes(1)
+    expect(b.focus).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("edgeHandleAnchor: places the hidden-FAB recovery grabber at the last snapped edge (Lane R13)", () => {
+  it("pins to a stored placement's edge + vertical offset, inner corners rounded", () => {
+    expect(edgeHandleAnchor({ edge: "left", top: 120 })).toEqual({ left: 0, borderRadius: "0 8px 8px 0", top: 120 })
+    expect(edgeHandleAnchor({ edge: "right", top: 240 })).toEqual({ right: 0, borderRadius: "8px 0 0 8px", top: 240 })
+  })
+
+  it("defaults to the right edge, vertically centered, when the FAB was never dragged", () => {
+    for (const p of [null, undefined]) {
+      expect(edgeHandleAnchor(p)).toEqual({ right: 0, borderRadius: "8px 0 0 8px", top: "calc(50% - 24px)" })
+    }
+  })
+
+  it("clamps a stored top into the current viewport so the handle never strands off-screen (P1)", () => {
+    // top 700 saved in a taller window, opened at 640px → clamp to 640 - 48 - 12 = 580
+    expect(edgeHandleAnchor({ edge: "right", top: 700 }, 640).top).toBe(580)
+    expect(edgeHandleAnchor({ edge: "left", top: -50 }, 640).top).toBe(12) // negative clamps up to the margin
+    expect(edgeHandleAnchor({ edge: "right", top: 200 }, 640).top).toBe(200) // within range → unchanged
+    expect(edgeHandleAnchor({ edge: "right", top: 700 }).top).toBe(700) // no viewport known → raw top
   })
 })
 
@@ -45,13 +137,26 @@ describe("'?' tooltip placement stays within the viewport (Lane R12 round 2/3)",
     expect(p.maxWidth).toBe(280)
     expect(p.bottom).toBe(900 - 400 + 10) // bottom edge 10px above the button top
     expect(p).not.toHaveProperty("top")
+    expect(p.maxHeight).toBe(400 - 10 - 12) // capped to the room above so a tall popup can't overflow the top
   })
 
   it("flips BELOW the button when the toolbar is top-docked (no room above)", () => {
-    // button.top ~30 leaves < estimatedHeight above → must open below, not clip off the top (finding 4)
+    // button.top ~30 leaves < estimatedHeight above → must open below, not clip off the top
     const p = tooltipPlacement({ left: 260, right: 288, top: 30, bottom: 58 }, vp)
     expect(p.top).toBe(58 + 10)
     expect(p).not.toHaveProperty("bottom")
+    expect(p.maxHeight).toBe(640 - 58 - 10 - 12) // capped to the room below (finding 6)
+  })
+
+  it("picks the side with MORE room when neither has the estimated height (short viewport)", () => {
+    // 200px viewport, button [90,118]: spaceAbove 78 > spaceBelow 70, both < 120 → open ABOVE (the roomier side)
+    const above = tooltipPlacement({ left: 100, right: 128, top: 90, bottom: 118 }, { width: 320, height: 200 })
+    expect(above).toHaveProperty("bottom")
+    expect(above).not.toHaveProperty("top")
+    // 130px viewport, button [30,58]: spaceAbove 18 < spaceBelow 60, both < 120 → open BELOW (the roomier side)
+    const below = tooltipPlacement({ left: 100, right: 128, top: 30, bottom: 58 }, { width: 320, height: 130 })
+    expect(below).toHaveProperty("top")
+    expect(below).not.toHaveProperty("bottom")
   })
 })
 

@@ -214,8 +214,14 @@ export type AnnotationOverlayLabels = {
   addNote?: string
   /** One-line tip shown by the toolbar '?' affordance. */
   fabTip?: string
-  /** Toast shown after the '✕' affordance hides the FAB. */
+  /** Toast shown after hiding the FAB. */
   fabHiddenToast?: string
+  /** Accessible name for the edge-handle grabber that restores a hidden FAB. */
+  restoreHandle?: string
+  /** Destructive action-row label inside the '?' popup that hides the FAB. */
+  hideAction?: string
+  /** Accessible name for the '?' help trigger, used when a host suppresses the visible tip copy. */
+  helpTrigger?: string
 }
 
 // Required<> so the built-in defaults must stay complete (every field, incl. the optional ones)
@@ -244,8 +250,11 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   enterToSend: "Enter 发送 · Esc 取消",
   approve: "批准",
   addNote: "添加备注",
-  fabTip: "点选元素或截图，把意见直接发给 Agent；按 Alt+M 显示/隐藏本按钮（macOS 为 ⌥M）",
-  fabHiddenToast: "已隐藏，按 Alt+M 恢复（macOS ⌥M）"
+  fabTip: "点选元素或截图，把意见直接发给 Agent；隐藏后轻点边缘把手可恢复（桌面 Alt+M，macOS ⌥M）",
+  fabHiddenToast: "已隐藏，轻点边缘把手恢复（桌面也可按 Alt+M）",
+  restoreHandle: "显示标注按钮",
+  hideAction: "隐藏标注按钮",
+  helpTrigger: "帮助"
 }
 
 export type AnnotationOverlayProps = {
@@ -780,6 +789,9 @@ export function AnnotationOverlay({
     merged.addNote = labels?.addNote ?? DEFAULT_ANNOTATION_LABELS.addNote
     merged.fabTip = labels?.fabTip ?? DEFAULT_ANNOTATION_LABELS.fabTip
     merged.fabHiddenToast = labels?.fabHiddenToast ?? DEFAULT_ANNOTATION_LABELS.fabHiddenToast
+    merged.restoreHandle = labels?.restoreHandle ?? DEFAULT_ANNOTATION_LABELS.restoreHandle
+    merged.hideAction = labels?.hideAction ?? DEFAULT_ANNOTATION_LABELS.hideAction
+    merged.helpTrigger = labels?.helpTrigger ?? DEFAULT_ANNOTATION_LABELS.helpTrigger
     return merged
   }, [labels])
   const intentOptions = intents ?? DEFAULT_ANNOTATION_INTENTS
@@ -1298,7 +1310,7 @@ export function AnnotationOverlay({
                     void submit()
                   }
                 }}
-                style={overlayTextareaStyle}
+                style={touchInput ? overlayTextareaTouchStyle : overlayTextareaStyle}
               />
             ) : (
               // Approve fast path: box hidden by default; offer a minimal opt-in to add a note.
@@ -1441,6 +1453,112 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined) {
   return { visible, hide, show }
 }
 
+/**
+ * Focus succession for the show/hide chrome swap. Hiding the FAB and restoring it each REPLACE the control the
+ * user was operating (toolbar/FAB ⇄ edge handle). On a USER-initiated swap the successor must claim focus or it
+ * collapses to <body>, stranding a keyboard user mid-page — and this is symmetric: hide→handle AND restore→FAB
+ * fail the same way. So it's one mechanism, not a focus flag per direction: request() arms the next mount;
+ * whichever primary control mounts next calls claim(node) to grab focus, then disarms. Never fires on the
+ * initial page load (nothing arms it there), so a stored-hidden FAB can't autofocus its handle on load.
+ * The state is a plain object so the transition is unit-tested without a DOM.
+ */
+export function createChromeFocusController() {
+  let pending = false
+  return {
+    request() {
+      pending = true
+    },
+    claim(node: { focus: () => void } | null) {
+      if (!node || !pending) return
+      pending = false
+      node.focus()
+    }
+  }
+}
+
+/** React binding for {@link createChromeFocusController}: a stable request() + a callback ref that claims focus. */
+function usePendingChromeFocus() {
+  const controller = React.useRef<ReturnType<typeof createChromeFocusController> | null>(null)
+  if (!controller.current) controller.current = createChromeFocusController()
+  const request = React.useCallback(() => controller.current!.request(), [])
+  // A stable callback ref → fires only on mount/unmount, not every render (a drag re-renders the FAB often).
+  const claimRef = React.useCallback((node: HTMLElement | null) => controller.current!.claim(node), [])
+  return { request, claimRef }
+}
+
+/**
+ * Position the edge-handle grabber at the FAB's last snapped edge. Pure so the edge/default logic is
+ * unit-tested: an existing placement pins the handle to that edge + vertical offset; with none it defaults
+ * to the right edge, vertically centered. The inner corners (facing into the viewport) are rounded.
+ */
+export function edgeHandleAnchor(
+  placement: FloatPlacement | null | undefined,
+  viewportHeight?: number,
+  opts: { margin?: number; height?: number } = {}
+): React.CSSProperties {
+  const margin = opts.margin ?? 12
+  const height = opts.height ?? 48
+  const side: React.CSSProperties =
+    (placement?.edge ?? "right") === "left" ? { left: 0, borderRadius: "0 8px 8px 0" } : { right: 0, borderRadius: "8px 0 0 8px" }
+  let vertical: React.CSSProperties
+  if (placement) {
+    // Clamp the stored top into the CURRENT viewport — a placement saved in a taller window must not leave the
+    // handle off-screen, which would strand the only recovery path. Raw top only when no viewport is known.
+    vertical =
+      typeof viewportHeight === "number"
+        ? { top: Math.max(margin, Math.min(placement.top, Math.max(margin, viewportHeight - height - margin))) }
+        : { top: placement.top }
+  } else {
+    vertical = { top: "calc(50% - 24px)" } // never dragged → vertically centered (auto-clamps to the viewport)
+  }
+  return { ...side, ...vertical }
+}
+
+/**
+ * The minimal grabber left at the screen edge when the FAB is hidden — the PRIMARY cross-platform recovery
+ * path, and the ONLY one on touch (where Alt+M doesn't exist). A ~5px strip at the FAB's last snapped edge;
+ * tapping it restores the FAB (same persistence). Barely visible at rest, a touch stronger on hover / press.
+ */
+function FabEdgeHandle({ sessionId, label, placement, touchCapable, focusRef, onRestore }: { sessionId: string | undefined; label: string; placement: FloatPlacement | null; touchCapable: boolean; focusRef: (node: HTMLButtonElement | null) => void; onRestore: () => void }) {
+  const storage = React.useMemo(() => safeLocalStorage(), [])
+  const stored = React.useMemo(() => readStoredFloatPlacement("fab", sessionId, storage) ?? null, [sessionId, storage])
+  // Prefer the FAB's LIVE placement (from useDraggable): a drag whose storage write failed still moved the FAB
+  // in memory, so re-reading storage here would strand the handle at a stale edge. Fall back to the stored value.
+  const resolved = placement ?? stored
+  const [active, setActive] = React.useState(false)
+  // Track the viewport height so a stored top is re-clamped on resize/rotate and the handle can't drift off-screen.
+  const [viewportHeight, setViewportHeight] = React.useState<number | undefined>(() => (typeof window !== "undefined" ? window.innerHeight : undefined))
+  React.useEffect(() => {
+    if (typeof window === "undefined") return
+    const onResize = () => setViewportHeight(window.innerHeight)
+    window.addEventListener("resize", onResize)
+    return () => window.removeEventListener("resize", onResize)
+  }, [])
+  const anchor = edgeHandleAnchor(resolved, viewportHeight)
+  const edge = resolved?.edge ?? "right"
+  const visualWidth = active ? 7 : 5
+  // The BUTTON is a transparent hit target — ~44px wide on any touch-CAPABLE device (incl. mouse-primary hybrids,
+  // where it may still be finger-tapped) so the only mobile recovery control is actually tappable; a thin mint
+  // strip sits flush to the screen edge inside it. A real box, not a pseudo-element, because elementFromPoint (and
+  // taps) ignore pseudo-elements. A pure pointer-only device keeps hit == visual. focusRef lands keyboard focus
+  // here after a user-initiated hide (see usePendingChromeFocus); never on initial page load.
+  return (
+    <button
+      ref={focusRef}
+      type="button"
+      data-show-annotation-ui=""
+      aria-label={label}
+      style={{ ...fabEdgeHandleStyle, top: anchor.top, ...(edge === "left" ? { left: 0, justifyContent: "flex-start" } : { right: 0, justifyContent: "flex-end" }), width: touchCapable ? 44 : visualWidth }}
+      onPointerEnter={() => setActive(true)}
+      onPointerLeave={() => setActive(false)}
+      onPointerDown={() => setActive(true)}
+      onClick={onRestore}
+    >
+      <span aria-hidden="true" style={{ ...fabEdgeHandleVisualStyle, width: visualWidth, borderRadius: anchor.borderRadius, opacity: active ? 0.55 : 0.2 }} />
+    </button>
+  )
+}
+
 // A touch above the old 20px: a down-biased drop shadow needs clearance from the viewport bottom or its
 // lower half is clipped (owner mobile report). This inset is the floating-chrome margin AND the drag
 // bottom bound, so the shadow renders fully at the resting position and at any snapped position.
@@ -1449,6 +1567,8 @@ const FLOAT_INSET = 26
 type DraggableResult = {
   style: React.CSSProperties
   dragging: boolean
+  /** The current resting edge placement (edge + top), or null before the element has been dragged. */
+  placement: FloatPlacement | null
   pointerHandlers: Pick<React.DOMAttributes<HTMLElement>, "onPointerDown" | "onPointerMove" | "onPointerUp" | "onPointerCancel">
   /** Call at the start of onClick: returns true (and consumes) when the gesture was a drag, not a click. */
   consumeDragClick: () => boolean
@@ -1547,7 +1667,7 @@ function useDraggable(element: "fab" | "badge", sessionId: string | undefined, r
     : placement
       ? { top: placement.top, bottom: "auto", touchAction: "none", ...(placement.edge === "left" ? { left: FLOAT_INSET, right: "auto" } : { right: FLOAT_INSET, left: "auto" }) }
       : { touchAction: "none" }
-  return { style, dragging, pointerHandlers: { onPointerDown, onPointerMove, onPointerUp: finish, onPointerCancel: finish }, consumeDragClick }
+  return { style, dragging, placement, pointerHandlers: { onPointerDown, onPointerMove, onPointerUp: finish, onPointerCancel: finish }, consumeDragClick }
 }
 
 function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, sessionId, onEnable, onDisable, onSetMode }: AnnotationChromeProps) {
@@ -1557,6 +1677,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // Hooks must be unconditional (called before the host/availability early returns below).
   const fabVisibility = useFabVisibility(host, sessionId)
   const fabDrag = useDraggable("fab", sessionId, 52) // FAB is 52px tall
+  const touchCapable = useTouchCapable() // any-pointer:coarse → enlarge the edge-handle hit box even on hybrids
   const [toast, setToast] = React.useState<string | null>(null)
   const toastTimer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   React.useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
@@ -1565,13 +1686,23 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     if (toastTimer.current) clearTimeout(toastTimer.current)
     toastTimer.current = setTimeout(() => setToast(null), 3200)
   }, [])
-  // ✕ affordance: hide the FAB (≡ #unmark, persisted) and confirm with a brief toast so the user knows
-  // how to bring it back. Also disables an active session so nothing is left capturing.
+  // Hiding and restoring the FAB both swap the control the user is on (toolbar/FAB ⇄ edge handle); on either
+  // user-initiated swap the successor claims focus via this one controller, so a keyboard user is never dropped
+  // on <body>. chromeFocusRef is the shared callback ref both the handle and the restored FAB attach.
+  const { request: requestChromeFocus, claimRef: chromeFocusRef } = usePendingChromeFocus()
+  // Hide the FAB (≡ #unmark, persisted) and confirm with a brief toast so the user knows how to bring it back.
+  // Also disables an active session so nothing is left capturing, and arms focus for the recovery handle.
   const hideFab = React.useCallback(() => {
+    requestChromeFocus()
     onDisable?.()
     fabVisibility.hide()
     if (labels.fabHiddenToast) flashToast(labels.fabHiddenToast)
-  }, [onDisable, fabVisibility, flashToast, labels.fabHiddenToast])
+  }, [requestChromeFocus, onDisable, fabVisibility, flashToast, labels.fabHiddenToast])
+  // Restore the FAB (edge-handle tap/Enter, or Alt+M): arm focus so the re-rendered FAB — not <body> — receives it.
+  const restoreFab = React.useCallback(() => {
+    requestChromeFocus()
+    fabVisibility.show()
+  }, [requestChromeFocus, fabVisibility])
   // If the hash flips to #unmark (or the ✕ fires) WHILE a session is active, the hide switch must also
   // stop capture — not just hide the collapsed FAB — so the documented switch works mid-session (#3637478399).
   React.useEffect(() => {
@@ -1589,13 +1720,13 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
       if (fabVisibility.visible) {
         hideFab()
       } else {
-        fabVisibility.show()
+        restoreFab()
         if (labels.fabTip) flashToast(labels.fabTip)
       }
     }
     document.addEventListener("keydown", onKeyDown)
     return () => document.removeEventListener("keydown", onKeyDown)
-  }, [host, fabVisibility, hideFab, flashToast, labels.fabTip])
+  }, [host, fabVisibility, hideFab, restoreFab, flashToast, labels.fabTip])
 
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
@@ -1617,7 +1748,19 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // #3637478399); the disable effect above stops capture too. The toast still renders so the ✕
   // confirmation shows even after the chrome is hidden.
   if (!fabVisibility.visible) {
-    return toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null
+    // Hidden FAB: leave a minimal edge-handle grabber (standalone) — the PRIMARY recovery path, and the ONLY
+    // one on touch, where Alt+M doesn't exist. Tapping it restores the FAB. The toast still renders so the
+    // ✕ / Alt+M confirmation shows even after the chrome is hidden.
+    return (
+      <>
+        {host === "standalone" && available ? (
+          // Only when the viewer can actually annotate — an anonymous viewer's FAB is a login hint, not the
+          // real FAB, so a recovery handle there would restore to nothing useful. Prefer the live drag placement.
+          <FabEdgeHandle sessionId={sessionId} label={labels.restoreHandle ?? DEFAULT_ANNOTATION_LABELS.restoreHandle} placement={fabDrag.placement} touchCapable={touchCapable} focusRef={chromeFocusRef} onRestore={restoreFab} />
+        ) : null}
+        {toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null}
+      </>
+    )
   }
 
   // Standalone tab: anonymous public visitors can't write — hide the FAB, show a quiet login hint.
@@ -1636,6 +1779,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   if (!enabled) {
     content = (
       <button
+        ref={chromeFocusRef}
         type="button"
         data-show-annotation-ui=""
         aria-label={labels.annotating}
@@ -1659,10 +1803,12 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
         </button>
         <ModeTab active={mode === "smart"} onClick={() => onSetMode?.("smart")} icon={<SparkleIcon />} label={labels.smart} compact={touchInput} />
         <ModeTab active={mode === "screenshot"} onClick={() => onSetMode?.("screenshot")} icon={<CameraIcon />} label={labels.screenshot} compact={touchInput} />
+        <span aria-hidden="true" style={toolbarDividerStyle} />
+        {/* '?' popup holds the one-line tip AND a deliberate red "hide" row — the ✕ used to sit next to 退出
+            and read as a second "close", so hiding is now a two-step (tap ? → tap the red row). 退出 sits at
+            the far right (owner mobile order) so the row reads [toggle][Smart][截图][divider][?][退出]. */}
+        <ToolbarHelp tip={labels.fabTip ?? ""} hideLabel={labels.hideAction ?? DEFAULT_ANNOTATION_LABELS.hideAction} triggerLabel={labels.helpTrigger ?? DEFAULT_ANNOTATION_LABELS.helpTrigger} onHide={hideFab} />
         <button type="button" style={toolbarExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
-        {/* Trailing subtle affordances: '?' one-line tip, '✕' hide (≡ #unmark). */}
-        <ToolbarHelp tip={labels.fabTip ?? ""} touchInput={touchInput} />
-        <button type="button" aria-label={labels.fabHiddenToast ?? "hide"} style={toolbarGlyphButtonStyle} onClick={hideFab}>✕</button>
       </div>
     )
   }
@@ -1688,7 +1834,7 @@ export function tooltipPlacement(
 ): React.CSSProperties {
   const margin = opts.margin ?? 12
   const preferred = opts.preferredMaxWidth ?? 280
-  const estimatedHeight = opts.estimatedHeight ?? 96 // conservative tip height for the above/below flip
+  const estimatedHeight = opts.estimatedHeight ?? 120 // tip text + one action row — bias the above/below flip
   // Horizontal: open toward the roomier side, cap the (border-box) width to that space, clamp within a margin.
   const spaceLeft = button.right - margin // room from the viewport's left margin to the button's right edge
   const spaceRight = viewport.width - button.left - margin
@@ -1700,20 +1846,35 @@ export function tooltipPlacement(
     const maxWidth = Math.max(0, Math.min(preferred, spaceLeft))
     horizontal = { right: Math.round(Math.max(margin, viewport.width - button.right)), maxWidth: Math.round(maxWidth) }
   }
-  // Vertical: open above the button, but flip BELOW when there isn't room above (top-docked toolbar) so the tip
-  // never clips off the top. Uses a conservative height estimate since the tip's real height isn't known yet.
-  const vertical: React.CSSProperties = button.top - margin >= estimatedHeight
-    ? { bottom: Math.round(viewport.height - button.top + 10) }
-    : { top: Math.round(button.bottom + 10) }
+  // Vertical: open above by default, but flip to whichever side actually has room. Enough room above → above;
+  // else enough room below → below; else (both cramped on a short/resized viewport) the side with MORE space.
+  // maxHeight is capped to the chosen side's room (paired with the popup's overflowY) so a taller-than-estimated
+  // popup — extra action row or long localized copy — can't overflow the viewport in either direction.
+  const spaceAbove = button.top - margin
+  const spaceBelow = viewport.height - button.bottom - margin
+  const openAbove = spaceAbove >= estimatedHeight ? true : spaceBelow >= estimatedHeight ? false : spaceAbove >= spaceBelow
+  const vertical: React.CSSProperties = openAbove
+    ? { bottom: Math.round(viewport.height - button.top + 10), maxHeight: Math.max(0, Math.round(spaceAbove - 10)) }
+    : { top: Math.round(button.bottom + 10), maxHeight: Math.max(0, Math.round(spaceBelow - 10)) }
   return { position: "fixed", ...vertical, ...horizontal }
 }
 
-/** Subtle '?' affordance on the toolbar: hover (mouse) or tap (touch) reveals a short tip. */
-function ToolbarHelp({ tip, touchInput }: { tip: string; touchInput: boolean }) {
+/**
+ * The toolbar '?' affordance: click/tap to open a compact popup holding the one-line tip AND a single,
+ * DELIBERATE red "hide" action row. The ✕ used to sit next to 退出 and read as a second "close", so users
+ * mis-clicked between them; moving hide behind a two-step (tap ? → tap the red row) removes that adjacent
+ * twin. Portaled to <body> so `position: fixed` escapes the toolbar's backdrop-filter containing block;
+ * closes on an outside pointer-down.
+ */
+function ToolbarHelp({ tip, hideLabel, triggerLabel, onHide }: { tip: string; hideLabel: string; triggerLabel: string; onHide: () => void }) {
   const btnRef = React.useRef<HTMLButtonElement>(null)
-  // Placement is measured on open; null means closed. Fixed-positioned off the button's viewport rect so
-  // the tip never spills off a ~320px screen regardless of where the draggable toolbar is docked.
+  const popRef = React.useRef<HTMLDivElement>(null)
+  const hideRowRef = React.useRef<HTMLButtonElement>(null)
+  const restoreFocusRef = React.useRef(true) // false when dismissed by an outside click, so that target keeps focus
+  // Placement is measured on open; null means closed. Fixed-positioned off the button's viewport rect so the
+  // popup never spills off a ~320px screen regardless of where the draggable toolbar is docked.
   const [placement, setPlacement] = React.useState<React.CSSProperties | null>(null)
+  const open = placement !== null
   const openTip = React.useCallback(() => {
     const button = btnRef.current
     if (!button || typeof window === "undefined") {
@@ -1729,28 +1890,68 @@ function ToolbarHelp({ tip, touchInput }: { tip: string; touchInput: boolean }) 
     )
   }, [])
   const closeTip = React.useCallback(() => setPlacement(null), [])
-  if (!tip) return null
-  const open = placement !== null
+  // Close on a pointer down outside the button + popup (the popup is portaled, so it isn't a DOM descendant).
+  React.useEffect(() => {
+    if (!open || typeof document === "undefined") return
+    function onDocPointerDown(event: PointerEvent) {
+      const target = event.target as Node | null
+      if ((target && btnRef.current?.contains(target)) || (target && popRef.current?.contains(target))) return
+      restoreFocusRef.current = false // dismissed by an outside interaction — let that target keep its focus
+      closeTip()
+    }
+    document.addEventListener("pointerdown", onDocPointerDown, true)
+    return () => document.removeEventListener("pointerdown", onDocPointerDown, true)
+  }, [open, closeTip])
+  // Consume Escape while open so it CLOSES the popup instead of reaching the overlay-wide Escape handler, which
+  // would otherwise disable annotation entirely. Capture phase + stopPropagation intercepts it first.
+  React.useEffect(() => {
+    if (!open || typeof document === "undefined") return
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return
+      event.stopPropagation()
+      event.preventDefault()
+      closeTip()
+    }
+    document.addEventListener("keydown", onKeyDown, true)
+    return () => document.removeEventListener("keydown", onKeyDown, true)
+  }, [open, closeTip])
+  // Move focus INTO the dialog on open: the hide row is portaled to end-of-body, so a keyboard Tab from the
+  // trigger would otherwise skip it and land on 退出. Restore focus to whatever was focused (the trigger) on
+  // close/unmount, so keyboard focus doesn't get stranded on document.body.
+  React.useEffect(() => {
+    if (!open || typeof document === "undefined") return
+    restoreFocusRef.current = true
+    const previouslyFocused = document.activeElement as HTMLElement | null
+    hideRowRef.current?.focus()
+    // Restore focus to the trigger on a keyboard/programmatic close (Escape, toggle); NOT when dismissed by an
+    // outside click, which already moved focus to whatever the user clicked.
+    return () => { if (restoreFocusRef.current) previouslyFocused?.focus?.() }
+  }, [open])
+  // No early return on an empty tip: the '?' now owns the hide action, so it must always render — a host that
+  // suppresses the tip copy still needs a way to hide the FAB.
   return (
     <span style={{ position: "relative", display: "inline-flex" }}>
       <button
         ref={btnRef}
         type="button"
-        aria-label={tip}
+        // A host may suppress the visible tip (empty fabTip) yet still needs the hide action here, so the
+        // trigger must never fall back to its bare "?" glyph for a screen reader — name it "帮助" in that case.
+        aria-label={tip || triggerLabel}
+        aria-expanded={open}
         style={toolbarGlyphButtonStyle}
-        onPointerEnter={() => { if (!touchInput) openTip() }}
-        onPointerLeave={() => { if (!touchInput) closeTip() }}
-        onClick={() => { if (touchInput) (open ? closeTip() : openTip()) }}
-        onBlur={closeTip}
+        onClick={() => (open ? closeTip() : openTip())}
       >
         ?
       </button>
       {open && typeof document !== "undefined"
         ? createPortal(
-            // Portal to <body> so the fixed-position tip escapes the toolbar's backdrop-filter containing
-            // block — otherwise `position: fixed` resolves against the filtered toolbar, not the viewport,
-            // and the viewport-derived clamp lands off-screen. data-show-annotation-ui keeps it out of captures.
-            <span role="tooltip" data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>{tip}</span>,
+            <div ref={popRef} role="dialog" aria-label={tip || triggerLabel} data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>
+              {tip ? <div style={helpTipTextStyle}>{tip}</div> : null}
+              <button ref={hideRowRef} type="button" style={helpHideRowStyle} onClick={() => { restoreFocusRef.current = false; closeTip(); onHide() }}>
+                <EyeOffIcon />
+                <span>{hideLabel}</span>
+              </button>
+            </div>,
             document.body
           )
         : null}
@@ -1899,6 +2100,7 @@ type ScreenshotBatchCardProps = {
 
 /** Scrollable body of the screenshot batch card (header, preview, numbered comment list, input). */
 function ScreenshotBatchBody({ draft, comment, labels, onCommentChange, onRemoveItem }: Pick<ScreenshotBatchCardProps, "draft" | "comment" | "labels" | "onCommentChange" | "onRemoveItem">) {
+  const touchInput = useTouchInput() // ≥16px input font on touch so iOS doesn't focus-zoom the send button off-screen
   return (
     <>
       <div style={batchHeaderStyle}>
@@ -1921,7 +2123,7 @@ function ScreenshotBatchBody({ draft, comment, labels, onCommentChange, onRemove
         placeholder={labels.screenshotCommentPlaceholder}
         value={comment}
         onChange={(event) => onCommentChange(event.target.value)}
-        style={overlayTextareaStyle}
+        style={touchInput ? overlayTextareaTouchStyle : overlayTextareaStyle}
       />
     </>
   )
@@ -1955,10 +2157,20 @@ function ScreenshotBatchFooter({ draft, comment, submitting, labels, onAddCommen
 //    off-screen). Layout-only — it must NOT gate keyboard affordances.
 const TOUCH_INPUT_QUERY = "(hover: none) and (pointer: coarse)"
 const CRAMPED_LAYOUT_QUERY = `${TOUCH_INPUT_QUERY}, (max-width: 640px)`
+//  • TOUCH-CAPABLE — the device HAS a coarse pointer at all (`any-pointer`), even when the PRIMARY one is a
+//    mouse/trackpad. This is deliberately broader than TOUCH_INPUT_QUERY: a hybrid laptop with a touchscreen
+//    is `pointer: fine` (primary) but `any-pointer: coarse`. Sizes only the edge-handle hit target, which the
+//    user may tap by finger regardless of the primary pointer — it must NOT gate keyboard/layout behavior.
+export const TOUCH_CAPABLE_QUERY = "(any-pointer: coarse)"
 
 /** Touch-primary input (coarse pointer, no hover); incl. iPad+keyboard, without UA sniffing. */
 function useTouchInput() {
   return useMediaQuery(TOUCH_INPUT_QUERY)
+}
+
+/** Device HAS a touchscreen (`any-pointer: coarse`), incl. mouse-primary hybrids — sizes the handle hit box. */
+function useTouchCapable() {
+  return useMediaQuery(TOUCH_CAPABLE_QUERY)
 }
 
 /** Use the bottom-sheet layout: touch device OR a viewport too narrow for the popover (#534). */
@@ -2757,6 +2969,14 @@ const overlayTextareaStyle: React.CSSProperties = {
   width: "100%"
 }
 
+// iOS auto-zooms the page when a focused input's font-size is < 16px, pushing the send button off-screen. On
+// touch / coarse-pointer viewports use ≥16px to remove that trigger (line-height nudged for the larger text);
+// desktop keeps the compact 13px. We fix the INPUT, not the page's viewport meta (disabling zoom harms a11y).
+const overlayTextareaTouchStyle: React.CSSProperties = {
+  ...overlayTextareaStyle,
+  font: `16px/1.4 ${FONT_STACK}`
+}
+
 const cardFooterStyle: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
@@ -2949,6 +3169,30 @@ const fabStyle: React.CSSProperties = {
   WebkitBackdropFilter: "blur(16px)"
 }
 
+// The hidden-FAB recovery grabber: a thin mint strip flush to the last snapped edge. Width/top/border-radius/
+// opacity come from edgeHandleAnchor() + the hover/press state; kept intentionally faint at rest.
+const fabEdgeHandleStyle: React.CSSProperties = {
+  position: "fixed",
+  height: 48,
+  padding: 0,
+  border: 0,
+  background: "transparent", // the visible strip is the inner span; the button is the (wider on touch) hit target
+  cursor: "pointer",
+  zIndex: CHROME_Z,
+  touchAction: "manipulation",
+  WebkitTapHighlightColor: "transparent",
+  display: "flex",
+  alignItems: "stretch",
+  transition: "width 140ms ease"
+}
+
+// The thin mint strip inside the (transparent) hit button — flush to the screen edge, height fills the button.
+const fabEdgeHandleVisualStyle: React.CSSProperties = {
+  background: COLORS.human,
+  pointerEvents: "none",
+  transition: "opacity 140ms ease, width 140ms ease"
+}
+
 // Standalone pill toolbar (expanded).
 const toolbarStyle: React.CSSProperties = {
   position: "fixed",
@@ -3034,8 +3278,14 @@ const toolbarHelpTipStyle: React.CSSProperties = {
   boxSizing: "border-box",
   width: "max-content",
   whiteSpace: "normal",
-  padding: "8px 10px",
-  borderRadius: 10,
+  // A compact column: tip text + one red hide row. Interactive now (the row is a button), so pointer events
+  // are enabled — clicks land on the row rather than passing through.
+  display: "flex",
+  flexDirection: "column",
+  gap: 8,
+  padding: 8,
+  borderRadius: 12,
+  overflowY: "auto", // paired with the placement's maxHeight so a tall popup scrolls rather than overflowing
   background: COLORS.surfacePopover,
   border: `1px solid ${COLORS.border}`,
   color: COLORS.textPrimary,
@@ -3044,7 +3294,39 @@ const toolbarHelpTipStyle: React.CSSProperties = {
   backdropFilter: "blur(16px)",
   WebkitBackdropFilter: "blur(16px)",
   zIndex: CARD_Z,
-  pointerEvents: "none"
+  pointerEvents: "auto"
+}
+
+/** The tip text block inside the '?' popup. */
+const helpTipTextStyle: React.CSSProperties = {
+  padding: "2px 4px",
+  color: COLORS.textPrimary,
+  font: `500 12px/1.5 ${FONT_STACK}`
+}
+
+/** The deliberate destructive "hide the FAB" row inside the '?' popup — red icon + red text, faint red field. */
+const helpHideRowStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  width: "100%",
+  padding: "8px 10px",
+  border: 0,
+  borderRadius: 8,
+  background: "rgba(255, 107, 107, 0.12)",
+  color: COLORS.danger,
+  font: `600 12px/1.2 ${FONT_STACK}`,
+  cursor: "pointer",
+  textAlign: "left"
+}
+
+/** Thin vertical rule separating the mode tabs from the exit / help affordances in the toolbar row. */
+const toolbarDividerStyle: React.CSSProperties = {
+  width: 1,
+  alignSelf: "stretch",
+  flexShrink: 0,
+  margin: "6px 2px",
+  background: COLORS.border
 }
 
 const toastStyle: React.CSSProperties = {
@@ -3493,6 +3775,15 @@ function TrashIcon({ size = 14 }: IconProps) {
   return (
     <svg {...svgProps(size)}>
       <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M6 6l1 14a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-14" />
+    </svg>
+  )
+}
+
+function EyeOffIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+      <path d="M1 1l22 22" />
     </svg>
   )
 }
