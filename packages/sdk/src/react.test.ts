@@ -32,6 +32,14 @@ describe("edgeHandleAnchor: places the hidden-FAB recovery grabber at the last s
       expect(edgeHandleAnchor(p)).toEqual({ right: 0, borderRadius: "8px 0 0 8px", top: "calc(50% - 24px)" })
     }
   })
+
+  it("clamps a stored top into the current viewport so the handle never strands off-screen (P1)", () => {
+    // top 700 saved in a taller window, opened at 640px → clamp to 640 - 48 - 12 = 580
+    expect(edgeHandleAnchor({ edge: "right", top: 700 }, 640).top).toBe(580)
+    expect(edgeHandleAnchor({ edge: "left", top: -50 }, 640).top).toBe(12) // negative clamps up to the margin
+    expect(edgeHandleAnchor({ edge: "right", top: 200 }, 640).top).toBe(200) // within range → unchanged
+    expect(edgeHandleAnchor({ edge: "right", top: 700 }).top).toBe(700) // no viewport known → raw top
+  })
 })
 
 describe("'?' tooltip placement stays within the viewport (Lane R12 round 2/3)", () => {

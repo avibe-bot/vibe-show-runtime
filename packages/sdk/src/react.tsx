@@ -1454,10 +1454,26 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined) {
  * unit-tested: an existing placement pins the handle to that edge + vertical offset; with none it defaults
  * to the right edge, vertically centered. The inner corners (facing into the viewport) are rounded.
  */
-export function edgeHandleAnchor(placement: FloatPlacement | null | undefined): React.CSSProperties {
+export function edgeHandleAnchor(
+  placement: FloatPlacement | null | undefined,
+  viewportHeight?: number,
+  opts: { margin?: number; height?: number } = {}
+): React.CSSProperties {
+  const margin = opts.margin ?? 12
+  const height = opts.height ?? 48
   const side: React.CSSProperties =
     (placement?.edge ?? "right") === "left" ? { left: 0, borderRadius: "0 8px 8px 0" } : { right: 0, borderRadius: "8px 0 0 8px" }
-  const vertical: React.CSSProperties = placement ? { top: placement.top } : { top: "calc(50% - 24px)" }
+  let vertical: React.CSSProperties
+  if (placement) {
+    // Clamp the stored top into the CURRENT viewport — a placement saved in a taller window must not leave the
+    // handle off-screen, which would strand the only recovery path. Raw top only when no viewport is known.
+    vertical =
+      typeof viewportHeight === "number"
+        ? { top: Math.max(margin, Math.min(placement.top, Math.max(margin, viewportHeight - height - margin))) }
+        : { top: placement.top }
+  } else {
+    vertical = { top: "calc(50% - 24px)" } // never dragged → vertically centered (auto-clamps to the viewport)
+  }
   return { ...side, ...vertical }
 }
 
@@ -1466,16 +1482,27 @@ export function edgeHandleAnchor(placement: FloatPlacement | null | undefined): 
  * path, and the ONLY one on touch (where Alt+M doesn't exist). A ~5px strip at the FAB's last snapped edge;
  * tapping it restores the FAB (same persistence). Barely visible at rest, a touch stronger on hover / press.
  */
-function FabEdgeHandle({ sessionId, label, onRestore }: { sessionId: string | undefined; label: string; onRestore: () => void }) {
+function FabEdgeHandle({ sessionId, label, placement, onRestore }: { sessionId: string | undefined; label: string; placement: FloatPlacement | null; onRestore: () => void }) {
   const storage = React.useMemo(() => safeLocalStorage(), [])
-  const placement = React.useMemo(() => readStoredFloatPlacement("fab", sessionId, storage) ?? null, [sessionId, storage])
+  const stored = React.useMemo(() => readStoredFloatPlacement("fab", sessionId, storage) ?? null, [sessionId, storage])
+  // Prefer the FAB's LIVE placement (from useDraggable): a drag whose storage write failed still moved the FAB
+  // in memory, so re-reading storage here would strand the handle at a stale edge. Fall back to the stored value.
+  const resolved = placement ?? stored
   const [active, setActive] = React.useState(false)
+  // Track the viewport height so a stored top is re-clamped on resize/rotate and the handle can't drift off-screen.
+  const [viewportHeight, setViewportHeight] = React.useState<number | undefined>(() => (typeof window !== "undefined" ? window.innerHeight : undefined))
+  React.useEffect(() => {
+    if (typeof window === "undefined") return
+    const onResize = () => setViewportHeight(window.innerHeight)
+    window.addEventListener("resize", onResize)
+    return () => window.removeEventListener("resize", onResize)
+  }, [])
   return (
     <button
       type="button"
       data-show-annotation-ui=""
       aria-label={label}
-      style={{ ...fabEdgeHandleStyle, ...edgeHandleAnchor(placement), opacity: active ? 0.55 : 0.2, width: active ? 7 : 5 }}
+      style={{ ...fabEdgeHandleStyle, ...edgeHandleAnchor(resolved, viewportHeight), opacity: active ? 0.55 : 0.2, width: active ? 7 : 5 }}
       onPointerEnter={() => setActive(true)}
       onPointerLeave={() => setActive(false)}
       onPointerDown={() => setActive(true)}
@@ -1492,6 +1519,8 @@ const FLOAT_INSET = 26
 type DraggableResult = {
   style: React.CSSProperties
   dragging: boolean
+  /** The current resting edge placement (edge + top), or null before the element has been dragged. */
+  placement: FloatPlacement | null
   pointerHandlers: Pick<React.DOMAttributes<HTMLElement>, "onPointerDown" | "onPointerMove" | "onPointerUp" | "onPointerCancel">
   /** Call at the start of onClick: returns true (and consumes) when the gesture was a drag, not a click. */
   consumeDragClick: () => boolean
@@ -1590,7 +1619,7 @@ function useDraggable(element: "fab" | "badge", sessionId: string | undefined, r
     : placement
       ? { top: placement.top, bottom: "auto", touchAction: "none", ...(placement.edge === "left" ? { left: FLOAT_INSET, right: "auto" } : { right: FLOAT_INSET, left: "auto" }) }
       : { touchAction: "none" }
-  return { style, dragging, pointerHandlers: { onPointerDown, onPointerMove, onPointerUp: finish, onPointerCancel: finish }, consumeDragClick }
+  return { style, dragging, placement, pointerHandlers: { onPointerDown, onPointerMove, onPointerUp: finish, onPointerCancel: finish }, consumeDragClick }
 }
 
 function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, sessionId, onEnable, onDisable, onSetMode }: AnnotationChromeProps) {
@@ -1665,8 +1694,10 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     // ✕ / Alt+M confirmation shows even after the chrome is hidden.
     return (
       <>
-        {host === "standalone" ? (
-          <FabEdgeHandle sessionId={sessionId} label={labels.restoreHandle ?? DEFAULT_ANNOTATION_LABELS.restoreHandle} onRestore={fabVisibility.show} />
+        {host === "standalone" && available ? (
+          // Only when the viewer can actually annotate — an anonymous viewer's FAB is a login hint, not the
+          // real FAB, so a recovery handle there would restore to nothing useful. Prefer the live drag placement.
+          <FabEdgeHandle sessionId={sessionId} label={labels.restoreHandle ?? DEFAULT_ANNOTATION_LABELS.restoreHandle} placement={fabDrag.placement} onRestore={fabVisibility.show} />
         ) : null}
         {toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null}
       </>
