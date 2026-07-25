@@ -4,16 +4,20 @@ import { DEFAULT_ANNOTATION_LABELS, disabledButtonStyle, modePillLabel, tooltipP
 // Overlay uses inline styles (no `:disabled` stylesheet), so the disabled LOOK is applied explicitly.
 // These pure assertions run in CI (the browser layout check does not), locking the visual contract the
 // owner flagged: a disabled send must read dimmed/gray, never the bright mint of an enabled action.
-describe("FAB tip / hidden-toast copy leads with the edge handle, Alt+M secondary (Lane R12/R13)", () => {
-  it("names the edge handle as the primary recovery, keeps Alt+M (⌥M) as the desktop shortcut, no query jargon", () => {
+describe("FAB copy leads with the edge handle; '?' popup owns the hide action (Lane R12/R13)", () => {
+  it("both the tip and the hidden toast name the edge handle + Alt+M, with no query-param jargon", () => {
     for (const copy of [DEFAULT_ANNOTATION_LABELS.fabTip, DEFAULT_ANNOTATION_LABELS.fabHiddenToast]) {
-      expect(copy).toContain("把手") // R13: the edge handle is THE cross-platform recovery, mentioned first
+      expect(copy).toContain("把手") // the edge handle is THE cross-platform recovery, mentioned first
       expect(copy).toContain("Alt+M") // desktop shortcut retained
-      expect(copy).toContain("⌥M") // macOS glyph retained (static, platform-neutral copy)
     }
+    expect(DEFAULT_ANNOTATION_LABELS.fabTip).toContain("⌥M") // macOS glyph kept in the (longer) tip
     // query params stay the programmatic path but must not be the user-facing copy
     expect(DEFAULT_ANNOTATION_LABELS.fabTip).not.toContain("?unmark")
     expect(DEFAULT_ANNOTATION_LABELS.fabHiddenToast).not.toContain("?mark")
+  })
+
+  it("the '?' popup hide row carries a distinct destructive label (no longer a bare ✕)", () => {
+    expect(DEFAULT_ANNOTATION_LABELS.hideAction).toBe("隐藏标注按钮")
   })
 })
 

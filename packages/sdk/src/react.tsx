@@ -214,10 +214,12 @@ export type AnnotationOverlayLabels = {
   addNote?: string
   /** One-line tip shown by the toolbar '?' affordance. */
   fabTip?: string
-  /** Toast shown after the '✕' affordance hides the FAB. */
+  /** Toast shown after hiding the FAB. */
   fabHiddenToast?: string
   /** Accessible name for the edge-handle grabber that restores a hidden FAB. */
   restoreHandle?: string
+  /** Destructive action-row label inside the '?' popup that hides the FAB. */
+  hideAction?: string
 }
 
 // Required<> so the built-in defaults must stay complete (every field, incl. the optional ones)
@@ -247,8 +249,9 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   approve: "批准",
   addNote: "添加备注",
   fabTip: "点选元素或截图，把意见直接发给 Agent；隐藏后轻点边缘把手可恢复（桌面 Alt+M，macOS ⌥M）",
-  fabHiddenToast: "已隐藏，轻点边缘把手可恢复（桌面 Alt+M，macOS ⌥M）",
-  restoreHandle: "显示标注按钮"
+  fabHiddenToast: "已隐藏，轻点边缘把手恢复（桌面也可按 Alt+M）",
+  restoreHandle: "显示标注按钮",
+  hideAction: "隐藏标注按钮"
 }
 
 export type AnnotationOverlayProps = {
@@ -784,6 +787,7 @@ export function AnnotationOverlay({
     merged.fabTip = labels?.fabTip ?? DEFAULT_ANNOTATION_LABELS.fabTip
     merged.fabHiddenToast = labels?.fabHiddenToast ?? DEFAULT_ANNOTATION_LABELS.fabHiddenToast
     merged.restoreHandle = labels?.restoreHandle ?? DEFAULT_ANNOTATION_LABELS.restoreHandle
+    merged.hideAction = labels?.hideAction ?? DEFAULT_ANNOTATION_LABELS.hideAction
     return merged
   }, [labels])
   const intentOptions = intents ?? DEFAULT_ANNOTATION_INTENTS
@@ -1708,10 +1712,11 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
         </button>
         <ModeTab active={mode === "smart"} onClick={() => onSetMode?.("smart")} icon={<SparkleIcon />} label={labels.smart} compact={touchInput} />
         <ModeTab active={mode === "screenshot"} onClick={() => onSetMode?.("screenshot")} icon={<CameraIcon />} label={labels.screenshot} compact={touchInput} />
+        <span aria-hidden="true" style={toolbarDividerStyle} />
         <button type="button" style={toolbarExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
-        {/* Trailing subtle affordances: '?' one-line tip, '✕' hide (≡ #unmark). */}
-        <ToolbarHelp tip={labels.fabTip ?? ""} touchInput={touchInput} />
-        <button type="button" aria-label={labels.fabHiddenToast ?? "hide"} style={toolbarGlyphButtonStyle} onClick={hideFab}>✕</button>
+        {/* '?' popup holds the one-line tip AND a deliberate red "hide" row — the ✕ used to sit next to 退出
+            and read as a second "close", so hiding is now a two-step (tap ? → tap the red row). */}
+        <ToolbarHelp tip={labels.fabTip ?? ""} hideLabel={labels.hideAction ?? DEFAULT_ANNOTATION_LABELS.hideAction} onHide={hideFab} />
       </div>
     )
   }
@@ -1757,12 +1762,20 @@ export function tooltipPlacement(
   return { position: "fixed", ...vertical, ...horizontal }
 }
 
-/** Subtle '?' affordance on the toolbar: hover (mouse) or tap (touch) reveals a short tip. */
-function ToolbarHelp({ tip, touchInput }: { tip: string; touchInput: boolean }) {
+/**
+ * The toolbar '?' affordance: click/tap to open a compact popup holding the one-line tip AND a single,
+ * DELIBERATE red "hide" action row. The ✕ used to sit next to 退出 and read as a second "close", so users
+ * mis-clicked between them; moving hide behind a two-step (tap ? → tap the red row) removes that adjacent
+ * twin. Portaled to <body> so `position: fixed` escapes the toolbar's backdrop-filter containing block;
+ * closes on an outside pointer-down.
+ */
+function ToolbarHelp({ tip, hideLabel, onHide }: { tip: string; hideLabel: string; onHide: () => void }) {
   const btnRef = React.useRef<HTMLButtonElement>(null)
-  // Placement is measured on open; null means closed. Fixed-positioned off the button's viewport rect so
-  // the tip never spills off a ~320px screen regardless of where the draggable toolbar is docked.
+  const popRef = React.useRef<HTMLDivElement>(null)
+  // Placement is measured on open; null means closed. Fixed-positioned off the button's viewport rect so the
+  // popup never spills off a ~320px screen regardless of where the draggable toolbar is docked.
   const [placement, setPlacement] = React.useState<React.CSSProperties | null>(null)
+  const open = placement !== null
   const openTip = React.useCallback(() => {
     const button = btnRef.current
     if (!button || typeof window === "undefined") {
@@ -1778,28 +1791,39 @@ function ToolbarHelp({ tip, touchInput }: { tip: string; touchInput: boolean }) 
     )
   }, [])
   const closeTip = React.useCallback(() => setPlacement(null), [])
+  // Close on a pointer down outside the button + popup (the popup is portaled, so it isn't a DOM descendant).
+  React.useEffect(() => {
+    if (!open || typeof document === "undefined") return
+    function onDocPointerDown(event: PointerEvent) {
+      const target = event.target as Node | null
+      if ((target && btnRef.current?.contains(target)) || (target && popRef.current?.contains(target))) return
+      closeTip()
+    }
+    document.addEventListener("pointerdown", onDocPointerDown, true)
+    return () => document.removeEventListener("pointerdown", onDocPointerDown, true)
+  }, [open, closeTip])
   if (!tip) return null
-  const open = placement !== null
   return (
     <span style={{ position: "relative", display: "inline-flex" }}>
       <button
         ref={btnRef}
         type="button"
         aria-label={tip}
+        aria-expanded={open}
         style={toolbarGlyphButtonStyle}
-        onPointerEnter={() => { if (!touchInput) openTip() }}
-        onPointerLeave={() => { if (!touchInput) closeTip() }}
-        onClick={() => { if (touchInput) (open ? closeTip() : openTip()) }}
-        onBlur={closeTip}
+        onClick={() => (open ? closeTip() : openTip())}
       >
         ?
       </button>
       {open && typeof document !== "undefined"
         ? createPortal(
-            // Portal to <body> so the fixed-position tip escapes the toolbar's backdrop-filter containing
-            // block — otherwise `position: fixed` resolves against the filtered toolbar, not the viewport,
-            // and the viewport-derived clamp lands off-screen. data-show-annotation-ui keeps it out of captures.
-            <span role="tooltip" data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>{tip}</span>,
+            <div ref={popRef} role="dialog" data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>
+              <div style={helpTipTextStyle}>{tip}</div>
+              <button type="button" style={helpHideRowStyle} onClick={() => { closeTip(); onHide() }}>
+                <EyeOffIcon />
+                <span>{hideLabel}</span>
+              </button>
+            </div>,
             document.body
           )
         : null}
@@ -3098,8 +3122,13 @@ const toolbarHelpTipStyle: React.CSSProperties = {
   boxSizing: "border-box",
   width: "max-content",
   whiteSpace: "normal",
-  padding: "8px 10px",
-  borderRadius: 10,
+  // A compact column: tip text + one red hide row. Interactive now (the row is a button), so pointer events
+  // are enabled — clicks land on the row rather than passing through.
+  display: "flex",
+  flexDirection: "column",
+  gap: 8,
+  padding: 8,
+  borderRadius: 12,
   background: COLORS.surfacePopover,
   border: `1px solid ${COLORS.border}`,
   color: COLORS.textPrimary,
@@ -3108,7 +3137,39 @@ const toolbarHelpTipStyle: React.CSSProperties = {
   backdropFilter: "blur(16px)",
   WebkitBackdropFilter: "blur(16px)",
   zIndex: CARD_Z,
-  pointerEvents: "none"
+  pointerEvents: "auto"
+}
+
+/** The tip text block inside the '?' popup. */
+const helpTipTextStyle: React.CSSProperties = {
+  padding: "2px 4px",
+  color: COLORS.textPrimary,
+  font: `500 12px/1.5 ${FONT_STACK}`
+}
+
+/** The deliberate destructive "hide the FAB" row inside the '?' popup — red icon + red text, faint red field. */
+const helpHideRowStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  width: "100%",
+  padding: "8px 10px",
+  border: 0,
+  borderRadius: 8,
+  background: "rgba(255, 107, 107, 0.12)",
+  color: COLORS.danger,
+  font: `600 12px/1.2 ${FONT_STACK}`,
+  cursor: "pointer",
+  textAlign: "left"
+}
+
+/** Thin vertical rule separating the mode tabs from the exit / help affordances in the toolbar row. */
+const toolbarDividerStyle: React.CSSProperties = {
+  width: 1,
+  alignSelf: "stretch",
+  flexShrink: 0,
+  margin: "6px 2px",
+  background: COLORS.border
 }
 
 const toastStyle: React.CSSProperties = {
@@ -3557,6 +3618,15 @@ function TrashIcon({ size = 14 }: IconProps) {
   return (
     <svg {...svgProps(size)}>
       <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M6 6l1 14a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-14" />
+    </svg>
+  )
+}
+
+function EyeOffIcon({ size = 14 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+      <path d="M1 1l22 22" />
     </svg>
   )
 }
