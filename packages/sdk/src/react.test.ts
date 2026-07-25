@@ -69,13 +69,15 @@ describe("'?' tooltip placement stays within the viewport (Lane R12 round 2/3)",
     expect(p.maxWidth).toBe(280)
     expect(p.bottom).toBe(900 - 400 + 10) // bottom edge 10px above the button top
     expect(p).not.toHaveProperty("top")
+    expect(p.maxHeight).toBe(400 - 10 - 12) // capped to the room above so a tall popup can't overflow the top
   })
 
   it("flips BELOW the button when the toolbar is top-docked (no room above)", () => {
-    // button.top ~30 leaves < estimatedHeight above → must open below, not clip off the top (finding 4)
+    // button.top ~30 leaves < estimatedHeight above → must open below, not clip off the top
     const p = tooltipPlacement({ left: 260, right: 288, top: 30, bottom: 58 }, vp)
     expect(p.top).toBe(58 + 10)
     expect(p).not.toHaveProperty("bottom")
+    expect(p.maxHeight).toBe(640 - 58 - 10 - 12) // capped to the room below (finding 6)
   })
 })
 

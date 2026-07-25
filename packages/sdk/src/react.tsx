@@ -1773,7 +1773,7 @@ export function tooltipPlacement(
 ): React.CSSProperties {
   const margin = opts.margin ?? 12
   const preferred = opts.preferredMaxWidth ?? 280
-  const estimatedHeight = opts.estimatedHeight ?? 96 // conservative tip height for the above/below flip
+  const estimatedHeight = opts.estimatedHeight ?? 120 // tip text + one action row — bias the above/below flip
   // Horizontal: open toward the roomier side, cap the (border-box) width to that space, clamp within a margin.
   const spaceLeft = button.right - margin // room from the viewport's left margin to the button's right edge
   const spaceRight = viewport.width - button.left - margin
@@ -1785,11 +1785,13 @@ export function tooltipPlacement(
     const maxWidth = Math.max(0, Math.min(preferred, spaceLeft))
     horizontal = { right: Math.round(Math.max(margin, viewport.width - button.right)), maxWidth: Math.round(maxWidth) }
   }
-  // Vertical: open above the button, but flip BELOW when there isn't room above (top-docked toolbar) so the tip
-  // never clips off the top. Uses a conservative height estimate since the tip's real height isn't known yet.
+  // Vertical: open above the button, but flip BELOW when there isn't room above (top-docked toolbar) so the
+  // popup never clips off the top. Also cap maxHeight to the room on the chosen side (paired with overflowY on
+  // the popup) so a taller-than-estimated popup — extra action row or long localized copy — can't overflow a
+  // short viewport in either direction.
   const vertical: React.CSSProperties = button.top - margin >= estimatedHeight
-    ? { bottom: Math.round(viewport.height - button.top + 10) }
-    : { top: Math.round(button.bottom + 10) }
+    ? { bottom: Math.round(viewport.height - button.top + 10), maxHeight: Math.max(0, Math.round(button.top - 10 - margin)) }
+    : { top: Math.round(button.bottom + 10), maxHeight: Math.max(0, Math.round(viewport.height - button.bottom - 10 - margin)) }
   return { position: "fixed", ...vertical, ...horizontal }
 }
 
@@ -1833,13 +1835,27 @@ function ToolbarHelp({ tip, hideLabel, onHide }: { tip: string; hideLabel: strin
     document.addEventListener("pointerdown", onDocPointerDown, true)
     return () => document.removeEventListener("pointerdown", onDocPointerDown, true)
   }, [open, closeTip])
-  if (!tip) return null
+  // Consume Escape while open so it CLOSES the popup instead of reaching the overlay-wide Escape handler, which
+  // would otherwise disable annotation entirely. Capture phase + stopPropagation intercepts it first.
+  React.useEffect(() => {
+    if (!open || typeof document === "undefined") return
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return
+      event.stopPropagation()
+      event.preventDefault()
+      closeTip()
+    }
+    document.addEventListener("keydown", onKeyDown, true)
+    return () => document.removeEventListener("keydown", onKeyDown, true)
+  }, [open, closeTip])
+  // No early return on an empty tip: the '?' now owns the hide action, so it must always render — a host that
+  // suppresses the tip copy still needs a way to hide the FAB.
   return (
     <span style={{ position: "relative", display: "inline-flex" }}>
       <button
         ref={btnRef}
         type="button"
-        aria-label={tip}
+        aria-label={tip || undefined}
         aria-expanded={open}
         style={toolbarGlyphButtonStyle}
         onClick={() => (open ? closeTip() : openTip())}
@@ -1849,7 +1865,7 @@ function ToolbarHelp({ tip, hideLabel, onHide }: { tip: string; hideLabel: strin
       {open && typeof document !== "undefined"
         ? createPortal(
             <div ref={popRef} role="dialog" data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>
-              <div style={helpTipTextStyle}>{tip}</div>
+              {tip ? <div style={helpTipTextStyle}>{tip}</div> : null}
               <button type="button" style={helpHideRowStyle} onClick={() => { closeTip(); onHide() }}>
                 <EyeOffIcon />
                 <span>{hideLabel}</span>
@@ -3160,6 +3176,7 @@ const toolbarHelpTipStyle: React.CSSProperties = {
   gap: 8,
   padding: 8,
   borderRadius: 12,
+  overflowY: "auto", // paired with the placement's maxHeight so a tall popup scrolls rather than overflowing
   background: COLORS.surfacePopover,
   border: `1px solid ${COLORS.border}`,
   color: COLORS.textPrimary,
