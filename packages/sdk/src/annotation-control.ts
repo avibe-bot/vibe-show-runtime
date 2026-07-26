@@ -816,7 +816,10 @@ export type AnnotationControllerDeps = {
   host?: AnnotationHost
   /** Injected mode-memory storage. Pass `null` to disable; omit to use `localStorage`. */
   storage?: AnnotationModeStorage | null
-  /** Initial `available` value; defaults to the injected `annotation.authenticated`, else `true`. */
+  /**
+   * Initial `available` value; defaults to the injected `annotation.authenticated`, else to whether a write
+   * token was injected — NOT to `true`. An anonymous viewer starts gated off and is upgraded by the auth probe.
+   */
   initialAvailable?: boolean
   /** Injectable clock for stamping local-command intent times (default: system clock). */
   now?: () => string
