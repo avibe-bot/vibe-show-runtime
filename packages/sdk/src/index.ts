@@ -2300,4 +2300,87 @@ function unionContentRect(element: Element): DOMRect | undefined {
 
 // Annotation control plane (phase 1 contract §2/§3/§4). Kept in a focused module; re-exported
 // here so `@avibe/show-sdk` consumers get the control API from the package root.
-export * from "./annotation-control.js"
+//
+// The list is written out on purpose. `export *` publishes whatever the module happens to define, so every
+// helper added there becomes package API by accident — nobody decides it, and nobody can tell from this file
+// what the package promises. Widening this list is a decision; make it here.
+//
+// Turning the wildcard into a list must not, by itself, take anything away. Every name `export *` published
+// before is still published below — the list changes who DECIDES the surface, not what the surface is. The
+// only names missing are ones that no longer exist: `readStoredFabVisible` / `writeStoredFabVisible` stored a
+// BOOLEAN, and the chrome now has four states (`FabVisibility`), so the boolean pair was replaced rather than
+// widened. Their successors are exported right below them. That break is deliberate and loud: a caller gets
+// "has no exported member", not a boolean silently reinterpreted as one of four states. `resolveFabVisibility`
+// keeps its name and its job, and its changed return shape is caught at every call site by the type checker.
+export {
+  // Mode vocabulary
+  ANNOTATION_MODES,
+  DEFAULT_ANNOTATION_MODE,
+  isAnnotationMode,
+  // Host detection
+  ANNOTATION_EMBED_QUERY_PARAM,
+  detectAnnotationHost,
+  // Control/query/state messages over the embed boundary
+  ANNOTATION_CONTROL_MESSAGE,
+  ANNOTATION_QUERY_MESSAGE,
+  ANNOTATION_STATE_MESSAGE,
+  annotationControlActionFromPayload,
+  annotationControlActionFromEvent,
+  annotationControlActionFromMessage,
+  isAnnotationQueryMessage,
+  annotationStateMessage,
+  // State reduction and event ordering
+  reduceAnnotationState,
+  isLiveControlEvent,
+  isBatchControlNewer,
+  // Submission gate
+  APPROVE_INTENT,
+  canSubmitAnnotation,
+  // Access + write token
+  fetchAnnotationAccess,
+  probeAnnotationAccess,
+  resolveWriteToken,
+  // Controller and its bindings
+  createAnnotationController,
+  attachAnnotationWindowApi,
+  connectAnnotationHostBridge,
+  // Mode persistence (and the storage shim every persisted setting here shares)
+  ANNOTATION_MODE_STORAGE_PREFIX,
+  annotationModeStorageKey,
+  safeLocalStorage,
+  readStoredAnnotationMode,
+  writeStoredAnnotationMode,
+  // Standalone chrome visibility: the URL flag, its storage, and the strip that puts the URL back
+  ANNOTATION_FAB_PARAM_SHOW,
+  ANNOTATION_FAB_PARAM_HIDE,
+  ANNOTATION_FAB_VISIBLE_STORAGE_PREFIX,
+  fabVisibleStorageKey,
+  resolveFabVisibility,
+  stripFabParamsFromSearch,
+  // …and the four-state successors of the removed boolean pair, so a caller hitting the compile error
+  // above has somewhere to land.
+  readStoredFabVisibility,
+  writeStoredFabVisibility,
+  // Restore shortcut
+  ANNOTATION_FAB_SHORTCUT_KEY,
+  isEditableTarget,
+  shouldToggleFabShortcut,
+  // Drag placement
+  ANNOTATION_FLOAT_POSITION_STORAGE_PREFIX,
+  DRAG_ACTIVATION_THRESHOLD,
+  floatPositionStorageKey,
+  exceedsDragThreshold,
+  snapToNearestEdge,
+  readStoredFloatPlacement,
+  writeStoredFloatPlacement,
+  type AnnotationHost,
+  type AnnotationModeStorage,
+  type FabVisibility,
+  type FloatPosition,
+  type FloatPlacement,
+  type AnnotationStateMessage,
+  type AnnotationController,
+  type AnnotationControllerDeps,
+  type AnnotationMessageTarget,
+  type AnnotationBroadcastTarget
+} from "./annotation-control.js"

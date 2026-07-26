@@ -2,35 +2,181 @@ import { describe, expect, it, vi } from "vitest"
 import {
   DEFAULT_ANNOTATION_LABELS,
   disabledButtonStyle,
+  mergeAnnotationLabels,
   modePillLabel,
+  fabHideRowLabel,
+  fabToastFor,
   tooltipPlacement,
   edgeHandleAnchor,
+  edgeHandleVisual,
   createChromeFocusController,
   TOUCH_CAPABLE_QUERY
 } from "./react.js"
+import {
+  fabHideOptions,
+  formatFabShortcut,
+  formatMarkUrl,
+  withParenthetical,
+  type FabHideTarget,
+  type FabVisibility
+} from "./annotation-control.js"
 
-// Overlay uses inline styles (no `:disabled` stylesheet), so the disabled LOOK is applied explicitly.
-// These pure assertions run in CI (the browser layout check does not), locking the visual contract the
-// owner flagged: a disabled send must read dimmed/gray, never the bright mint of an enabled action.
-describe("FAB copy leads with the edge handle; '?' popup owns the hide action (Lane R12/R13)", () => {
-  it("both the tip and the hidden toast name the edge handle + Alt+M, with no query-param jargon", () => {
-    for (const copy of [DEFAULT_ANNOTATION_LABELS.fabTip, DEFAULT_ANNOTATION_LABELS.fabHiddenToast]) {
-      expect(copy).toContain("把手") // the edge handle is THE cross-platform recovery, mentioned first
-      expect(copy).toContain("Alt+M") // desktop shortcut retained
+/** The page the restore link is built from. */
+const CLEAN = "https://h/p/abc"
+
+/** The '?' popup row for one hide target. Production `fabHideRowLabel`, so the composition under test is the
+ *  rendered one. The row takes no URL: a link does not belong in a menu row, so the row promises it and the
+ *  toast raised at the moment of hiding delivers it. */
+function hideRowLabel(target: FabHideTarget, shortcut: string | undefined): string {
+  return fabHideRowLabel(target, shortcut, DEFAULT_ANNOTATION_LABELS)
+}
+
+/** The toast for a state, same defaults. The URL only matters for the states whose exit IS a URL. */
+function toastFor(state: FabVisibility, shortcut?: string, href: string = CLEAN): string | null {
+  return fabToastFor(state, shortcut, formatMarkUrl(href), DEFAULT_ANNOTATION_LABELS)
+}
+
+// Recovery hints live in the PARENTHESES of the button that hides, named ONCE. Before Lane U the tip and
+// the toast each recited the shortcut AND the handle, so a desktop user was told about a grabber they never
+// get and read '⌥M' three times. These assertions lock the final user-visible strings — composed through the
+// same helpers the component uses, so drift in either the base or the clause fails here.
+describe("hide copy names each recovery exactly once, in the row that performs it (Lane U)", () => {
+  it("fabTip describes what annotation DOES — no shortcut, no handle, no query-param jargon", () => {
+    const tip = DEFAULT_ANNOTATION_LABELS.fabTip
+    for (const leaked of ["细条", "侧边", "Alt+M", "Option+M", "⌥M", "?mark", "?unmark"]) {
+      expect(tip).not.toContain(leaked)
     }
-    expect(DEFAULT_ANNOTATION_LABELS.fabTip).toContain("⌥M") // macOS glyph kept in the (longer) tip
-    // query params stay the programmatic path but must not be the user-facing copy
-    expect(DEFAULT_ANNOTATION_LABELS.fabTip).not.toContain("?unmark")
-    expect(DEFAULT_ANNOTATION_LABELS.fabHiddenToast).not.toContain("?mark")
+    expect(tip).toBe("点选元素或截图，把意见直接发给 Agent")
   })
 
-  it("the '?' popup hide row carries a distinct destructive label (no longer a bare ✕)", () => {
-    expect(DEFAULT_ANNOTATION_LABELS.hideAction).toBe("隐藏标注按钮")
+  it("a screen with no touch gets ONE destructive row naming the platform shortcut — and no handle option", () => {
+    const options = fabHideOptions(false) // no coarse pointer anywhere on this device
+    expect(options).toEqual(["hidden-key"]) // a mouse-only screen cannot CREATE a handle state
+
+    expect(hideRowLabel("hidden-key", formatFabShortcut({ platform: "macOS" }))).toBe("隐藏标注按钮（按 Option+M 恢复）")
+    expect(hideRowLabel("hidden-key", formatFabShortcut({ platform: "Windows" }))).toBe("隐藏标注按钮（按 Alt+M 恢复）")
+  })
+
+  it("a touchscreen gets TWO rows, handle first, neither mentioning a keyboard it may not have", () => {
+    const options = fabHideOptions(true) // any-pointer:coarse — phone, tablet, or hybrid laptop
+    expect(options).toEqual(["handle", "hidden-url"]) // order is the rendered order
+
+    const shortcut = formatFabShortcut({ platform: "iPhone", touchPrimary: true }) // undefined
+    const rows = options.map((target) => hideRowLabel(target, shortcut))
+    // One thing, one name: the 5px strip at the edge is 「侧边细条」 in every row and every toast. Nobody
+    // calls it a 「把手」 — a word for a shape the user is never shown.
+    expect(rows).toEqual(["隐藏至侧边（轻点侧边细条恢复）", "完全隐藏（隐藏后给出恢复链接）"])
+    for (const row of rows) {
+      expect(row).not.toContain("Alt+M")
+      expect(row).not.toContain("Option+M")
+    }
+  })
+
+  // Five review rounds went into printing a five-character suffix that stayed correct as the reader's URL
+  // changed shape — measuring the separator against the search, then the fragment, then the raw href, and
+  // reaching further into the host router's territory each time. The suffix is gone. The row promises a link
+  // and says nothing about URLs, so there is no per-URL copy left to get wrong.
+  it("the full-hide row promises the link without reciting one", () => {
+    expect(hideRowLabel("hidden-url", undefined)).toBe("完全隐藏（隐藏后给出恢复链接）")
+    // No address-bar instructions in a menu row — nothing to transcribe, and nothing shape-dependent.
+    for (const leaked of ["网址", "?", "&", "http"]) {
+      expect(hideRowLabel("hidden-url", undefined)).not.toContain(leaked)
+    }
+  })
+
+  // The link itself is delivered by the toast, at the moment of hiding, whole — because that is the only
+  // exit from the only state with nothing on screen, and users copy links rather than transcribe suffixes.
+  it("the toast hands over the WHOLE restore URL, with the flag in the real query position", () => {
+    const L = DEFAULT_ANNOTATION_LABELS
+    expect(L.hiddenToast(formatMarkUrl(CLEAN))).toBe("已完全隐藏，保存此链接恢复：https://h/p/abc?mark")
+    // A page that already has a query keeps it; the flag joins with '&'.
+    expect(L.hiddenToast(formatMarkUrl(`${CLEAN}?foo=1`))).toBe("已完全隐藏，保存此链接恢复：https://h/p/abc?foo=1&mark")
+    // A hash-routed page: the flag goes in front of the route, where our query string lives, and the route
+    // rides along untouched. This is the shape every earlier round printed a suffix for and got wrong.
+    expect(L.hiddenToast(formatMarkUrl(`${CLEAN}#/route?a=1`))).toBe(
+      "已完全隐藏，保存此链接恢复：https://h/p/abc?mark#/route?a=1"
+    )
+    // The premise, pinned so nobody "simplifies" the link back to an appended literal: a suffix typed at the
+    // tail of a hash route lands in the fragment, which is the host router's and which we no longer read.
+    expect(new URL("https://h/p/abc#/route?mark").search).toBe("")
+    expect(new URL("https://h/p/abc?mark#/route").search).toBe("?mark")
+  })
+
+  // The toast is a pure FUNCTION of the state, not something a handler remembers to set — which is what
+  // makes a stale toast structurally impossible rather than merely cleaned up. One case per state.
+  it("each toast is derived from the state just entered, naming that state's own exit", () => {
+    expect(toastFor("hidden-key", "Option+M")).toBe("已隐藏，按 Option+M 恢复")
+    expect(toastFor("hidden-key", "Alt+M")).toBe("已隐藏，按 Alt+M 恢复")
+    expect(toastFor("handle")).toBe("已收到侧边，轻点细条恢复")
+    expect(toastFor("hidden-url")).toBe("已完全隐藏，保存此链接恢复：https://h/p/abc?mark")
+    // Same state, a page that already has a query → the same link, built on the URL the user is actually on.
+    expect(toastFor("hidden-url", undefined, `${CLEAN}?foo=1`)).toBe(
+      "已完全隐藏，保存此链接恢复：https://h/p/abc?foo=1&mark"
+    )
+    // `visible` has nothing hidden and therefore no exit to advertise: the caller CLEARS, never flashes.
+    expect(toastFor("visible", "Option+M")).toBeNull()
+
+    // Each state names ONE way back — never a device's affordance it does not have.
+    expect(toastFor("handle")).not.toContain("+M")
+    expect(toastFor("hidden-key", "Option+M")).not.toContain("侧边")
+    expect(toastFor("hidden-url")).not.toContain("+M")
+  })
+
+  // Totality guard, not a reachable path: fabVisibilityForDevice degrades `hidden-key` to `handle` before
+  // any keyboardless render. If that rule ever regressed, the fallback still hands back a usable exit
+  // instead of naming a key this device cannot produce.
+  it("never names a shortcut the device does not have, even off the reachable path", () => {
+    expect(toastFor("hidden-key", undefined)).toBe("已完全隐藏，保存此链接恢复：https://h/p/abc?mark")
+    expect(hideRowLabel("hidden-key", undefined)).toBe("完全隐藏（隐藏后给出恢复链接）")
+  })
+
+  it("labels stay ADDITIVE, so overriding one string cannot cost a host the platform behavior", () => {
+    // A host renaming the base action keeps the auto-detected parenthetical clause.
+    const copy = mergeAnnotationLabels({ hideAction: "Hide", hideCompletelyAction: "Hide for good" })
+    expect(withParenthetical(copy.hideAction, copy.hideActionHint("Alt+M"))).toBe("Hide（按 Alt+M 恢复）")
+    // Same for the URL clause: renaming the row keeps the promise of a recovery link.
+    expect(withParenthetical(copy.hideCompletelyAction, copy.hideCompletelyHint)).toBe("Hide for good（隐藏后给出恢复链接）")
+    expect(copy.handleToast).toBe(DEFAULT_ANNOTATION_LABELS.handleToast) // untouched fields keep defaults
+  })
+
+  it("mergeAnnotationLabels fills EVERY field, so a newly added label can never render blank", () => {
+    const copy = mergeAnnotationLabels(undefined)
+    for (const key of Object.keys(DEFAULT_ANNOTATION_LABELS)) {
+      expect(copy[key as keyof typeof copy], key).toBeDefined()
+    }
+    // An explicitly-undefined override is an absent override, not a blank string.
+    expect(mergeAnnotationLabels({ hideAction: undefined }).hideAction).toBe(DEFAULT_ANNOTATION_LABELS.hideAction)
+    // exitShort still falls back through `exit` before the default.
+    expect(mergeAnnotationLabels({ exit: "Done" }).exitShort).toBe("Done")
   })
 
   it("the '?' trigger has a fallback accessible name for when a host suppresses the tip copy", () => {
     // With an empty fabTip the trigger's aria-label falls back to this so a screen reader never reads bare '?'.
     expect(DEFAULT_ANNOTATION_LABELS.helpTrigger).toBe("帮助")
+  })
+})
+
+// The handle is the only chrome a user can hide INTO and tap back out of, so a user-initiated collapse pulses
+// once (~1.5s) to show where it went. Rest/hover geometry is browser-verified; this locks the three visual
+// states so a refactor can't make the pulse indistinguishable from rest.
+describe("edgeHandleVisual: the collapse target announces itself once, then recedes (Lane U)", () => {
+  it("pulses widest + fully opaque, outranking hover, and settles to a faint resting sliver", () => {
+    const pulsing = edgeHandleVisual({ pulsing: true })
+    const active = edgeHandleVisual({ active: true })
+    const rest = edgeHandleVisual({})
+
+    expect(pulsing).toEqual({ width: 9, opacity: 1 })
+    expect(active).toEqual({ width: 7, opacity: 0.55 })
+    expect(rest).toEqual({ width: 5, opacity: 0.2 })
+
+    expect(pulsing.width).toBeGreaterThan(active.width)
+    expect(active.width).toBeGreaterThan(rest.width)
+    expect(pulsing.opacity).toBeGreaterThan(active.opacity)
+    expect(active.opacity).toBeGreaterThan(rest.opacity)
+  })
+
+  it("pulse wins even while hovered, so the attention cue is never swallowed by a resting pointer", () => {
+    expect(edgeHandleVisual({ active: true, pulsing: true })).toEqual({ width: 9, opacity: 1 })
   })
 })
 
@@ -65,6 +211,28 @@ describe("createChromeFocusController: focus follows the control that replaces t
     const node = { focus: vi.fn() }
     c.claim(node)
     expect(node.focus).not.toHaveBeenCalled()
+  })
+
+  // Why hideFab arms ONLY for the `handle` target: a request stays pending until *something* mounts, so
+  // arming with no successor (the fully hidden state renders nothing) leaves it live indefinitely, and the
+  // next unrelated mount consumes it — an SPA swapping sessionId would steal focus, and because claim()'s
+  // return value is also the pulse signal, a handle would announce itself for an action the user never took.
+  it("an unconsumed request survives to be claimed by an unrelated LATER mount — hence: don't arm without a successor", () => {
+    const c = createChromeFocusController()
+    const unrelated = { focus: vi.fn() }
+    c.request() // armed, but nothing mounts to consume it
+    expect(c.claim(unrelated)).toBe(true) // ...so a much later, unrelated mount takes it
+    expect(unrelated.focus).toHaveBeenCalledTimes(1)
+  })
+
+  it("claim() reports whether it consumed a request — the 'user-initiated' signal the handle pulse rides", () => {
+    const c = createChromeFocusController()
+    const node = { focus: vi.fn() }
+    expect(c.claim(node)).toBe(false) // page load: no request, no pulse
+    c.request()
+    expect(c.claim(node)).toBe(true) // user-initiated swap: pulse
+    expect(c.claim(node)).toBe(false) // consumed once only
+    expect(c.claim(null)).toBe(false) // a detaching node never counts as user-initiated
   })
 
   it("a null node (the outgoing control unmounting) is a no-op and keeps the request armed for the successor", () => {
@@ -160,6 +328,9 @@ describe("'?' tooltip placement stays within the viewport (Lane R12 round 2/3)",
   })
 })
 
+// Overlay uses inline styles (no `:disabled` stylesheet), so the disabled LOOK is applied explicitly.
+// These pure assertions run in CI (the browser layout check does not), locking the visual contract the
+// owner flagged: a disabled send must read dimmed/gray, never the bright mint of an enabled action.
 describe("screenshot comment card polish (Lane R8)", () => {
   const primary = { color: "#080812", background: "#5BFFA0", boxShadow: "0 8px 24px x", cursor: "pointer" }
 

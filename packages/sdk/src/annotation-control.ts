@@ -97,68 +97,271 @@ export function writeStoredAnnotationMode(
   }
 }
 
-// ── Standalone FAB visibility via URL QUERY PARAM (owner-frozen mark / unmark) ────────────
-// Default: FAB visible. `?unmark` hides it, `?mark` shows it (bare-presence). A query param — NOT the
-// hash — because the Show Page hash router owns `#/…` routes and a `#unmark` collided with it (404s).
-// The param is a ONE-TIME switch: read at overlay boot, persisted per session, then stripped from the URL
-// (history.replaceState) so the URL returns clean and a later param-free load honors the stored choice.
-// Standalone host only; coexists with `?vibe-embed=1` (the embedded host ignores these entirely).
+// ── Standalone FAB visibility via URL QUERY PARAM (mark / unmark) ─────────────────────────
+//
+// ┌─ THE INVARIANT THIS SECTION EXISTS UNDER (owner ruling, 2026-07-26) ──────────────────────────────┐
+// │ 标注控制面对宿主页面必须是隐形的：不把宿主的路由状态当输入读、不改写它、不派发导航事件。          │
+// │ 我们唯一拥有的网址表面，是 Show Page 网址自己的 query string。                                    │
+// │                                                                                                   │
+// │ The annotation control plane must be INVISIBLE to the host page: it does not read the host's       │
+// │ routing state as input, does not rewrite it, and does not dispatch navigation events. The only URL │
+// │ surface we own is the Show Page URL's own query string.                                           │
+// └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+//
+// Everything after `#` is the host router's territory — the fragment is where an SPA keeps its route, and
+// a route is not ours to parse, to claim a word inside, or to rewrite. Earlier rounds of this branch did
+// all three: they read a flag out of `#/route?…`, stripped it back out, and then hand-dispatched
+// `popstate`/`hashchange` because `replaceState` fires neither and the host's router would otherwise serve
+// a URL we had already changed. That last step is the tell — code that hand-drives someone else's router
+// is not a compatibility measure, it is a second author of the host's navigation. All of it is gone.
+//
+// Default: FAB visible. `?unmark` hides it, `?mark` shows it — read from `location.search` and nowhere
+// else. The flag is a ONE-TIME switch: read at overlay BOOT, persisted per session, then stripped from the
+// search via `history.replaceState` (the fragment passes through byte-for-byte) so the URL returns clean and
+// a later flag-free load honors the stored choice. Standalone host only; coexists with `?vibe-embed=1`
+// (the embedded host ignores these entirely).
+//
+// The words are bare `mark` / `unmark` and stay that way: they are typed by humans into an address bar, so
+// the shortest thing that works is the right thing. Round 14 namespaced them to `vibe-mark`/`vibe-unmark`
+// to make a generic word safe to claim inside the host's fragment; that safety is now bought by not being
+// in the fragment at all, which is cheaper and total. In our OWN query string, `mark` is ours by the same
+// prior reservation that `vibe-embed` sits on.
+//
+// The price, accepted explicitly by the owner: on a hash-routed page (`/p/x#/route`, the ordinary Show Page
+// shape) a user who appends `?mark` to the END of the address bar lands in the fragment, where we no longer
+// look — so that append does nothing and they cannot recover that way. There is no compensating mechanism
+// and there must not be one; every mechanism that made the tail-append work is what this section deleted.
+// Instead, the moment a user hides the chrome we hand them the WHOLE restore URL with the flag in its real
+// query position (`/p/x?mark#/route`) — see {@link formatMarkUrl}. People copy links; they do not
+// transcribe suffixes, and asking them to was what put us in the host's fragment in the first place.
+//
+// Visibility (Lane U) records TWO things in one value: what is on screen, and — when nothing is — WHICH
+// exit the user was told about. `visible` (FAB/toolbar) and `handle` (collapsed to the draggable edge
+// grabber) are their own exit: they are on screen, so the way back is visible. The two hidden flavors show
+// nothing, so their exit lives outside the page and the state has to carry which one was promised:
+// `hidden-key` (the shortcut named in the hide row) and `hidden-url` (the link named in it).
+//
+// Folding the exit into the state is the whole point. A hidden chrome whose promised exit doesn't exist on
+// this device is a screen with no way back, and the promise used to live only in a toast that expires in a
+// few seconds. Now the state names it, so the two can't drift apart. See {@link fabVisibilityForDevice}.
 export const ANNOTATION_FAB_PARAM_SHOW = "mark"
 export const ANNOTATION_FAB_PARAM_HIDE = "unmark"
 export const ANNOTATION_FAB_VISIBLE_STORAGE_PREFIX = "avibe:fab-visible:"
+
+/**
+ * What the standalone annotation chrome shows — and, when it shows nothing, which exit the user was told
+ * about. The two hidden flavors render IDENTICALLY (nothing); they differ only in the way back they promise.
+ */
+export type FabVisibility = "visible" | "handle" | "hidden-key" | "hidden-url"
+
+const FAB_VISIBILITIES: readonly FabVisibility[] = ["visible", "handle", "hidden-key", "hidden-url"]
+
+/**
+ * The states that put nothing on screen. The single predicate every renderer branches on, so a new hidden
+ * flavor can never be half-handled: the difference between the two is the exit they promise, never pixels.
+ */
+export function isFabHidden(visibility: FabVisibility): boolean {
+  return visibility === "hidden-key" || visibility === "hidden-url"
+}
 
 export function fabVisibleStorageKey(sessionId: string | undefined): string {
   return `${ANNOTATION_FAB_VISIBLE_STORAGE_PREFIX}${sessionId ?? "default"}`
 }
 
 /**
- * Resolve whether the standalone FAB is visible from the URL search string. Precedence: an explicit
- * `?unmark` / `?mark` (bare presence) WINS and dictates what to persist (`persist` = the boolean to write,
- * so the switch survives a later param-free load); else honor the stored choice; else default visible
- * (`persist: null` ⇒ write nothing). Pure; the caller reads `location.search`, persists, and strips the param.
+ * Where a raw href stops being ours and starts being the host router's: the fragment, in `location.hash`
+ * form (leading `#` included), or `undefined` when the href has no fragment at all.
+ *
+ * This is the boundary function for the whole section. Everything to the LEFT of what it returns is the Show
+ * Page URL we own and may read and rewrite; everything from the `#` onward is opaque — carried through
+ * untouched by {@link stripFabParamsFromUrl}, never parsed, never searched for our word.
+ *
+ * The FIRST `#` is the anchor, because that is where the URL spec puts the fragment and therefore where the
+ * host's router starts reading. Taking the last one would let a `#` inside a route pull our boundary to the
+ * right and put part of the host's fragment inside the string we rewrite.
+ */
+function hrefFragment(href: string): string | undefined {
+  const start = href.indexOf("#")
+  return start === -1 ? undefined : href.slice(start)
+}
+
+/**
+ * Is this `key=value` pair one of ours?
+ *
+ * Matches the full KEY only, so `?foo=mark` — a parameter whose VALUE happens to be our word — is left
+ * alone. Only ever asked about `location.search`, which is the Show Page's own query string; the host's
+ * fragment is not parsed at all, so there is no second, stricter reading of this question any more. Round 8
+ * needed one (`bareOnly`, tolerant in the search and bare-presence-only in the hash) and round 14 removed it
+ * by namespacing both; the invariant removes the seam itself — one concept, one segment, one rule.
+ *
+ * Tolerant rather than bare-only: {@link formatMarkUrl} only ever prints the bare form, but someone writing
+ * `?mark=1` by hand — the shape a flag takes for most people — means the flag, and a bare-only rule would
+ * ignore it while leaving it sitting in the address bar forever.
+ */
+function isFabParamPair(pair: string): boolean {
+  const eq = pair.indexOf("=")
+  const key = eq === -1 ? pair : pair.slice(0, eq)
+  return key === ANNOTATION_FAB_PARAM_SHOW || key === ANNOTATION_FAB_PARAM_HIDE
+}
+
+/** Our flag keys in a `location.search`, in the order written, WITH repeats. */
+function fabFlagKeys(query: string | undefined): string[] {
+  const raw = (query ?? "").replace(/^\?/, "")
+  if (!raw) return []
+  return raw
+    .split("&")
+    .filter((pair) => isFabParamPair(pair))
+    .map((pair) => pair.split("=")[0])
+}
+
+/**
+ * The flag a search carries, if any. When BOTH are present the RESCUE wins.
+ *
+ * That precedence is the opposite of what it was, and deliberately so. Both flags coexist in exactly one
+ * situation: the persistence write failed, so we left `?unmark` in the URL as the reload fallback, and the
+ * user then opened the restore link, which carries `mark`. If `unmark` still outranked it, the advertised way
+ * back would be unreachable for the one state whose entire promise is that its exit always works — this PR's
+ * own defect, re-entered through the back door. Being wrongly visible costs a second hide; being wrongly
+ * hidden with your rescue outranked is the blank screen we exist to prevent.
+ *
+ * Presence is the whole of the question, so it takes a SET — a second `mark` does not out-vote a first.
+ */
+function readFabFlag(flags: Set<string>): FabVisibility | undefined {
+  if (flags.has(ANNOTATION_FAB_PARAM_SHOW)) return "visible"
+  // `?unmark` → `hidden-url`, never `hidden-key`: whoever typed this flag already holds the URL vocabulary,
+  // so the URL is demonstrably an exit they can use — and unlike the shortcut it works on every device.
+  if (flags.has(ANNOTATION_FAB_PARAM_HIDE)) return "hidden-url"
+  return undefined
+}
+
+/**
+ * The status message that is still TRUE. Every toast this chrome raises is `fabToastFor(state, …)` — it
+ * narrates exactly one visibility and the way out of it — so the instant the visibility moves on, the
+ * message is describing somewhere the user no longer is. Deriving it from the current state rather than
+ * clearing it at each restore site means no path can forget: not the shortcut, not the edge handle, not the
+ * restore link (which reloads the page, so no handler here runs at all), and not whichever path is added next.
+ *
+ * A toast belongs to a SESSION as much as to a state. An SPA can swap `sessionId` under a mounted overlay,
+ * which re-resolves the visibility from the new session's storage — and when the new session happens to
+ * resolve to the same state, a match on state alone kept the old session's message alive. For `hidden-url`
+ * that message is a whole restore URL, captured from the page it was raised on, sitting for fifteen seconds
+ * as the only thing on a screen that now belongs to a different page: the user copies a link back to where
+ * they were, not a way out of where they are.
+ *
+ * The identity is the session, not the URL, and the difference is which changes invalidate the message. A
+ * host route change inside one session does not: the flag works on any route of that page, so the printed
+ * link still restores. A session swap does: that chrome, that storage key, that exit are all somebody
+ * else's now.
+ */
+export function activeFabToast(
+  toast: { message: string; state: FabVisibility; sessionId: string | undefined } | null | undefined,
+  current: FabVisibility,
+  sessionId: string | undefined
+): string | null {
+  return toast && toast.state === current && toast.sessionId === sessionId ? toast.message : null
+}
+
+/**
+ * How long a state's toast stays on screen — a property of WHAT IT SAYS, not one number for all of them.
+ *
+ * Every other toast confirms a transition whose way back is still on the device (a key to press, a strip to
+ * tap); it is read once and wants to get out of the way. The `hidden-url` toast is the only delivery of the
+ * only exit from the only state with nothing on screen, and since this round it carries a whole URL rather
+ * than a five-character suffix — something to select and copy, not to memorize. On the old 3.2s it would
+ * hand the user their way back and take it away before they could use it.
+ *
+ * It still expires, which is a bounded race rather than a guarantee, and that is deliberate: a toast that
+ * waited for a dismissal would need a document-level listener to hear one, and this control plane's whole
+ * invariant is that it attaches nothing to the host it does not have to. A dwell needs no listener.
+ */
+export function fabToastDurationMs(visibility: FabVisibility): number {
+  return visibility === "hidden-url" ? 15000 : 3200
+}
+
+/**
+ * Resolve the standalone chrome's visibility from `location.search` — the Show Page's own query string, and
+ * the only URL surface this control plane reads. Precedence: an explicit `unmark` / `mark` WINS and dictates
+ * what to persist (`persist` = the state to write, so the switch survives a later flag-free load); else honor
+ * the stored state; else default visible (`persist: null` ⇒ write nothing).
+ *
+ * `available` — can THIS viewer annotate — gates the whole flag path, and it lives here rather than as a
+ * guard at the call site because `persist` is the reason it matters. Annotation is an author's tool: a public
+ * Show Page renders no chrome for an anonymous visitor at all. But the storage key is
+ * {@link fabVisibleStorageKey}, keyed by session with no viewer identity in it, so an anonymous visitor
+ * opening a shared `?unmark` link on a shared browser used to WRITE `hidden-url` under the author's own key —
+ * and the author would come back to a page whose chrome was gone with no memory of hiding it. Someone else's
+ * click changing the author's state is the failure; it is not the annotation feature merely misbehaving for
+ * the clicker.
+ *
+ * Returning the stored value with `persist: null` is what makes that one decision cover all three behaviors:
+ * the flag is not adopted, not persisted, and — because the caller strips only when there is something to
+ * persist — not removed from the URL either. Leaving it in the URL is the load-bearing half. `available`
+ * starts from the config's guess and is flipped by an auth probe a moment later, so the author's own first
+ * paint can be "not available yet"; the flag has to still be sitting there when the answer arrives. The
+ * caller re-resolves on that transition and the flag is honored then — exactly once, because that pass is
+ * the one that finally strips it.
+ *
+ * Pure; the caller reads `location`, persists, and strips.
  */
 export function resolveFabVisibility(
   search: string | undefined,
-  stored: boolean | undefined
-): { visible: boolean; persist: boolean | null } {
-  let params: URLSearchParams | undefined
-  try {
-    params = new URLSearchParams(search ?? "") // tolerates a leading "?" and a bare key (no value)
-  } catch {
-    params = undefined
-  }
-  if (params?.has(ANNOTATION_FAB_PARAM_HIDE)) return { visible: false, persist: false }
-  if (params?.has(ANNOTATION_FAB_PARAM_SHOW)) return { visible: true, persist: true }
-  return { visible: stored ?? true, persist: null }
+  stored: FabVisibility | undefined,
+  available: boolean
+): { visibility: FabVisibility; persist: FabVisibility | null } {
+  const flag = available ? readFabFlag(new Set(fabFlagKeys(search))) : undefined
+  if (flag) return { visibility: flag, persist: flag }
+  return { visibility: stored ?? "visible", persist: null }
 }
 
-export function readStoredFabVisible(
+/**
+ * Read the persisted visibility, migrating every earlier vocabulary under the same key toward an exit THIS
+ * surface can actually use.
+ *
+ * Legacy `"1"` → `visible`. Legacy `"0"` → the hidden flavor this surface can recover from: `handle`
+ * wherever a touchscreen exists (tap the grabber), `hidden-key` only on a device with no coarse pointer at
+ * all. `touchCapable`, not touch-primary, for the reason spelled out on {@link fabHideOptions}: a tablet
+ * driven by a mouse reports a fine primary pointer and may still have no keyboard, so migrating its old
+ * `"0"` to `hidden-key` would hand it a promise it cannot keep — and unlike the popup row, this one it never
+ * agreed to. Legacy `"hidden"` (written by early builds of this branch, before the flavor split) →
+ * `hidden-key`: the exit it was told is unknowable, so we take the branch {@link fabVisibilityForDevice}
+ * rescues on a keyboardless device. Undoing one unreleased build's state beats leaving somebody on a blank
+ * screen.
+ *
+ * The migration is derived at READ time and never written back, so one synced profile opened on a phone and
+ * on a laptop leaves each surface with a working recovery path instead of freezing the first reader's guess.
+ */
+export function readStoredFabVisibility(
   sessionId: string | undefined,
+  touchCapable: boolean,
   storage: AnnotationModeStorage | undefined = safeLocalStorage()
-): boolean | undefined {
+): FabVisibility | undefined {
   if (!storage) return undefined
   try {
     const value = storage.getItem(fabVisibleStorageKey(sessionId))
-    return value === "1" ? true : value === "0" ? false : undefined
+    if (FAB_VISIBILITIES.includes(value as FabVisibility)) return value as FabVisibility
+    if (value === "1") return "visible"
+    if (value === "0") return touchCapable ? "handle" : "hidden-key"
+    if (value === "hidden") return "hidden-key" // pre-split builds of this branch; see the doc comment
+    return undefined
   } catch {
     return undefined
   }
 }
 
 /**
- * Persist the FAB visibility choice. Returns whether it was actually stored: `false` when no storage
- * exists or `setItem` throws (private-mode / quota). The caller uses this to decide whether the URL flag
- * is now durable enough to strip — if the write failed, `?mark` / `?unmark` must stay in the URL so a
- * reload still carries the intent.
+ * Persist the visibility choice. Returns whether it was actually stored: `false` when no storage exists or
+ * `setItem` throws (private-mode / quota). The caller uses this to decide whether the URL flag is now
+ * durable enough to strip — if the write failed, `?mark` / `?unmark` must stay in the URL so a reload still
+ * carries the intent.
  */
-export function writeStoredFabVisible(
+export function writeStoredFabVisibility(
   sessionId: string | undefined,
-  visible: boolean,
+  visibility: FabVisibility,
   storage: AnnotationModeStorage | undefined = safeLocalStorage()
 ): boolean {
   if (!storage) return false
   try {
-    storage.setItem(fabVisibleStorageKey(sessionId), visible ? "1" : "0")
+    storage.setItem(fabVisibleStorageKey(sessionId), visibility)
     return true
   } catch {
     // Best-effort — losing the visibility memory must never break the overlay.
@@ -166,23 +369,132 @@ export function writeStoredFabVisible(
   }
 }
 
+/** A state the '?' popup's hide rows can move to — never `visible`, which is what they move away from. */
+export type FabHideTarget = Exclude<FabVisibility, "visible">
+
 /**
- * Remove ONLY the overlay's own `mark` / `unmark` flag from a raw `location.search`, leaving every other
- * parameter byte-for-byte intact. We split on `&` and drop the tokens whose KEY is ours, rather than
+ * The hide targets the '?' popup offers, in row order — each one named for the exit it promises, so the row
+ * the user reads and the state it produces cannot drift apart.
+ *
+ * Split by touch CAPABILITY (`any-pointer: coarse`), not by the primary pointer, because the two failures
+ * are not the same size. Offering a tappable exit to someone holding a keyboard costs one extra row in a
+ * popup. Offering a keyboard exit to someone without one costs them the page. A tablet paired with a mouse
+ * or stylus reports a fine primary pointer and no hover, so a primary-input split handed it `hidden-key` as
+ * its ONLY row: every control gone, and the promised way back a key it has no way to press. Capability puts
+ * the finger-reachable rows wherever a finger exists and never withholds them on a guess.
+ *
+ * So: a touchscreen device — phone, tablet, or hybrid laptop — gets the edge handle (the only recovery that
+ * costs a single tap) and `hidden-url`, whose exit is a fragment anyone can type. A device with no coarse
+ * pointer at all gets one row straight to `hidden-key`. That branch is safe by construction: touch-primary
+ * implies touch-capable, so `!touchCapable` implies `!touchPrimary`, which is exactly the condition under
+ * which the shortcut listener binds — {@link formatFabShortcut} always has a real key to name in that row.
+ */
+export function fabHideOptions(touchCapable: boolean): FabHideTarget[] {
+  return touchCapable ? ["handle", "hidden-url"] : ["hidden-key"]
+}
+
+/**
+ * Alt+M semantics: it toggles `visible` ⇄ hidden, and rescues either non-visible state back to `visible` —
+ * `handle` is a state a phone can create and a laptop can only recover from. Hiding VIA the shortcut records
+ * `hidden-key`, because pressing it is proof the user has the keyboard we are about to name as the exit.
+ */
+export function toggleFabVisibilityByShortcut(current: FabVisibility): FabVisibility {
+  return current === "visible" ? "hidden-key" : "visible"
+}
+
+/**
+ * Reconcile a stored/current visibility with what THIS device can do — the single rule behind both the boot
+ * read and a keyboard detaching mid-session, since the state now names its own exit and no before/after
+ * comparison is needed to tell the two hides apart.
+ *
+ * `hidden-key` promises a shortcut. On a touch-primary device that shortcut does not exist and its document
+ * listener never binds, so the state would render nothing with no way back: degrade to `handle`, an exit the
+ * device can use. `hidden-url` is NEVER degraded — its exit is a fragment the reader types into the address
+ * bar, which does not depend on the device, so a touch user's deliberate full hide is never quietly undone.
+ * That is precisely what makes offering the full hide on touch safe. `visible` and `handle` are on screen
+ * and are their own exit. Returns the state to be in — same value when nothing needs to change.
+ */
+export function fabVisibilityForDevice(visibility: FabVisibility, shortcutAvailable: boolean): FabVisibility {
+  return visibility === "hidden-key" && !shortcutAvailable ? "handle" : visibility
+}
+
+/**
+ * Remove ONLY the overlay's own `mark` / `unmark` flag from a raw `location.search`, leaving every
+ * other parameter byte-for-byte intact. We split on `&` and drop the tokens whose KEY is ours, rather than
  * round-tripping through `URLSearchParams.toString()` — that round-trip re-encodes existing escapes and
  * rewrites bare flags (`?debug` → `?debug=`), mutating query strings the host app may read raw. Matches a
- * full key token only, so `?foo=mark` is untouched. Returns the search WITHOUT a leading "?" ("" if empty).
+ * full key token only, so `?foo=mark` is untouched. Returns the search WITHOUT a leading "?" ("" if
+ * empty).
+ *
+ * Strips exactly what {@link isFabParamPair} recognizes, and shares the predicate to say so: a reader and a
+ * stripper that disagree about which pairs are ours are worse than either rule alone.
  */
 export function stripFabParamsFromSearch(search: string | undefined): string {
   const raw = (search ?? "").replace(/^\?/, "")
   if (!raw) return ""
   return raw
     .split("&")
-    .filter((pair) => {
-      const key = pair.split("=")[0]
-      return key !== ANNOTATION_FAB_PARAM_SHOW && key !== ANNOTATION_FAB_PARAM_HIDE
-    })
+    .filter((pair) => !isFabParamPair(pair))
     .join("&")
+}
+
+/**
+ * Did this segment still have a query after the strip — INCLUDING an empty one?
+ *
+ * The delimiter and its contents are two different facts, and only the second one survives a join: `?` and
+ * `?mark` both strip to `""`, but the first page owned a `?` before we arrived and the second did not.
+ * Callers that reconstruct from truthiness collapse them and hand the host back a URL it never had. That is
+ * the same distinction {@link formatMarkUrl} makes on the way in — an empty query is not the absence of one,
+ * so it prints `&mark` for a URL ending in `?`: this is that append, read back off.
+ *
+ * Shares {@link isFabParamPair} with the strip itself, so the two cannot disagree about which pairs were ours.
+ */
+function keepsQueryDelimiter(query: string | undefined): boolean {
+  const raw = (query ?? "").replace(/^\?/, "")
+  if (!raw) return false
+  return raw.split("&").some((pair) => !isFabParamPair(pair))
+}
+
+/**
+ * The URL to hand `replaceState` after removing our flag — or `null` when the href holds nothing of ours and
+ * must not be rewritten at all.
+ *
+ * **The fragment is not touched.** It is sliced off at the first `#`, held aside, and concatenated back
+ * verbatim; nothing between here and the return value can parse it, rewrite it, or normalize it. That is the
+ * section invariant expressed as code rather than as a promise: the host's route is byte-for-byte identical
+ * on both sides of this function because the only thing that ever happens to it is a string concatenation.
+ * The previous version cleaned the fragment too, and the discipline required to leave a host's route
+ * undisturbed while rewriting the query hanging off it took four review rounds and never fully arrived.
+ *
+ * The `null` return is the other load-bearing part: it lets the caller distinguish "already clean" from
+ * "cleaned to the same string", so an untouched URL never reaches `replaceState` at all. It is decided by
+ * comparing the stripped search against the raw one — earlier than a whole-href comparison and stronger,
+ * because it cannot be satisfied by a rewrite that happens to reproduce its input.
+ *
+ * It takes the RAW HREF rather than `{pathname, search, hash}` because `location.search` is `""` for both
+ * "no query" and "an empty query", and `location.hash` is `""` for both "no fragment" and "an empty one" —
+ * so a decomposed input cannot distinguish `/p/x?#/route` from `/p/x#/route`, and this function's whole job
+ * is to hand back THE PAGE'S OWN URL rather than a normalized guess at it. An href loses nothing, so the
+ * rule below is total, and printer and stripper read the one source — which is what the round-trip property
+ * rests on.
+ *
+ * Everything left of the first `?` is copied through untouched, so an absolute href stays absolute and a
+ * path-relative one stays relative; this function has no opinion about the origin.
+ *
+ *   no `?` at all             → nothing of ours can be here
+ *   nothing of ours was there → `null`, do not rewrite
+ *   we removed something      → {@link keepsQueryDelimiter} decides whether the `?` was ours to remove too
+ */
+export function stripFabParamsFromUrl(href: string): string | null {
+  const fragment = hrefFragment(href)
+  const head = fragment === undefined ? href : href.slice(0, href.length - fragment.length)
+  const cut = head.indexOf("?")
+  if (cut === -1) return null
+  const search = head.slice(cut + 1)
+  const stripped = stripFabParamsFromSearch(search)
+  if (stripped === search) return null
+  const nextSearch = keepsQueryDelimiter(search) ? `?${stripped}` : ""
+  return `${head.slice(0, cut)}${nextSearch}${fragment ?? ""}`
 }
 
 // ── Standalone FAB visibility keyboard shortcut (Alt+M / ⌥M) ──────────────────────────────
@@ -191,6 +503,74 @@ export function stripFabParamsFromSearch(search: string | undefined): string {
 // as well as the character — the residual µ-in-a-custom-editor collision is accepted by the owner and, as
 // defense in depth, the toggle never fires while an editable element is focused.
 export const ANNOTATION_FAB_SHORTCUT_KEY = "m"
+
+/** Apple platforms print the Option key; every other keyboard prints Alt. */
+const APPLE_PLATFORM_PATTERN = /mac|iphone|ipad|ipod/i
+
+/**
+ * The platform string, preferring the structured `navigator.userAgentData.platform` ("macOS", "Windows")
+ * and falling back to the deprecated-but-universal `navigator.platform` ("MacIntel", "iPhone"). Never the
+ * full UA string: that is the sniffing this helper exists to avoid.
+ */
+export function detectPlatformLabel(
+  nav: { userAgentData?: { platform?: string }; platform?: string } | undefined = typeof navigator === "undefined"
+    ? undefined
+    : (navigator as { userAgentData?: { platform?: string }; platform?: string })
+): string {
+  return nav?.userAgentData?.platform || nav?.platform || ""
+}
+
+/**
+ * How to NAME the FAB shortcut for this device — the single source for that string, so the modifier is
+ * spelled once and every label interpolates it. `"Option+M"` on Apple platforms, `"Alt+M"` elsewhere, and
+ * `undefined` on a touch-PRIMARY device: no keyboard means the clause is omitted, not reworded.
+ */
+export function formatFabShortcut(
+  options: { platform?: string; touchPrimary?: boolean } = {}
+): string | undefined {
+  if (options.touchPrimary) return undefined
+  const platform = options.platform ?? detectPlatformLabel()
+  return APPLE_PLATFORM_PATTERN.test(platform) ? "Option+M" : "Alt+M"
+}
+
+/**
+ * The WHOLE URL that brings a fully hidden chrome back — the page's own href with our flag added to its
+ * search, e.g. `/p/x` → `/p/x?mark` and `/p/x?foo=1#/route` → `/p/x?foo=1&mark#/route`.
+ *
+ * It hands over a complete link rather than the suffix to type, and that is the correction rather than a
+ * nicety. The suffix form asked the reader to append to the END of the address bar, which on a hash-routed
+ * page is inside the host's route — so the printed instruction only worked if we then went looking for our
+ * word in the host's fragment, which is precisely what we are no longer allowed to do. A full URL puts the
+ * flag where it belongs and asks nothing of the reader but a copy. People copy links; they do not transcribe
+ * suffixes, and asking them to was what put us in the host's fragment in the first place.
+ *
+ * The accepted price: a user who ignores the link and appends `?mark` to a hash-routed URL by hand lands the
+ * word inside the fragment, where nothing reads it, and does not get the chrome back. There is no
+ * compensating mechanism and there must not be one — reaching into the fragment to rescue that user is the
+ * exact behavior the invariant at the top of this section forbids.
+ *
+ * The fragment is sliced off and concatenated back verbatim, so this is the printer half of the same
+ * byte-for-byte guarantee {@link stripFabParamsFromUrl} makes on the way out. It takes the RAW HREF for the
+ * same reason that one does: `location.search` cannot tell `/p/x?#/route` from `/p/x#/route`, and the two
+ * need different separators. One rule covers every shape there is — `&` if there is already a `?` to the
+ * left of the fragment, `?` otherwise — and the round-trip property over the shape matrix is what keeps
+ * printer and stripper from disagreeing.
+ */
+export function formatMarkUrl(href: string): string {
+  const fragment = hrefFragment(href)
+  const head = fragment === undefined ? href : href.slice(0, href.length - fragment.length)
+  const sep = head.includes("?") ? "&" : "?"
+  return `${head}${sep}${ANNOTATION_FAB_PARAM_SHOW}${fragment ?? ""}`
+}
+
+/**
+ * Compose an action label with its recovery clause: `base（clause）`, or bare `base` when there is none.
+ * Keeps the platform copy ADDITIVE — a host that overrides only the base sentence still gets the clause its
+ * device earned, instead of freezing one platform's wording into the override.
+ */
+export function withParenthetical(base: string, clause: string | undefined): string {
+  return clause ? `${base}（${clause}）` : base
+}
 
 /** Whether an event target is a text-editable element (typing there must not trigger the shortcut). */
 export function isEditableTarget(target: unknown): boolean {
@@ -460,7 +840,10 @@ export type AnnotationControllerDeps = {
   host?: AnnotationHost
   /** Injected mode-memory storage. Pass `null` to disable; omit to use `localStorage`. */
   storage?: AnnotationModeStorage | null
-  /** Initial `available` value; defaults to the injected `annotation.authenticated`, else `true`. */
+  /**
+   * Initial `available` value; defaults to the injected `annotation.authenticated`, else to whether a write
+   * token was injected — NOT to `true`. An anonymous viewer starts gated off and is upgraded by the auth probe.
+   */
   initialAvailable?: boolean
   /** Injectable clock for stamping local-command intent times (default: system clock). */
   now?: () => string
