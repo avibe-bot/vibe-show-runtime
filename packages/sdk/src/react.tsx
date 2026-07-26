@@ -213,7 +213,6 @@ export type AnnotationOverlayLabels = {
   screenshotTitle: (count: number) => string
   commentPlaceholder: string
   screenshotCommentPlaceholder: string
-  loginRequired: string
   selectedArea: string
   elementCount: (count: number) => string
   byElements: string
@@ -275,7 +274,6 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   screenshotTitle: (count) => (count ? `截图 1 · ${count} 条评论` : "截图 1"),
   commentPlaceholder: "写下你的反馈…",
   screenshotCommentPlaceholder: "点击截图内任意位置，添加下一条编号评论…",
-  loginRequired: "登录后可标注",
   selectedArea: "选中区域",
   elementCount: (count) => `${count} 个元素`,
   byElements: "按元素",
@@ -1426,7 +1424,7 @@ export function AnnotationOverlay({
   )
 }
 
-// ── Chrome: standalone FAB ⇄ pill toolbar, embedded mode pill, login hint ────────────────
+// ── Chrome: standalone FAB ⇄ pill toolbar, embedded mode pill ────────────────────────────
 
 type AnnotationChromeProps = {
   host: AnnotationHost
@@ -2035,10 +2033,9 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     )
   }
 
-  // The ?unmark / hide-row switch gates ALL standalone chrome — the collapsed FAB, the expanded toolbar, AND
-  // the anonymous login hint below — so it hides everything, not just the FAB (#3637621031 / #3637478399);
-  // the disable effect above stops capture too. The toast still renders so the confirmation shows even after
-  // the chrome is gone.
+  // The ?unmark / hide-row switch gates ALL standalone chrome — the collapsed FAB and the expanded toolbar
+  // alike — so it hides everything, not just the FAB (#3637621031 / #3637478399); the disable effect above
+  // stops capture too. The toast still renders so the confirmation shows even after the chrome is gone.
   if (fabVisibility.visibility !== "visible") {
     // The handle renders on STATE, not platform: `handle` is created only on touch, but a desktop opening the
     // same session must still show (and be able to drag) it. Both hidden flavors leave nothing at all on
@@ -2046,8 +2043,8 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     return (
       <>
         {host === "standalone" && available && fabVisibility.visibility === "handle" ? (
-          // Only when the viewer can actually annotate — an anonymous viewer's FAB is a login hint, not the
-          // real FAB, so a recovery handle there would restore to nothing useful.
+          // Only when the viewer can actually annotate — an anonymous viewer has no chrome at all, so a
+          // recovery handle there would restore to nothing.
           <FabEdgeHandle label={labels.restoreHandle} drag={fabDrag} touchCapable={touchCapable} claimFocus={claimFocus} onRestore={restoreFab} />
         ) : null}
         {toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null}
@@ -2055,15 +2052,9 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     )
   }
 
-  // Standalone tab: anonymous public visitors can't write — hide the FAB, show a quiet login hint.
-  if (!available) {
-    return (
-      <div data-show-annotation-ui="" style={loginHintStyle}>
-        <LockIcon />
-        {labels.loginRequired}
-      </div>
-    )
-  }
+  // Standalone tab: an anonymous public visitor can't write. Annotation is an author's tool, so a visitor
+  // has no reason to learn it exists — render nothing at all, not an empty box (owner ruling, 2026-07-26).
+  if (!available) return null
 
   // Standalone chrome (visible + available). The collapsed FAB is the draggable form; enabling expands
   // the toolbar, which reuses the FAB's edge placement.
@@ -3741,26 +3732,6 @@ const modePillExitStyle: React.CSSProperties = {
   flexShrink: 0
 }
 
-// Standalone login hint (anonymous public visitor; FAB hidden).
-const loginHintStyle: React.CSSProperties = {
-  position: "fixed",
-  right: 20,
-  bottom: 20,
-  zIndex: CHROME_Z,
-  display: "inline-flex",
-  alignItems: "center",
-  gap: 7,
-  padding: "8px 12px",
-  borderRadius: 999,
-  color: COLORS.textMuted,
-  background: COLORS.surfacePopover,
-  border: `1px solid ${COLORS.border}`,
-  boxShadow: "0 12px 34px rgba(4, 4, 10, 0.5)",
-  font: `500 12px/1 ${FONT_STACK}`,
-  backdropFilter: "blur(16px)",
-  WebkitBackdropFilter: "blur(16px)"
-}
-
 // Screenshot capture surfaces + region frame.
 const screenshotCaptureStyle: React.CSSProperties = {
   position: "fixed",
@@ -4059,15 +4030,6 @@ function AnchorIcon({ size = 13 }: IconProps) {
     <svg {...svgProps(size)}>
       <rect x="3" y="3" width="7" height="7" rx="1.5" />
       <path d="M14 8h5a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-5" />
-    </svg>
-  )
-}
-
-function LockIcon({ size = 14 }: IconProps) {
-  return (
-    <svg {...svgProps(size)}>
-      <rect x="4" y="11" width="16" height="10" rx="2" />
-      <path d="M8 11V7a4 4 0 0 1 8 0v4" />
     </svg>
   )
 }
