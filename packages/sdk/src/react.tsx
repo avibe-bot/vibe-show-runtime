@@ -1583,59 +1583,66 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
       // restores the chrome with the shortcut and the host's very next route change re-reads that same
       // stale token and hides it again.
       const fresh = shouldApplyFabFlag(token, appliedFlagRef.current)
-      // ONE assignment, on EVERY path — the flag-free early return below and the failed-write return further
-      // down included. The memo means "the occurrence currently in the URL that we already answered", so a
-      // clean pass erases it and the user's SECOND `?mark` counts as new rather than as an echo of their
-      // first. Recorded before the write is even attempted: persisted or not, this occurrence is answered.
-      appliedFlagRef.current = nextAppliedFlag(token)
-      const resolved: { visibility: FabVisibility; persist: FabVisibility | null } =
-        fresh ? resolveFabVisibility(url, stored) : { visibility: stored ?? "visible", persist: null }
-      if (resolved.persist === null) {
-        // No flag right now. At boot that means "honor what was stored"; on a later navigation it must mean
-        // NOTHING. Re-asserting the stored value on every popstate would let a host's own routing overwrite a
-        // choice the user just made whenever the write behind it failed (private mode, quota) — the listener
-        // exists to catch a flag the browser did not reload for, not to police visibility.
-        if (!fromEvent) setVisibility(fabVisibilityForDevice(resolved.visibility, !touchPrimaryRef.current))
-        return
-      }
-      setVisibility(fabVisibilityForDevice(resolved.visibility, !touchPrimaryRef.current))
-      // Strip the one-time flag ONLY once the choice is durable: if the write failed (no storage / quota),
-      // leave ?mark/?unmark in the URL so a reload still carries the intent instead of silently reverting.
-      if (!writeStoredFabVisibility(sessionId, resolved.persist, storage)) return
       try {
-        // The strip reaches wherever the read reaches. Clean only the search and an `unmark` that arrived in
-        // the hash sits there forever: no longer one-time, and the `mark` appended to that same tail next
-        // would be answering a flag that never left. Route path and foreign keys survive byte-for-byte.
-        const before = { search: window.location.search, hash: window.location.hash }
-        const next = stripFabParamsFromUrl({ pathname: window.location.pathname, ...before })
-        if (next === null) return // nothing of ours in the URL — do not fake a navigation
-        // Drop ONLY our flag: keep the app's other params (surgical string strip, no re-encode) and its
-        // existing history.state (a history router may keep location keys / scroll data there).
-        window.history.replaceState(window.history.state, "", next)
-        // replaceState fires neither event, so any router subscribed to them would keep serving the URL we
-        // just rewrote — a hash router would hold our `mark` in its route query forever. Re-issue exactly
-        // what the browser withheld. These wake `apply` again, harmlessly: the flag is gone by now, so the
-        // next pass persists nothing and rewrites nothing.
-        for (const type of fabUrlChangeEvents(before, { search: window.location.search, hash: window.location.hash })) {
-          window.dispatchEvent(
-            type === "hashchange"
-              ? new HashChangeEvent("hashchange", { oldURL: `${window.location.origin}${window.location.pathname}${before.search}${before.hash}`, newURL: window.location.href })
-              : new PopStateEvent("popstate", { state: window.history.state })
-          )
+        const resolved: { visibility: FabVisibility; persist: FabVisibility | null } =
+          fresh ? resolveFabVisibility(url, stored) : { visibility: stored ?? "visible", persist: null }
+        if (resolved.persist === null) {
+          // No flag right now. At boot that means "honor what was stored"; on a later navigation it must mean
+          // NOTHING. Re-asserting the stored value on every popstate would let a host's own routing overwrite a
+          // choice the user just made whenever the write behind it failed (private mode, quota) — the listener
+          // exists to catch a flag the browser did not reload for, not to police visibility.
+          if (!fromEvent) setVisibility(fabVisibilityForDevice(resolved.visibility, !touchPrimaryRef.current))
+          return
         }
-      } catch {
-        /* best-effort — a blocked replaceState / URL parse must not break visibility */
+        setVisibility(fabVisibilityForDevice(resolved.visibility, !touchPrimaryRef.current))
+        // Strip the one-time flag ONLY once the choice is durable: if the write failed (no storage / quota),
+        // leave ?mark/?unmark in the URL so a reload still carries the intent instead of silently reverting.
+        if (!writeStoredFabVisibility(sessionId, resolved.persist, storage)) return
+        try {
+          // The strip reaches wherever the read reaches. Clean only the search and an `unmark` that arrived in
+          // the hash sits there forever: no longer one-time, and the `mark` appended to that same tail next
+          // would be answering a flag that never left. Route path and foreign keys survive byte-for-byte.
+          const before = { search: window.location.search, hash: window.location.hash }
+          const next = stripFabParamsFromUrl({ pathname: window.location.pathname, ...before })
+          if (next === null) return // nothing of ours in the URL — do not fake a navigation
+          // Drop ONLY our flag: keep the app's other params (surgical string strip, no re-encode) and its
+          // existing history.state (a history router may keep location keys / scroll data there).
+          window.history.replaceState(window.history.state, "", next)
+          // replaceState fires neither event, so any router subscribed to them would keep serving the URL we
+          // just rewrote — a hash router would hold our `mark` in its route query forever. Re-issue exactly
+          // what the browser withheld. These wake `apply` again, harmlessly: the flag is gone by now, so the
+          // next pass persists nothing and rewrites nothing.
+          for (const type of fabUrlChangeEvents(before, { search: window.location.search, hash: window.location.hash })) {
+            window.dispatchEvent(
+              type === "hashchange"
+                ? new HashChangeEvent("hashchange", { oldURL: `${window.location.origin}${window.location.pathname}${before.search}${before.hash}`, newURL: window.location.href })
+                : new PopStateEvent("popstate", { state: window.history.state })
+            )
+          }
+        } catch {
+          /* best-effort — a blocked replaceState / URL parse must not break visibility */
+        }
+      } finally {
+        // ONE assignment, however this pass ended — early return, failed write, or throw. The memo means
+        // "the occurrence currently in the URL that we have already answered", so it is DERIVED FROM THE URL
+        // AS IT NOW STANDS rather than from the token we read on the way in. Those two differ in exactly the
+        // case that matters: a successful strip leaves nothing behind, so the answer is `undefined` — and a
+        // page opened AT `#/route?mark` no longer holds `mark` for the rest of the session, swallowing the
+        // user's next append as an echo of their first.
+        //
+        // Deriving it here rather than fixing the listener registration order is the difference between a
+        // property and a coincidence. Re-reading makes the memo agree with the URL by construction, on every
+        // path; ordering the listeners so the boot pass hears its own re-issued events would leave the memo
+        // correct only for as long as that round trip keeps happening — one refactor away from wrong again,
+        // and silently, since nothing in this package can render a DOM to catch it.
+        appliedFlagRef.current = nextAppliedFlag(fabFlagToken(currentUrl()))
       }
     }
     const onNavigate = () => apply(true)
-    // SUBSCRIBE FIRST, then read. The boot pass ends by re-issuing the events `replaceState` withheld, and we
-    // are one of the subscribers that has to hear them: it is the clean pass that erases the memo. Registering
-    // afterwards made the very first pass the one case that never got its own clearing edge — so a page opened
-    // AT `#/route?mark` (the printed recovery, followed with a reload) left the memo holding `mark` for the
-    // rest of the session, and the user's next `?mark` matched a spent token and was swallowed. The fix is not
-    // to clear the memo here as a special case; it is that there is no special case — every pass, boot
-    // included, now observes the same sequence the tests already pin. The re-entry is bounded: the flag is
-    // gone by then, so the second pass persists nothing, rewrites nothing, and dispatches nothing.
+    // Subscribing before the first read is hygiene, not mechanism: correctness no longer depends on this pass
+    // hearing the events it re-issues, because the memo above is derived from the URL rather than repaired by
+    // a round trip. The re-entry it causes is bounded — the flag is gone by then, so the woken pass persists
+    // nothing, rewrites nothing, and dispatches nothing.
     window.addEventListener("hashchange", onNavigate)
     window.addEventListener("popstate", onNavigate)
     apply(false)

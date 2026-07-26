@@ -1213,3 +1213,70 @@ describe("an empty query is not the absence of one, on the way out either (Lane 
     ).toBe("/p/x#") // the page's own URL was "/p/x?#"
   })
 })
+
+describe("the memo names the URL the pass LEAVES BEHIND, not the token it read on the way in (Lane U, round 13)", () => {
+  // Round 9 gave `nextAppliedFlag` the right rule and round 10 wired it to the wrong input: `react.tsx` read
+  // the token BEFORE the strip and remembered that. On a page opened at `#/route?mark` the strip succeeds and
+  // the URL ends up flag-free, but the memo still said "mark" — so the user's second append, the one the
+  // printed exit tells them to type, matched a spent occurrence and was swallowed for the rest of the session.
+  // It only appeared to work because the synthetic events re-entered the same effect and overwrote the memo
+  // with the correct value; on boot those events fire before anything is subscribed, so even that accident
+  // was unavailable exactly when the flag arrives with the page.
+  //
+  // The call site is one line in `react.tsx` and this package renders no DOM, so what is pinned here is the
+  // RULE it now follows: the memo is `nextAppliedFlag(fabFlagToken(<the URL as it now stands>))`, and the URL
+  // as it now stands is whatever `stripFabParamsFromUrl` left. Chaining the two real functions is the closest
+  // a pure test gets to that pass, and it is the part that was wrong — the derivation, not either half.
+  //
+  // The four rows are the owner's table, in order.
+
+  /** Decompose a stripped URL the way the browser hands it back. The fragment starts at the FIRST `#`. */
+  function readBack(stripped: string): { search: string; hash: string } {
+    const cut = stripped.indexOf("#")
+    const head = cut === -1 ? stripped : stripped.slice(0, cut)
+    const q = head.indexOf("?")
+    return { search: q === -1 ? "" : head.slice(q), hash: cut === -1 ? "" : stripped.slice(cut) }
+  }
+
+  const BOOTS = [
+    { label: "search", url: { pathname: "/p/x", search: "?mark", hash: "" } },
+    { label: "hash route", url: { pathname: "/p/x", search: "", hash: "#/route?mark" } },
+    { label: "both segments", url: { pathname: "/p/x", search: "?unmark", hash: "#/route?mark" } }
+  ]
+
+  it("row 1 & 4: a strip that landed erases the memo, so the SAME advertised token applies again", () => {
+    for (const { label, url } of BOOTS) {
+      const arriving = fabFlagToken(url)
+      expect(shouldApplyFabFlag(arriving, undefined), `boot via ${label} applies`).toBe(true)
+      const after = stripFabParamsFromUrl(url)
+      expect(after, `boot via ${label} strips`).not.toBeNull()
+      // Row 1 — the pass ends on a flag-free URL, so there is no answered occurrence left to remember.
+      const memo = nextAppliedFlag(fabFlagToken(readBack(after as string)))
+      expect(memo, `memo after stripping ${label}`).toBeUndefined()
+      // Row 4 — the user hides again and types the exit a second time, taken from the printer rather than
+      // hand-written, so this is literally the string the chrome told them to append. Same token as the
+      // first time; a different occurrence, so it must apply.
+      const clean = after as string
+      const typed = clean + formatMarkParam(`https://h${clean}`)
+      expect(shouldApplyFabFlag(fabFlagToken(readBack(typed)), memo), `second append after ${label}`).toBe(true)
+    }
+  })
+
+  it("row 2: a write that failed leaves the flag in the URL on purpose, so the memo must still name it", () => {
+    // No strip happens on this path — persistence failed and `?unmark` stays behind as the reload fallback.
+    // Re-reading therefore returns the same token, which is round 8's guard: it must not fire a second time.
+    const url = { pathname: "/p/x", search: "?unmark", hash: "" }
+    const memo = nextAppliedFlag(fabFlagToken(url))
+    expect(memo).toBe("unmark")
+    expect(shouldApplyFabFlag(fabFlagToken(url), memo)).toBe(false)
+  })
+
+  it("row 3: a pass carrying nothing of ours forgets whatever it was holding — the self-heal", () => {
+    // `stripFabParamsFromUrl` returns null here (nothing to rewrite) and the pass returns early; the memo is
+    // still assigned, from the URL it did not touch. That is what makes the erase unconditional rather than
+    // something each early return has to remember to do.
+    const url = { pathname: "/p/x", search: "?a=1", hash: "#/route?mark=42" }
+    expect(stripFabParamsFromUrl(url)).toBeNull()
+    expect(nextAppliedFlag(fabFlagToken(url))).toBeUndefined()
+  })
+})
