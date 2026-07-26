@@ -238,6 +238,33 @@ export function shouldApplyFabFlag(token: string, lastApplied: string | undefine
 }
 
 /**
+ * What the "already answered" memo becomes after observing `token` — the other half of the rule above, and
+ * the half round 8 left unsaid. The memo means "the occurrence currently in the URL that we have already
+ * acted on", so a flag-free URL must erase it: otherwise the memo outlives the flag, and the SECOND time the
+ * user follows the printed hint the token matches a spent one and their rescue is silently swallowed
+ * (round 9). Set on every pass, not only on the ones that apply something — that is what makes it self-heal
+ * instead of needing a clearing call at each early return.
+ */
+export function nextAppliedFlag(token: string): string | undefined {
+  return token === "" ? undefined : token
+}
+
+/**
+ * The status message that is still TRUE. Every toast this chrome raises is `fabToastFor(state, …)` — it
+ * narrates exactly one visibility and the way out of it — so the instant the visibility moves on, the
+ * message is describing somewhere the user no longer is. Deriving it from the current state rather than
+ * clearing it at each restore site means no path can forget: not the shortcut, not the edge handle, not a
+ * `?mark` typed into the address bar (which restores without going through any handler at all), and not
+ * whichever path is added next.
+ */
+export function activeFabToast(
+  toast: { message: string; state: FabVisibility } | null | undefined,
+  current: FabVisibility
+): string | null {
+  return toast && toast.state === current ? toast.message : null
+}
+
+/**
  * Resolve the standalone chrome's visibility from the URL. Precedence: an explicit `unmark` / `mark` (bare
  * presence) WINS and dictates what to persist (`persist` = the state to write, so the switch survives a later
  * param-free load); else honor the stored state; else default visible (`persist: null` ⇒ write nothing).

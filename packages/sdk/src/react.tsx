@@ -79,6 +79,8 @@ import {
   fabUrlChangeEvents,
   fabFlagToken,
   shouldApplyFabFlag,
+  nextAppliedFlag,
+  activeFabToast,
   shouldToggleFabShortcut,
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
@@ -1561,16 +1563,21 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
     if (host !== "standalone" || typeof window === "undefined") return
     const apply = (fromEvent: boolean) => {
       const url = currentUrl()
+      const token = fabFlagToken(url)
       const stored = readStoredFabVisibility(sessionId, touchPrimaryRef.current, storage)
       // A flag is spent once per OCCURRENCE, not once per read. The two correct decisions above collide
       // otherwise: when the write fails we leave `?unmark` in the URL on purpose (the reload fallback), and
       // since round 7 we also listen for navigation — so without an identity to compare against, the user
       // restores the chrome with the shortcut and the host's very next route change re-reads that same
       // stale token and hides it again.
+      const fresh = shouldApplyFabFlag(token, appliedFlagRef.current)
+      // ONE assignment, on EVERY path — the flag-free early return below and the failed-write return further
+      // down included. The memo means "the occurrence currently in the URL that we already answered", so a
+      // clean pass erases it and the user's SECOND `?mark` counts as new rather than as an echo of their
+      // first. Recorded before the write is even attempted: persisted or not, this occurrence is answered.
+      appliedFlagRef.current = nextAppliedFlag(token)
       const resolved: { visibility: FabVisibility; persist: FabVisibility | null } =
-        shouldApplyFabFlag(fabFlagToken(url), appliedFlagRef.current)
-          ? resolveFabVisibility(url, stored)
-          : { visibility: stored ?? "visible", persist: null }
+        fresh ? resolveFabVisibility(url, stored) : { visibility: stored ?? "visible", persist: null }
       if (resolved.persist === null) {
         // No flag right now. At boot that means "honor what was stored"; on a later navigation it must mean
         // NOTHING. Re-asserting the stored value on every popstate would let a host's own routing overwrite a
@@ -1580,8 +1587,6 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
         return
       }
       setVisibility(fabVisibilityForDevice(resolved.visibility, !touchPrimaryRef.current))
-      // Spent BEFORE the write is attempted: whether or not it persists, this occurrence has been answered.
-      appliedFlagRef.current = fabFlagToken(url)
       // Strip the one-time flag ONLY once the choice is durable: if the write failed (no storage / quota),
       // leave ?mark/?unmark in the URL so a reload still carries the intent instead of silently reverting.
       if (!writeStoredFabVisibility(sessionId, resolved.persist, storage)) return
@@ -1929,20 +1934,13 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
       })),
     [touchInput, shortcut, labels]
   )
-  const [toast, setToast] = React.useState<string | null>(null)
+  const [toast, setToast] = React.useState<{ message: string; state: FabVisibility } | null>(null)
   const toastTimer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   React.useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
-  const flashToast = React.useCallback((message: string) => {
-    setToast(message)
+  const flashToast = React.useCallback((message: string, state: FabVisibility) => {
+    setToast({ message, state })
     if (toastTimer.current) clearTimeout(toastTimer.current)
     toastTimer.current = setTimeout(() => setToast(null), 3200)
-  }, [])
-  // Drop a toast BEFORE its timer: every toast here narrates the hidden state ("已隐藏，按 …恢复"), so once
-  // the user leaves that state the message is describing somewhere they no longer are.
-  const clearToast = React.useCallback(() => {
-    if (toastTimer.current) clearTimeout(toastTimer.current)
-    toastTimer.current = undefined
-    setToast(null)
   }, [])
   // Hiding and restoring the FAB both swap the control the user is on (toolbar/FAB ⇄ edge handle); on either
   // user-initiated swap the successor claims focus via this one controller, so a keyboard user is never dropped
@@ -1965,19 +1963,15 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
       // The URL fragment is resolved HERE, in the handler, against the URL as it stands at the instant of the
       // hide — the one moment it is guaranteed current.
       const message = fabToastFor(next, shortcut, formatMarkParam(currentUrl()), labels)
-      if (message) flashToast(message)
+      if (message) flashToast(message, next)
     },
     [requestChromeFocus, onDisable, fabVisibility, flashToast, shortcut, labels]
   )
   // Restore the FAB (edge-handle tap/Enter, or the shortcut): arm focus so the re-rendered FAB — not <body> — receives it.
   const restoreFab = React.useCallback(() => {
     requestChromeFocus()
-    // A hide toast can still be on screen (3.2s) when the user restores — via the shortcut pressed twice, or
-    // a handle tap right after collapsing. Restoring no longer flashes its own toast, so nothing would
-    // replace that stale "已隐藏…" status; clear it here instead of letting the timer narrate the past.
-    clearToast()
     fabVisibility.set("visible")
-  }, [requestChromeFocus, clearToast, fabVisibility])
+  }, [requestChromeFocus, fabVisibility])
   // If ?unmark applies (or a hide row fires) WHILE a session is active, the hide switch must also stop
   // capture — not just hide the collapsed FAB — so the documented switch works mid-session (#3637478399).
   React.useEffect(() => {
@@ -1998,7 +1992,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     // one is not user-initiated, so an unannounced handle appearing on screen would be a second puzzle.
     // Deriving it from the new state answers both at once: what this is, and how to get out.
     const message = fabToastFor(rescued, shortcut, formatMarkParam(currentUrl()), labels)
-    if (message) flashToast(message)
+    if (message) flashToast(message, rescued)
   }, [host, shortcut, fabVisibility.visibility, fabVisibility.set, flashToast, labels])
   // Option/Alt+M toggles the chrome (standalone only), mirroring ?mark/?unmark and the '?' popup's hide row.
   // Registered at the document level so it works even while the chrome is hidden; the pure guard blocks it
@@ -2017,6 +2011,12 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     document.addEventListener("keydown", onKeyDown)
     return () => document.removeEventListener("keydown", onKeyDown)
   }, [host, shortcut, fabVisibility.visibility, hideFab, restoreFab])
+
+  // A hide toast is on screen for 3.2s and narrates ONE state ("已隐藏，…恢复"). Whoever moves the user out of
+  // that state makes it a lie — including the paths with no handler to clear it from: a `?mark` typed into the
+  // address bar restores through the URL listener without touching any callback here. Deriving the live
+  // message from the current state retires the stale one everywhere at once, rather than per call site.
+  const statusToast = activeFabToast(toast, fabVisibility.visibility)
 
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
@@ -2047,7 +2047,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
           // recovery handle there would restore to nothing.
           <FabEdgeHandle label={labels.restoreHandle} drag={fabDrag} touchCapable={touchCapable} claimFocus={claimFocus} onRestore={restoreFab} />
         ) : null}
-        {toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null}
+        {statusToast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{statusToast}</div> : null}
       </>
     )
   }
@@ -2099,7 +2099,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   return (
     <>
       {content}
-      {toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null}
+      {statusToast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{statusToast}</div> : null}
     </>
   )
 }

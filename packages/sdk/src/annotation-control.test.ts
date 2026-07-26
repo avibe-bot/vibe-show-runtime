@@ -40,6 +40,8 @@ import {
   stripFabParamsFromSearch,
   fabFlagToken,
   shouldApplyFabFlag,
+  nextAppliedFlag,
+  activeFabToast,
   stripFabParamsFromUrl,
   fabUrlChangeEvents,
   isEditableTarget,
@@ -1017,5 +1019,61 @@ describe("the hash belongs to the host router; we may only claim the bare flag t
 
   it("keeps location.search tolerant — that namespace was reserved before this PR, the hash was not", () => {
     expect(resolveFabVisibility({ search: "?mark=1" }, undefined).visibility).toBe("visible")
+  })
+})
+
+describe("the spent-flag memo must not outlive the flag itself (Lane U, round 9)", () => {
+  // Round 8 stopped a flag from firing twice. It did not say when the memo STOPS applying — so the memo
+  // outlived the flag and swallowed the user's second, genuinely new `?mark`. The memo means "the occurrence
+  // currently in the URL that we already answered"; once the URL is flag-free there is no such occurrence.
+  it("forgets the answered occurrence as soon as the URL is flag-free", () => {
+    expect(nextAppliedFlag("mark")).toBe("mark")
+    expect(nextAppliedFlag("")).toBeUndefined()
+  })
+
+  it("lets the SAME token apply again after an intervening clean URL — the whole round-9 bug, as a sequence", () => {
+    // 1. user appends ?mark on a hash route → fresh, applied, remembered
+    let memo: string | undefined = undefined
+    const first = fabFlagToken({ hash: "#/route?mark" })
+    expect(shouldApplyFabFlag(first, memo)).toBe(true)
+    memo = nextAppliedFlag(first)
+    // 2. the strip lands and re-issues the navigation; the woken pass sees a clean URL and forgets
+    const clean = fabFlagToken({ hash: "#/route" })
+    expect(shouldApplyFabFlag(clean, memo)).toBe(false)
+    memo = nextAppliedFlag(clean)
+    expect(memo).toBeUndefined()
+    // 3. the user hides again and appends the SAME advertised token — a new occurrence, so it must apply
+    const second = fabFlagToken({ hash: "#/route?mark" })
+    expect(second).toBe(first)
+    expect(shouldApplyFabFlag(second, memo)).toBe(true)
+  })
+
+  it("still refuses a flag that never left, which is what round 8 was about", () => {
+    // Persistence failed, so `unmark` stays in the URL on purpose. Every later navigation re-reads the same
+    // token with no clean URL in between — the memo survives and keeps swallowing it.
+    const token = fabFlagToken({ search: "?unmark" })
+    let memo = nextAppliedFlag(token)
+    expect(shouldApplyFabFlag(token, memo)).toBe(false)
+    memo = nextAppliedFlag(token)
+    expect(shouldApplyFabFlag(token, memo)).toBe(false)
+  })
+})
+
+describe("a toast narrates ONE state, so it expires when that state does (Lane U, round 9)", () => {
+  // Every toast here is fabToastFor(state, …) — it describes exactly one visibility. Deriving the visible
+  // message from the current state means no restore path can forget to clear it: not the shortcut, not the
+  // handle, not a `?mark` typed into the address bar, and not whichever path gets added next.
+  it("shows the message only while the state it describes is still the current one", () => {
+    const raised = { message: "已完全隐藏，网址末尾加 ?mark 恢复", state: "hidden-url" as const }
+    expect(activeFabToast(raised, "hidden-url")).toBe(raised.message)
+    // The round-9 report: the URL restore path sets visibility directly, never touching the toast.
+    expect(activeFabToast(raised, "visible")).toBeNull()
+    // A mid-session device degrade moves hidden-key → handle; the old exit is wrong there too.
+    expect(activeFabToast({ message: "按 Option+M 恢复", state: "hidden-key" }, "handle")).toBeNull()
+  })
+
+  it("is null when nothing was raised", () => {
+    expect(activeFabToast(null, "visible")).toBeNull()
+    expect(activeFabToast(undefined, "hidden-url")).toBeNull()
   })
 })
