@@ -89,21 +89,29 @@ describe("hide copy names each recovery exactly once, in the row that performs i
   // from the only state with nothing on screen. It is a LINE of its own with a copy button on it, not
   // punctuation inside a sentence, so the sentence is free to state the rule and the button to hand over an
   // address that already obeys it.
-  it("the sentence states the RULE and names the flag; the link rides beside it, not inside it", () => {
+  it("the sentence names the flag but never tells the reader where to put it", () => {
     const L = DEFAULT_ANNOTATION_LABELS
-    expect(L.hiddenToast).toBe("已完全隐藏。网址后面加 ?mark（已经带问号就改用 &mark）就能把按钮调回来")
-    // The flag is named. A user who reads this once can reproduce the exit on any page of this Show Page,
-    // instead of owning one magic address they have to keep somewhere forever. Pinned against the CONSTANT,
-    // not the literal: this sentence is the one place the flag is spelled out in prose rather than built by
-    // formatMarkUrl, so renaming the param would leave it quietly instructing the user to type a dead word.
-    expect(L.hiddenToast).toContain(`?${ANNOTATION_FAB_PARAM_SHOW}`)
-    // BOTH delimiters, because the rule outlives the link it was printed beside and has to hold on the next
-    // page too. On a URL that already carries a query, a literal `?mark` lands inside the previous parameter's
-    // VALUE — `?foo=1?mark` parses as foo="1?mark" — so the flag is never seen and the instruction fails
-    // silently, which is strictly worse than not offering a rule. Same choice formatMarkUrl makes in code.
-    expect(L.hiddenToast).toContain(`&${ANNOTATION_FAB_PARAM_SHOW}`)
+    expect(L.hiddenToast).toBe("已完全隐藏。网址带上 mark 参数就能把按钮调回来，下面这条已经带好了")
+    // The flag is named. A user who reads this once knows what the exit is called instead of owning one magic
+    // address they have to keep somewhere forever. Pinned against the CONSTANT, not the literal: this sentence
+    // is the one place the flag is spelled out in prose rather than built by formatMarkUrl, so renaming the
+    // param would leave it quietly naming a dead word.
+    expect(L.hiddenToast).toContain(ANNOTATION_FAB_PARAM_SHOW)
+    // But NO delimiter, in either form, because a delimiter is a claim about POSITION and every short claim
+    // available here is false on one of the two URL shapes a Show Page has. `?mark` appended to a URL that
+    // already carries a query lands inside the previous parameter's value; appended to a hash-routed URL it
+    // lands inside the fragment, which belongs to the host's router and which this control plane never reads.
+    // Both fail SILENTLY — the user follows the sentence exactly and the chrome stays gone — which is worse
+    // than declining to give a rule and pointing at an address that is already correct.
+    for (const delimiter of ["?", "&"]) {
+      expect(L.hiddenToast).not.toContain(`${delimiter}${ANNOTATION_FAB_PARAM_SHOW}`)
+    }
     expect(new URLSearchParams("?foo=1?mark".slice(1)).has(ANNOTATION_FAB_PARAM_SHOW)).toBe(false)
-    expect(new URLSearchParams("?foo=1&mark".slice(1)).has(ANNOTATION_FAB_PARAM_SHOW)).toBe(true)
+    expect(new URL("https://h/p/abc#/route?mark").searchParams.has(ANNOTATION_FAB_PARAM_SHOW)).toBe(false)
+    // …which is exactly what the link beside the sentence does carry, on both shapes. The rule the sentence
+    // declines to state is stated in code, once, where it can be exact.
+    expect(new URL(formatMarkUrl("https://h/p/abc#/route")).searchParams.has(ANNOTATION_FAB_PARAM_SHOW)).toBe(true)
+    expect(new URL(formatMarkUrl("https://h/p/abc?foo=1")).searchParams.has(ANNOTATION_FAB_PARAM_SHOW)).toBe(true)
     // …and the sentence is URL-free, so it cannot go stale against the page it was raised on. Every earlier
     // round's bugs were a printed address drifting from the reader's actual one.
     expect(L.hiddenToast).not.toContain("http")

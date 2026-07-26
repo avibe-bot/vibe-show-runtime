@@ -281,8 +281,8 @@ export function activeFabToast<T extends { state: FabVisibility; sessionId: stri
  * Not the shared 3.2s, though — that is roughly the time to notice a toast and read it, with nothing left
  * over to act. Overshooting the dwell obscures the page for a few seconds; undershooting it strands the user
  * in the one state that has no other way back. The asymmetry, not a preference for round numbers, is what
- * puts this above the baseline. This is only the dwell until the copy SETTLES, though — once it does,
- * `copySettleDwellMs` takes over, so the common path is far shorter than either bound.
+ * puts this above the baseline. This is only the RESTING dwell, though — the moment the copy button is
+ * touched {@link toastDwellMs} takes over, so the common path is far shorter than either bound.
  *
  * It still expires, which is a bounded race rather than a guarantee, and that is deliberate: a toast that
  * waited for a dismissal would need a document-level listener to hear one, and this control plane's whole
@@ -303,7 +303,7 @@ export function fabToastDurationMs(visibility: FabVisibility): number {
  * Absent on any insecure origin, and refusable by a permissions policy — neither is exotic for a Show Page
  * opened over plain HTTP on a phone. Both come back `false` rather than throwing, because a failed copy is
  * not a dead end: the printed link is still on screen and can still be selected by hand. The boolean exists
- * so the caller can tell those two paths apart — see `copySettleDwellMs`.
+ * so the caller can tell those two paths apart — see {@link toastDwellMs}.
  */
 export async function copyRestoreLink(
   text: string,
@@ -319,31 +319,43 @@ export async function copyRestoreLink(
 }
 
 /**
- * What a settled copy does to the toast's clock: how long it should stay from here, or `null` for "this copy
- * is not about the message on screen". The whole decision behind the copy button, minus the button.
- *
- * The dwell is sized to WHAT IS LEFT TO DO. A copy that lands ends the interaction — the link is on the
- * clipboard, the toast is now just a confirmation, and it should get off the page. A copy that does NOT land
- * hands the user back exactly the job the button existed to remove: select a URL by hand, a drag on a phone.
- * That is the job the long dwell was sized for in the first place, so leaving the raise-time countdown
- * running would be the worst of both — less time than before the button existed, to do the slower thing, in
- * `hidden-url`, the one state whose only exit is the pill about to vanish. The shorter dwell owner feedback
- * asked for therefore governs the path that actually happens, and the manual-selection dwell comes back only
- * on the path that actually needs it.
- *
- * `liveToken` is why this takes tokens at all rather than just a boolean. `writeText` is async: between the
- * tap and the settle the toast can be replaced by another hide, or retired by a session swap or a state
- * change. Re-timing then would hold a message the user has not read hostage to a copy they did not make.
- * Nothing on screen means no live token, so that case falls out of the same comparison instead of needing
- * its own branch. Same identity guard as {@link activeFabToast}, one layer down.
+ * What the toast's copy button is doing. A state, deliberately, rather than the pair of callbacks it started
+ * as — see {@link toastDwellMs} for why that difference is the whole fix.
  */
-export function copySettleDwellMs(
-  settlingToken: number,
-  liveToken: number | undefined,
-  copied: boolean
-): number | null {
-  if (settlingToken !== liveToken) return null
-  return copied ? 900 : 15000
+export type ToastCopyState = "idle" | "pending" | "copied" | "failed"
+
+/**
+ * How long the toast has left — or `null` for "hold it open, something is still in flight".
+ *
+ * This clock used to be armed imperatively, at two separate moments (the raise, then the copy's settle),
+ * against one `setTimeout` handle kept in a ref. That shape is what made every defect in it a race: the two
+ * call sites owned the same clock and could not see each other, so each fix was another guard comparing one
+ * site's stale idea of the toast against the other's. Deriving the dwell from state instead leaves exactly
+ * one answer for any given toast, and no second writer to disagree with. Each case below is a transition
+ * that used to need its own guard:
+ *
+ * - `pending` → held open, no deadline at all. `writeText` can stay unresolved for as long as a permission
+ *   prompt is on screen, and a clock that kept running underneath it would retire the toast while the user
+ *   was answering the prompt — taking the only exit from `hidden-url` with it, since a settle arriving after
+ *   that has no toast left to re-time and nothing else on the page says the copy failed.
+ * - `copied` → briefly. The link is on the clipboard and the pill has nothing left to give; but dismissing
+ *   instantly looks exactly like a timeout, so the confirmation gets long enough to be read as one.
+ * - `failed` → long. The user has just been handed back the manual selection the button existed to remove —
+ *   the slower gesture, in the one state with no other exit — so it gets MORE time than the raise, not
+ *   whatever happened to be left of it.
+ * - `idle` → the resting dwell, sized to the message. See {@link fabToastDurationMs}.
+ */
+export function toastDwellMs(visibility: FabVisibility, copy: ToastCopyState): number | null {
+  switch (copy) {
+    case "pending":
+      return null
+    case "copied":
+      return 900
+    case "failed":
+      return 15000
+    default:
+      return fabToastDurationMs(visibility)
+  }
 }
 
 /**

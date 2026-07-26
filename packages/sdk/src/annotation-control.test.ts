@@ -47,7 +47,7 @@ import {
   stripFabParamsFromSearch,
   activeFabToast,
   copyRestoreLink,
-  copySettleDwellMs,
+  toastDwellMs,
   fabToastDurationMs,
   stripFabParamsFromUrl,
   isEditableTarget,
@@ -1074,20 +1074,32 @@ describe("a toast narrates ONE state of ONE session, so it expires when either d
   // of it. Stated as relations rather than as two numbers: it is the ordering that is the fix.
   it("re-times the toast around what is left to do, not around the tap", () => {
     const raised = fabToastDurationMs("hidden-url")
-    expect(copySettleDwellMs(1, 1, false)).toBeGreaterThan(raised * 2) // manual selection, from a standing start
-    expect(copySettleDwellMs(1, 1, true)).toBeLessThan(raised) // just long enough to read "已复制"
-    expect(copySettleDwellMs(1, 1, true)).toBeGreaterThan(0) // an instant vanish looks exactly like a timeout
+    expect(toastDwellMs("hidden-url", "failed")).toBeGreaterThan(raised * 2) // manual selection, from a standing start
+    expect(toastDwellMs("hidden-url", "copied")).toBeLessThan(raised) // just long enough to read "已复制"
+    expect(toastDwellMs("hidden-url", "copied")).toBeGreaterThan(0) // an instant vanish looks exactly like a timeout
+    expect(toastDwellMs("hidden-url", "idle")).toBe(raised) // untouched, it keeps the dwell its message earned
   })
 
-  // `writeText` is async, so a settle can land after its toast is gone. Re-timing then would let a copy the
-  // user made on one message decide how long an unrelated one stays — including retiring a `hidden-url` toast
-  // they have not read yet, which is the only copy of the only exit. `null` is "not mine", and both ways of
-  // not being current collapse into it: a newer toast took the screen, or nothing is on screen at all.
-  it("ignores a copy that settles after its own toast is gone", () => {
-    expect(copySettleDwellMs(1, 2, true)).toBeNull() // a newer toast replaced it mid-copy
-    expect(copySettleDwellMs(2, 1, false)).toBeNull() // …and the comparison is identity, not recency
-    expect(copySettleDwellMs(1, undefined, true)).toBeNull() // the toast was retired outright
-    expect(copySettleDwellMs(1, undefined, false)).toBeNull()
-    expect(copySettleDwellMs(1, 1, true)).not.toBeNull() // and the live one still settles
+  // The failure this replaces: `writeText` stays unresolved for as long as a permission prompt is open, which
+  // is unbounded and routinely longer than the resting dwell — so a clock that kept running underneath it
+  // retired the toast mid-prompt, and the refusal then had nothing left to attach the manual-selection dwell
+  // to. The user was left in `hidden-url` with no link and no control: the exact state the toast exists to
+  // prevent, reachable by using the button as intended. A held-open toast cannot be timed out by anything.
+  it("stops the clock entirely while a copy is in flight", () => {
+    expect(toastDwellMs("hidden-url", "pending")).toBeNull()
+    expect(toastDwellMs("handle", "pending")).toBeNull() // a property of the copy, not of the message
+  })
+
+  // Every state answers, and the answer depends only on (visibility, copy). That total-ness is the point of
+  // deriving the dwell rather than arming it: there is no ordering of raises and settles that can leave the
+  // toast without a deadline, or with two.
+  it("gives one answer per state, so no two writers can disagree about the clock", () => {
+    for (const visibility of ["visible", "handle", "hidden-key", "hidden-url"] as const) {
+      for (const copy of ["idle", "pending", "copied", "failed"] as const) {
+        const dwell = toastDwellMs(visibility, copy)
+        expect(dwell === null || dwell > 0).toBe(true)
+        expect(toastDwellMs(visibility, copy)).toBe(dwell)
+      }
+    }
   })
 })
