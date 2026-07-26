@@ -1893,8 +1893,14 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     previousShortcutRef.current = shortcut
     if (host !== "standalone") return
     const rescued = fabVisibilityAfterShortcutLoss(fabVisibility.visibility, previous, shortcut)
-    if (rescued) fabVisibility.set(rescued)
-  }, [host, shortcut, fabVisibility.visibility, fabVisibility.set])
+    if (!rescued) return
+    fabVisibility.set(rescued)
+    // The toast obeys the same rule every other transition here does: it names the state just entered. A
+    // "按 Option+M 恢复" left over from the hide would now be advertising the very exit that just vanished —
+    // and unlike every other transition this one is not user-initiated, so an unannounced handle appearing on
+    // screen is a second puzzle. One existing string answers both: what it is, and how to get out.
+    flashToast(labels.handleToast)
+  }, [host, shortcut, fabVisibility.visibility, fabVisibility.set, flashToast, labels.handleToast])
   // Option/Alt+M toggles the chrome (standalone only), mirroring ?mark/?unmark and the '?' popup's hide row.
   // Registered at the document level so it works even while the chrome is hidden; the pure guard blocks it
   // while the user is typing or holding another modifier. Bound only where a shortcut EXISTS — a touch-primary
