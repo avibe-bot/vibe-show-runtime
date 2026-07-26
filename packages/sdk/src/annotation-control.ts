@@ -396,6 +396,28 @@ export function mergeCopyState(prev: ToastCopyState, next: ToastCopyState): Toas
 }
 
 /**
+ * Whether a deadline computed for one toast state may still retire what is on screen.
+ *
+ * `clearTimeout` is not retroactive. Once a timer has expired its callback is already queued, and cancelling
+ * it does nothing — so a deadline that was correct when it was armed can still run after the state it was
+ * computed from has moved on. The window is small but real: tap the copy button in the same tick the resting
+ * dwell expires, and the queued callback runs after the `pending` state has already been applied, retiring a
+ * toast {@link toastDwellMs} is deliberately holding open. In `hidden-url` that leaves the user with neither
+ * the link nor any other way back.
+ *
+ * So the deadline carries the identity it was computed for and re-checks it at fire time, which is the only
+ * moment that can tell. `copy` is part of that identity because the dwell is a function of it; `token` covers
+ * the rest, since a toast's visibility is fixed at the raise that minted its token.
+ */
+export function deadlineRetiresToast(
+  current: { token: number; copy: ToastCopyState } | null | undefined,
+  token: number,
+  copy: ToastCopyState
+): boolean {
+  return !!current && current.token === token && current.copy === copy
+}
+
+/**
  * Resolve the standalone chrome's visibility from `location.search` — the Show Page's own query string, and
  * the only URL surface this control plane reads. Precedence: an explicit `unmark` / `mark` WINS and dictates
  * what to persist (`persist` = the state to write, so the switch survives a later flag-free load); else honor

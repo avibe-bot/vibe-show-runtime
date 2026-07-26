@@ -80,6 +80,7 @@ import {
   toastDwellMs,
   settledCopyState,
   mergeCopyState,
+  deadlineRetiresToast,
   shouldToggleFabShortcut,
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
@@ -1834,13 +1835,12 @@ function FabEdgeHandle({ label, drag, touchCapable, claimFocus, onRestore }: { l
  * own idea of what it was doing would be a second writer to a state the toast's clock also reads, which is
  * exactly the split this seam kept producing bugs from. Here the button reports; `toastDwellMs` decides.
  *
- * `attempts` is the one piece of local truth left, and it is about ORDERING, not state: it answers "has a
- * newer tap started since this one?" and nothing else. Comparing a captured attempt against the same ref that
- * minted it is a within-instance ordering check, not a read of some other render's state — which is why it
- * can be a ref at all. What that ordering is worth differs per outcome, and this component does not decide
- * that either: {@link settledCopyState} says what an attempt may claim, {@link mergeCopyState} says what the
- * toast will accept. Both are pure, so the rule that a copied clipboard cannot be un-copied by a later
- * refusal is a tested branch rather than a shape of this callback.
+ * So this component keeps NO copy state — not the attempt counter, not the clipboard call. It reports the
+ * tap and renders what it is handed. The reason is lifetime: this child is NOT as long-lived as the toast it
+ * draws. The overlay returns null while unavailable and renders the toast from two different branches, so the
+ * child unmounts and remounts under a toast whose state and token never changed. A counter kept here would
+ * silently restart at zero with a clipboard write still in flight, and the abandoned attempt would come back
+ * looking like the newest one. The overlay owns it instead, next to the state it has to agree with.
  *
  * Focus follows the control. `hideFab` skips its usual focus transfer for hidden states — correct when they
  * rendered nothing, wrong now that `hidden-url` renders the only exit: focus would fall to <body> and Tab
@@ -1858,33 +1858,20 @@ function FabToast({
   copy: ToastCopyState
   labels: Pick<Required<AnnotationOverlayLabels>, "copyLinkAction" | "copiedLabel" | "copyFailedLabel">
   token: number
-  onCopy: (token: number, copy: ToastCopyState) => void
+  onCopy: (token: number, link: string) => void
 }) {
   const link = content.link
   const copyRef = React.useRef<HTMLButtonElement | null>(null)
-  const attempts = React.useRef(0)
   React.useEffect(() => {
     if (link) copyRef.current?.focus({ preventScroll: true })
   }, [link, token])
-  const copyLink = React.useCallback(() => {
-    if (!link) return
-    const attempt = (attempts.current += 1)
-    // Reported BEFORE the await, so the toast is held open for the whole of a permission prompt rather than
-    // for whatever was left of its resting dwell when the button was tapped.
-    onCopy(token, "pending")
-    const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard
-    void copyRestoreLink(link, clipboard).then((ok) => {
-      const next = settledCopyState(ok, attempt === attempts.current)
-      if (next) onCopy(token, next)
-    })
-  }, [link, token, onCopy])
   return (
     <div data-show-annotation-ui="" role="status" style={toastStyle}>
       <span>{content.message}</span>
       {link ? (
         <span style={toastLinkRowStyle}>
           <span style={toastLinkStyle}>{link}</span>
-          <button type="button" ref={copyRef} style={toastCopyStyle} onClick={copyLink}>
+          <button type="button" ref={copyRef} style={toastCopyStyle} onClick={() => onCopy(token, link)}>
             {copy === "copied"
               ? labels.copiedLabel
               : copy === "failed"
@@ -2062,6 +2049,11 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // it was computed from: React tears the old timer down on any change of identity OR copy state, and
   // `toastDwellMs` returning null (a copy in flight) simply means no timer is set up at all. Unmount cleanup
   // is the same teardown, so it needs no separate handler.
+  //
+  // Teardown alone is not enough, though, because `clearTimeout` cannot recall a callback that is already
+  // queued — tap copy in the same tick the resting dwell expires and the stale deadline still runs, against a
+  // toast that is now `pending` and meant to stay open. So the deadline also checks, at fire time, that it is
+  // still retiring the state it was computed for. See deadlineRetiresToast.
   const toastToken = toast?.token
   const toastVisibility = toast?.state
   const toastCopy = toast?.copy
@@ -2069,7 +2061,10 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     if (toastToken === undefined || toastVisibility === undefined || toastCopy === undefined) return
     const dwell = toastDwellMs(toastVisibility, toastCopy)
     if (dwell === null) return
-    const timer = setTimeout(() => setToast(null), dwell)
+    const timer = setTimeout(
+      () => setToast((prev) => (deadlineRetiresToast(prev, toastToken, toastCopy) ? null : prev)),
+      dwell
+    )
     return () => clearTimeout(timer)
   }, [toastToken, toastVisibility, toastCopy])
   const flashToast = React.useCallback((content: FabToastContent, state: FabVisibility) => {
@@ -2175,6 +2170,28 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   const setToastCopy = React.useCallback((token: number, copy: ToastCopyState) => {
     setToast((prev) => (prev && prev.token === token ? { ...prev, copy: mergeCopyState(prev.copy, copy) } : prev))
   }, [])
+  // The tap itself. It lives here, beside the state it reports into, because the two have to share a lifetime:
+  // the button's component does not outlive a re-render into the `null` branch or a swap between the two places
+  // the toast is drawn, while the toast state — and any clipboard write still in flight — outlives both.
+  //
+  // `copyAttempts` is ORDERING, not state: it answers "has a newer tap started since this one?" and nothing
+  // else, by comparing a captured number against the same ref that minted it. That is why it can be a ref at
+  // all. What the answer is WORTH differs per outcome, and this callback decides neither: settledCopyState says
+  // what a settled attempt may claim, mergeCopyState says what the toast will accept. Both are pure, so "a
+  // copied clipboard cannot be un-copied by a later refusal" is a tested branch rather than a shape of this
+  // closure.
+  const copyAttempts = React.useRef(0)
+  const copyToastLink = React.useCallback((token: number, link: string) => {
+    const attempt = (copyAttempts.current += 1)
+    // Reported BEFORE the await, so the toast is held open for the whole of a permission prompt rather than for
+    // whatever was left of its resting dwell when the button was tapped.
+    setToastCopy(token, "pending")
+    const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard
+    void copyRestoreLink(link, clipboard).then((ok) => {
+      const next = settledCopyState(ok, attempt === copyAttempts.current)
+      if (next) setToastCopy(token, next)
+    })
+  }, [setToastCopy])
 
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
@@ -2212,7 +2229,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
         {fabVisibility.visibility === "handle" ? (
           <FabEdgeHandle label={labels.restoreHandle} drag={fabDrag} touchCapable={touchCapable} claimFocus={claimFocus} onRestore={restoreFab} />
         ) : null}
-        {statusToast ? <FabToast key={statusToast.link ?? statusToast.message} content={statusToast} copy={statusToast.copy} labels={labels} token={statusToast.token} onCopy={setToastCopy} /> : null}
+        {statusToast ? <FabToast key={statusToast.link ?? statusToast.message} content={statusToast} copy={statusToast.copy} labels={labels} token={statusToast.token} onCopy={copyToastLink} /> : null}
       </>
     )
   }
@@ -2260,7 +2277,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   return (
     <>
       {content}
-      {statusToast ? <FabToast key={statusToast.link ?? statusToast.message} content={statusToast} copy={statusToast.copy} labels={labels} token={statusToast.token} onCopy={setToastCopy} /> : null}
+      {statusToast ? <FabToast key={statusToast.link ?? statusToast.message} content={statusToast} copy={statusToast.copy} labels={labels} token={statusToast.token} onCopy={copyToastLink} /> : null}
     </>
   )
 }

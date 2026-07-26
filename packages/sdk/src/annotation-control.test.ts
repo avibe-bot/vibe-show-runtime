@@ -50,6 +50,7 @@ import {
   toastDwellMs,
   settledCopyState,
   mergeCopyState,
+  deadlineRetiresToast,
   fabToastDurationMs,
   stripFabParamsFromUrl,
   isEditableTarget,
@@ -1187,5 +1188,37 @@ describe("a toast narrates ONE state of ONE session, so it expires when either d
     expect(retry.settled()).toBe("copied") // `pending` would have held the toast open with no deadline
     again(false)
     expect(retry.settled()).toBe("copied")
+  })
+
+  // The clock's half of the same problem. Tearing the timer down does NOT recall a callback that has already
+  // been queued, so a deadline computed for the resting toast can still run one tick after the tap that was
+  // supposed to hold the toast open. The deadline therefore re-checks, at fire time, that it is retiring the
+  // state it was computed FOR — same toast, same copy state — and otherwise leaves it alone.
+  it("only lets a deadline retire the exact state it was computed for", () => {
+    expect(deadlineRetiresToast({ token: 3, copy: "idle" }, 3, "idle")).toBe(true)
+    expect(deadlineRetiresToast({ token: 3, copy: "pending" }, 3, "idle")).toBe(false) // a tap intervened
+    expect(deadlineRetiresToast({ token: 4, copy: "idle" }, 3, "idle")).toBe(false) // a newer hide replaced it
+    expect(deadlineRetiresToast(null, 3, "idle")).toBe(false) // already retired
+    expect(deadlineRetiresToast(undefined, 3, "idle")).toBe(false)
+  })
+
+  // The race itself, replayed: the resting dwell expires in the same tick the user taps copy. React runs the
+  // click first — cleanup included — but the expired timer's callback is already in the queue and runs anyway.
+  // Without the fire-time check it would close a toast that had just been re-opened for a clipboard write,
+  // taking the only exit `hidden-url` has off screen mid-write.
+  it("does not close a toast that was re-opened in the tick the old deadline expired", () => {
+    let toast: { token: number; copy: ToastCopyState } | null = { token: 7, copy: "idle" }
+    const armed = { token: toast.token, copy: toast.copy } // the deadline the resting toast set up
+
+    // The tap lands first and moves the toast to `pending`, which is the state with no deadline at all.
+    toast = { ...toast, copy: mergeCopyState(toast.copy, "pending") }
+    // Then the already-queued callback fires against whatever is current.
+    if (deadlineRetiresToast(toast, armed.token, armed.copy)) toast = null
+    expect(toast).toEqual({ token: 7, copy: "pending" })
+
+    // And the deadline that DOES belong to the current state still retires it.
+    toast = { token: 7, copy: mergeCopyState("pending", "copied") }
+    if (deadlineRetiresToast(toast, 7, "copied")) toast = null
+    expect(toast).toBeNull()
   })
 })
