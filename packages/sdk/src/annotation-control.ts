@@ -281,8 +281,8 @@ export function activeFabToast<T extends { state: FabVisibility; sessionId: stri
  * Not the shared 3.2s, though — that is roughly the time to notice a toast and read it, with nothing left
  * over to act. Overshooting the dwell obscures the page for a few seconds; undershooting it strands the user
  * in the one state that has no other way back. The asymmetry, not a preference for round numbers, is what
- * puts this above the baseline. A copy also RETIRES the toast (see the overlay's copy handler), so the
- * common path is far shorter than either bound.
+ * puts this above the baseline. This is only the dwell until the copy SETTLES, though — once it does,
+ * `copySettleDwellMs` takes over, so the common path is far shorter than either bound.
  *
  * It still expires, which is a bounded race rather than a guarantee, and that is deliberate: a toast that
  * waited for a dismissal would need a document-level listener to hear one, and this control plane's whole
@@ -301,9 +301,9 @@ export function fabToastDurationMs(visibility: FabVisibility): number {
  * said no", and both are ordinary arguments to this function while being awkward globals to fake.
  *
  * Absent on any insecure origin, and refusable by a permissions policy — neither is exotic for a Show Page
- * opened over plain HTTP on a phone. Both come back `false` rather than throwing, because the caller's whole
- * response to a failed copy is to leave the printed link on screen: the copy is a shortcut past selecting it
- * by hand, never the only way out of a chrome that renders nothing.
+ * opened over plain HTTP on a phone. Both come back `false` rather than throwing, because a failed copy is
+ * not a dead end: the printed link is still on screen and can still be selected by hand. The boolean exists
+ * so the caller can tell those two paths apart — see `copySettleDwellMs`.
  */
 export async function copyRestoreLink(
   text: string,
@@ -316,6 +316,34 @@ export async function copyRestoreLink(
   } catch {
     return false
   }
+}
+
+/**
+ * What a settled copy does to the toast's clock: how long it should stay from here, or `null` for "this copy
+ * is not about the message on screen". The whole decision behind the copy button, minus the button.
+ *
+ * The dwell is sized to WHAT IS LEFT TO DO. A copy that lands ends the interaction — the link is on the
+ * clipboard, the toast is now just a confirmation, and it should get off the page. A copy that does NOT land
+ * hands the user back exactly the job the button existed to remove: select a URL by hand, a drag on a phone.
+ * That is the job the long dwell was sized for in the first place, so leaving the raise-time countdown
+ * running would be the worst of both — less time than before the button existed, to do the slower thing, in
+ * `hidden-url`, the one state whose only exit is the pill about to vanish. The shorter dwell owner feedback
+ * asked for therefore governs the path that actually happens, and the manual-selection dwell comes back only
+ * on the path that actually needs it.
+ *
+ * `liveToken` is why this takes tokens at all rather than just a boolean. `writeText` is async: between the
+ * tap and the settle the toast can be replaced by another hide, or retired by a session swap or a state
+ * change. Re-timing then would hold a message the user has not read hostage to a copy they did not make.
+ * Nothing on screen means no live token, so that case falls out of the same comparison instead of needing
+ * its own branch. Same identity guard as {@link activeFabToast}, one layer down.
+ */
+export function copySettleDwellMs(
+  settlingToken: number,
+  liveToken: number | undefined,
+  copied: boolean
+): number | null {
+  if (settlingToken !== liveToken) return null
+  return copied ? 900 : 15000
 }
 
 /**

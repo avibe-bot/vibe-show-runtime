@@ -47,6 +47,7 @@ import {
   stripFabParamsFromSearch,
   activeFabToast,
   copyRestoreLink,
+  copySettleDwellMs,
   fabToastDurationMs,
   stripFabParamsFromUrl,
   isEditableTarget,
@@ -1065,5 +1066,28 @@ describe("a toast narrates ONE state of ONE session, so it expires when either d
     // caller have exactly one failure path instead of a try/catch AND a rejection handler.
     const throwsSync = { writeText: () => { throw new Error("boom") } } as unknown as { writeText(t: string): Promise<void> }
     await expect(copyRestoreLink("https://h/p/x?mark", throwsSync)).resolves.toBe(false)
+  })
+
+  // The boolean above only matters because these two dwells differ. A copy that lands ends the interaction; a
+  // copy that does not hands back the manual selection the button existed to remove — the slower gesture, in
+  // the state with no other exit — so it has to get MORE time than the tap-a-button dwell, not the remainder
+  // of it. Stated as relations rather than as two numbers: it is the ordering that is the fix.
+  it("re-times the toast around what is left to do, not around the tap", () => {
+    const raised = fabToastDurationMs("hidden-url")
+    expect(copySettleDwellMs(1, 1, false)).toBeGreaterThan(raised * 2) // manual selection, from a standing start
+    expect(copySettleDwellMs(1, 1, true)).toBeLessThan(raised) // just long enough to read "已复制"
+    expect(copySettleDwellMs(1, 1, true)).toBeGreaterThan(0) // an instant vanish looks exactly like a timeout
+  })
+
+  // `writeText` is async, so a settle can land after its toast is gone. Re-timing then would let a copy the
+  // user made on one message decide how long an unrelated one stays — including retiring a `hidden-url` toast
+  // they have not read yet, which is the only copy of the only exit. `null` is "not mine", and both ways of
+  // not being current collapse into it: a newer toast took the screen, or nothing is on screen at all.
+  it("ignores a copy that settles after its own toast is gone", () => {
+    expect(copySettleDwellMs(1, 2, true)).toBeNull() // a newer toast replaced it mid-copy
+    expect(copySettleDwellMs(2, 1, false)).toBeNull() // …and the comparison is identity, not recency
+    expect(copySettleDwellMs(1, undefined, true)).toBeNull() // the toast was retired outright
+    expect(copySettleDwellMs(1, undefined, false)).toBeNull()
+    expect(copySettleDwellMs(1, 1, true)).not.toBeNull() // and the live one still settles
   })
 })
