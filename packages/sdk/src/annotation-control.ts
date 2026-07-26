@@ -235,30 +235,40 @@ function readFabFlag(flags: Set<string>): FabVisibility | undefined {
 }
 
 /**
+ * Permanently retire toast state when its owning session ceases to be current.
+ *
+ * Rendering `null` is not retirement: a `pending` clipboard write deliberately has no dwell timer, so a
+ * state value merely hidden during a session swap can reappear forever if the SPA returns before that write
+ * settles. The overlay applies this transition to the state owner on every session change. A route change
+ * inside one session does not retire anything; a session change does.
+ *
+ * Generic over the payload because session ownership applies to the complete toast — message, link, copy
+ * state, token, and any later addition — rather than to a field that each caller has to remember.
+ */
+export function retainFabToastForSession<T extends { sessionId: string | undefined }>(
+  toast: T | null | undefined,
+  sessionId: string | undefined
+): T | null {
+  return toast && toast.sessionId === sessionId ? toast : null
+}
+
+/**
  * The status message that is still TRUE. Every toast this chrome raises is `fabToastFor(state, …)` — it
  * narrates exactly one visibility and the way out of it — so the instant the visibility moves on, the
  * message is describing somewhere the user no longer is. Deriving it from the current state rather than
  * clearing it at each restore site means no path can forget: not the shortcut, not the edge handle, not the
  * restore link (which reloads the page, so no handler here runs at all), and not whichever path is added next.
  *
- * A toast belongs to a SESSION as much as to a state. An SPA can swap `sessionId` under a mounted overlay,
- * which re-resolves the visibility from the new session's storage — and when the new session happens to
- * resolve to the same state, a match on state alone kept the old session's message alive. For `hidden-url`
- * that message is a whole restore URL, captured from the page it was raised on, sitting for fifteen seconds
- * as the only thing on a screen that now belongs to a different page: the user copies a link back to where
- * they were, not a way out of where they are.
- *
- * The identity is the session, not the URL, and the difference is which changes invalidate the message. A
- * host route change inside one session does not: the flag works on any route of that page, so the printed
- * link still restores. A session swap does: that chrome, that storage key, that exit are all somebody
- * else's now.
+ * Session identity is reconciled by {@link retainFabToastForSession}; this projection also suppresses the
+ * old value synchronously during the render before React runs the state-retirement effect.
  */
-export function activeFabToast(
-  toast: { message: string; state: FabVisibility; sessionId: string | undefined } | null | undefined,
+export function activeFabToast<T extends { state: FabVisibility; sessionId: string | undefined }>(
+  toast: T | null | undefined,
   current: FabVisibility,
   sessionId: string | undefined
-): string | null {
-  return toast && toast.state === current && toast.sessionId === sessionId ? toast.message : null
+): T | null {
+  const retained = retainFabToastForSession(toast, sessionId)
+  return retained?.state === current ? retained : null
 }
 
 /**
@@ -266,16 +276,150 @@ export function activeFabToast(
  *
  * Every other toast confirms a transition whose way back is still on the device (a key to press, a strip to
  * tap); it is read once and wants to get out of the way. The `hidden-url` toast is the only delivery of the
- * only exit from the only state with nothing on screen, and since this round it carries a whole URL rather
- * than a five-character suffix — something to select and copy, not to memorize. On the old 3.2s it would
- * hand the user their way back and take it away before they could use it.
+ * only exit from the only state with nothing on screen, so it still gets the longer dwell — but the dwell is
+ * sized to the GESTURE it has to survive, and the gesture got shorter. The previous round printed a URL and
+ * asked the reader to select it by hand, a drag on a phone, which needed something like fifteen seconds; the
+ * link now sits behind a copy button, so noticing it and tapping once is the whole interaction. Owner
+ * feedback on that round was that fifteen seconds of an opaque pill over the page is its own problem, and
+ * they were right: past the point where the exit is reachable, extra dwell buys nothing and costs the view.
+ *
+ * Not the shared 3.2s, though — that is roughly the time to notice a toast and read it, with nothing left
+ * over to act. Overshooting the dwell obscures the page for a few seconds; undershooting it strands the user
+ * in the one state that has no other way back. The asymmetry, not a preference for round numbers, is what
+ * puts this above the baseline. This is only the RESTING dwell, though — the moment the copy button is
+ * touched {@link toastDwellMs} takes over, so the common path is far shorter than either bound.
  *
  * It still expires, which is a bounded race rather than a guarantee, and that is deliberate: a toast that
  * waited for a dismissal would need a document-level listener to hear one, and this control plane's whole
  * invariant is that it attaches nothing to the host it does not have to. A dwell needs no listener.
  */
 export function fabToastDurationMs(visibility: FabVisibility): number {
-  return visibility === "hidden-url" ? 15000 : 3200
+  return visibility === "hidden-url" ? 6000 : 3200
+}
+
+/**
+ * Put the restore link on the clipboard, reporting whether it actually got there.
+ *
+ * Split out of the button so the part with a decision in it is testable without a DOM: the button is then a
+ * label and a click, and everything that can go wrong lives here. `clipboard` is injected rather than read
+ * from `navigator` for the same reason — the failures worth pinning are "the API is not there" and "the API
+ * said no", and both are ordinary arguments to this function while being awkward globals to fake.
+ *
+ * Absent on any insecure origin, and refusable by a permissions policy — neither is exotic for a Show Page
+ * opened over plain HTTP on a phone. Both come back `false` rather than throwing, because a failed copy is
+ * not a dead end: the printed link is still on screen and can still be selected by hand. The boolean exists
+ * so the caller can tell those two paths apart — see {@link toastDwellMs}.
+ */
+export async function copyRestoreLink(
+  text: string,
+  clipboard: { writeText(text: string): Promise<void> } | undefined
+): Promise<boolean> {
+  if (!clipboard) return false
+  try {
+    await clipboard.writeText(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * What the toast's copy button is doing. A state, deliberately, rather than the pair of callbacks it started
+ * as — see {@link toastDwellMs} for why that difference is the whole fix.
+ */
+export type ToastCopyState = "idle" | "pending" | "copied" | "failed"
+
+/**
+ * How long the toast has left — or `null` for "hold it open, something is still in flight".
+ *
+ * This clock used to be armed imperatively, at two separate moments (the raise, then the copy's settle),
+ * against one `setTimeout` handle kept in a ref. That shape is what made every defect in it a race: the two
+ * call sites owned the same clock and could not see each other, so each fix was another guard comparing one
+ * site's stale idea of the toast against the other's. Deriving the dwell from state instead leaves exactly
+ * one answer for any given toast, and no second writer to disagree with. Each case below is a transition
+ * that used to need its own guard:
+ *
+ * - `pending` → held open, no deadline at all. `writeText` can stay unresolved for as long as a permission
+ *   prompt is on screen, and a clock that kept running underneath it would retire the toast while the user
+ *   was answering the prompt — taking the only exit from `hidden-url` with it, since a settle arriving after
+ *   that has no toast left to re-time and nothing else on the page says the copy failed.
+ * - `copied` → briefly. The link is on the clipboard and the pill has nothing left to give; but dismissing
+ *   instantly looks exactly like a timeout, so the confirmation gets long enough to be read as one.
+ * - `failed` → long. The user has just been handed back the manual selection the button existed to remove —
+ *   the slower gesture, in the one state with no other exit — so it gets MORE time than the raise, not
+ *   whatever happened to be left of it.
+ * - `idle` → the resting dwell, sized to the message. See {@link fabToastDurationMs}.
+ */
+export function toastDwellMs(visibility: FabVisibility, copy: ToastCopyState): number | null {
+  switch (copy) {
+    case "pending":
+      return null
+    case "copied":
+      return 900
+    case "failed":
+      return 15000
+    default:
+      return fabToastDurationMs(visibility)
+  }
+}
+
+/**
+ * What a settled copy attempt is entitled to claim — or `null` for "this one has nothing to say".
+ *
+ * Nothing stops a second tap while the first `writeText` is still pending, and the two can settle in either
+ * order. The obvious rule for that is "only the newest tap may speak", and it is wrong, because the two
+ * outcomes are not the same KIND of fact:
+ *
+ * - A success is a fact about the CLIPBOARD. The link is on it. Which tap put it there, and whether a newer
+ *   tap has since been started, changes nothing about that — so a superseded attempt still reports it.
+ * - A refusal is a fact about ONE ATTEMPT, and only that one. A refusal from an attempt that has already been
+ *   superseded says nothing about the newer write still in flight, so it stays quiet rather than telling the
+ *   user to select a link by hand that may be about to land on the clipboard anyway.
+ *
+ * Treating the two alike is exactly what let a later refusal discard an earlier success — the clipboard
+ * holding the link while the toast asked for it to be copied by hand. See {@link mergeCopyState} for the
+ * other half of the rule.
+ */
+export function settledCopyState(ok: boolean, isLatestAttempt: boolean): ToastCopyState | null {
+  if (ok) return "copied"
+  return isLatestAttempt ? "failed" : null
+}
+
+/**
+ * What the toast accepts, given what it already knows.
+ *
+ * `copied` is terminal for the life of one toast: a write that succeeded cannot be undone by a later write
+ * that failed, because a failed `writeText` does not empty the clipboard. Without this, tapping twice —
+ * first succeeds, second refused — ends with the link on the clipboard and a pill insisting it has to be
+ * copied by hand. Every other transition is just the newest report.
+ *
+ * The toast's identity is checked by the caller: a new toast is a new token, so `idle` never has to be
+ * merged through here.
+ */
+export function mergeCopyState(prev: ToastCopyState, next: ToastCopyState): ToastCopyState {
+  return prev === "copied" ? "copied" : next
+}
+
+/**
+ * Whether a deadline computed for one toast state may still retire what is on screen.
+ *
+ * `clearTimeout` is not retroactive. Once a timer has expired its callback is already queued, and cancelling
+ * it does nothing — so a deadline that was correct when it was armed can still run after the state it was
+ * computed from has moved on. The window is small but real: tap the copy button in the same tick the resting
+ * dwell expires, and the queued callback runs after the `pending` state has already been applied, retiring a
+ * toast {@link toastDwellMs} is deliberately holding open. In `hidden-url` that leaves the user with neither
+ * the link nor any other way back.
+ *
+ * So the deadline carries the identity it was computed for and re-checks it at fire time, which is the only
+ * moment that can tell. `copy` is part of that identity because the dwell is a function of it; `token` covers
+ * the rest, since a toast's visibility is fixed at the raise that minted its token.
+ */
+export function deadlineRetiresToast(
+  current: { token: number; copy: ToastCopyState } | null | undefined,
+  token: number,
+  copy: ToastCopyState
+): boolean {
+  return !!current && current.token === token && current.copy === copy
 }
 
 /**

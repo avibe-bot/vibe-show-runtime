@@ -45,7 +45,13 @@ import {
   formatMarkUrl,
   withParenthetical,
   stripFabParamsFromSearch,
+  retainFabToastForSession,
   activeFabToast,
+  copyRestoreLink,
+  toastDwellMs,
+  settledCopyState,
+  mergeCopyState,
+  deadlineRetiresToast,
   fabToastDurationMs,
   stripFabParamsFromUrl,
   isEditableTarget,
@@ -55,7 +61,8 @@ import {
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
   floatPositionStorageKey,
-  type AnnotationModeStorage
+  type AnnotationModeStorage,
+  type ToastCopyState
 } from "./annotation-control.js"
 
 function memoryStorage(initial: Record<string, string> = {}): AnnotationModeStorage {
@@ -998,8 +1005,10 @@ describe("a toast narrates ONE state of ONE session, so it expires when either d
   // message from the current state means no restore path can forget to clear it: not the shortcut, not the
   // handle, not the restore link (which reloads the page outright), and not whichever path gets added next.
   it("shows the message only while the state it describes is still the current one", () => {
-    const raised = { message: "已完全隐藏，保存此链接恢复：https://h/p/x?mark", state: "hidden-url" as const, sessionId: "ses_1" }
-    expect(activeFabToast(raised, "hidden-url", "ses_1")).toBe(raised.message)
+    const raised = { message: "已完全隐藏。网址后面加 ?mark 就能把按钮调回来", link: "https://h/p/x?mark", state: "hidden-url" as const, sessionId: "ses_1" }
+    // Hands back what was captured, whole. The guard is about IDENTITY — does this still describe where the
+    // user is — so the sentence, the link, and anything added later ride along without touching it.
+    expect(activeFabToast(raised, "hidden-url", "ses_1")).toBe(raised)
     expect(activeFabToast(raised, "visible", "ses_1")).toBeNull()
     // A mid-session device degrade moves hidden-key → handle; the old exit is wrong there too.
     expect(activeFabToast({ message: "按 Option+M 恢复", state: "hidden-key", sessionId: "ses_1" }, "handle", "ses_1")).toBeNull()
@@ -1011,11 +1020,12 @@ describe("a toast narrates ONE state of ONE session, so it expires when either d
     // `hidden-url` that message is a whole restore URL for the page the user just left, sitting there as
     // the only thing on screen. The identity is the SESSION: a host route change inside one session does
     // not invalidate the link, a session swap does.
-    const raised = { message: "已完全隐藏，保存此链接恢复：https://h/p/OLD?mark", state: "hidden-url" as const, sessionId: "ses_old" }
+    const raised = { message: "已完全隐藏。网址后面加 ?mark 就能把按钮调回来", link: "https://h/p/OLD?mark", state: "hidden-url" as const, sessionId: "ses_old" }
     expect(activeFabToast(raised, "hidden-url", "ses_new")).toBeNull()
     expect(activeFabToast(raised, "hidden-url", undefined)).toBeNull()
     // …and a session-less overlay (no sessionId at all) still matches itself.
-    expect(activeFabToast({ ...raised, sessionId: undefined }, "hidden-url", undefined)).toBe(raised.message)
+    const sessionless = { ...raised, sessionId: undefined }
+    expect(activeFabToast(sessionless, "hidden-url", undefined)).toBe(sessionless)
   })
 
   it("is null when nothing was raised", () => {
@@ -1023,15 +1033,215 @@ describe("a toast narrates ONE state of ONE session, so it expires when either d
     expect(activeFabToast(undefined, "hidden-url", "ses_1")).toBeNull()
   })
 
-  // The dwell is a property of what the toast SAYS. Every other one confirms a transition whose way back is
-  // still on the device and wants to get out of the way; `hidden-url`'s is the only delivery of the only exit
-  // from the only state with nothing on screen, and since this round it carries a whole URL to select and
-  // copy rather than a five-character suffix to memorize. On the shared 3.2s it handed the user their way
-  // back and took it away before they could use it.
-  it("gives the URL toast long enough to be copied, and keeps every other one brief", () => {
-    expect(fabToastDurationMs("hidden-url")).toBeGreaterThanOrEqual(15000)
+  // A session mismatch is a state transition, not a render filter. In particular, `pending` has no clock:
+  // leaving it stored while another session is current lets it reappear forever when the SPA comes back.
+  it("permanently retires an in-flight toast when its session ceases to be current", () => {
+    let toast: {
+      state: "hidden-url"
+      sessionId: string
+      token: number
+      copy: ToastCopyState
+    } | null = {
+      state: "hidden-url",
+      sessionId: "ses_old",
+      token: 9,
+      copy: "pending"
+    }
+
+    toast = retainFabToastForSession(toast, "ses_new")
+    expect(toast).toBeNull()
+    // Returning while the clipboard promise is still unresolved cannot resurrect retired state.
+    toast = retainFabToastForSession(toast, "ses_old")
+    expect(toast).toBeNull()
+  })
+
+  // The dwell is a property of what the toast SAYS — and, for the one toast that carries an action, of how
+  // long that action takes. Every other toast confirms a transition whose way back is still on the device and
+  // wants out of the way; `hidden-url`'s is the only delivery of the only exit from the only state with
+  // nothing on screen. It is sized to the gesture, and the gesture is now noticing a button and tapping it,
+  // not dragging a text selection across a URL — so it sits above the shared baseline and far below the
+  // fifteen seconds the select-by-hand round needed. Overshooting covers the page; undershooting strands the
+  // user. That asymmetry is the whole justification for the gap, so the test states it as a RANGE rather than
+  // freezing a preference: any value inside it is a legitimate tuning, either edge is a regression.
+  it("gives the URL toast time to be tapped without parking a pill over the page", () => {
+    const dwell = fabToastDurationMs("hidden-url")
+    expect(dwell).toBeGreaterThan(3200) // 3.2s is notice-and-read; there has to be room left to act
+    expect(dwell).toBeLessThanOrEqual(8000) // owner feedback: a long dwell blocks the view and is its own bug
     for (const state of ["visible", "handle", "hidden-key"] as const) {
       expect(fabToastDurationMs(state)).toBe(3200)
     }
+  })
+
+  // The copy button's whole job, minus the button. A Show Page opened over plain HTTP on a phone has no
+  // `navigator.clipboard` at all, and a permissions policy can refuse the write on one that does — for the
+  // ONE state with no other way back, so what happens then is the part worth pinning, not the happy path.
+  it("reports whether the link actually reached the clipboard, and never throws when it did not", async () => {
+    const written: string[] = []
+    const ok = { writeText: async (text: string) => void written.push(text) }
+    await expect(copyRestoreLink("https://h/p/x?mark", ok)).resolves.toBe(true)
+    expect(written).toEqual(["https://h/p/x?mark"])
+
+    // Insecure origin: the API is simply not there. `false`, not a crash — the caller leaves the printed
+    // link up, which is the pre-button behavior and still a complete way out.
+    await expect(copyRestoreLink("https://h/p/x?mark", undefined)).resolves.toBe(false)
+
+    // Present but refused (permissions policy, or a document that is not focused).
+    const refused = { writeText: async () => { throw new Error("NotAllowedError") } }
+    await expect(copyRestoreLink("https://h/p/x?mark", refused)).resolves.toBe(false)
+
+    // Some implementations throw synchronously rather than rejecting; a `false` either way is what lets the
+    // caller have exactly one failure path instead of a try/catch AND a rejection handler.
+    const throwsSync = { writeText: () => { throw new Error("boom") } } as unknown as { writeText(t: string): Promise<void> }
+    await expect(copyRestoreLink("https://h/p/x?mark", throwsSync)).resolves.toBe(false)
+  })
+
+  // The boolean above only matters because these two dwells differ. A copy that lands ends the interaction; a
+  // copy that does not hands back the manual selection the button existed to remove — the slower gesture, in
+  // the state with no other exit — so it has to get MORE time than the tap-a-button dwell, not the remainder
+  // of it. Stated as relations rather than as two numbers: it is the ordering that is the fix.
+  it("re-times the toast around what is left to do, not around the tap", () => {
+    const raised = fabToastDurationMs("hidden-url")
+    expect(toastDwellMs("hidden-url", "failed")).toBeGreaterThan(raised * 2) // manual selection, from a standing start
+    expect(toastDwellMs("hidden-url", "copied")).toBeLessThan(raised) // just long enough to read "已复制"
+    expect(toastDwellMs("hidden-url", "copied")).toBeGreaterThan(0) // an instant vanish looks exactly like a timeout
+    expect(toastDwellMs("hidden-url", "idle")).toBe(raised) // untouched, it keeps the dwell its message earned
+  })
+
+  // The failure this replaces: `writeText` stays unresolved for as long as a permission prompt is open, which
+  // is unbounded and routinely longer than the resting dwell — so a clock that kept running underneath it
+  // retired the toast mid-prompt, and the refusal then had nothing left to attach the manual-selection dwell
+  // to. The user was left in `hidden-url` with no link and no control: the exact state the toast exists to
+  // prevent, reachable by using the button as intended. A held-open toast cannot be timed out by anything.
+  it("stops the clock entirely while a copy is in flight", () => {
+    expect(toastDwellMs("hidden-url", "pending")).toBeNull()
+    expect(toastDwellMs("handle", "pending")).toBeNull() // a property of the copy, not of the message
+  })
+
+  // Every state answers, and the answer depends only on (visibility, copy). That total-ness is the point of
+  // deriving the dwell rather than arming it: there is no ordering of raises and settles that can leave the
+  // toast without a deadline, or with two.
+  it("gives one answer per state, so no two writers can disagree about the clock", () => {
+    for (const visibility of ["visible", "handle", "hidden-key", "hidden-url"] as const) {
+      for (const copy of ["idle", "pending", "copied", "failed"] as const) {
+        const dwell = toastDwellMs(visibility, copy)
+        expect(dwell === null || dwell > 0).toBe(true)
+        expect(toastDwellMs(visibility, copy)).toBe(dwell)
+      }
+    }
+  })
+
+  // The button stays enabled while a copy is pending — deliberately, since a `writeText` that never settles
+  // would otherwise lock the user out of the only exit `hidden-url` has — so two writes can be in flight and
+  // settle in either order. "Newest tap wins" is symmetric; the outcomes are not. A success is a fact about
+  // the CLIPBOARD and stays true however many taps followed it. A refusal is a fact about ONE attempt and
+  // says nothing about the rest.
+  it("lets a success speak even after a newer tap started, and keeps a stale refusal to itself", () => {
+    expect(settledCopyState(true, true)).toBe("copied")
+    expect(settledCopyState(true, false)).toBe("copied") // overtaken, but the link IS on the clipboard
+    expect(settledCopyState(false, true)).toBe("failed")
+    expect(settledCopyState(false, false)).toBeNull() // describes an attempt nobody is waiting on any more
+  })
+
+  // The other half of the same rule, on the receiving side: a write that succeeded cannot be undone by a
+  // write that failed, because a failed `writeText` does not empty the clipboard. Terminal for the life of
+  // ONE toast — a fresh raise starts from `idle` again, since it is a fresh link and a fresh clipboard claim.
+  it("cannot un-copy a clipboard", () => {
+    for (const next of ["idle", "pending", "copied", "failed"] as const) {
+      expect(mergeCopyState("copied", next)).toBe("copied")
+    }
+    expect(mergeCopyState("idle", "pending")).toBe("pending")
+    expect(mergeCopyState("pending", "failed")).toBe("failed")
+    expect(mergeCopyState("failed", "pending")).toBe("pending") // a retry re-opens the clock
+    expect(mergeCopyState("failed", "copied")).toBe("copied")
+  })
+
+  // The two rules replayed as the component composes them: tap, tap again, and let the writes settle in each
+  // order. Before this, the loser's refusal was applied and the winner's success discarded, so the pill sat
+  // on "请手动复制" for 15 seconds over a link the user already had — and the manual selection it asked for
+  // was of a link that had scrolled away with the toast.
+  it("ends on 已复制 whichever of two overlapping taps reaches the clipboard", () => {
+    function overlappingTaps() {
+      let attempts = 0
+      let copy: ToastCopyState = "idle"
+      const report = (next: ToastCopyState) => void (copy = mergeCopyState(copy, next))
+      const tap = () => {
+        const attempt = (attempts += 1)
+        report("pending")
+        return (ok: boolean) => {
+          const next = settledCopyState(ok, attempt === attempts)
+          if (next) report(next)
+        }
+      }
+      return { tap, settled: () => copy }
+    }
+
+    // Reported case: the SECOND write rejects first, then the first one lands.
+    const late = overlappingTaps()
+    const first = late.tap()
+    const second = late.tap()
+    second(false)
+    expect(late.settled()).toBe("failed")
+    first(true)
+    expect(late.settled()).toBe("copied")
+
+    // Mirror: the newer tap lands and an older refusal arrives afterwards.
+    const stale = overlappingTaps()
+    const older = stale.tap()
+    const newer = stale.tap()
+    newer(true)
+    older(false)
+    expect(stale.settled()).toBe("copied")
+
+    // Both taps refused: nothing reached the clipboard, so the manual-selection dwell is the right answer.
+    const refused = overlappingTaps()
+    const a = refused.tap()
+    const b = refused.tap()
+    a(false)
+    b(false)
+    expect(refused.settled()).toBe("failed")
+
+    // Not an overlap at all — the ordinary "tap again to be sure" within the 900ms the pill is up. The retry
+    // reports `pending`, which stops the clock, and can then be refused; neither may take the toast back off
+    // a clipboard that already has the link.
+    const retry = overlappingTaps()
+    const landed = retry.tap()
+    landed(true)
+    expect(retry.settled()).toBe("copied")
+    const again = retry.tap()
+    expect(retry.settled()).toBe("copied") // `pending` would have held the toast open with no deadline
+    again(false)
+    expect(retry.settled()).toBe("copied")
+  })
+
+  // The clock's half of the same problem. Tearing the timer down does NOT recall a callback that has already
+  // been queued, so a deadline computed for the resting toast can still run one tick after the tap that was
+  // supposed to hold the toast open. The deadline therefore re-checks, at fire time, that it is retiring the
+  // state it was computed FOR — same toast, same copy state — and otherwise leaves it alone.
+  it("only lets a deadline retire the exact state it was computed for", () => {
+    expect(deadlineRetiresToast({ token: 3, copy: "idle" }, 3, "idle")).toBe(true)
+    expect(deadlineRetiresToast({ token: 3, copy: "pending" }, 3, "idle")).toBe(false) // a tap intervened
+    expect(deadlineRetiresToast({ token: 4, copy: "idle" }, 3, "idle")).toBe(false) // a newer hide replaced it
+    expect(deadlineRetiresToast(null, 3, "idle")).toBe(false) // already retired
+    expect(deadlineRetiresToast(undefined, 3, "idle")).toBe(false)
+  })
+
+  // The race itself, replayed: the resting dwell expires in the same tick the user taps copy. React runs the
+  // click first — cleanup included — but the expired timer's callback is already in the queue and runs anyway.
+  // Without the fire-time check it would close a toast that had just been re-opened for a clipboard write,
+  // taking the only exit `hidden-url` has off screen mid-write.
+  it("does not close a toast that was re-opened in the tick the old deadline expired", () => {
+    let toast: { token: number; copy: ToastCopyState } | null = { token: 7, copy: "idle" }
+    const armed = { token: toast.token, copy: toast.copy } // the deadline the resting toast set up
+
+    // The tap lands first and moves the toast to `pending`, which is the state with no deadline at all.
+    toast = { ...toast, copy: mergeCopyState(toast.copy, "pending") }
+    // Then the already-queued callback fires against whatever is current.
+    if (deadlineRetiresToast(toast, armed.token, armed.copy)) toast = null
+    expect(toast).toEqual({ token: 7, copy: "pending" })
+
+    // And the deadline that DOES belong to the current state still retires it.
+    toast = { token: 7, copy: mergeCopyState("pending", "copied") }
+    if (deadlineRetiresToast(toast, 7, "copied")) toast = null
+    expect(toast).toBeNull()
   })
 })
