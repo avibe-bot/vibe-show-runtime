@@ -35,6 +35,7 @@ import {
   formatFabShortcut,
   formatMarkParam,
   withParenthetical,
+  stripFabParamsFromHash,
   stripFabParamsFromSearch,
   isEditableTarget,
   shouldToggleFabShortcut,
@@ -474,27 +475,96 @@ describe("uniform write-token resolution (contract §5 v2)", () => {
 
 describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R11, tri-state in U)", () => {
   it("a query param WINS (bare presence) and dictates what to persist (one-time switch)", () => {
-    expect(resolveFabVisibility("?unmark", undefined)).toEqual({ visibility: "hidden", persist: "hidden" })
-    expect(resolveFabVisibility("?mark", undefined)).toEqual({ visibility: "visible", persist: "visible" })
+    expect(resolveFabVisibility({ search: "?unmark" }, undefined)).toEqual({ visibility: "hidden", persist: "hidden" })
+    expect(resolveFabVisibility({ search: "?mark" }, undefined)).toEqual({ visibility: "visible", persist: "visible" })
     // param overrides a conflicting stored choice AND re-persists it; coexists with other params.
-    expect(resolveFabVisibility("?mark", "hidden")).toEqual({ visibility: "visible", persist: "visible" })
-    expect(resolveFabVisibility("?mark", "handle")).toEqual({ visibility: "visible", persist: "visible" })
-    expect(resolveFabVisibility("?vibe-embed=1&unmark", "visible")).toEqual({ visibility: "hidden", persist: "hidden" })
-    expect(resolveFabVisibility("unmark", undefined)).toEqual({ visibility: "hidden", persist: "hidden" }) // no leading '?'
+    expect(resolveFabVisibility({ search: "?mark" }, "hidden")).toEqual({ visibility: "visible", persist: "visible" })
+    expect(resolveFabVisibility({ search: "?mark" }, "handle")).toEqual({ visibility: "visible", persist: "visible" })
+    expect(resolveFabVisibility({ search: "?vibe-embed=1&unmark" }, "visible")).toEqual({
+      visibility: "hidden",
+      persist: "hidden",
+    })
+    expect(resolveFabVisibility({ search: "unmark" }, undefined)).toEqual({ visibility: "hidden", persist: "hidden" }) // no leading '?'
+  })
+
+  // A hash route puts the END of the URL inside `location.hash`, and appending to the end is exactly what the
+  // hint tells the reader to do. So the flag is read from BOTH places the tail can be — a page on `#/route`
+  // has an empty `location.search`, and looking only there strands the one state with no on-screen exit.
+  it("the flag is also read from the hash's OWN query segment, since that is where an append lands", () => {
+    expect(resolveFabVisibility({ hash: "#/route?mark" }, "hidden")).toEqual({
+      visibility: "visible",
+      persist: "visible",
+    })
+    expect(resolveFabVisibility({ hash: "#/route?unmark" }, undefined)).toEqual({
+      visibility: "hidden",
+      persist: "hidden",
+    })
+    expect(resolveFabVisibility({ hash: "#section?mark" }, "hidden")).toEqual({
+      visibility: "visible",
+      persist: "visible",
+    })
+    // Alongside the hash route's own params, and alongside a search string that has no flag of its own.
+    expect(resolveFabVisibility({ hash: "#/route?a=1&mark" }, "hidden")).toEqual({
+      visibility: "visible",
+      persist: "visible",
+    })
+    expect(resolveFabVisibility({ search: "?foo=1", hash: "#/route?mark" }, "hidden")).toEqual({
+      visibility: "visible",
+      persist: "visible",
+    })
+  })
+
+  // Reading a second place must not widen WHAT counts as the flag. The hash segment goes through the same
+  // URLSearchParams parse as the search — no lenient substring search — so a host's legitimate value that
+  // merely contains our word stays untouched, on both sides, byte for byte.
+  it("the hash is parsed as a query string, not scanned for our word — host params keep their meaning", () => {
+    // `redirect=/a?mark` is ONE value per URLSearchParams (no `mark` key). Locked on both sides.
+    expect(resolveFabVisibility({ search: "?redirect=/a?mark" }, "hidden")).toEqual({
+      visibility: "hidden",
+      persist: null,
+    })
+    expect(resolveFabVisibility({ hash: "#/route?redirect=/a?mark" }, "hidden")).toEqual({
+      visibility: "hidden",
+      persist: null,
+    })
+    // No '?' in the hash ⇒ no query segment at all: a route PATH named /mark is a route, not our flag.
+    expect(resolveFabVisibility({ hash: "#/mark" }, "hidden")).toEqual({ visibility: "hidden", persist: null })
+    expect(resolveFabVisibility({ hash: "#/some/hash-route" }, undefined)).toEqual({
+      visibility: "visible",
+      persist: null,
+    })
+    expect(resolveFabVisibility({ hash: "#/route?foo=mark" }, "hidden")).toEqual({ visibility: "hidden", persist: null })
+  })
+
+  // Two places can disagree; that has to be a decision, not an accident of evaluation order.
+  it("when both places carry a flag, the SEARCH wins — a fixed, explicitly tested priority", () => {
+    expect(resolveFabVisibility({ search: "?unmark", hash: "#/route?mark" }, undefined)).toEqual({
+      visibility: "hidden",
+      persist: "hidden",
+    })
+    expect(resolveFabVisibility({ search: "?mark", hash: "#/route?unmark" }, undefined)).toEqual({
+      visibility: "visible",
+      persist: "visible",
+    })
+    // Only a flag outranks the hash — an unrelated search param does not suppress it.
+    expect(resolveFabVisibility({ search: "?foo=1", hash: "#/route?unmark" }, undefined)).toEqual({
+      visibility: "hidden",
+      persist: "hidden",
+    })
   })
 
   it("no param honors the stored state (including 'handle'), else defaults visible, persisting nothing new", () => {
-    expect(resolveFabVisibility("", undefined)).toEqual({ visibility: "visible", persist: null }) // default visible
-    expect(resolveFabVisibility(undefined, "hidden")).toEqual({ visibility: "hidden", persist: null })
-    expect(resolveFabVisibility(undefined, "handle")).toEqual({ visibility: "handle", persist: null })
-    expect(resolveFabVisibility("?other=1", "visible")).toEqual({ visibility: "visible", persist: null }) // unknown param ignored
-    expect(resolveFabVisibility("#/some/hash-route", undefined)).toEqual({ visibility: "visible", persist: null }) // a hash route is NOT a param
+    expect(resolveFabVisibility({ search: "" }, undefined)).toEqual({ visibility: "visible", persist: null }) // default visible
+    expect(resolveFabVisibility({}, "hidden")).toEqual({ visibility: "hidden", persist: null })
+    expect(resolveFabVisibility({}, "handle")).toEqual({ visibility: "handle", persist: null })
+    expect(resolveFabVisibility({ search: "?other=1" }, "visible")).toEqual({ visibility: "visible", persist: null }) // unknown param ignored
   })
 
   it("there is NO third query param — 'handle' is reachable only from the UI, and ?mark still wins over it", () => {
     // Owner-frozen: the URL vocabulary stays two words. `?handle` is just an unknown param.
-    expect(resolveFabVisibility("?handle", undefined)).toEqual({ visibility: "visible", persist: null })
-    expect(resolveFabVisibility("?handle", "hidden")).toEqual({ visibility: "hidden", persist: null })
+    expect(resolveFabVisibility({ search: "?handle" }, undefined)).toEqual({ visibility: "visible", persist: null })
+    expect(resolveFabVisibility({ search: "?handle" }, "hidden")).toEqual({ visibility: "hidden", persist: null })
+    expect(resolveFabVisibility({ hash: "#/route?handle" }, "hidden")).toEqual({ visibility: "hidden", persist: null })
   })
 
   it("persisted visibility round-trips all three states and ignores garbage", () => {
@@ -556,6 +626,29 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
     // Matches the KEY only — `mark`/`unmark` as a value is untouched.
     expect(stripFabParamsFromSearch("?foo=mark")).toBe("foo=mark")
   })
+
+  // The strip has to reach wherever the read reaches: leave `unmark` sitting in the hash and it outlives its
+  // one-time switch, so a later `mark` appended to the same tail fights a flag that never left.
+  it("stripFabParamsFromHash drops our flag from the hash's query segment, keeping the ROUTE intact", () => {
+    // The route path survives; a query segment left empty loses its '?' rather than trailing a bare one.
+    expect(stripFabParamsFromHash("#/route?mark")).toBe("/route")
+    expect(stripFabParamsFromHash("#/route?unmark")).toBe("/route")
+    expect(stripFabParamsFromHash("#section?mark")).toBe("section")
+    // Foreign keys and their escapes are preserved byte-for-byte, same discipline as the search side.
+    expect(stripFabParamsFromHash("#/route?a=1&unmark")).toBe("/route?a=1")
+    expect(stripFabParamsFromHash("#/route?debug&mark")).toBe("/route?debug") // bare flag stays bare
+    expect(stripFabParamsFromHash("#/route?a=%20b&mark=1")).toBe("/route?a=%20b")
+    // No flag of ours ⇒ the hash comes back exactly as it went in, down to a bare trailing '?' the host wrote.
+    // (Reached whenever the flag arrived in the SEARCH: the hash strip still runs, and must be a no-op.)
+    expect(stripFabParamsFromHash("#/route")).toBe("/route")
+    expect(stripFabParamsFromHash("#/route?")).toBe("/route?")
+    expect(stripFabParamsFromHash("#/mark")).toBe("/mark") // a route named /mark is a route
+    expect(stripFabParamsFromHash("")).toBe("")
+    expect(stripFabParamsFromHash(undefined)).toBe("")
+    // Matches the KEY only — the same host value the reader refuses to see is the one it must not corrupt.
+    expect(stripFabParamsFromHash("#/route?redirect=/a?mark")).toBe("/route?redirect=/a?mark")
+    expect(stripFabParamsFromHash("#/route?foo=mark")).toBe("/route?foo=mark")
+  })
 })
 
 // The '?' popup's hide rows split by PRIMARY input, not by touch capability: a hybrid touchscreen laptop
@@ -569,29 +662,46 @@ describe("platform-split hide options (Lane U)", () => {
     expect(fabHideOptions(true)).toEqual(["handle", "hidden"])
   })
 
-  it("formatMarkParam hands out the exact fragment to append: '?mark' on a clean URL, '&mark' once params exist", () => {
+  it("formatMarkParam picks the separator for the segment the user APPENDS to — the hash when there is one", () => {
     // Same shape as formatFabShortcut one axis over — compute the exact token the user must reproduce
     // instead of making them derive it. There it's the platform's modifier; here it's the URL's separator.
-    expect(formatMarkParam("")).toBe("?mark")
-    expect(formatMarkParam(undefined)).toBe("?mark")
-    expect(formatMarkParam("?")).toBe("?mark") // an empty query reads as "" per the URL spec; a bare ? means the same
-    expect(formatMarkParam("?foo=1")).toBe("&mark")
-    expect(formatMarkParam("foo=1")).toBe("&mark") // tolerates a missing leading '?', like stripFabParamsFromSearch
-    expect(formatMarkParam("?vibe-embed=1&debug")).toBe("&mark")
+    // The user types at the END of the address bar, so the segment that decides is whichever one ends the URL.
+    expect(formatMarkParam({})).toBe("?mark") // no query, no hash
+    expect(formatMarkParam({ search: "?foo=1" })).toBe("&mark") // query, no hash → search decides
+    expect(formatMarkParam({ hash: "#/route" })).toBe("?mark") // hash route, no query of its own
+    expect(formatMarkParam({ hash: "#/route?a=1" })).toBe("&mark") // hash route already carrying a query
+    // The one that is easiest to write backwards: the SEARCH has a query, but the append lands past it, in a
+    // hash that has none. Reading `search` here would hand out '&mark' and produce `#/route&mark` — no flag.
+    expect(formatMarkParam({ search: "?foo=1", hash: "#/route" })).toBe("?mark")
+    expect(formatMarkParam({ search: "?foo=1", hash: "#/route?a=1" })).toBe("&mark")
+    // Degenerate shapes read as "no segment", per the URL spec's own normalization.
+    expect(formatMarkParam({ search: "?", hash: "" })).toBe("?mark")
+    expect(formatMarkParam({ search: "foo=1" })).toBe("&mark") // tolerates a missing leading '?'
     // Already carrying the flag → still '&'. A duplicate key keeps has('mark') true, whereas special-casing it
     // back to '?' would emit the broken form for a URL that demonstrably has a query string.
-    expect(formatMarkParam("?mark")).toBe("&mark")
-    expect(formatMarkParam("?foo=1&mark")).toBe("&mark")
+    expect(formatMarkParam({ search: "?mark" })).toBe("&mark")
+    expect(formatMarkParam({ hash: "#/route?mark" })).toBe("&mark")
   })
 
-  it("what formatMarkParam hands out parses back — the whole reason it exists", () => {
+  it("what formatMarkParam hands out parses back on EVERY real URL shape — the whole reason it exists", () => {
     // The bug it closes: a literal '?mark' appended to a URL that already has a query string yields
     // `?foo=1?mark`, which URLSearchParams reads as ONE `foo` value. No `mark` key, so the stored `hidden`
     // survives the reload — on the one hidden state with neither a handle nor a shortcut to fall back on.
     expect(new URLSearchParams("?foo=1?mark").has("mark")).toBe(false)
-    // Composed the documented way, every starting URL round-trips.
-    for (const search of ["", "?foo=1", "?a=%20b&debug", "?vibe-embed=1"]) {
-      expect(new URLSearchParams(`${search}${formatMarkParam(search)}`).has("mark"), search).toBe(true)
+    // The full loop, exactly as a user drives it: append the token we printed to the end of the address bar,
+    // let the URL parser split the result, and require the reader to see it. `new URL()` does the splitting so
+    // the test asserts against real browser semantics rather than our own idea of them.
+    for (const href of [
+      "https://h/p/abc",
+      "https://h/p/abc?foo=1",
+      "https://h/p/abc#/route",
+      "https://h/p/abc#/route?a=1",
+      "https://h/p/abc?foo=1#/route", // ← the shape rounds 1–3 kept missing
+      "https://h/p/abc?foo=1#/route?a=1",
+      "https://h/p/abc#section",
+    ]) {
+      const appended = new URL(`${href}${formatMarkParam(new URL(href))}`)
+      expect(resolveFabVisibility(appended, "hidden"), href).toEqual({ visibility: "visible", persist: "visible" })
     }
   })
 

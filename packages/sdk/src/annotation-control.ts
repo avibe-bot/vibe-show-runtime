@@ -121,23 +121,64 @@ export function fabVisibleStorageKey(sessionId: string | undefined): string {
 }
 
 /**
- * Resolve the standalone chrome's visibility from the URL search string. Precedence: an explicit
- * `?unmark` / `?mark` (bare presence) WINS and dictates what to persist (`persist` = the state to write,
- * so the switch survives a later param-free load); else honor the stored state; else default visible
- * (`persist: null` ⇒ write nothing). Pure; the caller reads `location.search`, persists, and strips the param.
+ * The two segments of the current URL a `mark` / `unmark` flag can occupy. Taken as a pair because the user's
+ * action is "append to the end of the address bar", and which segment that lands in depends on the page:
+ * `location.search` normally, but `location.hash` the moment the page is on a `#/…` route. Structurally
+ * satisfied by both `window.location` and `new URL(...)`, so callers hand over the real thing.
  */
-export function resolveFabVisibility(
-  search: string | undefined,
-  stored: FabVisibility | undefined
-): { visibility: FabVisibility; persist: FabVisibility | null } {
+export interface FabParamUrl {
+  search?: string
+  hash?: string
+}
+
+/**
+ * Split a hash into the router's route and the hash's OWN query segment (everything after its first `?`).
+ *
+ * The split is positional, never a search for our word somewhere in the hash: `#/route?redirect=/a?mark` has
+ * to keep parsing as a single `redirect` value — exactly as it already does on the search side — so that a
+ * lenient scan can't invent a flag out of a host's parameter, or corrupt one on the way back out. Everything
+ * left of the `?` belongs to the hash router and is never read or rewritten here.
+ */
+function splitHash(hash: string | undefined): { route: string; query: string } {
+  const raw = (hash ?? "").replace(/^#/, "")
+  const start = raw.indexOf("?")
+  return start === -1 ? { route: raw, query: "" } : { route: raw.slice(0, start), query: raw.slice(start + 1) }
+}
+
+/** The flag a single query segment carries, if any. `unmark` outranks `mark` when both are present. */
+function readFabFlag(query: string | undefined): FabVisibility | undefined {
   let params: URLSearchParams | undefined
   try {
-    params = new URLSearchParams(search ?? "") // tolerates a leading "?" and a bare key (no value)
+    params = new URLSearchParams(query ?? "") // tolerates a leading "?" and a bare key (no value)
   } catch {
-    params = undefined
+    return undefined
   }
-  if (params?.has(ANNOTATION_FAB_PARAM_HIDE)) return { visibility: "hidden", persist: "hidden" }
-  if (params?.has(ANNOTATION_FAB_PARAM_SHOW)) return { visibility: "visible", persist: "visible" }
+  if (params.has(ANNOTATION_FAB_PARAM_HIDE)) return "hidden"
+  if (params.has(ANNOTATION_FAB_PARAM_SHOW)) return "visible"
+  return undefined
+}
+
+/**
+ * Resolve the standalone chrome's visibility from the URL. Precedence: an explicit `unmark` / `mark` (bare
+ * presence) WINS and dictates what to persist (`persist` = the state to write, so the switch survives a later
+ * param-free load); else honor the stored state; else default visible (`persist: null` ⇒ write nothing).
+ *
+ * Read from BOTH the search and the hash's own query segment, because both are places the flag legitimately
+ * lands: on a hash-routed page (`/p/x#/route`, the ordinary Show Page shape) `location.search` is empty and an
+ * appended `?mark` becomes part of the hash. Looking in one place only would strand `hidden` — the single
+ * state with neither an on-screen handle nor a guaranteed keyboard shortcut — on whichever shape wasn't
+ * checked. Both segments go through the same `URLSearchParams` parse, so reading twice widens WHERE we look
+ * without widening WHAT counts. The search wins when the two disagree: a fixed priority, pinned by a test,
+ * rather than an accident of evaluation order.
+ *
+ * Pure; the caller reads `location`, persists, and strips the flag from whichever segment held it.
+ */
+export function resolveFabVisibility(
+  url: FabParamUrl,
+  stored: FabVisibility | undefined
+): { visibility: FabVisibility; persist: FabVisibility | null } {
+  const flag = readFabFlag(url.search) ?? readFabFlag(splitHash(url.hash).query)
+  if (flag) return { visibility: flag, persist: flag }
   return { visibility: stored ?? "visible", persist: null }
 }
 
@@ -247,6 +288,26 @@ export function stripFabParamsFromSearch(search: string | undefined): string {
     .join("&")
 }
 
+/**
+ * The same strip, one segment over: remove our flag from the hash's own query while leaving the ROUTE and
+ * every foreign key byte-for-byte intact. Returns the hash body WITHOUT a leading "#" ("" if empty).
+ *
+ * The strip has to reach wherever {@link resolveFabVisibility} reads, or the one-time switch stops being
+ * one-time: an `unmark` left sitting in the hash outlives its load, and the `mark` the user appends next to
+ * that same tail arrives to find the old flag still there. The query segment is handed to the search
+ * stripper rather than re-implemented, so both sides drop exactly the same key tokens and re-encode nothing.
+ * When there was nothing of ours to remove, the ORIGINAL string is handed back rather than a reassembled
+ * one — the common case for a flag that arrived in the search — so a hash we have no business rewriting
+ * cannot be perturbed by the round trip. Only when a token really is dropped is the hash rebuilt, and a
+ * segment emptied by that drop loses its now-meaningless `?` with it.
+ */
+export function stripFabParamsFromHash(hash: string | undefined): string {
+  const { route, query } = splitHash(hash)
+  const rest = stripFabParamsFromSearch(query)
+  if (rest === query) return (hash ?? "").replace(/^#/, "")
+  return rest ? `${route}?${rest}` : route
+}
+
 // ── Standalone FAB visibility keyboard shortcut (Alt+M / ⌥M) ──────────────────────────────
 // Alt+M toggles the FAB the same way ?mark/?unmark and the ✕ button do (standalone host only). Alt is the
 // SOLE modifier. macOS Option+M emits key "µ" in some layouts, so we match the physical `code === "KeyM"`
@@ -293,11 +354,19 @@ export function formatFabShortcut(
  * `?foo=1?mark`, which `URLSearchParams` reads as a single `foo="1?mark"` — no `mark` key, so the stored
  * `hidden` survives the reload. That is the one hidden state with neither an edge handle nor a keyboard
  * shortcut, so its hint has to work on the URL the reader is actually looking at. Callers must read
- * `location.search` at DISPLAY time, not at mount: the boot strip rewrites it.
+ * `location` at DISPLAY time, not at mount: the boot strip rewrites it.
+ *
+ * Which separator is right is decided by the segment the user APPENDS TO — the end of the address bar. On a
+ * hash-routed page that is the hash, not the search, and the two can disagree: `/p/x?foo=1#/route` has a
+ * query string yet its tail has none, so the answer there is `?mark`, and reading `search` would hand out
+ * `&mark` and produce `#/route&mark` — one more shape where the flag silently isn't a flag. Only when there
+ * is no hash at all does the search decide.
  */
-export function formatMarkParam(search: string | undefined): string {
-  const raw = (search ?? "").replace(/^\?/, "")
-  return `${raw ? "&" : "?"}${ANNOTATION_FAB_PARAM_SHOW}`
+export function formatMarkParam(url: FabParamUrl): string {
+  const hash = (url.hash ?? "").replace(/^#/, "")
+  const search = (url.search ?? "").replace(/^\?/, "")
+  const tailHasQuery = hash ? hash.includes("?") : search !== ""
+  return `${tailHasQuery ? "&" : "?"}${ANNOTATION_FAB_PARAM_SHOW}`
 }
 
 /**

@@ -10,18 +10,24 @@ import {
   createChromeFocusController,
   TOUCH_CAPABLE_QUERY
 } from "./react.js"
-import { fabHideOptions, formatFabShortcut, formatMarkParam, withParenthetical } from "./annotation-control.js"
+import {
+  fabHideOptions,
+  formatFabShortcut,
+  formatMarkParam,
+  withParenthetical,
+  type FabParamUrl
+} from "./annotation-control.js"
 
 /**
  * The row label the '?' popup renders for one hide target — the same composition AnnotationChrome does,
  * against `search` as the URL stands when the popup is opened (ToolbarHelp snapshots it there).
  */
-function hideRowLabel(target: "handle" | "hidden", shortcut: string | undefined, search = ""): string {
+function hideRowLabel(target: "handle" | "hidden", shortcut: string | undefined, url: FabParamUrl = {}): string {
   const L = DEFAULT_ANNOTATION_LABELS
   if (target === "handle") return withParenthetical(L.hideToHandleAction, L.hideToHandleHint)
   return shortcut
     ? withParenthetical(L.hideAction, L.hideActionHint(shortcut))
-    : withParenthetical(L.hideCompletelyAction, L.hideCompletelyHint(formatMarkParam(search)))
+    : withParenthetical(L.hideCompletelyAction, L.hideCompletelyHint(formatMarkParam(url)))
 }
 
 // Recovery hints live in the PARENTHESES of the button that hides, named ONCE. Before Lane U the tip and
@@ -65,14 +71,26 @@ describe("hide copy names each recovery exactly once, in the row that performs i
   it("the full-hide hint adapts its separator to the URL the reader is on", () => {
     const L = DEFAULT_ANNOTATION_LABELS
     // Clean URL → the friendly literal.
-    expect(hideRowLabel("hidden", undefined, "")).toBe("完全隐藏（网址加 ?mark 恢复）")
-    expect(L.hiddenToast(formatMarkParam(""))).toBe("已完全隐藏，网址加 ?mark 可恢复")
+    expect(hideRowLabel("hidden", undefined, {})).toBe("完全隐藏（网址加 ?mark 恢复）")
+    expect(L.hiddenToast(formatMarkParam({}))).toBe("已完全隐藏，网址加 ?mark 可恢复")
     // Query string already present → "&mark", in BOTH the row and its toast.
-    expect(hideRowLabel("hidden", undefined, "?foo=1")).toBe("完全隐藏（网址加 &mark 恢复）")
-    expect(L.hiddenToast(formatMarkParam("?vibe-embed=1&debug"))).toBe("已完全隐藏，网址加 &mark 可恢复")
+    expect(hideRowLabel("hidden", undefined, { search: "?foo=1" })).toBe("完全隐藏（网址加 &mark 恢复）")
+    expect(L.hiddenToast(formatMarkParam({ search: "?vibe-embed=1&debug" }))).toBe("已完全隐藏，网址加 &mark 可恢复")
     // The premise, pinned so nobody "simplifies" this back to a hardcoded literal.
     expect(new URLSearchParams("?foo=1?mark").has("mark")).toBe(false)
     expect(new URLSearchParams("?foo=1&mark").has("mark")).toBe(true)
+  })
+
+  // The copy is unchanged; what changed is where the separator is measured. On a hash-routed page the reader
+  // appends past the search, into the hash — so the row must describe THAT segment, or it prints a token that
+  // lands where nothing reads it.
+  it("on a hash route the hint describes the HASH's tail, not the search's", () => {
+    // Search has a query, hash has none: the append lands in the hash → the clean literal is the correct one.
+    expect(hideRowLabel("hidden", undefined, { search: "?foo=1", hash: "#/route" })).toBe(
+      "完全隐藏（网址加 ?mark 恢复）"
+    )
+    // The hash already carries its own query → "&mark", regardless of the search.
+    expect(hideRowLabel("hidden", undefined, { hash: "#/route?a=1" })).toBe("完全隐藏（网址加 &mark 恢复）")
   })
 
   it("each toast repeats the hint for the state just entered, and nothing else", () => {
@@ -93,7 +111,7 @@ describe("hide copy names each recovery exactly once, in the row that performs i
     const copy = mergeAnnotationLabels({ hideAction: "Hide", hideCompletelyAction: "Hide for good" })
     expect(withParenthetical(copy.hideAction, copy.hideActionHint("Alt+M"))).toBe("Hide（Alt+M 恢复）")
     // Same for the URL clause: renaming the row keeps the separator the current URL earned.
-    expect(withParenthetical(copy.hideCompletelyAction, copy.hideCompletelyHint(formatMarkParam("?foo=1")))).toBe(
+    expect(withParenthetical(copy.hideCompletelyAction, copy.hideCompletelyHint(formatMarkParam({ search: "?foo=1" })))).toBe(
       "Hide for good（网址加 &mark 恢复）"
     )
     expect(copy.handleToast).toBe(DEFAULT_ANNOTATION_LABELS.handleToast) // untouched fields keep defaults

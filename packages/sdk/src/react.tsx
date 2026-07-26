@@ -71,8 +71,10 @@ import {
   fabVisibilityAfterShortcutLoss,
   formatFabShortcut,
   formatMarkParam,
+  type FabParamUrl,
   toggleFabVisibilityByShortcut,
   withParenthetical,
+  stripFabParamsFromHash,
   stripFabParamsFromSearch,
   shouldToggleFabShortcut,
   readStoredFloatPlacement,
@@ -284,10 +286,12 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   hideToHandleAction: "隐藏至把手",
   hideToHandleHint: "点把手可恢复",
   hideCompletelyAction: "完全隐藏",
-  // The fragment is computed for the URL in front of the reader (formatMarkParam), so a page that already has
-  // a query string reads "&mark" instead of a "?mark" that would land as `?foo=1?mark` — one `foo` value,
-  // no `mark` key, chrome stays hidden. This is the one hide with neither a handle nor a shortcut behind it,
-  // so the hint has to be copy-pasteable rather than merely correct in the abstract.
+  // The fragment is computed for the URL in front of the reader (formatMarkParam), against the segment their
+  // append actually lands in: a page that already has a query string reads "&mark" instead of a "?mark" that
+  // would land as `?foo=1?mark` — one `foo` value, no `mark` key, chrome stays hidden — and a page on a
+  // `#/…` route is measured by its hash, which is what the end of that address bar belongs to. This is the
+  // one hide with neither a handle nor a shortcut behind it, so the hint has to be copy-pasteable rather
+  // than merely correct in the abstract.
   hideCompletelyHint: (markParam) => `网址加 ${markParam} 恢复`,
   hiddenShortcutToast: (shortcut) => `已隐藏，按 ${shortcut} 恢复`,
   handleToast: "已缩至边缘把手，轻点可恢复",
@@ -1452,15 +1456,19 @@ export function modePillLabel(
  * captured at mount: the boot strip below rewrites `location.search` after the chrome first renders, and a
  * host router may change it again, so a fragment baked early can name the wrong separator.
  */
-function currentSearch(): string {
-  return typeof window === "undefined" ? "" : window.location.search
+/** The URL as it stands right now, in both segments a `mark` / `unmark` flag can occupy. */
+function currentUrl(): FabParamUrl {
+  if (typeof window === "undefined") return {}
+  return { search: window.location.search, hash: window.location.hash }
 }
 
-/** Standalone-only chrome visibility (visible | handle | hidden) from the frozen ?mark / ?unmark query
- *  param: an explicit param flips it AND persists the choice, then is stripped from the URL at boot
- *  (one-time switch); a param-free load honors the stored state. Query param, not the hash, so it never
- *  collides with the Show Page hash router. Embedded host is always visible. `set()` is every UI path — the
- *  '?' popup hide rows, the handle's restore tap, Alt+M — persisting so the choice survives a reload. */
+/** Standalone-only chrome visibility (visible | handle | hidden) from the frozen ?mark / ?unmark flag: an
+ *  explicit flag flips it AND persists the choice, then is stripped from the URL at boot (one-time switch);
+ *  a flag-free load honors the stored state. Read from the search AND from the hash's own query segment,
+ *  because "append to the end of the address bar" lands in the hash on a hash-routed page — the vocabulary
+ *  is still two words and the hash ROUTE is never touched, only its query. Embedded host is always visible.
+ *  `set()` is every UI path — the '?' popup hide rows, the handle's restore tap, Alt+M — persisting so the
+ *  choice survives a reload. */
 function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, touchPrimary: boolean) {
   const storage = React.useMemo(() => safeLocalStorage(), [])
   // `touchPrimary` only selects which hidden flavor a LEGACY boolean migrates to, so it is read fresh
@@ -1469,32 +1477,33 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
   touchPrimaryRef.current = touchPrimary
   const [visibility, setVisibility] = React.useState<FabVisibility>(() => {
     if (host !== "standalone" || typeof window === "undefined") return "visible"
-    return resolveFabVisibility(window.location.search, readStoredFabVisibility(sessionId, touchPrimary, storage))
-      .visibility
+    return resolveFabVisibility(currentUrl(), readStoredFabVisibility(sessionId, touchPrimary, storage)).visibility
   })
-  // Read the ?mark / ?unmark switch ONCE at boot: apply it, persist the choice, then STRIP the param via
-  // replaceState so the URL returns clean — keeping any other query params AND the hash route (#/…) intact,
-  // since the Show Page hash router owns the hash. It's a one-time switch, so there is no ongoing listener.
+  // Read the ?mark / ?unmark switch ONCE at boot: apply it, persist the choice, then STRIP the flag via
+  // replaceState so the URL returns clean. It's a one-time switch, so there is no ongoing listener.
   React.useEffect(() => {
     if (host !== "standalone" || typeof window === "undefined") return
     const stored = readStoredFabVisibility(sessionId, touchPrimaryRef.current, storage)
-    const resolved = resolveFabVisibility(window.location.search, stored)
+    const resolved = resolveFabVisibility(currentUrl(), stored)
     setVisibility(resolved.visibility)
     if (resolved.persist === null) return // no ?mark/?unmark this load → nothing to persist or strip
     // Strip the one-time flag ONLY once the choice is durable: if the write failed (no storage / quota),
     // leave ?mark/?unmark in the URL so a reload still carries the intent instead of silently reverting.
     if (!writeStoredFabVisibility(sessionId, resolved.persist, storage)) return
     try {
-      const stripped = stripFabParamsFromSearch(window.location.search)
-      const nextSearch = stripped ? `?${stripped}` : ""
-      if (nextSearch !== window.location.search) {
-        // Drop ONLY our flag: keep the app's other query params (surgical string strip, no re-encode) and
-        // its existing history.state (a history router may keep location keys / scroll data there).
-        window.history.replaceState(
-          window.history.state,
-          "",
-          `${window.location.pathname}${nextSearch}${window.location.hash}`
-        )
+      const strippedSearch = stripFabParamsFromSearch(window.location.search)
+      const nextSearch = strippedSearch ? `?${strippedSearch}` : ""
+      // The strip reaches wherever the read reaches. Clean only the search and an `unmark` that arrived in the
+      // hash sits there forever: no longer one-time, and the `mark` appended to that same tail next would be
+      // answering a flag that never left. Route path and foreign keys survive byte-for-byte; replaceState
+      // fires neither `hashchange` nor `popstate`, so the router is not kicked — its own navigate() has to
+      // dispatch PopStateEvent by hand for exactly that reason, and it reads pathname, which we never touch.
+      const strippedHash = stripFabParamsFromHash(window.location.hash)
+      const nextHash = strippedHash ? `#${strippedHash}` : ""
+      if (nextSearch !== window.location.search || nextHash !== window.location.hash) {
+        // Drop ONLY our flag: keep the app's other params (surgical string strip, no re-encode) and its
+        // existing history.state (a history router may keep location keys / scroll data there).
+        window.history.replaceState(window.history.state, "", `${window.location.pathname}${nextSearch}${nextHash}`)
       }
     } catch {
       /* best-effort — a blocked replaceState / URL parse must not break visibility */
@@ -1854,7 +1863,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
           ? labels.handleToast
           : shortcut
             ? labels.hiddenShortcutToast(shortcut)
-            : labels.hiddenToast(formatMarkParam(currentSearch()))
+            : labels.hiddenToast(formatMarkParam(currentUrl()))
       if (message) flashToast(message)
     },
     [requestChromeFocus, onDisable, fabVisibility, flashToast, shortcut, labels.handleToast, labels.hiddenShortcutToast, labels.hiddenToast]
@@ -2049,12 +2058,12 @@ function ToolbarHelp({ tip, hideOptions, triggerLabel, onHide }: { tip: string; 
   // Snapshotted on OPEN; null means closed. Both fields are properties of *the moment the user opens this* —
   // the button's viewport rect (fixed-positioned off it so the popup never spills off a ~320px screen wherever
   // the draggable toolbar is docked), and the URL fragment the hide row must name for the URL they are on right
-  // now. The fragment can't be computed with the chrome's other labels: the boot strip rewrites the query
-  // string after the chrome renders, and opening the popup is local state that re-renders nothing above.
+  // now. The fragment can't be computed with the chrome's other labels: the boot strip rewrites the URL after
+  // the chrome renders, and opening the popup is local state that re-renders nothing above.
   const [snapshot, setSnapshot] = React.useState<{ style: React.CSSProperties; markParam: string } | null>(null)
   const open = snapshot !== null
   const openTip = React.useCallback(() => {
-    const markParam = formatMarkParam(currentSearch())
+    const markParam = formatMarkParam(currentUrl())
     const button = btnRef.current
     if (!button || typeof window === "undefined") {
       setSnapshot({ style: {}, markParam })
