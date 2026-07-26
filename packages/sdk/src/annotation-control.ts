@@ -104,17 +104,36 @@ export function writeStoredAnnotationMode(
 // (history.replaceState) so the URL returns clean and a later param-free load honors the stored choice.
 // Standalone host only; coexists with `?vibe-embed=1` (the embedded host ignores these entirely).
 //
-// Visibility is TRI-state (Lane U): `visible` (FAB/toolbar), `handle` (collapsed to the draggable edge
-// grabber — a touch-created state) and `hidden` (nothing on screen). The URL vocabulary stays TWO words:
-// `?mark` → visible, `?unmark` → hidden. `handle` is reachable only from the '?' popup on a touch device.
+// Visibility (Lane U) records TWO things in one value: what is on screen, and — when nothing is — WHICH
+// exit the user was told about. `visible` (FAB/toolbar) and `handle` (collapsed to the draggable edge
+// grabber) are their own exit: they are on screen, so the way back is visible. The two hidden flavors show
+// nothing, so their exit lives outside the page and the state has to carry which one was promised:
+// `hidden-key` (the shortcut named in the hide row) and `hidden-url` (the `?mark` fragment named in it).
+//
+// Folding the exit into the state is the whole point. A hidden chrome whose promised exit doesn't exist on
+// this device is a screen with no way back, and the promise used to live only in a toast that expires in a
+// few seconds. Now the state names it, so the two can't drift apart. See {@link fabVisibilityForDevice}.
+//
+// The URL vocabulary stays TWO words: `?mark` → visible, `?unmark` → hidden-url.
 export const ANNOTATION_FAB_PARAM_SHOW = "mark"
 export const ANNOTATION_FAB_PARAM_HIDE = "unmark"
 export const ANNOTATION_FAB_VISIBLE_STORAGE_PREFIX = "avibe:fab-visible:"
 
-/** What the standalone annotation chrome shows: the full FAB/toolbar, just the edge handle, or nothing. */
-export type FabVisibility = "visible" | "handle" | "hidden"
+/**
+ * What the standalone annotation chrome shows — and, when it shows nothing, which exit the user was told
+ * about. The two hidden flavors render IDENTICALLY (nothing); they differ only in the way back they promise.
+ */
+export type FabVisibility = "visible" | "handle" | "hidden-key" | "hidden-url"
 
-const FAB_VISIBILITIES: readonly FabVisibility[] = ["visible", "handle", "hidden"]
+const FAB_VISIBILITIES: readonly FabVisibility[] = ["visible", "handle", "hidden-key", "hidden-url"]
+
+/**
+ * The states that put nothing on screen. The single predicate every renderer branches on, so a new hidden
+ * flavor can never be half-handled: the difference between the two is the exit they promise, never pixels.
+ */
+export function isFabHidden(visibility: FabVisibility): boolean {
+  return visibility === "hidden-key" || visibility === "hidden-url"
+}
 
 export function fabVisibleStorageKey(sessionId: string | undefined): string {
   return `${ANNOTATION_FAB_VISIBLE_STORAGE_PREFIX}${sessionId ?? "default"}`
@@ -153,7 +172,9 @@ function readFabFlag(query: string | undefined): FabVisibility | undefined {
   } catch {
     return undefined
   }
-  if (params.has(ANNOTATION_FAB_PARAM_HIDE)) return "hidden"
+  // `?unmark` → `hidden-url`, never `hidden-key`: whoever typed this flag already holds the URL vocabulary,
+  // so the URL is demonstrably an exit they can use — and unlike the shortcut it works on every device.
+  if (params.has(ANNOTATION_FAB_PARAM_HIDE)) return "hidden-url"
   if (params.has(ANNOTATION_FAB_PARAM_SHOW)) return "visible"
   return undefined
 }
@@ -183,10 +204,16 @@ export function resolveFabVisibility(
 }
 
 /**
- * Read the persisted visibility, migrating the pre-tri-state BOOLEAN format under the same key.
+ * Read the persisted visibility, migrating every earlier vocabulary under the same key toward an exit THIS
+ * surface can actually use.
  *
- * Legacy `"1"` → `visible`. Legacy `"0"` → whichever hidden flavor this surface can recover from:
- * `handle` when the primary input is touch (tap the grabber), `hidden` on a keyboard device (Option/Alt+M).
+ * Legacy `"1"` → `visible`. Legacy `"0"` → the hidden flavor this surface can recover from: `handle` when
+ * the primary input is touch (tap the grabber), `hidden-key` on a keyboard device (Option/Alt+M). Legacy
+ * `"hidden"` (written by early builds of this branch, before the flavor split) → `hidden-key`: the exit it
+ * was told is unknowable, so we take the conservative branch, because `hidden-key` is the one that
+ * {@link fabVisibilityForDevice} will rescue on a keyboardless device. Undoing one unreleased build's state
+ * beats leaving somebody on a blank screen.
+ *
  * The migration is derived at READ time and never written back, so one synced profile opened on a phone and
  * on a laptop leaves each surface with a working recovery path instead of freezing the first reader's guess.
  */
@@ -200,7 +227,8 @@ export function readStoredFabVisibility(
     const value = storage.getItem(fabVisibleStorageKey(sessionId))
     if (FAB_VISIBILITIES.includes(value as FabVisibility)) return value as FabVisibility
     if (value === "1") return "visible"
-    if (value === "0") return touchPrimary ? "handle" : "hidden"
+    if (value === "0") return touchPrimary ? "handle" : "hidden-key"
+    if (value === "hidden") return "hidden-key" // pre-split builds of this branch; see the doc comment
     return undefined
   } catch {
     return undefined
@@ -232,41 +260,41 @@ export function writeStoredFabVisibility(
 export type FabHideTarget = Exclude<FabVisibility, "visible">
 
 /**
- * The hide targets the '?' popup offers, in row order. Split by PRIMARY input, not touch capability: a
- * hybrid touchscreen laptop has a keyboard, so it gets the desktop treatment — one destructive row straight
- * to `hidden`, recoverable by the shortcut. Only a touch-primary device is offered the edge handle, because
- * there the handle is the ONLY recovery an unhidden URL can't provide.
+ * The hide targets the '?' popup offers, in row order — each one named for the exit it promises, so the row
+ * the user reads and the state it produces cannot drift apart.
+ *
+ * Split by PRIMARY input, not touch capability: a hybrid touchscreen laptop has a keyboard, so it gets the
+ * desktop treatment — one row straight to `hidden-key`, recoverable by the shortcut. A touch-primary device
+ * has no keyboard, so its full hide is `hidden-url`, whose exit works everywhere; it also gets the edge
+ * handle, the only recovery that costs a single tap.
  */
 export function fabHideOptions(touchPrimary: boolean): FabHideTarget[] {
-  return touchPrimary ? ["handle", "hidden"] : ["hidden"]
+  return touchPrimary ? ["handle", "hidden-url"] : ["hidden-key"]
 }
 
 /**
- * Alt+M semantics over the tri-state: it toggles `visible` ⇄ `hidden`, and rescues `handle` back to
- * `visible` — a state a phone can create and a laptop can only recover from.
+ * Alt+M semantics: it toggles `visible` ⇄ hidden, and rescues either non-visible state back to `visible` —
+ * `handle` is a state a phone can create and a laptop can only recover from. Hiding VIA the shortcut records
+ * `hidden-key`, because pressing it is proof the user has the keyboard we are about to name as the exit.
  */
 export function toggleFabVisibilityByShortcut(current: FabVisibility): FabVisibility {
-  return current === "visible" ? "hidden" : "visible"
+  return current === "visible" ? "hidden-key" : "visible"
 }
 
 /**
- * A `hidden` chrome must not outlive the keyboard that is its on-screen-free exit. Detach a keyboard or
- * trackpad mid-session and the primary pointer flips to touch: the shortcut we PROMISED in the hide row
- * stops existing, its document listener unbinds, and `hidden` renders nothing to tap — a screen with no way
- * back. Degrading to `handle` restores an exit the device can actually use.
+ * Reconcile a stored/current visibility with what THIS device can do — the single rule behind both the boot
+ * read and a keyboard detaching mid-session, since the state now names its own exit and no before/after
+ * comparison is needed to tell the two hides apart.
  *
- * Keyed on the LOSS (had one, now doesn't), not on `!shortcut`: a touch-primary device never has a shortcut
- * and is still offered the full hide by {@link fabHideOptions}, so a plain state test would flip that
- * deliberate choice back on the very next render and make the row unusable exactly where it is offered.
- * Returns the state to move to, or `null` to stay put.
+ * `hidden-key` promises a shortcut. On a touch-primary device that shortcut does not exist and its document
+ * listener never binds, so the state would render nothing with no way back: degrade to `handle`, an exit the
+ * device can use. `hidden-url` is NEVER degraded — its exit is a fragment the reader types into the address
+ * bar, which does not depend on the device, so a touch user's deliberate full hide is never quietly undone.
+ * That is precisely what makes offering the full hide on touch safe. `visible` and `handle` are on screen
+ * and are their own exit. Returns the state to be in — same value when nothing needs to change.
  */
-export function fabVisibilityAfterShortcutLoss(
-  current: FabVisibility,
-  previousShortcut: string | undefined,
-  nextShortcut: string | undefined
-): FabVisibility | null {
-  if (current !== "hidden") return null // `visible` and `handle` are both recoverable on screen
-  return previousShortcut && !nextShortcut ? "handle" : null
+export function fabVisibilityForDevice(visibility: FabVisibility, shortcutAvailable: boolean): FabVisibility {
+  return visibility === "hidden-key" && !shortcutAvailable ? "handle" : visibility
 }
 
 /**

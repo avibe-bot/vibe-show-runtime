@@ -30,7 +30,8 @@ import {
   writeStoredFabVisibility,
   fabVisibleStorageKey,
   fabHideOptions,
-  fabVisibilityAfterShortcutLoss,
+  fabVisibilityForDevice,
+  isFabHidden,
   toggleFabVisibilityByShortcut,
   formatFabShortcut,
   formatMarkParam,
@@ -475,40 +476,40 @@ describe("uniform write-token resolution (contract §5 v2)", () => {
 
 describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R11, tri-state in U)", () => {
   it("a query param WINS (bare presence) and dictates what to persist (one-time switch)", () => {
-    expect(resolveFabVisibility({ search: "?unmark" }, undefined)).toEqual({ visibility: "hidden", persist: "hidden" })
+    expect(resolveFabVisibility({ search: "?unmark" }, undefined)).toEqual({ visibility: "hidden-url", persist: "hidden-url" })
     expect(resolveFabVisibility({ search: "?mark" }, undefined)).toEqual({ visibility: "visible", persist: "visible" })
     // param overrides a conflicting stored choice AND re-persists it; coexists with other params.
-    expect(resolveFabVisibility({ search: "?mark" }, "hidden")).toEqual({ visibility: "visible", persist: "visible" })
+    expect(resolveFabVisibility({ search: "?mark" }, "hidden-url")).toEqual({ visibility: "visible", persist: "visible" })
     expect(resolveFabVisibility({ search: "?mark" }, "handle")).toEqual({ visibility: "visible", persist: "visible" })
     expect(resolveFabVisibility({ search: "?vibe-embed=1&unmark" }, "visible")).toEqual({
-      visibility: "hidden",
-      persist: "hidden",
+      visibility: "hidden-url",
+      persist: "hidden-url",
     })
-    expect(resolveFabVisibility({ search: "unmark" }, undefined)).toEqual({ visibility: "hidden", persist: "hidden" }) // no leading '?'
+    expect(resolveFabVisibility({ search: "unmark" }, undefined)).toEqual({ visibility: "hidden-url", persist: "hidden-url" }) // no leading '?'
   })
 
   // A hash route puts the END of the URL inside `location.hash`, and appending to the end is exactly what the
   // hint tells the reader to do. So the flag is read from BOTH places the tail can be — a page on `#/route`
   // has an empty `location.search`, and looking only there strands the one state with no on-screen exit.
   it("the flag is also read from the hash's OWN query segment, since that is where an append lands", () => {
-    expect(resolveFabVisibility({ hash: "#/route?mark" }, "hidden")).toEqual({
+    expect(resolveFabVisibility({ hash: "#/route?mark" }, "hidden-url")).toEqual({
       visibility: "visible",
       persist: "visible",
     })
     expect(resolveFabVisibility({ hash: "#/route?unmark" }, undefined)).toEqual({
-      visibility: "hidden",
-      persist: "hidden",
+      visibility: "hidden-url",
+      persist: "hidden-url",
     })
-    expect(resolveFabVisibility({ hash: "#section?mark" }, "hidden")).toEqual({
+    expect(resolveFabVisibility({ hash: "#section?mark" }, "hidden-url")).toEqual({
       visibility: "visible",
       persist: "visible",
     })
     // Alongside the hash route's own params, and alongside a search string that has no flag of its own.
-    expect(resolveFabVisibility({ hash: "#/route?a=1&mark" }, "hidden")).toEqual({
+    expect(resolveFabVisibility({ hash: "#/route?a=1&mark" }, "hidden-url")).toEqual({
       visibility: "visible",
       persist: "visible",
     })
-    expect(resolveFabVisibility({ search: "?foo=1", hash: "#/route?mark" }, "hidden")).toEqual({
+    expect(resolveFabVisibility({ search: "?foo=1", hash: "#/route?mark" }, "hidden-url")).toEqual({
       visibility: "visible",
       persist: "visible",
     })
@@ -519,28 +520,28 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
   // merely contains our word stays untouched, on both sides, byte for byte.
   it("the hash is parsed as a query string, not scanned for our word — host params keep their meaning", () => {
     // `redirect=/a?mark` is ONE value per URLSearchParams (no `mark` key). Locked on both sides.
-    expect(resolveFabVisibility({ search: "?redirect=/a?mark" }, "hidden")).toEqual({
-      visibility: "hidden",
+    expect(resolveFabVisibility({ search: "?redirect=/a?mark" }, "hidden-url")).toEqual({
+      visibility: "hidden-url",
       persist: null,
     })
-    expect(resolveFabVisibility({ hash: "#/route?redirect=/a?mark" }, "hidden")).toEqual({
-      visibility: "hidden",
+    expect(resolveFabVisibility({ hash: "#/route?redirect=/a?mark" }, "hidden-url")).toEqual({
+      visibility: "hidden-url",
       persist: null,
     })
     // No '?' in the hash ⇒ no query segment at all: a route PATH named /mark is a route, not our flag.
-    expect(resolveFabVisibility({ hash: "#/mark" }, "hidden")).toEqual({ visibility: "hidden", persist: null })
+    expect(resolveFabVisibility({ hash: "#/mark" }, "hidden-url")).toEqual({ visibility: "hidden-url", persist: null })
     expect(resolveFabVisibility({ hash: "#/some/hash-route" }, undefined)).toEqual({
       visibility: "visible",
       persist: null,
     })
-    expect(resolveFabVisibility({ hash: "#/route?foo=mark" }, "hidden")).toEqual({ visibility: "hidden", persist: null })
+    expect(resolveFabVisibility({ hash: "#/route?foo=mark" }, "hidden-url")).toEqual({ visibility: "hidden-url", persist: null })
   })
 
   // Two places can disagree; that has to be a decision, not an accident of evaluation order.
   it("when both places carry a flag, the SEARCH wins — a fixed, explicitly tested priority", () => {
     expect(resolveFabVisibility({ search: "?unmark", hash: "#/route?mark" }, undefined)).toEqual({
-      visibility: "hidden",
-      persist: "hidden",
+      visibility: "hidden-url",
+      persist: "hidden-url",
     })
     expect(resolveFabVisibility({ search: "?mark", hash: "#/route?unmark" }, undefined)).toEqual({
       visibility: "visible",
@@ -548,14 +549,14 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
     })
     // Only a flag outranks the hash — an unrelated search param does not suppress it.
     expect(resolveFabVisibility({ search: "?foo=1", hash: "#/route?unmark" }, undefined)).toEqual({
-      visibility: "hidden",
-      persist: "hidden",
+      visibility: "hidden-url",
+      persist: "hidden-url",
     })
   })
 
   it("no param honors the stored state (including 'handle'), else defaults visible, persisting nothing new", () => {
     expect(resolveFabVisibility({ search: "" }, undefined)).toEqual({ visibility: "visible", persist: null }) // default visible
-    expect(resolveFabVisibility({}, "hidden")).toEqual({ visibility: "hidden", persist: null })
+    expect(resolveFabVisibility({}, "hidden-url")).toEqual({ visibility: "hidden-url", persist: null })
     expect(resolveFabVisibility({}, "handle")).toEqual({ visibility: "handle", persist: null })
     expect(resolveFabVisibility({ search: "?other=1" }, "visible")).toEqual({ visibility: "visible", persist: null }) // unknown param ignored
   })
@@ -563,13 +564,13 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
   it("there is NO third query param — 'handle' is reachable only from the UI, and ?mark still wins over it", () => {
     // Owner-frozen: the URL vocabulary stays two words. `?handle` is just an unknown param.
     expect(resolveFabVisibility({ search: "?handle" }, undefined)).toEqual({ visibility: "visible", persist: null })
-    expect(resolveFabVisibility({ search: "?handle" }, "hidden")).toEqual({ visibility: "hidden", persist: null })
-    expect(resolveFabVisibility({ hash: "#/route?handle" }, "hidden")).toEqual({ visibility: "hidden", persist: null })
+    expect(resolveFabVisibility({ search: "?handle" }, "hidden-url")).toEqual({ visibility: "hidden-url", persist: null })
+    expect(resolveFabVisibility({ hash: "#/route?handle" }, "hidden-url")).toEqual({ visibility: "hidden-url", persist: null })
   })
 
-  it("persisted visibility round-trips all three states and ignores garbage", () => {
+  it("persisted visibility round-trips all four states and ignores garbage", () => {
     const storage = memoryStorage()
-    for (const state of ["visible", "handle", "hidden"] as const) {
+    for (const state of ["visible", "handle", "hidden-key", "hidden-url"] as const) {
       writeStoredFabVisibility("ses_1", state, storage)
       expect(readStoredFabVisibility("ses_1", false, storage)).toBe(state)
       expect(readStoredFabVisibility("ses_1", true, storage)).toBe(state) // platform only matters for LEGACY values
@@ -587,7 +588,7 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
     // Legacy falsy → the platform-appropriate equivalent: a touch user gets the tappable handle back,
     // a keyboard user gets true-hidden (Option/Alt+M is their recovery).
     expect(readStoredFabVisibility("ses_1", true, memoryStorage({ [key]: "0" }))).toBe("handle")
-    expect(readStoredFabVisibility("ses_1", false, memoryStorage({ [key]: "0" }))).toBe("hidden")
+    expect(readStoredFabVisibility("ses_1", false, memoryStorage({ [key]: "0" }))).toBe("hidden-key")
   })
 
   it("migration does NOT rewrite storage — the same legacy value re-derives per surface on every read", () => {
@@ -595,21 +596,21 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
     // would strand the other. Re-deriving keeps both surfaces recoverable.
     const storage = memoryStorage({ [fabVisibleStorageKey("ses_1")]: "0" })
     expect(readStoredFabVisibility("ses_1", true, storage)).toBe("handle")
-    expect(readStoredFabVisibility("ses_1", false, storage)).toBe("hidden") // unchanged by the first read
+    expect(readStoredFabVisibility("ses_1", false, storage)).toBe("hidden-key") // unchanged by the first read
   })
 
   it("writeStoredFabVisibility reports whether the choice was durably stored", () => {
     // The boot effect only strips ?mark/?unmark from the URL when this returns true — a failed write must
     // keep the flag in the URL so a reload still carries the intent.
-    expect(writeStoredFabVisibility("ses_1", "hidden", memoryStorage())).toBe(true)
-    expect(writeStoredFabVisibility("ses_1", "hidden", undefined)).toBe(false) // no storage at all
+    expect(writeStoredFabVisibility("ses_1", "hidden-url", memoryStorage())).toBe(true)
+    expect(writeStoredFabVisibility("ses_1", "hidden-url", undefined)).toBe(false) // no storage at all
     const throwing: AnnotationModeStorage = {
       getItem: () => null,
       setItem: () => {
         throw new Error("quota / private mode")
       }
     }
-    expect(writeStoredFabVisibility("ses_1", "hidden", throwing)).toBe(false)
+    expect(writeStoredFabVisibility("ses_1", "hidden-url", throwing)).toBe(false)
   })
 
   it("stripFabParamsFromSearch removes ONLY our flag, preserving other params byte-for-byte", () => {
@@ -654,12 +655,13 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
 // The '?' popup's hide rows split by PRIMARY input, not by touch capability: a hybrid touchscreen laptop
 // has a keyboard, so it gets the desktop treatment (one destructive row, shortcut recovery, no handle).
 describe("platform-split hide options (Lane U)", () => {
-  it("a keyboard device offers exactly ONE hide row: straight to fully hidden (no handle)", () => {
-    expect(fabHideOptions(false)).toEqual(["hidden"])
+  it("a keyboard device offers exactly ONE hide row: straight to hidden, with the shortcut as its exit", () => {
+    expect(fabHideOptions(false)).toEqual(["hidden-key"])
   })
 
-  it("a touch-primary device offers TWO rows, handle first, then complete hide", () => {
-    expect(fabHideOptions(true)).toEqual(["handle", "hidden"])
+  it("a touch-primary device offers TWO rows, handle first, then a complete hide the URL can undo", () => {
+    // Not `hidden-key`: this device has no keyboard, so the row that promises one would be a dead end.
+    expect(fabHideOptions(true)).toEqual(["handle", "hidden-url"])
   })
 
   it("formatMarkParam picks the separator for the segment the user APPENDS to — the hash when there is one", () => {
@@ -701,7 +703,7 @@ describe("platform-split hide options (Lane U)", () => {
       "https://h/p/abc#section",
     ]) {
       const appended = new URL(`${href}${formatMarkParam(new URL(href))}`)
-      expect(resolveFabVisibility(appended, "hidden"), href).toEqual({ visibility: "visible", persist: "visible" })
+      expect(resolveFabVisibility(appended, "hidden-url"), href).toEqual({ visibility: "visible", persist: "visible" })
     }
   })
 
@@ -711,6 +713,96 @@ describe("platform-split hide options (Lane U)", () => {
     expect(withParenthetical("隐藏标注按钮", undefined)).toBe("隐藏标注按钮")
     expect(withParenthetical("隐藏标注按钮", "")).toBe("隐藏标注按钮")
     expect(withParenthetical("", "Alt+M 恢复")).toBe("（Alt+M 恢复）")
+  })
+})
+
+// Two review rounds found the same bug from opposite ends: a chrome hidden with a keyboard attached, met on a
+// device that has none. The state used to record only WHAT is on screen, while the way back out lived in a
+// toast that expires in 3.2s — so the two could disagree and strand someone on an empty screen. Splitting
+// `hidden` by the exit the user was TOLD about puts the way out inside the state, where it cannot go stale.
+describe("hidden carries its own exit: hidden-key vs hidden-url (Lane U, owner ruling round 6)", () => {
+  it("isFabHidden groups the two flavors that render nothing, and only those", () => {
+    expect(isFabHidden("hidden-key")).toBe(true)
+    expect(isFabHidden("hidden-url")).toBe(true)
+    expect(isFabHidden("handle")).toBe(false) // a 5px bar IS on screen, and one tap wide
+    expect(isFabHidden("visible")).toBe(false)
+  })
+
+  it("a keyboard hide degrades to the handle on a device with no keyboard — at boot AND mid-session", () => {
+    // The whole point of the split: `hidden-key` promised a shortcut, so it must not outlive one. The old
+    // rule had to watch for the LOSS transition (`had one, now doesn't`) because plain `hidden` was ambiguous.
+    // The state now says which exit it advertised, so a plain test is safe — and it covers the case the
+    // transition watch structurally could not: a laptop-created hide reopened on a tablet, where there is no
+    // previous value to have lost because the page is booting for the first time.
+    expect(fabVisibilityForDevice("hidden-key", false)).toBe("handle")
+    expect(fabVisibilityForDevice("hidden-key", true)).toBe("hidden-key") // keyboard present → honored
+  })
+
+  it("a URL hide is NEVER degraded — its exit does not depend on the device", () => {
+    // This is what makes the owner's touch-side full-hide row safe to keep. `?mark` works on every device and
+    // every URL shape, so a touch user's deliberate `完全隐藏` must survive every reload, keyboard or not.
+    // Degrading it would collapse the two touch rows into one and quietly cancel a choice they just made.
+    expect(fabVisibilityForDevice("hidden-url", false)).toBe("hidden-url")
+    expect(fabVisibilityForDevice("hidden-url", true)).toBe("hidden-url")
+  })
+
+  it("leaves the on-screen states alone — they are their own exit", () => {
+    for (const shortcut of [true, false]) {
+      expect(fabVisibilityForDevice("visible", shortcut)).toBe("visible")
+      expect(fabVisibilityForDevice("handle", shortcut)).toBe("handle")
+    }
+  })
+
+  it("each hide row advertises the exit its own state names — no shortcut/target drift possible", () => {
+    expect(fabHideOptions(false)).toEqual(["hidden-key"]) // desktop: one row, recovered by the shortcut
+    expect(fabHideOptions(true)).toEqual(["handle", "hidden-url"]) // touch keeps BOTH rows (owner ruling)
+  })
+
+  it("the shortcut's own hide records the shortcut as its exit", () => {
+    // Pressing the key IS the proof this device has one, and the toast that follows names it.
+    expect(toggleFabVisibilityByShortcut("visible")).toBe("hidden-key")
+    for (const hidden of ["hidden-key", "hidden-url", "handle"] as const) {
+      expect(toggleFabVisibilityByShortcut(hidden)).toBe("visible")
+    }
+  })
+
+  it("?unmark persists as hidden-url — the reader already typed the URL vocabulary", () => {
+    // Getting this backwards would be a silent downgrade for exactly the users who proved they know the way
+    // out: a phone opened via ?unmark would store `hidden-key`, and the next boot would demote it to a handle.
+    expect(resolveFabVisibility({ search: "?unmark" }, undefined)).toEqual({
+      visibility: "hidden-url",
+      persist: "hidden-url"
+    })
+    expect(resolveFabVisibility({ hash: "#/route?unmark" }, "visible")).toEqual({
+      visibility: "hidden-url",
+      persist: "hidden-url"
+    })
+    expect(resolveFabVisibility({ search: "?mark" }, "hidden-url")).toEqual({
+      visibility: "visible",
+      persist: "visible"
+    })
+  })
+
+  it("storage migrates every earlier vocabulary toward an exit this device can use", () => {
+    const store = (value: string): AnnotationModeStorage => ({
+      getItem: () => value,
+      setItem: () => {},
+      removeItem: () => {}
+    })
+    // The pre-tri-state BOOLEAN, unchanged in spirit: `0` becomes whichever hide the surface can recover from.
+    expect(readStoredFabVisibility("s", false, store("0"))).toBe("hidden-key")
+    expect(readStoredFabVisibility("s", true, store("0"))).toBe("handle")
+    expect(readStoredFabVisibility("s", false, store("1"))).toBe("visible")
+    // The tri-state `hidden` this branch briefly wrote in unreleased builds. Read as `hidden-key`, the
+    // CONSERVATIVE guess: it degrades to a handle on a keyboard-less device, so the worst case is undoing one
+    // unreleased state rather than leaving somebody on a blank screen with no vocabulary to escape it.
+    expect(readStoredFabVisibility("s", false, store("hidden"))).toBe("hidden-key")
+    expect(fabVisibilityForDevice(readStoredFabVisibility("s", true, store("hidden"))!, false)).toBe("handle")
+    // Current vocabulary passes through untouched, on both surfaces.
+    for (const value of ["visible", "handle", "hidden-key", "hidden-url"] as const) {
+      expect(readStoredFabVisibility("s", false, store(value))).toBe(value)
+      expect(readStoredFabVisibility("s", true, store(value))).toBe(value)
+    }
   })
 })
 
@@ -728,30 +820,12 @@ describe("Alt+M FAB toggle shortcut guard (Lane R12)", () => {
   })
 
   it("toggleFabVisibilityByShortcut flips visible⇄hidden and rescues a handle state back to visible", () => {
-    expect(toggleFabVisibilityByShortcut("visible")).toBe("hidden")
-    expect(toggleFabVisibilityByShortcut("hidden")).toBe("visible")
+    // Hiding BY the shortcut proves the keyboard exists, so the state it records names the shortcut.
+    expect(toggleFabVisibilityByShortcut("visible")).toBe("hidden-key")
+    expect(toggleFabVisibilityByShortcut("hidden-key")).toBe("visible")
+    expect(toggleFabVisibilityByShortcut("hidden-url")).toBe("visible")
     // A `handle` set on a phone then opened on a laptop: the shortcut must RESTORE, not re-hide.
     expect(toggleFabVisibilityByShortcut("handle")).toBe("visible")
-  })
-
-  it("fabVisibilityAfterShortcutLoss rescues a hidden chrome when the keyboard that was its exit goes away", () => {
-    // The whole point: a keyboard/trackpad detaches mid-session, the primary pointer flips to touch, and the
-    // shortcut the user was PROMISED stops existing. `hidden` renders nothing, so the chrome has no exit left.
-    expect(fabVisibilityAfterShortcutLoss("hidden", "Option+M", undefined)).toBe("handle")
-    expect(fabVisibilityAfterShortcutLoss("hidden", "Alt+M", undefined)).toBe("handle")
-  })
-
-  it("fabVisibilityAfterShortcutLoss keys on the LOSS, so it never undoes a touch user's deliberate full hide", () => {
-    // A touch-primary device has no shortcut and never had one, yet `fabHideOptions(true)` still offers it
-    // the full hide. Testing `!shortcut` instead of the transition would flip that choice back on the very
-    // next render — the row would be unusable on exactly the devices that are offered it.
-    expect(fabVisibilityAfterShortcutLoss("hidden", undefined, undefined)).toBeNull()
-    // Nothing was lost while the shortcut is still there, and GAINING one strands nobody.
-    expect(fabVisibilityAfterShortcutLoss("hidden", "Option+M", "Option+M")).toBeNull()
-    expect(fabVisibilityAfterShortcutLoss("hidden", undefined, "Alt+M")).toBeNull()
-    // Only `hidden` is exit-less; the other two states are recoverable on screen and must be left alone.
-    expect(fabVisibilityAfterShortcutLoss("visible", "Option+M", undefined)).toBeNull()
-    expect(fabVisibilityAfterShortcutLoss("handle", "Option+M", undefined)).toBeNull()
   })
 
   it("isEditableTarget: true for input / textarea / select / contenteditable, false otherwise", () => {
