@@ -42,16 +42,12 @@ import {
   isFabHidden,
   toggleFabVisibilityByShortcut,
   formatFabShortcut,
-  formatMarkParam,
+  formatMarkUrl,
   withParenthetical,
-  stripFabParamsFromHash,
   stripFabParamsFromSearch,
-  fabFlagToken,
-  shouldApplyFabFlag,
-  nextAppliedFlag,
   activeFabToast,
+  fabToastDurationMs,
   stripFabParamsFromUrl,
-  fabUrlChangeEvents,
   isEditableTarget,
   shouldToggleFabShortcut,
   snapToNearestEdge,
@@ -485,132 +481,93 @@ describe("uniform write-token resolution (contract §5 v2)", () => {
   })
 })
 
-describe("standalone FAB visibility via ?vibe-mark / ?vibe-unmark query param (Lane R10/R11, tri-state in U)", () => {
+describe("standalone FAB visibility via the ?mark / ?unmark query param (Lane R10/R11, tri-state in U)", () => {
   it("a query param WINS (bare presence) and dictates what to persist (one-time switch)", () => {
-    expect(resolveFabVisibility({ search: "?vibe-unmark" }, undefined)).toEqual({ visibility: "hidden-url", persist: "hidden-url" })
-    expect(resolveFabVisibility({ search: "?vibe-mark" }, undefined)).toEqual({ visibility: "visible", persist: "visible" })
+    expect(resolveFabVisibility("?unmark", undefined, true)).toEqual({ visibility: "hidden-url", persist: "hidden-url" })
+    expect(resolveFabVisibility("?mark", undefined, true)).toEqual({ visibility: "visible", persist: "visible" })
     // param overrides a conflicting stored choice AND re-persists it; coexists with other params.
-    expect(resolveFabVisibility({ search: "?vibe-mark" }, "hidden-url")).toEqual({ visibility: "visible", persist: "visible" })
-    expect(resolveFabVisibility({ search: "?vibe-mark" }, "handle")).toEqual({ visibility: "visible", persist: "visible" })
-    expect(resolveFabVisibility({ search: "?vibe-embed=1&vibe-unmark" }, "visible")).toEqual({
+    expect(resolveFabVisibility("?mark", "hidden-url", true)).toEqual({ visibility: "visible", persist: "visible" })
+    expect(resolveFabVisibility("?mark", "handle", true)).toEqual({ visibility: "visible", persist: "visible" })
+    expect(resolveFabVisibility("?vibe-embed=1&unmark", "visible", true)).toEqual({
       visibility: "hidden-url",
       persist: "hidden-url",
     })
-    expect(resolveFabVisibility({ search: "vibe-unmark" }, undefined)).toEqual({ visibility: "hidden-url", persist: "hidden-url" }) // no leading '?'
+    expect(resolveFabVisibility("unmark", undefined, true)).toEqual({ visibility: "hidden-url", persist: "hidden-url" }) // no leading '?'
   })
 
-  // A hash route puts the END of the URL inside `location.hash`, and appending to the end is exactly what the
-  // hint tells the reader to do. So the flag is read from BOTH places the tail can be — a page on `#/route`
-  // has an empty `location.search`, and looking only there strands the one state with no on-screen exit.
-  it("the flag is also read from the hash's OWN query segment, since that is where an append lands", () => {
-    expect(resolveFabVisibility({ hash: "#/route?vibe-mark" }, "hidden-url")).toEqual({
-      visibility: "visible",
-      persist: "visible",
-    })
-    expect(resolveFabVisibility({ hash: "#/route?vibe-unmark" }, undefined)).toEqual({
-      visibility: "hidden-url",
-      persist: "hidden-url",
-    })
-    expect(resolveFabVisibility({ hash: "#section?vibe-mark" }, "hidden-url")).toEqual({
-      visibility: "visible",
-      persist: "visible",
-    })
-    // Alongside the hash route's own params, and alongside a search string that has no flag of its own.
-    expect(resolveFabVisibility({ hash: "#/route?a=1&vibe-mark" }, "hidden-url")).toEqual({
-      visibility: "visible",
-      persist: "visible",
-    })
-    expect(resolveFabVisibility({ search: "?foo=1", hash: "#/route?vibe-mark" }, "hidden-url")).toEqual({
-      visibility: "visible",
-      persist: "visible",
-    })
+  // THE INVARIANT, as a test. Everything after `#` is the host router's route, and this control plane does not
+  // read it — not to find our word, not to check whether the host squatted on it, not at all. Rounds 7 through
+  // 14 all reached into the hash to make "append at the end of the address bar" work on a hash-routed page, and
+  // each round found one more way that trespass went wrong. The exit is a whole URL now (see formatMarkUrl), so
+  // there is nothing left to look for out there.
+  it("reads the SEARCH and nothing else — a flag in the host's fragment is not ours to see", () => {
+    // The exact shapes earlier rounds honored. All of them are now invisible: `resolveFabVisibility` never
+    // receives them, and the parameter it does receive is `location.search`, which on `/p/x#/route?mark` is "".
+    expect(resolveFabVisibility("", "hidden-url", true)).toEqual({ visibility: "hidden-url", persist: null })
+    expect(resolveFabVisibility(undefined, undefined, true)).toEqual({ visibility: "visible", persist: null })
+    // And the host's own route, whatever it says, cannot reach the resolver through the only input it has.
+    expect(resolveFabVisibility("?foo=1", "hidden-url", true)).toEqual({ visibility: "hidden-url", persist: null })
   })
 
-  // Reading a second place must not widen WHAT counts as the flag. The hash segment goes through the same
-  // URLSearchParams parse as the search — no lenient substring search — so a host's legitimate value that
-  // merely contains our word stays untouched, on both sides, byte for byte.
-  it("the hash is parsed as a query string, not scanned for our word — host params keep their meaning", () => {
-    // `redirect=/a?vibe-mark` is ONE value per URLSearchParams (no `vibe-mark` key). Locked on both sides.
-    expect(resolveFabVisibility({ search: "?redirect=/a?vibe-mark" }, "hidden-url")).toEqual({
+  // The search is parsed as a query string, never scanned for our word, so a host parameter whose VALUE merely
+  // contains it keeps its meaning.
+  it("matches a full key token — a host value that contains our word is not a flag", () => {
+    // `redirect=/a?mark` is ONE value: no `mark` key.
+    expect(resolveFabVisibility("?redirect=/a?mark", "hidden-url", true)).toEqual({
       visibility: "hidden-url",
       persist: null,
     })
-    expect(resolveFabVisibility({ hash: "#/route?redirect=/a?vibe-mark" }, "hidden-url")).toEqual({
-      visibility: "hidden-url",
-      persist: null,
-    })
-    // No '?' in the hash ⇒ no query segment at all: a route PATH named /vibe-mark is a route, not our flag.
-    expect(resolveFabVisibility({ hash: "#/vibe-mark" }, "hidden-url")).toEqual({ visibility: "hidden-url", persist: null })
-    expect(resolveFabVisibility({ hash: "#/some/hash-route" }, undefined)).toEqual({
-      visibility: "visible",
-      persist: null,
-    })
-    expect(resolveFabVisibility({ hash: "#/route?foo=vibe-mark" }, "hidden-url")).toEqual({ visibility: "hidden-url", persist: null })
+    expect(resolveFabVisibility("?foo=mark", "hidden-url", true)).toEqual({ visibility: "hidden-url", persist: null })
+    // The valued form of our OWN key is a flag, because that is the shape a person types by hand.
+    expect(resolveFabVisibility("?mark=1", "hidden-url", true)).toEqual({ visibility: "visible", persist: "visible" })
   })
 
-  // Two places can disagree; that has to be a decision, not an accident of evaluation order. The decision is
-  // the SAME one round 8 made inside a single segment — the rescue wins — because the argument for it never
-  // mentioned segments: being wrongly visible costs a second hide, being wrongly hidden with your rescue
-  // outranked is the blank screen this whole state exists to avoid. It replaces an earlier "the search wins",
-  // which was a coin-flip dressed as a priority, and which made the ONE URL that can carry both a dead end.
-  it("when the two places disagree, the RESCUE wins — the same rule, now indifferent to which segment holds it", () => {
-    // The reachable shape, and the whole reason this changed: a host links `/page?vibe-unmark`, the persistence
-    // write fails, so the flag deliberately stays in the search as the reload fallback. The user is now
-    // `hidden-url` and is told to append `?vibe-mark` at the end — which on a hash-routed page lands in the hash.
-    // Under search-first, the only exit we advertise for the one state with no other exit was outranked.
-    expect(resolveFabVisibility({ search: "?vibe-unmark", hash: "#/route?vibe-mark" }, undefined)).toEqual({
-      visibility: "visible",
-      persist: "visible",
-    })
-    expect(resolveFabVisibility({ search: "?vibe-mark", hash: "#/route?vibe-unmark" }, undefined)).toEqual({
-      visibility: "visible",
-      persist: "visible",
-    })
-    // Agreement is unaffected, in either direction.
-    expect(resolveFabVisibility({ search: "?vibe-unmark", hash: "#/route?vibe-unmark" }, undefined)).toEqual({
+  // Both flags coexist in exactly one situation: the persistence write failed, so `?unmark` deliberately stayed
+  // in the URL as the reload fallback, and the user then opened the restore link, which carries `mark`. If
+  // `unmark` still outranked it, the advertised way back would be unreachable for the one state whose entire
+  // promise is that its exit always works. Being wrongly visible costs a second hide; being wrongly hidden with
+  // your rescue outranked is the blank screen this state exists to avoid.
+  it("when both sit in the search, the RESCUE wins", () => {
+    expect(resolveFabVisibility("?unmark&mark", undefined, true)).toEqual({ visibility: "visible", persist: "visible" })
+    expect(resolveFabVisibility("?mark&unmark", undefined, true)).toEqual({ visibility: "visible", persist: "visible" })
+    // Presence is the whole question — a repeat does not out-vote.
+    expect(resolveFabVisibility("?unmark&unmark&mark", undefined, true)).toEqual({ visibility: "visible", persist: "visible" })
+    // A host key that is not ours cannot rescue — that is what the priority is over.
+    expect(resolveFabVisibility("?unmark&id=42", undefined, true)).toEqual({
       visibility: "hidden-url",
       persist: "hidden-url",
-    })
-    // Only a flag outranks the hash — an unrelated search param does not suppress it.
-    expect(resolveFabVisibility({ search: "?foo=1", hash: "#/route?vibe-unmark" }, undefined)).toEqual({
-      visibility: "hidden-url",
-      persist: "hidden-url",
-    })
-    // A host key that is not ours cannot rescue from either segment — that is what the priority is over.
-    expect(resolveFabVisibility({ search: "?vibe-unmark", hash: "#/review?id=42" }, undefined)).toEqual({
-      visibility: "hidden-url",
-      persist: "hidden-url",
-    })
-    // Round 14 removed the segment asymmetry with the prefix: `vibe-mark=42` is nobody's row id, so it rescues
-    // from the hash exactly as it does from the search. One vocabulary, one rule, both readers.
-    expect(resolveFabVisibility({ search: "?vibe-unmark", hash: "#/review?vibe-mark=42" }, undefined)).toEqual({
-      visibility: "visible",
-      persist: "visible",
     })
   })
 
-  // `fabFlagToken` (the "have I answered this occurrence" identity) already unions both segments. When
-  // `resolveFabVisibility` read them in priority order instead, one URL had two readings: the identity said
-  // "search+hash, a new occurrence", the resolver said "search, hidden". Both now go through the same set, so
-  // what we remember and what we decide cannot come apart — the same closure the formatter got in round 11.
-  it("the identity and the decision read the SAME flag set, so one URL cannot have two readings", () => {
-    const url = { search: "?vibe-unmark", hash: "#/route?vibe-mark" }
-    expect(fabFlagToken(url)).toBe("vibe-mark+vibe-unmark") // both, order-independent
-    expect(resolveFabVisibility(url, undefined).visibility).toBe("visible") // and the rescue in it wins
+  // A viewer who cannot annotate sees no chrome at all — so the URL switch is not theirs to spend. The storage
+  // key is keyed by SESSION with no viewer identity in it (fabVisibleStorageKey), so an anonymous visitor
+  // opening a shared `?unmark` link on a shared browser used to write `hidden-url` under the author's own key,
+  // and the author came back to a page whose chrome was gone with no memory of hiding it. Someone else's click
+  // changing the author's state is a different failure from the annotation feature misbehaving for the clicker.
+  it("an unauthorized viewer neither consumes nor persists the switch", () => {
+    expect(resolveFabVisibility("?unmark", undefined, false)).toEqual({ visibility: "visible", persist: null })
+    expect(resolveFabVisibility("?mark", "hidden-url", false)).toEqual({ visibility: "hidden-url", persist: null })
+    // `persist: null` is one decision covering all three behaviors: not adopted, not persisted, and — because
+    // the caller strips only when there is something to persist — not removed from the URL either. That last
+    // one is load-bearing: `available` starts from the config's guess and is corrected by an auth probe a
+    // moment later, so the author's own first paint can be "not available yet" and the flag has to still be
+    // there when the answer arrives.
+    expect(resolveFabVisibility("?unmark", undefined, false).persist).toBeNull()
+    expect(resolveFabVisibility("?unmark", undefined, true)).toEqual({ visibility: "hidden-url", persist: "hidden-url" })
   })
 
   it("no param honors the stored state (including 'handle'), else defaults visible, persisting nothing new", () => {
-    expect(resolveFabVisibility({ search: "" }, undefined)).toEqual({ visibility: "visible", persist: null }) // default visible
-    expect(resolveFabVisibility({}, "hidden-url")).toEqual({ visibility: "hidden-url", persist: null })
-    expect(resolveFabVisibility({}, "handle")).toEqual({ visibility: "handle", persist: null })
-    expect(resolveFabVisibility({ search: "?other=1" }, "visible")).toEqual({ visibility: "visible", persist: null }) // unknown param ignored
+    expect(resolveFabVisibility("", undefined, true)).toEqual({ visibility: "visible", persist: null }) // default visible
+    expect(resolveFabVisibility(undefined, "hidden-url", true)).toEqual({ visibility: "hidden-url", persist: null })
+    expect(resolveFabVisibility(undefined, "handle", true)).toEqual({ visibility: "handle", persist: null })
+    expect(resolveFabVisibility("?other=1", "visible", true)).toEqual({ visibility: "visible", persist: null }) // unknown param ignored
   })
 
-  it("there is NO third query param — 'handle' is reachable only from the UI, and ?vibe-mark still wins over it", () => {
+  it("there is NO third query param — 'handle' is reachable only from the UI, and ?mark still wins over it", () => {
     // Owner-frozen: the URL vocabulary stays two words. `?handle` is just an unknown param.
-    expect(resolveFabVisibility({ search: "?handle" }, undefined)).toEqual({ visibility: "visible", persist: null })
-    expect(resolveFabVisibility({ search: "?handle" }, "hidden-url")).toEqual({ visibility: "hidden-url", persist: null })
-    expect(resolveFabVisibility({ hash: "#/route?handle" }, "hidden-url")).toEqual({ visibility: "hidden-url", persist: null })
+    expect(resolveFabVisibility("?handle", undefined, true)).toEqual({ visibility: "visible", persist: null })
+    expect(resolveFabVisibility("?handle", "hidden-url", true)).toEqual({ visibility: "hidden-url", persist: null })
+    expect(resolveFabVisibility("?handle&mark", "hidden-url", true)).toEqual({ visibility: "visible", persist: "visible" })
   })
 
   it("persisted visibility round-trips all four states and ignores garbage", () => {
@@ -645,7 +602,7 @@ describe("standalone FAB visibility via ?vibe-mark / ?vibe-unmark query param (L
   })
 
   it("writeStoredFabVisibility reports whether the choice was durably stored", () => {
-    // The boot effect only strips ?vibe-mark/?vibe-unmark from the URL when this returns true — a failed write must
+    // The boot effect only strips ?mark/?unmark from the URL when this returns true — a failed write must
     // keep the flag in the URL so a reload still carries the intent.
     expect(writeStoredFabVisibility("ses_1", "hidden-url", memoryStorage())).toBe(true)
     expect(writeStoredFabVisibility("ses_1", "hidden-url", undefined)).toBe(false) // no storage at all
@@ -660,42 +617,17 @@ describe("standalone FAB visibility via ?vibe-mark / ?vibe-unmark query param (L
 
   it("stripFabParamsFromSearch removes ONLY our flag, preserving other params byte-for-byte", () => {
     // The lone flag → empty search (URL returns clean).
-    expect(stripFabParamsFromSearch("?vibe-mark")).toBe("")
-    expect(stripFabParamsFromSearch("?vibe-unmark")).toBe("")
-    expect(stripFabParamsFromSearch("vibe-mark")).toBe("") // tolerates a missing leading '?'
+    expect(stripFabParamsFromSearch("?mark")).toBe("")
+    expect(stripFabParamsFromSearch("?unmark")).toBe("")
+    expect(stripFabParamsFromSearch("mark")).toBe("") // tolerates a missing leading '?'
     expect(stripFabParamsFromSearch("")).toBe("")
     // A bare sibling flag stays bare (NOT rewritten to `debug=`), and only our key token is dropped.
-    expect(stripFabParamsFromSearch("?debug&vibe-unmark")).toBe("debug")
-    expect(stripFabParamsFromSearch("?vibe-embed=1&vibe-unmark")).toBe("vibe-embed=1")
+    expect(stripFabParamsFromSearch("?debug&unmark")).toBe("debug")
+    expect(stripFabParamsFromSearch("?vibe-embed=1&unmark")).toBe("vibe-embed=1")
     // Existing escapes are preserved verbatim (no URLSearchParams re-encode).
-    expect(stripFabParamsFromSearch("?a=%20b&vibe-mark=1")).toBe("a=%20b")
-    // Matches the KEY only — `vibe-mark`/`vibe-unmark` as a value is untouched.
-    expect(stripFabParamsFromSearch("?foo=vibe-mark")).toBe("foo=vibe-mark")
-  })
-
-  // The strip has to reach wherever the read reaches: leave `vibe-unmark` sitting in the hash and it outlives its
-  // one-time switch, so a later `vibe-mark` appended to the same tail fights a flag that never left.
-  it("stripFabParamsFromHash drops our flag from the hash's query segment, keeping the ROUTE intact", () => {
-    // The route path survives; a query segment left empty loses its '?' rather than trailing a bare one.
-    expect(stripFabParamsFromHash("#/route?vibe-mark")).toBe("/route")
-    expect(stripFabParamsFromHash("#/route?vibe-unmark")).toBe("/route")
-    expect(stripFabParamsFromHash("#section?vibe-mark")).toBe("section")
-    // Foreign keys and their escapes are preserved byte-for-byte, same discipline as the search side.
-    expect(stripFabParamsFromHash("#/route?a=1&vibe-unmark")).toBe("/route?a=1")
-    expect(stripFabParamsFromHash("#/route?debug&vibe-mark")).toBe("/route?debug") // bare flag stays bare
-    // A VALUED form of our own key goes, in the hash as in the search (round 14) — the escapes around it stay
-    // byte-for-byte, which is the property this shape was here to guard.
-    expect(stripFabParamsFromHash("#/route?a=%20b&vibe-mark=1")).toBe("/route?a=%20b")
-    // No flag of ours ⇒ the hash comes back exactly as it went in, down to a bare trailing '?' the host wrote.
-    // (Reached whenever the flag arrived in the SEARCH: the hash strip still runs, and must be a no-op.)
-    expect(stripFabParamsFromHash("#/route")).toBe("/route")
-    expect(stripFabParamsFromHash("#/route?")).toBe("/route?")
-    expect(stripFabParamsFromHash("#/vibe-mark")).toBe("/vibe-mark") // a route named /vibe-mark is a route
-    expect(stripFabParamsFromHash("")).toBe("")
-    expect(stripFabParamsFromHash(undefined)).toBe("")
-    // Matches the KEY only — the same host value the reader refuses to see is the one it must not corrupt.
-    expect(stripFabParamsFromHash("#/route?redirect=/a?vibe-mark")).toBe("/route?redirect=/a?vibe-mark")
-    expect(stripFabParamsFromHash("#/route?foo=vibe-mark")).toBe("/route?foo=vibe-mark")
+    expect(stripFabParamsFromSearch("?a=%20b&mark=1")).toBe("a=%20b")
+    // Matches the KEY only — `mark`/`unmark` as a value is untouched.
+    expect(stripFabParamsFromSearch("?foo=mark")).toBe("foo=mark")
   })
 })
 
@@ -711,57 +643,26 @@ describe("platform-split hide options (Lane U)", () => {
     expect(fabHideOptions(true)).toEqual(["handle", "hidden-url"])
   })
 
-  it("what we print parses back — ONE property over every URL shape, which is what closes this family", () => {
-    // Four review rounds found four URL shapes where the printed token was not a token. Each was answered by
-    // handling one more shape, which is why there was always a fifth. This is the assertion that ends that:
-    // not a list of shapes with their expected separators, but the round trip the user actually performs —
-    //
-    //     parse(append(url, format(url))) === restored
-    //
-    // — required to hold over a matrix. A new shape is one line of data, and no new expectation to get right.
-    // Pure string work, so it runs in a package with no jsdom: rounds 7, 8 and 10 were all caught by a human
-    // reading the code, and this is the first thing here a machine can catch instead.
-    const SHAPES = [
-      "https://h/p/abc",
-      "https://h/p/abc?foo=1",
-      "https://h/p/abc#", // a bare trailing '#' — an EMPTY fragment, which `location.hash` reports as ''
-      "https://h/p/abc?foo=1#", // ← round 10: '' from `.hash` meant "no fragment", so the search decided. Wrong.
-      "https://h/p/abc#/route",
-      "https://h/p/abc#/route?a=1",
-      "https://h/p/abc#/route?a=1#x", // ← a second '#'. The fragment starts at the FIRST one; see below.
-      "https://h/p/abc?foo=1#/route", // ← the shape rounds 1–3 kept missing
-      "https://h/p/abc?foo=1#/route?a=1",
-      "https://h/p/abc#section",
-      // …and each of them as the user actually meets it: still carrying the `vibe-unmark` a failed write left
-      // behind, which is the ONLY situation in which the printed rescue is ever typed.
-      "https://h/p/abc?vibe-unmark",
-      "https://h/p/abc?foo=1#?vibe-unmark",
-      "https://h/p/abc#/route?vibe-unmark",
-      "https://h/p/abc#/route?a=1&vibe-unmark",
-      "https://h/p/abc#/route?a=1#x&vibe-unmark",
-    ]
-    for (const href of SHAPES) {
-      const appended = new URL(`${href}${formatMarkParam(href)}`)
-      expect(resolveFabVisibility(appended, "hidden-url"), href).toEqual({ visibility: "visible", persist: "visible" })
-    }
+  it("the printed exit is a whole URL, with the flag in the real query position", () => {
+    // What the `hidden-url` toast hands over. Users copy links; they do not transcribe suffixes — and a
+    // suffix was the whole reason four rounds of this PR were reaching into the host's fragment to find one.
+    expect(formatMarkUrl("https://h/p/abc")).toBe("https://h/p/abc?mark")
+    expect(formatMarkUrl("https://h/p/abc?foo=1")).toBe("https://h/p/abc?foo=1&mark")
+    // On a hash-routed page the flag goes in FRONT of the route, which is where our query string lives.
+    expect(formatMarkUrl("https://h/p/abc#/route")).toBe("https://h/p/abc?mark#/route")
+    expect(formatMarkUrl("https://h/p/abc?foo=1#/route?a=1")).toBe("https://h/p/abc?foo=1&mark#/route?a=1")
+    // The SSR case, where there is no URL to read.
+    expect(formatMarkUrl("")).toBe("?mark")
   })
 
-  it("the fragment begins at the FIRST '#', because that is where the reader's parser begins it", () => {
-    // The separator question is "does the segment I am appending to already have a '?'", and the segment is
-    // decided by the same rule the reader uses — `location.hash` is everything after the first '#'. Anchoring
-    // on the LAST one instead reads a different string, and the two disagree the moment a URL has two.
-    const href = "https://h/p/abc#/route?a=1#x"
-    expect(formatMarkParam(href)).toBe("&vibe-mark") // first '#' → the fragment `/route?a=1#x` already has a '?'
-    // The counterfactual, so this is not a rule anyone has to take on faith: anchoring on the last '#' sees
-    // no '?' after it and prints '?vibe-mark'. The reader splits the fragment at ITS first '?', so URLSearchParams
-    // is handed `a=1#x?vibe-mark` — one key `a`, and no `vibe-mark` at all.
-    expect(new URL(`${href}?vibe-mark`).hash).toBe("#/route?a=1#x?vibe-mark")
-    expect(resolveFabVisibility(new URL(`${href}?vibe-mark`), "hidden-url").visibility).toBe("hidden-url")
-    // No '#' at all → the append lands in the search, and the href's own '?' decides. Includes the SSR case,
-    // where there is no URL to read and nothing has a query.
-    expect(formatMarkParam("")).toBe("?vibe-mark")
-    expect(formatMarkParam("https://h/p/abc")).toBe("?vibe-mark")
-    expect(formatMarkParam("https://h/p/abc?foo=1")).toBe("&vibe-mark")
+  it("the fragment begins at the FIRST '#', and is carried through untouched", () => {
+    // The host's route is opaque: we neither read it to decide the separator nor rewrite it to make room.
+    // Anchoring on the LAST '#' would pull our boundary rightward and put part of the host's fragment inside
+    // the string we edit — the concrete way "we own the query, they own the fragment" gets violated.
+    expect(formatMarkUrl("https://h/p/abc#/route?a=1#x")).toBe("https://h/p/abc?mark#/route?a=1#x")
+    // An empty fragment is still a fragment, and still theirs.
+    expect(formatMarkUrl("https://h/p/abc#")).toBe("https://h/p/abc?mark#")
+    expect(formatMarkUrl("https://h/p/abc?#")).toBe("https://h/p/abc?&mark#") // an empty query keeps its delimiter
   })
 
   it("withParenthetical composes a base action with its recovery clause, and degrades to bare base", () => {
@@ -796,8 +697,8 @@ describe("hidden carries its own exit: hidden-key vs hidden-url (Lane U, owner r
   })
 
   it("a URL hide is NEVER degraded — its exit does not depend on the device", () => {
-    // This is what makes the owner's touch-side full-hide row safe to keep. `?vibe-mark` works on every device and
-    // every URL shape, so a touch user's deliberate `完全隐藏` must survive every reload, keyboard or not.
+    // This is what makes the owner's touch-side full-hide row safe to keep. The restore LINK works on every
+    // device and every URL shape, so a touch user's deliberate `完全隐藏` must survive every reload, keyboard or not.
     // Degrading it would collapse the two touch rows into one and quietly cancel a choice they just made.
     expect(fabVisibilityForDevice("hidden-url", false)).toBe("hidden-url")
     expect(fabVisibilityForDevice("hidden-url", true)).toBe("hidden-url")
@@ -823,18 +724,18 @@ describe("hidden carries its own exit: hidden-key vs hidden-url (Lane U, owner r
     }
   })
 
-  it("?vibe-unmark persists as hidden-url — the reader already typed the URL vocabulary", () => {
+  it("?unmark persists as hidden-url — the reader already holds the URL vocabulary", () => {
     // Getting this backwards would be a silent downgrade for exactly the users who proved they know the way
-    // out: a phone opened via ?vibe-unmark would store `hidden-key`, and the next boot would demote it to a handle.
-    expect(resolveFabVisibility({ search: "?vibe-unmark" }, undefined)).toEqual({
+    // out: a phone opened via ?unmark would store `hidden-key`, and the next boot would demote it to a handle.
+    expect(resolveFabVisibility("?unmark", undefined, true)).toEqual({
       visibility: "hidden-url",
       persist: "hidden-url"
     })
-    expect(resolveFabVisibility({ hash: "#/route?vibe-unmark" }, "visible")).toEqual({
+    expect(resolveFabVisibility("?a=1&unmark", "visible", true)).toEqual({
       visibility: "hidden-url",
       persist: "hidden-url"
     })
-    expect(resolveFabVisibility({ search: "?vibe-mark" }, "hidden-url")).toEqual({
+    expect(resolveFabVisibility("?mark", "hidden-url", true)).toEqual({
       visibility: "visible",
       persist: "visible"
     })
@@ -955,169 +856,123 @@ describe("draggable floating chrome: snap + threshold + position storage (Lane R
   })
 })
 
-describe("the address bar is a live input, not a boot-time constant (Lane U, round 7)", () => {
-  // The `?vibe-mark` exit is advertised as "type it at the end of the address bar". On a hash-routed page that
-  // edit is a same-document fragment change: no reload, no remount, so a boot-only read never sees it and
-  // the one state whose exit is supposed to work everywhere — `hidden-url` — is the one that strands.
-  // These pin the two pure halves the effect leans on: what the cleaned URL is, and who must be told.
+// The invariant, from the rewrite's side. `replaceState` edits the host's address bar, so the only part of it
+// we may change is the part we own: everything up to the first `#`. What follows is the host router's route,
+// and it comes back byte-for-byte — not "carefully preserved", but never taken apart in the first place. See
+// `stripFabParamsFromUrl`, which slices the fragment off and concatenates the original substring back.
+describe("the rewrite edits the SEARCH and hands the fragment back byte-for-byte (Lane U)", () => {
+  const ORIGIN = "https://h"
 
-  it("rebuilds the whole URL after dropping our flag, wherever it sat", () => {
-    // hash query only — the ordinary Show Page shape, where `location.search` is empty
-    expect(stripFabParamsFromUrl("/p/x#/route?vibe-mark")).toBe("/p/x#/route")
-    // search only
-    expect(stripFabParamsFromUrl("/p/x?vibe-mark")).toBe("/p/x")
-    // both segments carry it; both get cleaned in one rewrite
-    expect(stripFabParamsFromUrl("/p/x?vibe-mark#/route?vibe-unmark")).toBe("/p/x#/route")
+  it("drops our flag and leaves the host's own parameters exactly as they were", () => {
+    expect(stripFabParamsFromUrl("/p/x?mark")).toBe("/p/x")
+    expect(stripFabParamsFromUrl("/p/x?a=1&mark&b=2")).toBe("/p/x?a=1&b=2")
+    expect(stripFabParamsFromUrl("/p/x?debug&unmark")).toBe("/p/x?debug") // a bare sibling stays bare
+    expect(stripFabParamsFromUrl("/p/x?a=%20b&unmark")).toBe("/p/x?a=%20b") // escapes not re-encoded
+    // Everything left of the first '?' is copied through, so a relative href stays relative.
+    expect(stripFabParamsFromUrl(`${ORIGIN}/p/x?a=1&mark`)).toBe(`${ORIGIN}/p/x?a=1`)
   })
 
-  it("keeps every byte that is not ours", () => {
-    expect(stripFabParamsFromUrl("/p/x?a=1&vibe-mark&b=2#/r?c=3")).toBe(
-      "/p/x?a=1&b=2#/r?c=3"
-    )
-    // a hash ROUTE that merely looks like a query is not touched
-    expect(stripFabParamsFromUrl("/p/x?vibe-mark#/redirect=/a?vibe-mark")).toBe(
-      "/p/x#/redirect=/a"
-    )
+  it("returns the fragment unchanged, whatever it contains — including our own words", () => {
+    // Every shape rounds 7 through 14 reached into is a passthrough now, and the reason is structural rather
+    // than careful: nothing between the slice and the return can parse the fragment.
+    expect(stripFabParamsFromUrl("/p/x?mark#/route?a=1")).toBe("/p/x#/route?a=1")
+    expect(stripFabParamsFromUrl("/p/x?mark#/review?mark")).toBe("/p/x#/review?mark")
+    expect(stripFabParamsFromUrl("/p/x?mark#/r?a=1#x")).toBe("/p/x#/r?a=1#x") // the fragment starts at the FIRST '#'
+    expect(stripFabParamsFromUrl("/p/x?mark#")).toBe("/p/x#") // an EMPTY fragment is the host's too
   })
 
-  it("returns null when there is nothing of ours to strip, so the caller skips the rewrite entirely", () => {
+  it("a flag sitting only in the fragment is not ours, so there is no rewrite at all", () => {
+    // The old exit, and the accepted price of this round: someone who still appends to the tail of a
+    // hash-routed URL gets nothing. That is why the printed exit is now a whole URL to copy (formatMarkUrl)
+    // rather than a five-character suffix to transcribe.
+    expect(stripFabParamsFromUrl("/p/x#/route?mark")).toBeNull()
+    expect(stripFabParamsFromUrl("/p/x#/route?unmark")).toBeNull()
+  })
+
+  it("returns null when nothing of ours is there, so the caller skips replaceState entirely", () => {
     expect(stripFabParamsFromUrl("/p/x?a=1#/route")).toBeNull()
     expect(stripFabParamsFromUrl("/p/x")).toBeNull()
+    expect(stripFabParamsFromUrl("/p/x?#/route")).toBeNull()
+    expect(stripFabParamsFromUrl("/p/x?foo=mark")).toBeNull() // our word as a host VALUE
   })
 
-  it("tells hash routers only when the hash actually moved", () => {
-    // replaceState fires neither event; we re-issue what the browser withheld. `hashchange` is a claim about
-    // the fragment, so it may only be made when the fragment really changed — otherwise it is a lie a
-    // subscriber will act on.
-    expect(fabUrlChangeEvents({ search: "?vibe-mark", hash: "#/route" }, { search: "", hash: "#/route" })).toEqual([
-      "popstate",
-    ])
-    expect(fabUrlChangeEvents({ search: "", hash: "#/route?vibe-mark" }, { search: "", hash: "#/route" })).toEqual([
-      "popstate",
-      "hashchange",
-    ])
+  // `location.search` is "" for both "no query" and "an empty query", and `location.hash` is "" for both "no
+  // fragment" and "an empty one" — so no rule reading a decomposed URL can be right about both members of
+  // either pair; it can only enumerate one more shape per round. Both halves take the raw href, which is what
+  // makes these shapes expressible at all.
+  it("keeps a delimiter that was the page's own, and removes only one that was ours", () => {
+    expect(stripFabParamsFromUrl("/p/x?&mark")).toBe("/p/x?") // the '?' was there before we appended
+    expect(stripFabParamsFromUrl("/p/x?mark")).toBe("/p/x") // this one came with the flag
+    expect(stripFabParamsFromUrl("/p/x?&mark#/r")).toBe("/p/x?#/r")
   })
 
-  it("stays silent when nothing moved, so our own rewrite cannot echo forever", () => {
-    expect(fabUrlChangeEvents({ search: "?a=1", hash: "#/r" }, { search: "?a=1", hash: "#/r" })).toEqual([])
+  // Printer and stripper are ONE round trip and are tested as one — pinning each alone is what let the pair
+  // drift for four rounds. A new URL shape is one line of data here, not a new expectation to get right.
+  const SHAPES = [
+    "/p/x",
+    "/p/x?",
+    "/p/x?foo=1",
+    "/p/x#",
+    "/p/x#/r",
+    "/p/x#/r?",
+    "/p/x#/r?a=1",
+    "/p/x#/r?a=1#x", // a second '#'
+    "/p/x?#",
+    "/p/x?#/r",
+    "/p/x?foo=1#",
+    "/p/x?foo=1#/r?a=1"
+  ]
+
+  it("round-trips every shape: stripping what we print returns the page's own URL", () => {
+    // No `new URL()` in this round trip. That rebuild reports `search === ""` for a page at `/p/x?` and
+    // `hash === ""` for one at `/p/x#`, so it erases the very delimiters under test and would agree with a
+    // stripper that is wrong about them.
+    for (const shape of SHAPES) {
+      const page = ORIGIN + shape
+      expect(stripFabParamsFromUrl(formatMarkUrl(page)), `round trip of ${shape}`).toBe(page)
+    }
   })
 
-  it("is idempotent, which is what BOUNDS the echo rather than any timing assumption", () => {
-    // The handler re-issues the events replaceState withheld, and those wake the handler again. What stops
-    // that is not a guard or a debounce: a second pass finds no flag left to strip, so it rewrites nothing
-    // and therefore dispatches nothing. Depth is bounded by the flag's own disappearance.
-    const first = stripFabParamsFromUrl("/p/x?a=1&vibe-mark#/r?vibe-unmark")
-    expect(first).toBe("/p/x?a=1#/r")
-    // Fed straight back in, with no `new URL()` in between: what the browser hands the second pass IS this
-    // string, and rebuilding it through a parser is the very normalization this function exists to avoid.
-    expect(stripFabParamsFromUrl(first as string)).toBeNull()
-  })
-})
-
-describe("a stale URL flag must not outlive the choice it recorded (Lane U, round 8)", () => {
-  // The wound: when the storage write fails we deliberately LEAVE ?vibe-unmark in the URL so a reload still
-  // carries the intent. Round 7 then made the overlay subscribe to navigation — and those two correct
-  // decisions combine into a trap: every later popstate re-reads the same stale token.
-
-  it("lets the RESCUE flag win when both sit in one segment, because being wrongly hidden is the trap", () => {
-    // Failed persistence leaves `vibe-unmark` behind; the user follows the printed exit and appends `vibe-mark` to
-    // that same tail. If `vibe-unmark` still outranked it, the advertised exit would be unreachable — the exact
-    // defect this PR exists to close, reintroduced through the back door.
-    expect(resolveFabVisibility({ search: "?vibe-unmark&vibe-mark" }, undefined).visibility).toBe("visible")
-    expect(resolveFabVisibility({ search: "?vibe-mark&vibe-unmark" }, undefined).visibility).toBe("visible")
-    expect(resolveFabVisibility({ hash: "#/r?vibe-unmark&vibe-mark" }, undefined).visibility).toBe("visible")
+  it("leaves every one of those shapes alone when it carries nothing of ours", () => {
+    // The other half of the property, and the one that catches a "fix" preserving delimiters by rewriting
+    // URLs it should never have touched: an unflagged page must produce no rewrite whatsoever.
+    for (const shape of SHAPES) {
+      expect(stripFabParamsFromUrl(ORIGIN + shape), `no-op on ${shape}`).toBeNull()
+    }
   })
 
-  // Round 8 applied that ruling INSIDE a segment and left "the search wins" standing between segments, which
-  // is where it did the least good: `?vibe-unmark&vibe-mark` in one tail is a shape nothing produces, while
-  // `/page?vibe-unmark#/route?vibe-mark` is what the printed copy actually makes a hash-routed reader type. Same rule,
-  // now over the union — see the resolver's own test above.
-  it("and wins across segments too, since the argument for it never mentioned segments", () => {
-    expect(resolveFabVisibility({ search: "?vibe-unmark", hash: "#/r?vibe-mark" }, undefined).visibility).toBe("visible")
+  it("and what we print lands where the resolver actually looks", () => {
+    // The half a strip-only property cannot see: the flag has to end up in `location.search`, which is the
+    // one surface `resolveFabVisibility` reads. `new URL(...).search` here is not a normalization — it is
+    // precisely what the browser will hand the boot read.
+    for (const shape of SHAPES) {
+      const search = new URL(formatMarkUrl(ORIGIN + shape)).search
+      expect(resolveFabVisibility(search, "hidden-url", true), `rescue via ${shape}`).toEqual({
+        visibility: "visible",
+        persist: "visible"
+      })
+    }
   })
 
-  it("tokenizes what the URL carries, so 'unmark' and 'unmark then mark' are different occurrences", () => {
-    expect(fabFlagToken({ search: "?vibe-unmark" })).toBe("vibe-unmark")
-    expect(fabFlagToken({ search: "?vibe-unmark&vibe-mark" })).toBe("vibe-mark+vibe-unmark")
-    expect(fabFlagToken({ search: "?vibe-mark&vibe-unmark" })).toBe("vibe-mark+vibe-unmark") // order-independent identity
-    expect(fabFlagToken({ hash: "#/r?vibe-mark" })).toBe("vibe-mark")
-    expect(fabFlagToken({ search: "?a=1", hash: "#/route" })).toBe("")
-  })
-
-  it("applies an occurrence once: the same token never fires twice, a changed one always does", () => {
-    expect(shouldApplyFabFlag("vibe-unmark", undefined)).toBe(true) // boot
-    expect(shouldApplyFabFlag("vibe-unmark", "vibe-unmark")).toBe(false) // the stale re-read that hid a restored FAB
-    expect(shouldApplyFabFlag("vibe-mark+vibe-unmark", "vibe-unmark")).toBe(true) // the user just typed the exit
-    expect(shouldApplyFabFlag("", "vibe-unmark")).toBe(false) // stripped clean — nothing to apply
-    expect(shouldApplyFabFlag("", undefined)).toBe(false)
-  })
-})
-
-describe("the hash belongs to the host router, so nothing of the ROUTE may be disturbed (Lane U, round 8)", () => {
-  // Round 8 read this ownership as "claim only the bare word in the hash". That was the right instinct
-  // pointed one level too shallow: the fix for borrowing someone's namespace is to stop using their words,
-  // not to use them more carefully. Round 14 namespaced the pair, which retires the asymmetry and the case
-  // this block opened with (`#/review?mark=42`) in one move — see the round-14 block at the end of the file.
-  //
-  // What survives is the invariant underneath, which no vocabulary change can be allowed to break: the
-  // host's own parameters, and the route itself, come out the other side byte-for-byte.
-  it("leaves a host's parameters in place when stripping, so route state survives", () => {
-    expect(stripFabParamsFromHash("#/review?id=42")).toBe("/review?id=42")
-    expect(stripFabParamsFromHash("#/review?id=42&vibe-mark")).toBe("/review?id=42")
-    expect(fabFlagToken({ hash: "#/review?id=42" })).toBe("")
-  })
-
-  it("honors the flag the recovery flow actually produces, next to those parameters", () => {
-    expect(resolveFabVisibility({ hash: "#/review?vibe-mark" }, undefined).visibility).toBe("visible")
-    expect(resolveFabVisibility({ hash: "#/review?a=1&vibe-unmark" }, undefined).visibility).toBe("hidden-url")
-  })
-})
-
-describe("the spent-flag memo must not outlive the flag itself (Lane U, round 9)", () => {
-  // Round 8 stopped a flag from firing twice. It did not say when the memo STOPS applying — so the memo
-  // outlived the flag and swallowed the user's second, genuinely new `?vibe-mark`. The memo means "the occurrence
-  // currently in the URL that we already answered"; once the URL is flag-free there is no such occurrence.
-  it("forgets the answered occurrence as soon as the URL is flag-free", () => {
-    expect(nextAppliedFlag("vibe-mark")).toBe("vibe-mark")
-    expect(nextAppliedFlag("")).toBeUndefined()
-  })
-
-  it("lets the SAME token apply again after an intervening clean URL — the whole round-9 bug, as a sequence", () => {
-    // 1. user appends ?vibe-mark on a hash route → fresh, applied, remembered
-    let memo: string | undefined = undefined
-    const first = fabFlagToken({ hash: "#/route?vibe-mark" })
-    expect(shouldApplyFabFlag(first, memo)).toBe(true)
-    memo = nextAppliedFlag(first)
-    // 2. the strip lands and re-issues the navigation; the woken pass sees a clean URL and forgets
-    const clean = fabFlagToken({ hash: "#/route" })
-    expect(shouldApplyFabFlag(clean, memo)).toBe(false)
-    memo = nextAppliedFlag(clean)
-    expect(memo).toBeUndefined()
-    // 3. the user hides again and appends the SAME advertised token — a new occurrence, so it must apply
-    const second = fabFlagToken({ hash: "#/route?vibe-mark" })
-    expect(second).toBe(first)
-    expect(shouldApplyFabFlag(second, memo)).toBe(true)
-  })
-
-  it("still refuses a flag that never left, which is what round 8 was about", () => {
-    // Persistence failed, so `vibe-unmark` stays in the URL on purpose. Every later navigation re-reads the same
-    // token with no clean URL in between — the memo survives and keeps swallowing it.
-    const token = fabFlagToken({ search: "?vibe-unmark" })
-    let memo = nextAppliedFlag(token)
-    expect(shouldApplyFabFlag(token, memo)).toBe(false)
-    memo = nextAppliedFlag(token)
-    expect(shouldApplyFabFlag(token, memo)).toBe(false)
+  it("rescues a page still carrying the flag a failed write left behind", () => {
+    // The one situation in which the printed link is used on a URL that already has a flag: persistence
+    // failed, `?unmark` stayed on purpose, and the restore link appends `mark` next to it.
+    const page = `${ORIGIN}/p/x?foo=1&unmark#/r`
+    const printed = formatMarkUrl(page)
+    expect(printed).toBe(`${ORIGIN}/p/x?foo=1&unmark&mark#/r`)
+    expect(resolveFabVisibility(new URL(printed).search, undefined, true).visibility).toBe("visible")
+    // Both flags leave together on the pass that persists — the stale one has nothing left to record.
+    expect(stripFabParamsFromUrl(printed)).toBe(`${ORIGIN}/p/x?foo=1#/r`)
   })
 })
 
 describe("a toast narrates ONE state, so it expires when that state does (Lane U, round 9)", () => {
   // Every toast here is fabToastFor(state, …) — it describes exactly one visibility. Deriving the visible
   // message from the current state means no restore path can forget to clear it: not the shortcut, not the
-  // handle, not a `?vibe-mark` typed into the address bar, and not whichever path gets added next.
+  // handle, not the restore link (which reloads the page outright), and not whichever path gets added next.
   it("shows the message only while the state it describes is still the current one", () => {
-    const raised = { message: "已完全隐藏，网址末尾加 ?vibe-mark 恢复", state: "hidden-url" as const }
+    const raised = { message: "已完全隐藏，保存此链接恢复：https://h/p/x?mark", state: "hidden-url" as const }
     expect(activeFabToast(raised, "hidden-url")).toBe(raised.message)
-    // The round-9 report: the URL restore path sets visibility directly, never touching the toast.
     expect(activeFabToast(raised, "visible")).toBeNull()
     // A mid-session device degrade moves hidden-key → handle; the old exit is wrong there too.
     expect(activeFabToast({ message: "按 Option+M 恢复", state: "hidden-key" }, "handle")).toBeNull()
@@ -1127,259 +982,16 @@ describe("a toast narrates ONE state, so it expires when that state does (Lane U
     expect(activeFabToast(null, "visible")).toBeNull()
     expect(activeFabToast(undefined, "hidden-url")).toBeNull()
   })
-})
 
-describe("an occurrence identity may not dedupe what tells occurrences apart (Lane U, round 12)", () => {
-  // Same shape as round 11, one layer up. There the reader stood on `URL.hash`, which cannot tell "no
-  // fragment" from "empty fragment". Here it stood on a SET, which cannot tell one `vibe-mark` from two — and the
-  // memo compares identities, so information the identity drops is information the memo cannot act on.
-  //
-  // The stranding: persistence is failing, so `vibe-unmark` stays in the URL by design. The user follows the
-  // printed exit, gets `?vibe-unmark&vibe-mark`, is rescued, and hides again — the flag never left, so they are now at
-  // `?vibe-unmark&vibe-mark` and hidden. They follow the SAME printed exit a second time. As a set that URL still reads
-  // `{vibe-mark, unmark}`, identical to the spent token, so the rescue is swallowed. `hidden-url` is the one state
-  // with neither a handle nor a guaranteed shortcut: its URL exit is the whole exit, and it just stopped
-  // working on the repeat — which is exactly when a user leans on it hardest.
-  it("counts repeats: appending the printed exit a SECOND time is a second occurrence", () => {
-    const stale = fabFlagToken({ hash: "#/route?vibe-unmark&vibe-mark" })
-    const repeated = fabFlagToken({ hash: "#/route?vibe-unmark&vibe-mark&vibe-mark" })
-    expect(repeated).not.toBe(stale)
-    expect(shouldApplyFabFlag(repeated, nextAppliedFlag(stale))).toBe(true)
-  })
-
-  it("counts them across segments too, since the append lands in whichever tail the reader is holding", () => {
-    const stale = fabFlagToken({ search: "?vibe-unmark", hash: "#/route?vibe-mark" })
-    const repeated = fabFlagToken({ search: "?vibe-unmark", hash: "#/route?vibe-mark&vibe-mark" })
-    expect(repeated).not.toBe(stale)
-    expect(shouldApplyFabFlag(repeated, nextAppliedFlag(stale))).toBe(true)
-  })
-
-  it("keeps every property the identity was built for — it is a multiset now, not a different thing", () => {
-    // Round 8: a flag that never left is still ONE occurrence however the host re-navigates around it.
-    expect(fabFlagToken({ hash: "#/a?vibe-unmark" })).toBe(fabFlagToken({ hash: "#/b?vibe-unmark" }))
-    // Order-independence: our two names are a set within one append, only the COUNT was load-bearing.
-    expect(fabFlagToken({ search: "?vibe-unmark&vibe-mark" })).toBe(fabFlagToken({ search: "?vibe-mark&vibe-unmark" }))
-    // Round 9: no flag, no occurrence — the memo still erases itself.
-    expect(fabFlagToken({ search: "?a=1", hash: "#/route" })).toBe("")
-    // Round 8's other half, restated in the round-14 vocabulary: a host parameter is not ours to count. It is a
-    // foreign KEY that proves this now — `vibe-mark=42` is ours, because nobody else writes that key.
-    expect(fabFlagToken({ hash: "#/review?id=42&vibe-mark" })).toBe(fabFlagToken({ hash: "#/x?vibe-mark" }))
-  })
-
-  it("still reads the DECISION over a deduped set — multiplicity identifies, it does not vote", () => {
-    expect(resolveFabVisibility({ hash: "#/route?vibe-unmark&vibe-mark&vibe-mark" }, undefined).visibility).toBe("visible")
-    expect(resolveFabVisibility({ search: "?vibe-unmark&vibe-unmark" }, undefined).visibility).toBe("hidden-url")
-  })
-})
-
-describe("an empty query is not the absence of one, on the way out either (Lane U, round 12)", () => {
-  // The counterpart to round 11's separator ruling, on the strip side. `formatMarkParam` correctly prints
-  // `&vibe-mark` for a URL whose tail is already `?` — an empty query still has its delimiter — so the recovery
-  // URL is `/page?&vibe-mark`. Reconstructing by truthiness ("no pairs left ⇒ no `?`") then hands the host back
-  // `/page`, deleting a delimiter that was theirs before we appended. Round-tripping our own printed exit
-  // must return the page's own URL, not a normalized guess at it.
-  it("restores the page's own URL after stripping the exit we told the user to type", () => {
-    expect(stripFabParamsFromUrl("/p/x?&vibe-mark")).toBe("/p/x?")
-    expect(stripFabParamsFromUrl("/p/x#/route?&vibe-mark")).toBe("/p/x#/route?")
-  })
-
-  it("still deletes a delimiter that was OURS — `?vibe-mark` was appended to a page that had no query", () => {
-    expect(stripFabParamsFromUrl("/p/x?vibe-mark")).toBe("/p/x")
-    expect(stripFabParamsFromUrl("/p/x#/route?vibe-mark")).toBe("/p/x#/route")
-  })
-
-  // The property, over the same matrix round 11 pinned the printer against: for every shape, appending what
-  // we print and then stripping it must return THE PAGE'S OWN URL. Printer and stripper are one round trip,
-  // so they have to be tested as one — pinning each alone is what let the pair drift.
-  //
-  // No `new URL(...)` anywhere in the round trip. That rebuild reports `search === ""` for a page at `/p/x?`
-  // and `hash === ""` for one at `/p/x#`, so it erases the exact delimiters under test and agrees with the
-  // bug — round 12 wrote it that way and got a green run against a stripper that was wrong. Both halves take
-  // the href now, which is also why the matrix can finally include the `?#…` shapes: they were not omitted
-  // for being exotic, they were unreachable through a decomposed read.
-  const ORIGIN = "https://h"
-  const SHAPES = [
-    "/p/x",
-    "/p/x?",
-    "/p/x?foo=1",
-    "/p/x#",
-    "/p/x#/r",
-    "/p/x#/r?",
-    "/p/x#/r?a=1",
-    "/p/x?#",
-    "/p/x?#/r",
-    "/p/x?foo=1#",
-    "/p/x?foo=1#/r?a=1"
-  ]
-
-  it("round-trips every shape the formatter can print, which is the property the two rules share", () => {
-    for (const shape of SHAPES) {
-      const page = ORIGIN + shape
-      const stripped = stripFabParamsFromUrl(page + formatMarkParam(page))
-      expect(stripped, `round trip of ${shape}`).toBe(page)
+  // The dwell is a property of what the toast SAYS. Every other one confirms a transition whose way back is
+  // still on the device and wants to get out of the way; `hidden-url`'s is the only delivery of the only exit
+  // from the only state with nothing on screen, and since this round it carries a whole URL to select and
+  // copy rather than a five-character suffix to memorize. On the shared 3.2s it handed the user their way
+  // back and took it away before they could use it.
+  it("gives the URL toast long enough to be copied, and keeps every other one brief", () => {
+    expect(fabToastDurationMs("hidden-url")).toBeGreaterThanOrEqual(15000)
+    for (const state of ["visible", "handle", "hidden-key"] as const) {
+      expect(fabToastDurationMs(state)).toBe(3200)
     }
-  })
-
-  it("leaves every one of those shapes alone when it carries nothing of ours", () => {
-    // The other half of the same property, and the one that catches a "fix" that preserves delimiters by
-    // rewriting URLs it should not have touched at all: an unflagged page must produce no rewrite whatsoever.
-    for (const shape of SHAPES) {
-      expect(stripFabParamsFromUrl(ORIGIN + shape), `no-op on ${shape}`).toBeNull()
-    }
-  })
-})
-
-describe("the memo names the URL the pass LEAVES BEHIND, not the token it read on the way in (Lane U, round 13)", () => {
-  // Round 9 gave `nextAppliedFlag` the right rule and round 10 wired it to the wrong input: `react.tsx` read
-  // the token BEFORE the strip and remembered that. On a page opened at `#/route?vibe-mark` the strip succeeds and
-  // the URL ends up flag-free, but the memo still said "vibe-mark" — so the user's second append, the one the
-  // printed exit tells them to type, matched a spent occurrence and was swallowed for the rest of the session.
-  // It only appeared to work because the synthetic events re-entered the same effect and overwrote the memo
-  // with the correct value; on boot those events fire before anything is subscribed, so even that accident
-  // was unavailable exactly when the flag arrives with the page.
-  //
-  // The call site is one line in `react.tsx` and this package renders no DOM, so what is pinned here is the
-  // RULE it now follows: the memo is `nextAppliedFlag(fabFlagToken(<the URL as it now stands>))`, and the URL
-  // as it now stands is whatever `stripFabParamsFromUrl` left. Chaining the two real functions is the closest
-  // a pure test gets to that pass, and it is the part that was wrong — the derivation, not either half.
-  //
-  // The four rows are the owner's table, in order.
-
-  /**
-   * The href, decomposed the way `currentUrl()` does it in `react.tsx` — the reader takes `{search, hash}`
-   * and is allowed to, because "is our flag present" is the one question the lost delimiters cannot change.
-   * The fragment starts at the FIRST `#`, per the spec and per {@link formatMarkParam}'s own split.
-   */
-  function readBack(href: string): { search: string; hash: string } {
-    const cut = href.indexOf("#")
-    const head = cut === -1 ? href : href.slice(0, cut)
-    const q = head.indexOf("?")
-    return { search: q === -1 ? "" : head.slice(q), hash: cut === -1 ? "" : href.slice(cut) }
-  }
-
-  const BOOTS = [
-    { label: "search", href: "/p/x?vibe-mark" },
-    { label: "hash route", href: "/p/x#/route?vibe-mark" },
-    { label: "both segments", href: "/p/x?vibe-unmark#/route?vibe-mark" }
-  ]
-
-  it("row 1 & 4: a strip that landed erases the memo, so the SAME advertised token applies again", () => {
-    for (const { label, href } of BOOTS) {
-      expect(shouldApplyFabFlag(fabFlagToken(readBack(href)), undefined), `boot via ${label} applies`).toBe(true)
-      const after = stripFabParamsFromUrl(href)
-      expect(after, `boot via ${label} strips`).not.toBeNull()
-      // Row 1 — the pass ends on a flag-free URL, so there is no answered occurrence left to remember.
-      const clean = after as string
-      const memo = nextAppliedFlag(fabFlagToken(readBack(clean)))
-      expect(memo, `memo after stripping ${label}`).toBeUndefined()
-      // Row 4 — the user hides again and types the exit a second time, taken from the printer rather than
-      // hand-written, so this is literally the string the chrome told them to append. Same token as the
-      // first time; a different occurrence, so it must apply.
-      const typed = clean + formatMarkParam(clean)
-      expect(shouldApplyFabFlag(fabFlagToken(readBack(typed)), memo), `second append after ${label}`).toBe(true)
-    }
-  })
-
-  it("row 2: a write that failed leaves the flag in the URL on purpose, so the memo must still name it", () => {
-    // No strip happens on this path — persistence failed and `?vibe-unmark` stays behind as the reload fallback.
-    // Re-reading therefore returns the same token, which is round 8's guard: it must not fire a second time.
-    const memo = nextAppliedFlag(fabFlagToken(readBack("/p/x?vibe-unmark")))
-    expect(memo).toBe("vibe-unmark")
-    expect(shouldApplyFabFlag(fabFlagToken(readBack("/p/x?vibe-unmark")), memo)).toBe(false)
-  })
-
-  it("row 3: a pass carrying nothing of ours forgets whatever it was holding — the self-heal", () => {
-    // `stripFabParamsFromUrl` returns null here (nothing to rewrite) and the pass returns early; the memo is
-    // still assigned, from the URL it did not touch. That is what makes the erase unconditional rather than
-    // something each early return has to remember to do.
-    const href = "/p/x?a=1#/route?id=42"
-    expect(stripFabParamsFromUrl(href)).toBeNull()
-    expect(nextAppliedFlag(fabFlagToken(readBack(href)))).toBeUndefined()
-  })
-})
-
-describe("the stripper reads the raw href too, because a decomposed URL cannot express `?` (Lane U, round 13)", () => {
-  // `formatMarkParam` was given the raw href in round 11 with a reason that applies verbatim here: `URL.search`
-  // is `""` for both "no query" and "an empty query", `URL.hash` is `""` for both "no fragment" and "an empty
-  // one", so no rule reading `{search, hash}` can be right about both members of either pair — it can only
-  // enumerate one more shape per round. Round 12 enumerated `?&vibe-mark` and `#?vibe-mark`; the shapes below are the
-  // rest of that same set, and they are unreachable from a decomposed read no matter what rule is written.
-  //
-  // Taking the href closes the class instead of its next instance, and it makes printer and stripper read the
-  // one source — which is the invariant the round trip below actually rests on.
-  const ORIGIN = "https://h"
-
-  it("keeps an empty search that belongs to the page, in front of a hash route", () => {
-    // The page's own URL is `/p/x?#/route`; the advertised exit appends to the fragment.
-    expect(stripFabParamsFromUrl(`${ORIGIN}/p/x?#/route?vibe-mark`)).toBe(`${ORIGIN}/p/x?#/route`)
-  })
-
-  it("keeps an empty fragment that belongs to the page, behind a flag in the search", () => {
-    // The mirror image, and the one `location.hash` erases: for `/p/x?vibe-mark#` it reports `""`, so the old
-    // reconstruction returned `/p/x` and deleted a `#` the page had before we arrived.
-    expect(stripFabParamsFromUrl(`${ORIGIN}/p/x?vibe-mark#`)).toBe(`${ORIGIN}/p/x#`)
-  })
-
-  it("round-trips `?#`, the shape round 12 had to name as out of reach", () => {
-    expect(stripFabParamsFromUrl(`${ORIGIN}/p/x?#?vibe-mark`)).toBe(`${ORIGIN}/p/x?#`)
-  })
-
-  it("still returns null when nothing of ours is there, byte-for-byte", () => {
-    expect(stripFabParamsFromUrl(`${ORIGIN}/p/x?#/route`)).toBeNull()
-    expect(stripFabParamsFromUrl(`${ORIGIN}/p/x?a=1#/r?b=2`)).toBeNull()
-    expect(stripFabParamsFromUrl(`${ORIGIN}/p/x`)).toBeNull()
-  })
-})
-
-describe("the flag words are namespaced, and ONE rule reads both segments (Lane U, round 14)", () => {
-  // `mark` and `unmark` are generic words, and we were claiming them in a segment we do not own: on a
-  // hash-routed page `#/review?mark` is the host router's parameter, and we read it, stripped it, and
-  // re-dispatched a navigation carrying the rewrite. The quieter half was the worse one — `resolveFabVisibility`
-  // returns `persist: <flag>`, so a host route that happened to carry `?mark` overwrote the author's stored
-  // visibility on every single load, and the chrome could never stay hidden on that page at all.
-  //
-  // Round 8 had drawn the line at BARE presence in the hash while `location.search` stayed tolerant, on the
-  // grounds that we own one namespace and borrow the other. That is one concept with two spellings, and the
-  // seam between them is where the rest of it lived. A namespaced key is ours in every segment, so the
-  // ambiguity is REMOVED rather than adjudicated and both segments go back to a single rule.
-
-  const ORIGIN = "https://h"
-
-  it("no longer answers to the bare words, in either segment", () => {
-    for (const bare of ["mark", "unmark"]) {
-      const stored = "hidden-url" as const
-      expect(resolveFabVisibility({ search: `?${bare}` }, stored), `search ?${bare}`).toEqual({ visibility: stored, persist: null })
-      expect(resolveFabVisibility({ hash: `#/review?${bare}` }, stored), `hash ?${bare}`).toEqual({ visibility: stored, persist: null })
-      expect(fabFlagToken({ search: `?${bare}`, hash: `#/r?${bare}` }), `${bare} is nobody's flag`).toBe("")
-    }
-  })
-
-  it("leaves the bare words in the URL, because deleting a word we do not own is the same defect", () => {
-    expect(stripFabParamsFromSearch("?mark&unmark")).toBe("mark&unmark")
-    expect(stripFabParamsFromHash("#/review?mark")).toBe("/review?mark")
-    expect(stripFabParamsFromUrl(`${ORIGIN}/p/x?unmark#/review?mark`)).toBeNull()
-  })
-
-  it("answers to the namespaced words in BOTH segments, in every shape", () => {
-    // Tolerant matching, and now uniformly so: the key is ours wherever it appears, which makes `?vibe-mark=1`
-    // — what a person writes when a bare word does not look like a flag to them — a flag too. That is the
-    // shape the old hash rule ignored while leaving it sitting in the address bar forever.
-    for (const shape of ["vibe-mark", "vibe-mark=", "vibe-mark=1"]) {
-      expect(resolveFabVisibility({ search: `?${shape}` }, "hidden-url").visibility, `search ${shape}`).toBe("visible")
-      expect(resolveFabVisibility({ hash: `#/review?${shape}` }, "hidden-url").visibility, `hash ${shape}`).toBe("visible")
-    }
-    expect(resolveFabVisibility({ hash: "#/review?a=1&vibe-unmark" }, undefined).visibility).toBe("hidden-url")
-  })
-
-  it("still leaves the host's own parameters alone, including one whose VALUE is our word", () => {
-    expect(stripFabParamsFromHash("#/review?id=42")).toBe("/review?id=42")
-    expect(stripFabParamsFromSearch("?foo=vibe-mark")).toBe("foo=vibe-mark")
-    // A route PATH is not a query segment, whatever it is named — including named after us.
-    expect(resolveFabVisibility({ hash: "#/vibe-mark" }, "hidden-url").visibility).toBe("hidden-url")
-  })
-
-  it("prints the word it accepts, which is the property the whole exit rests on", () => {
-    expect(formatMarkParam(`${ORIGIN}/p/x`)).toBe("?vibe-mark")
-    expect(formatMarkParam(`${ORIGIN}/p/x#/r?a=1`)).toBe("&vibe-mark")
   })
 })

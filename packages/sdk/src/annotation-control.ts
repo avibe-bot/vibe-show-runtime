@@ -97,36 +97,55 @@ export function writeStoredAnnotationMode(
   }
 }
 
-// ── Standalone FAB visibility via URL QUERY PARAM (vibe-mark / vibe-unmark) ───────────────
-// Default: FAB visible. `?vibe-unmark` hides it, `?vibe-mark` shows it. A query param — NOT the hash —
-// because the Show Page hash router owns `#/…` routes and a `#vibe-unmark` collided with it (404s).
-// The param is a ONE-TIME switch: read at overlay boot, persisted per session, then stripped from the URL
-// (history.replaceState) so the URL returns clean and a later param-free load honors the stored choice.
-// Standalone host only; coexists with `?vibe-embed=1` (the embedded host ignores these entirely).
+// ── Standalone FAB visibility via URL QUERY PARAM (mark / unmark) ─────────────────────────
+//
+// ┌─ THE INVARIANT THIS SECTION EXISTS UNDER (owner ruling, 2026-07-26) ──────────────────────────────┐
+// │ 标注控制面对宿主页面必须是隐形的：不把宿主的路由状态当输入读、不改写它、不派发导航事件。          │
+// │ 我们唯一拥有的网址表面，是 Show Page 网址自己的 query string。                                    │
+// │                                                                                                   │
+// │ The annotation control plane must be INVISIBLE to the host page: it does not read the host's       │
+// │ routing state as input, does not rewrite it, and does not dispatch navigation events. The only URL │
+// │ surface we own is the Show Page URL's own query string.                                           │
+// └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+//
+// Everything after `#` is the host router's territory — the fragment is where an SPA keeps its route, and
+// a route is not ours to parse, to claim a word inside, or to rewrite. Earlier rounds of this branch did
+// all three: they read a flag out of `#/route?…`, stripped it back out, and then hand-dispatched
+// `popstate`/`hashchange` because `replaceState` fires neither and the host's router would otherwise serve
+// a URL we had already changed. That last step is the tell — code that hand-drives someone else's router
+// is not a compatibility measure, it is a second author of the host's navigation. All of it is gone.
+//
+// Default: FAB visible. `?unmark` hides it, `?mark` shows it — read from `location.search` and nowhere
+// else. The flag is a ONE-TIME switch: read at overlay BOOT, persisted per session, then stripped from the
+// search via `history.replaceState` (the fragment passes through byte-for-byte) so the URL returns clean and
+// a later flag-free load honors the stored choice. Standalone host only; coexists with `?vibe-embed=1`
+// (the embedded host ignores these entirely).
+//
+// The words are bare `mark` / `unmark` and stay that way: they are typed by humans into an address bar, so
+// the shortest thing that works is the right thing. Round 14 namespaced them to `vibe-mark`/`vibe-unmark`
+// to make a generic word safe to claim inside the host's fragment; that safety is now bought by not being
+// in the fragment at all, which is cheaper and total. In our OWN query string, `mark` is ours by the same
+// prior reservation that `vibe-embed` sits on.
+//
+// The price, accepted explicitly by the owner: on a hash-routed page (`/p/x#/route`, the ordinary Show Page
+// shape) a user who appends `?mark` to the END of the address bar lands in the fragment, where we no longer
+// look — so that append does nothing and they cannot recover that way. There is no compensating mechanism
+// and there must not be one; every mechanism that made the tail-append work is what this section deleted.
+// Instead, the moment a user hides the chrome we hand them the WHOLE restore URL with the flag in its real
+// query position (`/p/x?mark#/route`) — see {@link formatMarkUrl}. People copy links; they do not
+// transcribe suffixes, and asking them to was what put us in the host's fragment in the first place.
 //
 // Visibility (Lane U) records TWO things in one value: what is on screen, and — when nothing is — WHICH
 // exit the user was told about. `visible` (FAB/toolbar) and `handle` (collapsed to the draggable edge
 // grabber) are their own exit: they are on screen, so the way back is visible. The two hidden flavors show
 // nothing, so their exit lives outside the page and the state has to carry which one was promised:
-// `hidden-key` (the shortcut named in the hide row) and `hidden-url` (the fragment named in it).
+// `hidden-key` (the shortcut named in the hide row) and `hidden-url` (the link named in it).
 //
 // Folding the exit into the state is the whole point. A hidden chrome whose promised exit doesn't exist on
 // this device is a screen with no way back, and the promise used to live only in a toast that expires in a
 // few seconds. Now the state names it, so the two can't drift apart. See {@link fabVisibilityForDevice}.
-//
-// The URL vocabulary is TWO words: `?vibe-mark` → visible, `?vibe-unmark` → hidden-url. NAMESPACED, and
-// that prefix is the whole of round 14. The words were bare `mark` / `unmark`, which are generic — so on a
-// hash-routed page `#/review?mark` was the HOST's parameter and we read it, stripped it, and re-dispatched
-// a navigation carrying our rewrite; worse and quieter, `resolveFabVisibility` persists what it reads, so
-// such a route overwrote the author's stored visibility on every load. Round 8 had answered the valued half
-// of this (`#/review?mark=42`) by narrowing the hash to bare presence while the search stayed tolerant —
-// one concept with two spellings, and the seam between them is where the rest of the defect lived. A
-// namespaced key is ours in EVERY segment, so the ambiguity is removed instead of adjudicated and one rule
-// reads both. It shares the prefix of `vibe-embed` above rather than inventing a second one: this SDK
-// claims exactly one namespace in a URL. The advertised string grows five characters; we stop claiming any
-// generic word in someone else's space, which is worth more than five characters.
-export const ANNOTATION_FAB_PARAM_SHOW = "vibe-mark"
-export const ANNOTATION_FAB_PARAM_HIDE = "vibe-unmark"
+export const ANNOTATION_FAB_PARAM_SHOW = "mark"
+export const ANNOTATION_FAB_PARAM_HIDE = "unmark"
 export const ANNOTATION_FAB_VISIBLE_STORAGE_PREFIX = "avibe:fab-visible:"
 
 /**
@@ -150,43 +169,16 @@ export function fabVisibleStorageKey(sessionId: string | undefined): string {
 }
 
 /**
- * The two segments of the current URL a `vibe-mark` / `vibe-unmark` flag can occupy. Taken as a pair because the user's
- * action is "append to the end of the address bar", and which segment that lands in depends on the page:
- * `location.search` normally, but `location.hash` the moment the page is on a `#/…` route. Structurally
- * satisfied by both `window.location` and `new URL(...)`, so callers hand over the real thing.
- */
-export interface FabParamUrl {
-  search?: string
-  hash?: string
-}
-
-/**
- * Split a hash into the router's route and the hash's OWN query segment (everything after its first `?`).
+ * Where a raw href stops being ours and starts being the host router's: the fragment, in `location.hash`
+ * form (leading `#` included), or `undefined` when the href has no fragment at all.
  *
- * The split is positional, never a search for our word somewhere in the hash: `#/route?redirect=/a?vibe-mark` has
- * to keep parsing as a single `redirect` value — exactly as it already does on the search side — so that a
- * lenient scan can't invent a flag out of a host's parameter, or corrupt one on the way back out. Everything
- * left of the `?` belongs to the hash router and is never read or rewritten here.
- *
- * `hasQuery` is reported separately from `query` because an empty query is not the absence of one:
- * `#/route?` already carries the `?` that decides the next separator. Reader and writer share this one split
- * precisely so they cannot answer that question differently — see {@link formatMarkParam}.
- */
-function splitHash(hash: string | undefined): { route: string; query: string; hasQuery: boolean } {
-  const raw = (hash ?? "").replace(/^#/, "")
-  const start = raw.indexOf("?")
-  if (start === -1) return { route: raw, query: "", hasQuery: false }
-  return { route: raw.slice(0, start), query: raw.slice(start + 1), hasQuery: true }
-}
-
-/**
- * The fragment of a raw href in `location.hash` form — leading `#` included — or `undefined` when the href has
- * no fragment at all.
+ * This is the boundary function for the whole section. Everything to the LEFT of what it returns is the Show
+ * Page URL we own and may read and rewrite; everything from the `#` onward is opaque — carried through
+ * untouched by {@link stripFabParamsFromUrl}, never parsed, never searched for our word.
  *
  * The FIRST `#` is the anchor, because that is where the URL spec puts the fragment and therefore where the
- * reader's parser starts. On `#/route?a=1#x` the last `#` would name a different string, one with no `?` in
- * it, and the two answers diverge: we would print `?vibe-mark`, the reader would split at the fragment's first `?`
- * and hand `URLSearchParams` the value `1#x?vibe-mark` — a single `a` key, no flag.
+ * host's router starts reading. Taking the last one would let a `#` inside a route pull our boundary to the
+ * right and put part of the host's fragment inside the string we rewrite.
  */
 function hrefFragment(href: string): string | undefined {
   const start = href.indexOf("#")
@@ -196,18 +188,15 @@ function hrefFragment(href: string): string | undefined {
 /**
  * Is this `key=value` pair one of ours?
  *
- * Matches the full KEY only, so `?foo=vibe-mark` — a host's parameter whose VALUE happens to be our word —
- * is left alone.
+ * Matches the full KEY only, so `?foo=mark` — a parameter whose VALUE happens to be our word — is left
+ * alone. Only ever asked about `location.search`, which is the Show Page's own query string; the host's
+ * fragment is not parsed at all, so there is no second, stricter reading of this question any more. Round 8
+ * needed one (`bareOnly`, tolerant in the search and bare-presence-only in the hash) and round 14 removed it
+ * by namespacing both; the invariant removes the seam itself — one concept, one segment, one rule.
  *
- * ONE rule for both segments, which is what the namespace bought. This predicate used to take a `bareOnly`
- * flag: tolerant in `location.search` (ours by prior reservation), bare-presence-only in the hash (the host
- * router's, so claim the least there). That asymmetry was the honest reading of a borrowed namespace and it
- * was still wrong, because a bare generic word was never ours to claim in the first place — see the header
- * above. A namespaced key is ours in every segment, so there is nothing left for the flag to express.
- *
- * Tolerant rather than bare-only, now that it is uniform: `formatMarkParam` only ever prints the bare form,
- * but someone writing `?vibe-mark=1` by hand — the shape a flag takes for most people — means the flag, and
- * the old hash rule would have ignored it while leaving it sitting in the address bar forever.
+ * Tolerant rather than bare-only: {@link formatMarkUrl} only ever prints the bare form, but someone writing
+ * `?mark=1` by hand — the shape a flag takes for most people — means the flag, and a bare-only rule would
+ * ignore it while leaving it sitting in the address bar forever.
  */
 function isFabParamPair(pair: string): boolean {
   const eq = pair.indexOf("=")
@@ -215,7 +204,7 @@ function isFabParamPair(pair: string): boolean {
   return key === ANNOTATION_FAB_PARAM_SHOW || key === ANNOTATION_FAB_PARAM_HIDE
 }
 
-/** Our flag keys in one query segment, in the order written, WITH repeats. */
+/** Our flag keys in a `location.search`, in the order written, WITH repeats. */
 function fabFlagKeys(query: string | undefined): string[] {
   const raw = (query ?? "").replace(/^\?/, "")
   if (!raw) return []
@@ -226,94 +215,31 @@ function fabFlagKeys(query: string | undefined): string[] {
 }
 
 /**
- * Every flag key this URL carries, across BOTH segments one can legitimately land in — the search and the
- * hash's own query, read by the same rule since the words are namespaced (round 14). One list, so nothing
- * downstream has to know there were ever two.
- *
- * A list and not a set. The two readers below want different things from it — the decision wants presence,
- * the identity wants the whole observation — and only one of those can be recovered from the other. Deduping
- * here served the decision and quietly cost the identity a repeat it needed (round 12); this returns what was
- * actually there and lets each reader narrow it for itself.
- */
-function urlFabFlagKeys(url: FabParamUrl): string[] {
-  return [...fabFlagKeys(url.search), ...fabFlagKeys(splitHash(url.hash).query)]
-}
-
-/**
- * The flag a set carries, if any. When BOTH are present the RESCUE wins.
+ * The flag a search carries, if any. When BOTH are present the RESCUE wins.
  *
  * That precedence is the opposite of what it was, and deliberately so. Both flags coexist in exactly one
- * situation: the persistence write failed, so we left `?vibe-unmark` in the URL as the reload fallback, and the
- * user then followed the printed exit and appended `vibe-mark`. If `vibe-unmark` still outranked it, the advertised way
+ * situation: the persistence write failed, so we left `?unmark` in the URL as the reload fallback, and the
+ * user then opened the restore link, which carries `mark`. If `unmark` still outranked it, the advertised way
  * back would be unreachable for the one state whose entire promise is that its exit always works — this PR's
  * own defect, re-entered through the back door. Being wrongly visible costs a second hide; being wrongly
  * hidden with your rescue outranked is the blank screen we exist to prevent.
  *
- * Presence is all this reader needs, so it takes the deduped SET — a second `vibe-mark` does not out-vote a first.
- * It takes a SET rather than a segment, so that argument decides the case it was made for. Ruling on one
- * segment at a time and then ranking the segments meant `/page?vibe-unmark#/route?vibe-mark` — a page linked with
- * `vibe-unmark`, a failed write, and then the exact append the copy prints, since "the end of the address bar" is
- * the hash on a hash-routed page — still resolved to `hidden`: rescue-wins twice, over nothing, and then a
- * coin-flip between segments overrode both. The segment a flag landed in was never part of the argument.
+ * Presence is the whole of the question, so it takes a SET — a second `mark` does not out-vote a first.
  */
 function readFabFlag(flags: Set<string>): FabVisibility | undefined {
   if (flags.has(ANNOTATION_FAB_PARAM_SHOW)) return "visible"
-  // `?vibe-unmark` → `hidden-url`, never `hidden-key`: whoever typed this flag already holds the URL vocabulary,
+  // `?unmark` → `hidden-url`, never `hidden-key`: whoever typed this flag already holds the URL vocabulary,
   // so the URL is demonstrably an exit they can use — and unlike the shortcut it works on every device.
   if (flags.has(ANNOTATION_FAB_PARAM_HIDE)) return "hidden-url"
   return undefined
 }
 
 /**
- * A stable identity for "the flags this URL carries right now" — `""` when it carries none.
- *
- * The caller keeps the last token it ACTED on, so a flag is consumed once per occurrence instead of once per
- * read. That distinction only became load-bearing when the overlay started subscribing to navigation: if the
- * write failed we leave the flag in the URL on purpose (the reload fallback), and without an identity to
- * compare against, every later `popstate` re-applies the same stale token — silently undoing a restore the
- * user just performed. Order-independent, so `?vibe-unmark&vibe-mark` and `?vibe-mark&vibe-unmark` are one occurrence, while
- * `?vibe-unmark` → `?vibe-unmark&vibe-mark` is genuinely a new one.
- *
- * A sorted MULTISET, not a sorted set. The identity has to survive everything that is not a new append —
- * a host route change around a flag that never left is still one occurrence, hence keys and not the raw URL —
- * while distinguishing everything that is one. A repeat is the second kind: with persistence failing, the
- * flag stays put, so following the printed exit twice reads `?vibe-unmark&vibe-mark` then `?vibe-unmark&vibe-mark&vibe-mark`, and
- * deduping made those one token. The second rescue matched a spent memo and was swallowed — on the one state
- * that has no handle and no guaranteed shortcut, where the URL exit is the entire exit (round 12).
- */
-export function fabFlagToken(url: FabParamUrl): string {
-  return [...urlFabFlagKeys(url)].sort().join("+")
-}
-
-/**
- * Should this pass act on the URL flag? Only when there IS one and it is not the one we already applied.
- *
- * Deliberately in-memory and per page load: a reload starts with no memory, re-reads the URL, and the
- * failed-persistence fallback still works. What it cannot survive is a stale token firing twice.
- */
-export function shouldApplyFabFlag(token: string, lastApplied: string | undefined): boolean {
-  return token !== "" && token !== lastApplied
-}
-
-/**
- * What the "already answered" memo becomes after observing `token` — the other half of the rule above, and
- * the half round 8 left unsaid. The memo means "the occurrence currently in the URL that we have already
- * acted on", so a flag-free URL must erase it: otherwise the memo outlives the flag, and the SECOND time the
- * user follows the printed hint the token matches a spent one and their rescue is silently swallowed
- * (round 9). Set on every pass, not only on the ones that apply something — that is what makes it self-heal
- * instead of needing a clearing call at each early return.
- */
-export function nextAppliedFlag(token: string): string | undefined {
-  return token === "" ? undefined : token
-}
-
-/**
  * The status message that is still TRUE. Every toast this chrome raises is `fabToastFor(state, …)` — it
  * narrates exactly one visibility and the way out of it — so the instant the visibility moves on, the
  * message is describing somewhere the user no longer is. Deriving it from the current state rather than
- * clearing it at each restore site means no path can forget: not the shortcut, not the edge handle, not a
- * `?vibe-mark` typed into the address bar (which restores without going through any handler at all), and not
- * whichever path is added next.
+ * clearing it at each restore site means no path can forget: not the shortcut, not the edge handle, not the
+ * restore link (which reloads the page, so no handler here runs at all), and not whichever path is added next.
  */
 export function activeFabToast(
   toast: { message: string; state: FabVisibility } | null | undefined,
@@ -323,29 +249,53 @@ export function activeFabToast(
 }
 
 /**
- * Resolve the standalone chrome's visibility from the URL. Precedence: an explicit `vibe-unmark` /
- * `vibe-mark` WINS and dictates what to persist (`persist` = the state to write, so the switch survives a
- * later param-free load); else honor the stored state; else default visible (`persist: null` ⇒ write nothing).
+ * How long a state's toast stays on screen — a property of WHAT IT SAYS, not one number for all of them.
  *
- * That `persist` is why the namespace matters more here than anywhere else: a flag we misrecognize does not
- * merely act once, it OVERWRITES the author's stored choice on every load of that URL (round 14).
+ * Every other toast confirms a transition whose way back is still on the device (a key to press, a strip to
+ * tap); it is read once and wants to get out of the way. The `hidden-url` toast is the only delivery of the
+ * only exit from the only state with nothing on screen, and since this round it carries a whole URL rather
+ * than a five-character suffix — something to select and copy, not to memorize. On the old 3.2s it would
+ * hand the user their way back and take it away before they could use it.
  *
- * Read from BOTH the search and the hash's own query segment, because both are places the flag legitimately
- * lands: on a hash-routed page (`/p/x#/route`, the ordinary Show Page shape) `location.search` is empty and an
- * appended `?vibe-mark` becomes part of the hash. Looking in one place only would strand `hidden` — the single
- * state with neither an on-screen handle nor a guaranteed keyboard shortcut — on whichever shape wasn't
- * checked. They are read as ONE list ({@link urlFabFlagKeys}), the same list {@link fabFlagToken} builds its
- * identity from, so the two cannot disagree about what a URL carries; the rescue-wins ruling in
- * {@link readFabFlag} then decides once, over everything present, rather than per segment and then again
- * between segments. It narrows to a set on the way in, because presence is the whole of its question.
+ * It still expires, which is a bounded race rather than a guarantee, and that is deliberate: a toast that
+ * waited for a dismissal would need a document-level listener to hear one, and this control plane's whole
+ * invariant is that it attaches nothing to the host it does not have to. A dwell needs no listener.
+ */
+export function fabToastDurationMs(visibility: FabVisibility): number {
+  return visibility === "hidden-url" ? 15000 : 3200
+}
+
+/**
+ * Resolve the standalone chrome's visibility from `location.search` — the Show Page's own query string, and
+ * the only URL surface this control plane reads. Precedence: an explicit `unmark` / `mark` WINS and dictates
+ * what to persist (`persist` = the state to write, so the switch survives a later flag-free load); else honor
+ * the stored state; else default visible (`persist: null` ⇒ write nothing).
  *
- * Pure; the caller reads `location`, persists, and strips the flag from whichever segment held it.
+ * `available` — can THIS viewer annotate — gates the whole flag path, and it lives here rather than as a
+ * guard at the call site because `persist` is the reason it matters. Annotation is an author's tool: a public
+ * Show Page renders no chrome for an anonymous visitor at all. But the storage key is
+ * {@link fabVisibleStorageKey}, keyed by session with no viewer identity in it, so an anonymous visitor
+ * opening a shared `?unmark` link on a shared browser used to WRITE `hidden-url` under the author's own key —
+ * and the author would come back to a page whose chrome was gone with no memory of hiding it. Someone else's
+ * click changing the author's state is the failure; it is not the annotation feature merely misbehaving for
+ * the clicker.
+ *
+ * Returning the stored value with `persist: null` is what makes that one decision cover all three behaviors:
+ * the flag is not adopted, not persisted, and — because the caller strips only when there is something to
+ * persist — not removed from the URL either. Leaving it in the URL is the load-bearing half. `available`
+ * starts from the config's guess and is flipped by an auth probe a moment later, so the author's own first
+ * paint can be "not available yet"; the flag has to still be sitting there when the answer arrives. The
+ * caller re-resolves on that transition and the flag is honored then — exactly once, because that pass is
+ * the one that finally strips it.
+ *
+ * Pure; the caller reads `location`, persists, and strips.
  */
 export function resolveFabVisibility(
-  url: FabParamUrl,
-  stored: FabVisibility | undefined
+  search: string | undefined,
+  stored: FabVisibility | undefined,
+  available: boolean
 ): { visibility: FabVisibility; persist: FabVisibility | null } {
-  const flag = readFabFlag(new Set(urlFabFlagKeys(url)))
+  const flag = available ? readFabFlag(new Set(fabFlagKeys(search))) : undefined
   if (flag) return { visibility: flag, persist: flag }
   return { visibility: stored ?? "visible", persist: null }
 }
@@ -385,7 +335,7 @@ export function readStoredFabVisibility(
 /**
  * Persist the visibility choice. Returns whether it was actually stored: `false` when no storage exists or
  * `setItem` throws (private-mode / quota). The caller uses this to decide whether the URL flag is now
- * durable enough to strip — if the write failed, `?vibe-mark` / `?vibe-unmark` must stay in the URL so a reload still
+ * durable enough to strip — if the write failed, `?mark` / `?unmark` must stay in the URL so a reload still
  * carries the intent.
  */
 export function writeStoredFabVisibility(
@@ -445,11 +395,11 @@ export function fabVisibilityForDevice(visibility: FabVisibility, shortcutAvaila
 }
 
 /**
- * Remove ONLY the overlay's own `vibe-mark` / `vibe-unmark` flag from a raw `location.search`, leaving every
+ * Remove ONLY the overlay's own `mark` / `unmark` flag from a raw `location.search`, leaving every
  * other parameter byte-for-byte intact. We split on `&` and drop the tokens whose KEY is ours, rather than
  * round-tripping through `URLSearchParams.toString()` — that round-trip re-encodes existing escapes and
  * rewrites bare flags (`?debug` → `?debug=`), mutating query strings the host app may read raw. Matches a
- * full key token only, so `?foo=vibe-mark` is untouched. Returns the search WITHOUT a leading "?" ("" if
+ * full key token only, so `?foo=mark` is untouched. Returns the search WITHOUT a leading "?" ("" if
  * empty).
  *
  * Strips exactly what {@link isFabParamPair} recognizes, and shares the predicate to say so: a reader and a
@@ -468,10 +418,10 @@ export function stripFabParamsFromSearch(search: string | undefined): string {
  * Did this segment still have a query after the strip — INCLUDING an empty one?
  *
  * The delimiter and its contents are two different facts, and only the second one survives a join: `?` and
- * `?vibe-mark` both strip to `""`, but the first page owned a `?` before we arrived and the second did not.
+ * `?mark` both strip to `""`, but the first page owned a `?` before we arrived and the second did not.
  * Callers that reconstruct from truthiness collapse them and hand the host back a URL it never had. That is
- * the same distinction round 11 made on the way in — an empty query is not the absence of one — which is why
- * `formatMarkParam` prints `&vibe-mark` for a URL ending in `?`: this is that append, read back off.
+ * the same distinction {@link formatMarkUrl} makes on the way in — an empty query is not the absence of one,
+ * so it prints `&mark` for a URL ending in `?`: this is that append, read back off.
  *
  * Shares {@link isFabParamPair} with the strip itself, so the two cannot disagree about which pairs were ours.
  */
@@ -482,104 +432,49 @@ function keepsQueryDelimiter(query: string | undefined): boolean {
 }
 
 /**
- * The same strip, one segment over: remove our flag from the hash's own query while leaving the ROUTE and
- * every foreign key byte-for-byte intact. Returns the hash body WITHOUT a leading "#" ("" if empty).
+ * The URL to hand `replaceState` after removing our flag — or `null` when the href holds nothing of ours and
+ * must not be rewritten at all.
  *
- * The strip has to reach wherever {@link resolveFabVisibility} reads, or the one-time switch stops being
- * one-time: a `vibe-unmark` left sitting in the hash outlives its load, and the `vibe-mark` the user appends
- * next to that same tail arrives to find the old flag still there. The query segment is handed to the search
- * stripper rather than re-implemented, so both sides drop exactly the same key tokens and re-encode nothing.
- * When there was nothing of ours to remove, the ORIGINAL string is handed back rather than a reassembled
- * one — the common case for a flag that arrived in the search — so a hash we have no business rewriting
- * cannot be perturbed by the round trip. Only when a token really is dropped is the hash rebuilt, and a `?`
- * that existed only to carry our flag goes with it — while one the route already had stays, which is what
- * {@link keepsQueryDelimiter} is for and what emptiness alone could not tell us.
- */
-export function stripFabParamsFromHash(hash: string | undefined): string {
-  const { route, query } = splitHash(hash)
-  const rest = stripFabParamsFromSearch(query)
-  if (rest === query) return (hash ?? "").replace(/^#/, "")
-  return keepsQueryDelimiter(query) ? `${route}?${rest}` : route
-}
-
-/**
- * Both strips at once, reassembled into the URL to hand `replaceState` — or `null` when the href holds
- * nothing of ours and must not be rewritten at all.
+ * **The fragment is not touched.** It is sliced off at the first `#`, held aside, and concatenated back
+ * verbatim; nothing between here and the return value can parse it, rewrite it, or normalize it. That is the
+ * section invariant expressed as code rather than as a promise: the host's route is byte-for-byte identical
+ * on both sides of this function because the only thing that ever happens to it is a string concatenation.
+ * The previous version cleaned the fragment too, and the discipline required to leave a host's route
+ * undisturbed while rewriting the query hanging off it took four review rounds and never fully arrived.
  *
- * The two segments are cleaned together because the flag legitimately lands in either and a load can carry
- * one in each; rewriting them in two passes would put a half-cleaned URL in the address bar in between. The
- * `null` return is the load-bearing part: it is what lets the caller distinguish "already clean" from
- * "cleaned to the same string", so an untouched URL never reaches `replaceState` and never fakes a
- * navigation for the host's router. Here it is simply "the rebuild is the input", which is the strongest
- * form of that claim available: nothing can be quietly normalized on a URL we then declare unchanged.
+ * The `null` return is the other load-bearing part: it lets the caller distinguish "already clean" from
+ * "cleaned to the same string", so an untouched URL never reaches `replaceState` at all. It is decided by
+ * comparing the stripped search against the raw one — earlier than a whole-href comparison and stronger,
+ * because it cannot be satisfied by a rewrite that happens to reproduce its input.
  *
- * It takes the RAW HREF, for the reason {@link formatMarkParam} already takes one, and it is the same
- * defect read backwards. `location.search` is `""` for both "no query" and "an empty query" and
- * `location.hash` is `""` for both "no fragment" and "an empty one" — so a decomposed input cannot
- * distinguish `/p/x?#/route` from `/p/x#/route`, and this function's whole job is to hand back THE PAGE'S OWN
- * URL rather than a normalized guess at it. Reading `{search, hash}` bought one more enumerated shape per
- * round (`?&vibe-mark`, then `#?vibe-mark`) and could never reach `?#`. An href loses nothing, so the rule below is
- * total, and printer and stripper now read the one source — which is what the round-trip property rests on.
+ * It takes the RAW HREF rather than `{pathname, search, hash}` because `location.search` is `""` for both
+ * "no query" and "an empty query", and `location.hash` is `""` for both "no fragment" and "an empty one" —
+ * so a decomposed input cannot distinguish `/p/x?#/route` from `/p/x#/route`, and this function's whole job
+ * is to hand back THE PAGE'S OWN URL rather than a normalized guess at it. An href loses nothing, so the
+ * rule below is total, and printer and stripper read the one source — which is what the round-trip property
+ * rests on.
  *
- * Everything left of the first `?` or `#` is copied through untouched, so an absolute href stays absolute and
- * a path-relative one stays relative; this function has no opinion about the origin.
+ * Everything left of the first `?` is copied through untouched, so an absolute href stays absolute and a
+ * path-relative one stays relative; this function has no opinion about the origin.
  *
- * Each segment gets the same three-way decision, and the middle branch is the one emptiness cannot express:
- *
- *   no delimiter at all       → nothing to keep
- *   nothing of ours was there → hand the segment back byte-for-byte, delimiter included
+ *   no `?` at all             → nothing of ours can be here
+ *   nothing of ours was there → `null`, do not rewrite
  *   we removed something      → {@link keepsQueryDelimiter} decides whether the `?` was ours to remove too
  */
 export function stripFabParamsFromUrl(href: string): string | null {
   const fragment = hrefFragment(href)
   const head = fragment === undefined ? href : href.slice(0, href.length - fragment.length)
   const cut = head.indexOf("?")
-  const search = cut === -1 ? undefined : head.slice(cut + 1)
-  const strippedSearch = search === undefined ? undefined : stripFabParamsFromSearch(search)
-  const nextSearch =
-    search === undefined || strippedSearch === undefined
-      ? ""
-      : strippedSearch === search
-        ? `?${search}`
-        : keepsQueryDelimiter(search)
-          ? `?${strippedSearch}`
-          : ""
-  // The fragment's own delimiter needs no such vote: `formatMarkParam` emits `?vibe-mark` / `&vibe-mark` and
-  // never a `#`, so a `#` in front of us is always one the page already had and always survives. What it
-  // could not survive was being read off `location.hash`, which reports "" for the `/p/x#` that owns it.
-  const strippedHash = stripFabParamsFromHash(fragment)
-  const nextHash = fragment === undefined ? "" : strippedHash ? `#${strippedHash}` : "#"
-  const next = `${cut === -1 ? head : head.slice(0, cut)}${nextSearch}${nextHash}`
-  return next === href ? null : next
-}
-
-/**
- * Which events the browser owes a subscriber after we rewrite the URL ourselves — and which we must
- * therefore re-issue by hand.
- *
- * `history.replaceState` fires neither `popstate` nor `hashchange`, so a host router that subscribes to
- * either keeps serving a location we have already changed. The scaffold router in `packages/runtime` reads
- * `pathname` and is unaffected, but the SDK's public surface permits a hash router, and that one would keep
- * a stale `vibe-mark` in its route query forever.
- *
- * `popstate` covers the history routers (and matches what the scaffold's own `navigate()` hand-dispatches
- * for exactly this reason). `hashchange` is a narrower claim — that the FRAGMENT moved — so it is only made
- * when the fragment really moved; announcing it otherwise sends a hash router chasing a change that did not
- * happen. An unchanged URL yields nothing, which is also what keeps our own re-issued events from echoing:
- * the handler they wake re-reads a URL with no flag left in it and rewrites nothing.
- */
-export function fabUrlChangeEvents(
-  before: { search?: string; hash?: string },
-  after: { search?: string; hash?: string }
-): ("popstate" | "hashchange")[] {
-  const searchMoved = (before.search ?? "") !== (after.search ?? "")
-  const hashMoved = (before.hash ?? "") !== (after.hash ?? "")
-  if (!searchMoved && !hashMoved) return []
-  return hashMoved ? ["popstate", "hashchange"] : ["popstate"]
+  if (cut === -1) return null
+  const search = head.slice(cut + 1)
+  const stripped = stripFabParamsFromSearch(search)
+  if (stripped === search) return null
+  const nextSearch = keepsQueryDelimiter(search) ? `?${stripped}` : ""
+  return `${head.slice(0, cut)}${nextSearch}${fragment ?? ""}`
 }
 
 // ── Standalone FAB visibility keyboard shortcut (Alt+M / ⌥M) ──────────────────────────────
-// Alt+M toggles the FAB the same way ?vibe-mark/?vibe-unmark and the ✕ button do (standalone host only). Alt is the
+// Alt+M toggles the FAB the same way ?mark/?unmark and the ✕ button do (standalone host only). Alt is the
 // SOLE modifier. macOS Option+M emits key "µ" in some layouts, so we match the physical `code === "KeyM"`
 // as well as the character — the residual µ-in-a-custom-editor collision is accepted by the owner and, as
 // defense in depth, the toggle never fires while an editable element is focused.
@@ -615,40 +510,33 @@ export function formatFabShortcut(
 }
 
 /**
- * The exact URL fragment to APPEND to bring a fully hidden chrome back: `"?vibe-mark"` on a URL with no query
- * string, `"&vibe-mark"` on one that already has parameters. Same job as `formatFabShortcut` one axis over — that
- * one computes the exact key the user must press, this one the exact text they must paste; platform-derived
- * there, URL-derived here.
+ * The WHOLE URL that brings a fully hidden chrome back — the page's own href with our flag added to its
+ * search, e.g. `/p/x` → `/p/x?mark` and `/p/x?foo=1#/route` → `/p/x?foo=1&mark#/route`.
  *
- * Prescribing a bare `"?vibe-mark"` is a dead end on a page that already has a query string: the result is
- * `?foo=1?vibe-mark`, which `URLSearchParams` reads as a single `foo="1?vibe-mark"` — no `vibe-mark` key, so the stored
- * `hidden` survives the reload. That is the one hidden state with neither an edge handle nor a keyboard
- * shortcut, so its hint has to work on the URL the reader is actually looking at. Callers must read
- * `location` at DISPLAY time, not at mount: the boot strip rewrites it.
+ * It hands over a complete link rather than the suffix to type, and that is the correction rather than a
+ * nicety. The suffix form asked the reader to append to the END of the address bar, which on a hash-routed
+ * page is inside the host's route — so the printed instruction only worked if we then went looking for our
+ * word in the host's fragment, which is precisely what we are no longer allowed to do. A full URL puts the
+ * flag where it belongs and asks nothing of the reader but a copy. People copy links; they do not transcribe
+ * suffixes, and asking them to was what put us in the host's fragment in the first place.
  *
- * Which separator is right is decided by the segment the user APPENDS TO — the end of the address bar. On a
- * hash-routed page that is the hash, not the search, and the two can disagree: `/p/x?foo=1#/route` has a
- * query string yet its tail has none, so the answer there is `?vibe-mark`, and reading `search` would hand out
- * `&vibe-mark` and produce `#/route&vibe-mark` — one more shape where the flag silently isn't a flag.
+ * The accepted price: a user who ignores the link and appends `?mark` to a hash-routed URL by hand lands the
+ * word inside the fragment, where nothing reads it, and does not get the chrome back. There is no
+ * compensating mechanism and there must not be one — reaching into the fragment to rescue that user is the
+ * exact behavior the invariant at the top of this section forbids.
  *
- * It takes the RAW HREF, and that is the point rather than a convenience. Four review rounds each found one
- * more URL shape this got wrong, and the reason was never the rule — it was the input. `URL.hash` is `""`
- * for BOTH "there is no fragment" and "there is an empty fragment" (`/page?foo=1#`), and those two demand
- * opposite separators, so no rule reading a decomposed `{search, hash}` can be right about both; every round
- * could only enumerate one more shape. An href loses nothing, so one rule covers every shape there is:
- *
- *   no `#`  → the append lands in the search   → `&` if the href already has a `?`
- *   a `#`   → the append lands in the fragment → `&` if that fragment already has a `?`
- *
- * Both halves go through the reader's own {@link splitHash} and {@link hrefFragment}, so what we print and
- * what we accept cannot disagree — a printed instruction the parser rejects is the whole failure mode here.
- * The property test over the shape matrix is the thing that keeps it that way; prefer adding a row there to
- * adding a branch here.
+ * The fragment is sliced off and concatenated back verbatim, so this is the printer half of the same
+ * byte-for-byte guarantee {@link stripFabParamsFromUrl} makes on the way out. It takes the RAW HREF for the
+ * same reason that one does: `location.search` cannot tell `/p/x?#/route` from `/p/x#/route`, and the two
+ * need different separators. One rule covers every shape there is — `&` if there is already a `?` to the
+ * left of the fragment, `?` otherwise — and the round-trip property over the shape matrix is what keeps
+ * printer and stripper from disagreeing.
  */
-export function formatMarkParam(href: string): string {
+export function formatMarkUrl(href: string): string {
   const fragment = hrefFragment(href)
-  const tailHasQuery = fragment === undefined ? href.includes("?") : splitHash(fragment).hasQuery
-  return `${tailHasQuery ? "&" : "?"}${ANNOTATION_FAB_PARAM_SHOW}`
+  const head = fragment === undefined ? href : href.slice(0, href.length - fragment.length)
+  const sep = head.includes("?") ? "&" : "?"
+  return `${head}${sep}${ANNOTATION_FAB_PARAM_SHOW}${fragment ?? ""}`
 }
 
 /**
