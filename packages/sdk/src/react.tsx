@@ -2024,12 +2024,16 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // mounted overlay; if the new session resolves to the same state, a match on state alone would keep the old
   // session's message on screen — and for `hidden-url` that message carries a restore URL pointing at the
   // page the user just left, one tap from the clipboard. See activeFabToast.
-  // `token` counts raises, so a settle that arrives late can tell whether the toast it belongs to is still the
-  // one on screen: every toast shares one timer, and without it a slow clipboard would re-time whichever toast
-  // happened to be up when it resolved. It lives in the state rather than in a ref because it is rendered.
+  // `token` identifies one raise, so a settle that arrives late can tell whether the toast it belongs to is
+  // still the one on screen: every toast shares one timer, and without it a slow clipboard would re-time
+  // whichever toast happened to be up when it resolved. The value is held in the state because it is rendered,
+  // but it is minted from a ref that only ever counts UP. Deriving it from the previous state instead would
+  // restart at 1 every time the toast had already timed out — and a recycled token makes two different raises
+  // indistinguishable, which is precisely the confusion it exists to prevent.
   const [toast, setToast] = React.useState<
     (FabToastContent & { state: FabVisibility; sessionId: string | undefined; token: number }) | null
   >(null)
+  const toastRaises = React.useRef(0)
   const toastTimer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const armToastTimer = React.useCallback((ms: number) => {
     if (toastTimer.current) clearTimeout(toastTimer.current)
@@ -2037,7 +2041,8 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   }, [])
   React.useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
   const flashToast = React.useCallback((content: FabToastContent, state: FabVisibility) => {
-    setToast((prev) => ({ ...content, state, sessionId, token: (prev?.token ?? 0) + 1 }))
+    toastRaises.current += 1
+    setToast({ ...content, state, sessionId, token: toastRaises.current })
     // How long it stays is a property of WHAT IT SAYS — see fabToastDurationMs. Most of these confirm
     // something and vanish; the `hidden-url` one carries the only copy of the way back, so it dwells long
     // enough to be noticed and its copy button tapped.
@@ -2138,11 +2143,19 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   //
   // Either way it only re-times the toast the copy was FOR — `null` back means the settle belongs to a toast
   // that is no longer the one on screen. The decision itself, guard included, is copySettleDwellMs.
-  const liveToastToken = statusToast?.token
+  //
+  // The live token is read through a ref rather than captured in the callback. A pending `writeText` keeps
+  // alive the `onCopySettled` it was given, so a captured value would age out WITH the toast it came from —
+  // and the comparison would then be stale-against-stale, matching every time, which is the one case the
+  // guard is for. The ref is always the token of whatever is on screen right now, or `undefined` for nothing.
+  const liveToastToken = React.useRef<number | undefined>(undefined)
+  React.useEffect(() => {
+    liveToastToken.current = statusToast?.token
+  }, [statusToast?.token])
   const settleCopy = React.useCallback((token: number, copied: boolean) => {
-    const dwell = copySettleDwellMs(token, liveToastToken, copied)
+    const dwell = copySettleDwellMs(token, liveToastToken.current, copied)
     if (dwell !== null) armToastTimer(dwell)
-  }, [liveToastToken, armToastTimer])
+  }, [armToastTimer])
 
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
