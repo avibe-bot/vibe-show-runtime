@@ -235,35 +235,40 @@ function readFabFlag(flags: Set<string>): FabVisibility | undefined {
 }
 
 /**
+ * Permanently retire toast state when its owning session ceases to be current.
+ *
+ * Rendering `null` is not retirement: a `pending` clipboard write deliberately has no dwell timer, so a
+ * state value merely hidden during a session swap can reappear forever if the SPA returns before that write
+ * settles. The overlay applies this transition to the state owner on every session change. A route change
+ * inside one session does not retire anything; a session change does.
+ *
+ * Generic over the payload because session ownership applies to the complete toast — message, link, copy
+ * state, token, and any later addition — rather than to a field that each caller has to remember.
+ */
+export function retainFabToastForSession<T extends { sessionId: string | undefined }>(
+  toast: T | null | undefined,
+  sessionId: string | undefined
+): T | null {
+  return toast && toast.sessionId === sessionId ? toast : null
+}
+
+/**
  * The status message that is still TRUE. Every toast this chrome raises is `fabToastFor(state, …)` — it
  * narrates exactly one visibility and the way out of it — so the instant the visibility moves on, the
  * message is describing somewhere the user no longer is. Deriving it from the current state rather than
  * clearing it at each restore site means no path can forget: not the shortcut, not the edge handle, not the
  * restore link (which reloads the page, so no handler here runs at all), and not whichever path is added next.
  *
- * A toast belongs to a SESSION as much as to a state. An SPA can swap `sessionId` under a mounted overlay,
- * which re-resolves the visibility from the new session's storage — and when the new session happens to
- * resolve to the same state, a match on state alone kept the old session's message alive. For `hidden-url`
- * that message carries a restore URL captured from the page it was raised on, sitting behind a copy button
- * on a screen that now belongs to a different page: one tap and the user has a link back to where they
- * were, not a way out of where they are. A copy button makes that failure quieter and therefore worse —
- * nothing on screen says the address is stale.
- *
- * The identity is the session, not the URL, and the difference is which changes invalidate the message. A
- * host route change inside one session does not: the flag works on any route of that page, so the captured
- * link still restores. A session swap does: that chrome, that storage key, that exit are all somebody
- * else's now.
- *
- * Generic over the payload because the guard is about IDENTITY, not content: it decides whether a captured
- * toast still describes where the user is, and hands back whatever was captured — sentence, link, and any
- * later addition — rather than picking a field and forcing every new one through this signature.
+ * Session identity is reconciled by {@link retainFabToastForSession}; this projection also suppresses the
+ * old value synchronously during the render before React runs the state-retirement effect.
  */
 export function activeFabToast<T extends { state: FabVisibility; sessionId: string | undefined }>(
   toast: T | null | undefined,
   current: FabVisibility,
   sessionId: string | undefined
 ): T | null {
-  return toast && toast.state === current && toast.sessionId === sessionId ? toast : null
+  const retained = retainFabToastForSession(toast, sessionId)
+  return retained?.state === current ? retained : null
 }
 
 /**

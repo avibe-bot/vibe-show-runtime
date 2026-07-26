@@ -75,6 +75,7 @@ import {
   toggleFabVisibilityByShortcut,
   withParenthetical,
   stripFabParamsFromUrl,
+  retainFabToastForSession,
   activeFabToast,
   copyRestoreLink,
   toastDwellMs,
@@ -2045,8 +2046,15 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     | null
   >(null)
   const toastRaises = React.useRef(0)
-  // The ONLY thing that retires a toast. It is an effect, not a call, so the deadline cannot outlive the state
-  // it was computed from: React tears the old timer down on any change of identity OR copy state, and
+  // Session ownership is a state invariant, not only a render condition. A pending copy has no dwell timer,
+  // so leaving its old toast in state while another session is current would let it reappear indefinitely if
+  // the SPA returns. Apply the pure transition to the state owner; the render projection below suppresses the
+  // stale value during this effect's one-commit delay.
+  React.useEffect(() => {
+    setToast((prev) => retainFabToastForSession(prev, sessionId))
+  }, [sessionId])
+  // The only TIME-BASED retirement is this effect, so the deadline cannot outlive the state it was computed
+  // from: React tears the old timer down on any change of identity OR copy state, and
   // `toastDwellMs` returning null (a copy in flight) simply means no timer is set up at all. Unmount cleanup
   // is the same teardown, so it needs no separate handler.
   //

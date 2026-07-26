@@ -45,6 +45,7 @@ import {
   formatMarkUrl,
   withParenthetical,
   stripFabParamsFromSearch,
+  retainFabToastForSession,
   activeFabToast,
   copyRestoreLink,
   toastDwellMs,
@@ -1030,6 +1031,28 @@ describe("a toast narrates ONE state of ONE session, so it expires when either d
   it("is null when nothing was raised", () => {
     expect(activeFabToast(null, "visible", "ses_1")).toBeNull()
     expect(activeFabToast(undefined, "hidden-url", "ses_1")).toBeNull()
+  })
+
+  // A session mismatch is a state transition, not a render filter. In particular, `pending` has no clock:
+  // leaving it stored while another session is current lets it reappear forever when the SPA comes back.
+  it("permanently retires an in-flight toast when its session ceases to be current", () => {
+    let toast: {
+      state: "hidden-url"
+      sessionId: string
+      token: number
+      copy: ToastCopyState
+    } | null = {
+      state: "hidden-url",
+      sessionId: "ses_old",
+      token: 9,
+      copy: "pending"
+    }
+
+    toast = retainFabToastForSession(toast, "ses_new")
+    expect(toast).toBeNull()
+    // Returning while the clipboard promise is still unresolved cannot resurrect retired state.
+    toast = retainFabToastForSession(toast, "ses_old")
+    expect(toast).toBeNull()
   })
 
   // The dwell is a property of what the toast SAYS — and, for the one toast that carries an action, of how
