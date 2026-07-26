@@ -575,7 +575,7 @@ describe("standalone FAB visibility via the ?mark / ?unmark query param (Lane R1
     for (const state of ["visible", "handle", "hidden-key", "hidden-url"] as const) {
       writeStoredFabVisibility("ses_1", state, storage)
       expect(readStoredFabVisibility("ses_1", false, storage)).toBe(state)
-      expect(readStoredFabVisibility("ses_1", true, storage)).toBe(state) // platform only matters for LEGACY values
+      expect(readStoredFabVisibility("ses_1", true, storage)).toBe(state) // the device only matters for LEGACY values
     }
     expect(readStoredFabVisibility("ses_absent", false, storage)).toBeUndefined()
     expect(readStoredFabVisibility("ses_1", false, memoryStorage({ [fabVisibleStorageKey("ses_1")]: "yes" }))).toBeUndefined()
@@ -587,14 +587,24 @@ describe("standalone FAB visibility via the ?mark / ?unmark query param (Lane R1
     // Legacy truthy → visible, on either surface.
     expect(readStoredFabVisibility("ses_1", false, memoryStorage({ [key]: "1" }))).toBe("visible")
     expect(readStoredFabVisibility("ses_1", true, memoryStorage({ [key]: "1" }))).toBe("visible")
-    // Legacy falsy → the platform-appropriate equivalent: a touch user gets the tappable handle back,
-    // a keyboard user gets true-hidden (Option/Alt+M is their recovery).
+    // Legacy falsy → the hidden flavor the surface can actually recover from. The argument is touch
+    // CAPABILITY, not the primary pointer: anything with a touchscreen gets the tappable handle back;
+    // `hidden-key` is only for a device with no coarse pointer at all, where the shortcut is guaranteed.
     expect(readStoredFabVisibility("ses_1", true, memoryStorage({ [key]: "0" }))).toBe("handle")
     expect(readStoredFabVisibility("ses_1", false, memoryStorage({ [key]: "0" }))).toBe("hidden-key")
   })
 
+  it("a legacy hidden tablet driven by a mouse migrates to the handle, not to a key it cannot press", () => {
+    // The hybrid case the primary-pointer split got wrong: `any-pointer: coarse` matches (touchscreen)
+    // while `hover: none and pointer: coarse` does not (a mouse is driving). Keying the migration on the
+    // primary pointer restored `hidden-key` here — every control gone, and the promised exit a keyboard
+    // this device may not have. Capability puts the finger-reachable handle back instead.
+    const storage = memoryStorage({ [fabVisibleStorageKey("ses_1")]: "0" })
+    expect(readStoredFabVisibility("ses_1", /* touchCapable */ true, storage)).toBe("handle")
+  })
+
   it("migration does NOT rewrite storage — the same legacy value re-derives per surface on every read", () => {
-    // A phone and a laptop can share one synced profile; freezing the first reader's platform into storage
+    // A phone and a laptop can share one synced profile; freezing the first reader's device into storage
     // would strand the other. Re-deriving keeps both surfaces recoverable.
     const storage = memoryStorage({ [fabVisibleStorageKey("ses_1")]: "0" })
     expect(readStoredFabVisibility("ses_1", true, storage)).toBe("handle")
@@ -631,16 +641,33 @@ describe("standalone FAB visibility via the ?mark / ?unmark query param (Lane R1
   })
 })
 
-// The '?' popup's hide rows split by PRIMARY input, not by touch capability: a hybrid touchscreen laptop
-// has a keyboard, so it gets the desktop treatment (one destructive row, shortcut recovery, no handle).
+// The '?' popup's hide rows split by touch CAPABILITY, not by the primary pointer, because the two
+// failures are different sizes: an extra tappable row for someone with a keyboard costs one line in a
+// popup; a keyboard-only exit for someone without one costs them the page.
 describe("platform-split hide options (Lane U)", () => {
-  it("a keyboard device offers exactly ONE hide row: straight to hidden, with the shortcut as its exit", () => {
+  it("a device with no coarse pointer offers exactly ONE hide row: hidden, with the shortcut as its exit", () => {
     expect(fabHideOptions(false)).toEqual(["hidden-key"])
   })
 
-  it("a touch-primary device offers TWO rows, handle first, then a complete hide the URL can undo", () => {
-    // Not `hidden-key`: this device has no keyboard, so the row that promises one would be a dead end.
+  it("a touchscreen device offers TWO rows, handle first, then a complete hide the URL can undo", () => {
+    // Not `hidden-key`: a finger cannot press Option/Alt+M, so the row that promises one may be a dead end.
     expect(fabHideOptions(true)).toEqual(["handle", "hidden-url"])
+  })
+
+  it("a tablet driven by a mouse is a touchscreen device, whatever its primary pointer says", () => {
+    // The regression the primary-pointer split produced: `hover: none and pointer: coarse` is FALSE here
+    // (a mouse is driving), so the popup offered `hidden-key` as the ONLY row — the user taps the one hide
+    // available, every control disappears, and the promised way back is a key they may have no keyboard for.
+    // `any-pointer: coarse` is TRUE, so the tappable rows come back.
+    expect(fabHideOptions(/* touchCapable */ true)).toContain("handle")
+    expect(fabHideOptions(true)).not.toContain("hidden-key")
+  })
+
+  it("the one row that promises a key is only offered where the shortcut provably binds", () => {
+    // touch-primary ⇒ touch-capable, so !touchCapable ⇒ !touchPrimary — exactly when formatFabShortcut
+    // returns a key and the keydown listener binds. The `hidden-key` row can never name a missing key.
+    expect(fabHideOptions(false)).toEqual(["hidden-key"])
+    expect(formatFabShortcut({ platform: "macOS", touchPrimary: false })).toBeTruthy()
   })
 
   it("the printed exit is a whole URL, with the flag in the real query position", () => {
@@ -712,8 +739,8 @@ describe("hidden carries its own exit: hidden-key vs hidden-url (Lane U, owner r
   })
 
   it("each hide row advertises the exit its own state names — no shortcut/target drift possible", () => {
-    expect(fabHideOptions(false)).toEqual(["hidden-key"]) // desktop: one row, recovered by the shortcut
-    expect(fabHideOptions(true)).toEqual(["handle", "hidden-url"]) // touch keeps BOTH rows (owner ruling)
+    expect(fabHideOptions(false)).toEqual(["hidden-key"]) // no touchscreen: one row, recovered by the shortcut
+    expect(fabHideOptions(true)).toEqual(["handle", "hidden-url"]) // touchscreen keeps BOTH rows (owner ruling)
   })
 
   it("the shortcut's own hide records the shortcut as its exit", () => {
@@ -966,21 +993,34 @@ describe("the rewrite edits the SEARCH and hands the fragment back byte-for-byte
   })
 })
 
-describe("a toast narrates ONE state, so it expires when that state does (Lane U, round 9)", () => {
+describe("a toast narrates ONE state of ONE session, so it expires when either does (Lane U, round 9)", () => {
   // Every toast here is fabToastFor(state, …) — it describes exactly one visibility. Deriving the visible
   // message from the current state means no restore path can forget to clear it: not the shortcut, not the
   // handle, not the restore link (which reloads the page outright), and not whichever path gets added next.
   it("shows the message only while the state it describes is still the current one", () => {
-    const raised = { message: "已完全隐藏，保存此链接恢复：https://h/p/x?mark", state: "hidden-url" as const }
-    expect(activeFabToast(raised, "hidden-url")).toBe(raised.message)
-    expect(activeFabToast(raised, "visible")).toBeNull()
+    const raised = { message: "已完全隐藏，保存此链接恢复：https://h/p/x?mark", state: "hidden-url" as const, sessionId: "ses_1" }
+    expect(activeFabToast(raised, "hidden-url", "ses_1")).toBe(raised.message)
+    expect(activeFabToast(raised, "visible", "ses_1")).toBeNull()
     // A mid-session device degrade moves hidden-key → handle; the old exit is wrong there too.
-    expect(activeFabToast({ message: "按 Option+M 恢复", state: "hidden-key" }, "handle")).toBeNull()
+    expect(activeFabToast({ message: "按 Option+M 恢复", state: "hidden-key", sessionId: "ses_1" }, "handle", "ses_1")).toBeNull()
+  })
+
+  it("retires when the SESSION changes under a mounted overlay, even at the identical state", () => {
+    // An SPA can swap `sessionId` without unmounting. The new session resolves independently and can land
+    // on the same state, so a state-only match kept the previous session's message alive — and for
+    // `hidden-url` that message is a whole restore URL for the page the user just left, sitting there as
+    // the only thing on screen. The identity is the SESSION: a host route change inside one session does
+    // not invalidate the link, a session swap does.
+    const raised = { message: "已完全隐藏，保存此链接恢复：https://h/p/OLD?mark", state: "hidden-url" as const, sessionId: "ses_old" }
+    expect(activeFabToast(raised, "hidden-url", "ses_new")).toBeNull()
+    expect(activeFabToast(raised, "hidden-url", undefined)).toBeNull()
+    // …and a session-less overlay (no sessionId at all) still matches itself.
+    expect(activeFabToast({ ...raised, sessionId: undefined }, "hidden-url", undefined)).toBe(raised.message)
   })
 
   it("is null when nothing was raised", () => {
-    expect(activeFabToast(null, "visible")).toBeNull()
-    expect(activeFabToast(undefined, "hidden-url")).toBeNull()
+    expect(activeFabToast(null, "visible", "ses_1")).toBeNull()
+    expect(activeFabToast(undefined, "hidden-url", "ses_1")).toBeNull()
   })
 
   // The dwell is a property of what the toast SAYS. Every other one confirms a transition whose way back is

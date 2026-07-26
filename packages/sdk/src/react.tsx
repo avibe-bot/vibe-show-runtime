@@ -1478,8 +1478,10 @@ export function fabHideRowLabel(
 ): string {
   if (target === "handle") return withParenthetical(labels.hideToHandleAction, labels.hideToHandleHint)
   if (target === "hidden-url") return withParenthetical(labels.hideCompletelyAction, labels.hideCompletelyHint)
-  // `hidden-key` is offered only where a shortcut exists (fabHideOptions splits on the same input); the
-  // fallback keeps the row honest rather than naming a key this device cannot produce.
+  // `hidden-key` is only OFFERED where a shortcut exists: fabHideOptions gives that row to devices with no
+  // coarse pointer, and touch-primary implies touch-capable, so no-coarse-pointer implies not-touch-primary
+  // — the condition under which formatFabShortcut returns a key. It can still be REACHED elsewhere, by an
+  // actual keypress on a hybrid; the fallback keeps the row honest rather than naming a key it cannot produce.
   return shortcut
     ? withParenthetical(labels.hideAction, labels.hideActionHint(shortcut))
     : withParenthetical(labels.hideCompletelyAction, labels.hideCompletelyHint)
@@ -1533,28 +1535,31 @@ function currentHref(): string {
 function useFabVisibility(
   host: AnnotationHost,
   sessionId: string | undefined,
-  touchPrimary: boolean,
+  device: { touchPrimary: boolean; touchCapable: boolean },
   available: boolean
 ) {
   const storage = React.useMemo(() => safeLocalStorage(), [])
-  // `touchPrimary` decides which hidden flavor a LEGACY boolean migrates to and whether a `hidden-key`
-  // state has the keyboard it promises, so it is read fresh rather than tracked: re-resolving the whole URL
-  // on a media-query flip would stomp a choice the user just made. The device rule below is the one part
-  // that DOES follow a live flip, and it lives in its own effect for exactly that reason.
-  const touchPrimaryRef = React.useRef(touchPrimary)
-  touchPrimaryRef.current = touchPrimary
+  // Two different device facts, because the two questions have different answers on a hybrid. `touchCapable`
+  // ("is there a touchscreen at all") picks which hidden flavor a LEGACY boolean migrates to, matching the
+  // popup rows this device is offered. `touchPrimary` ("is touch the only input") decides whether a
+  // `hidden-key` state has the keyboard it promises, because that is the same condition under which the
+  // shortcut listener binds. Both are read fresh rather than tracked: re-resolving the whole URL on a
+  // media-query flip would stomp a choice the user just made. The device rule below is the one part that
+  // DOES follow a live flip, and it lives in its own effect for exactly that reason.
+  const deviceRef = React.useRef(device)
+  deviceRef.current = device
   const [visibility, setVisibility] = React.useState<FabVisibility>(() => {
     if (host !== "standalone" || typeof window === "undefined") return "visible"
     const resolved = resolveFabVisibility(
       window.location.search,
-      readStoredFabVisibility(sessionId, touchPrimary, storage),
+      readStoredFabVisibility(sessionId, device.touchCapable, storage),
       available
     )
     // Silently, before the first paint: a `hidden-key` restored onto a keyboardless device would render
     // nothing with no way back. Derived at read and never written back (like the legacy migration above), so
     // the same profile opened on the laptop again still finds its `hidden-key`. A `hidden-url` passes
     // through untouched — its exit is in the address bar, which every device has.
-    return fabVisibilityForDevice(resolved.visibility, !touchPrimary)
+    return fabVisibilityForDevice(resolved.visibility, !device.touchPrimary)
   })
   // Apply the `?mark` / `?unmark` switch: adopt it, persist the choice, then STRIP the flag via replaceState
   // so the URL returns clean.
@@ -1567,10 +1572,10 @@ function useFabVisibility(
     if (host !== "standalone" || typeof window === "undefined") return
     const resolved = resolveFabVisibility(
       window.location.search,
-      readStoredFabVisibility(sessionId, touchPrimaryRef.current, storage),
+      readStoredFabVisibility(sessionId, deviceRef.current.touchCapable, storage),
       available
     )
-    setVisibility(fabVisibilityForDevice(resolved.visibility, !touchPrimaryRef.current))
+    setVisibility(fabVisibilityForDevice(resolved.visibility, !deviceRef.current.touchPrimary))
     if (resolved.persist === null) return
     // Strip the one-time flag ONLY once the choice is durable: if the write failed (no storage / quota),
     // leave `?mark`/`?unmark` in the URL so a reload still carries the intent instead of silently reverting.
@@ -1879,36 +1884,43 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // No "Esc" wording on touch devices (no hardware Esc); the exit affordance is always tappable. Keyed
   // on input capability, not layout, so a narrow desktop window still shows the clickable "Esc" label.
   const exitLabel = touchInput ? labels.exitShort : labels.exit
+  const touchCapable = useTouchCapable() // any-pointer:coarse → there is a touchscreen, whatever drives it now
   // Hooks must be unconditional (called before the host/availability early returns below) — which is why
   // `available` is passed IN rather than guarding the call: the early return sits underneath these lines.
-  const fabVisibility = useFabVisibility(host, sessionId, touchInput, available)
+  const fabVisibility = useFabVisibility(host, sessionId, { touchPrimary: touchInput, touchCapable }, available)
   // ONE draggable instance for the FAB and the edge handle it collapses to: two instances over the same
   // storage key would each hold their own state, so dragging the handle would leave the FAB's placement
   // stale and the restored FAB would reappear at the old spot.
   const fabDrag = useDraggable("fab", sessionId, 52) // FAB is 52px tall
-  const touchCapable = useTouchCapable() // any-pointer:coarse → enlarge the edge-handle hit box even on hybrids
-  // How this device recovers a fully hidden chrome. `undefined` on touch-primary (no keyboard) — which is
-  // also exactly when the '?' popup offers the handle row, so the two stay consistent by construction.
+  // How this device recovers a fully hidden chrome. `undefined` on touch-primary (no keyboard), which is
+  // also exactly when the shortcut's document listener declines to bind.
   const shortcut = React.useMemo(() => formatFabShortcut({ touchPrimary: touchInput }), [touchInput])
   // The '?' popup's hide rows: the platform's targets, each composed from the TARGET STATE by
   // fabHideRowLabel. Row copy and row behavior now read the same fact — the state names its own exit — so
   // they cannot drift. Finished strings, because no row names a URL any more: the full-hide row promises the
   // restore link rather than printing one, so nothing here depends on when it is read.
+  //
+  // Keyed on CAPABILITY, not on the primary pointer: a tablet driven by a mouse has no keyboard to press,
+  // so a primary-pointer split offered it `hidden-key` as its only row — see fabHideOptions.
   const hideOptions = React.useMemo(
-    () => fabHideOptions(touchInput).map((target) => ({ target, label: fabHideRowLabel(target, shortcut, labels) })),
-    [touchInput, shortcut, labels]
+    () => fabHideOptions(touchCapable).map((target) => ({ target, label: fabHideRowLabel(target, shortcut, labels) })),
+    [touchCapable, shortcut, labels]
   )
-  const [toast, setToast] = React.useState<{ message: string; state: FabVisibility } | null>(null)
+  // The toast carries the SESSION it was raised for, not just the state. An SPA can swap `sessionId` under a
+  // mounted overlay; if the new session resolves to the same state, a match on state alone would keep the old
+  // session's message on screen — and for `hidden-url` that message is a whole restore URL pointing at the
+  // page the user just left. See activeFabToast.
+  const [toast, setToast] = React.useState<{ message: string; state: FabVisibility; sessionId: string | undefined } | null>(null)
   const toastTimer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   React.useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
   const flashToast = React.useCallback((message: string, state: FabVisibility) => {
-    setToast({ message, state })
+    setToast({ message, state, sessionId })
     if (toastTimer.current) clearTimeout(toastTimer.current)
     // How long it stays is a property of WHAT IT SAYS — see fabToastDurationMs. Most of these confirm
     // something and vanish; the `hidden-url` one carries the only copy of the way back, so it dwells long
     // enough to be selected and copied.
     toastTimer.current = setTimeout(() => setToast(null), fabToastDurationMs(state))
-  }, [])
+  }, [sessionId])
   // Hiding and restoring the FAB both swap the control the user is on (toolbar/FAB ⇄ edge handle); on either
   // user-initiated swap the successor claims focus via this one controller, so a keyboard user is never dropped
   // on <body>. chromeFocusRef is the shared callback ref both the handle and the restored FAB attach.
@@ -1985,11 +1997,11 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     return () => document.removeEventListener("keydown", onKeyDown)
   }, [host, shortcut, available, fabVisibility.visibility, hideFab, restoreFab])
 
-  // A hide toast outlives the action that raised it and narrates ONE state ("已隐藏，…恢复"). Whoever moves the
-  // user out of that state makes it a lie — the shortcut, the edge handle, a `sessionId` swap into a session
-  // stored visible. Deriving the live message from the current state retires the stale one everywhere at
+  // A hide toast outlives the action that raised it and narrates ONE state of ONE session ("已隐藏，…恢复").
+  // Whoever moves the user out of that state makes it a lie — the shortcut, the edge handle, a `sessionId`
+  // swap. Deriving the live message from the current state AND session retires the stale one everywhere at
   // once, rather than asking each of those paths to remember to clear it.
-  const statusToast = activeFabToast(toast, fabVisibility.visibility)
+  const statusToast = activeFabToast(toast, fabVisibility.visibility, sessionId)
 
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a

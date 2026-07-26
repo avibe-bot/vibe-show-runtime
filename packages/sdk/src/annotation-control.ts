@@ -240,12 +240,25 @@ function readFabFlag(flags: Set<string>): FabVisibility | undefined {
  * message is describing somewhere the user no longer is. Deriving it from the current state rather than
  * clearing it at each restore site means no path can forget: not the shortcut, not the edge handle, not the
  * restore link (which reloads the page, so no handler here runs at all), and not whichever path is added next.
+ *
+ * A toast belongs to a SESSION as much as to a state. An SPA can swap `sessionId` under a mounted overlay,
+ * which re-resolves the visibility from the new session's storage — and when the new session happens to
+ * resolve to the same state, a match on state alone kept the old session's message alive. For `hidden-url`
+ * that message is a whole restore URL, captured from the page it was raised on, sitting for fifteen seconds
+ * as the only thing on a screen that now belongs to a different page: the user copies a link back to where
+ * they were, not a way out of where they are.
+ *
+ * The identity is the session, not the URL, and the difference is which changes invalidate the message. A
+ * host route change inside one session does not: the flag works on any route of that page, so the printed
+ * link still restores. A session swap does: that chrome, that storage key, that exit are all somebody
+ * else's now.
  */
 export function activeFabToast(
-  toast: { message: string; state: FabVisibility } | null | undefined,
-  current: FabVisibility
+  toast: { message: string; state: FabVisibility; sessionId: string | undefined } | null | undefined,
+  current: FabVisibility,
+  sessionId: string | undefined
 ): string | null {
-  return toast && toast.state === current ? toast.message : null
+  return toast && toast.state === current && toast.sessionId === sessionId ? toast.message : null
 }
 
 /**
@@ -304,19 +317,22 @@ export function resolveFabVisibility(
  * Read the persisted visibility, migrating every earlier vocabulary under the same key toward an exit THIS
  * surface can actually use.
  *
- * Legacy `"1"` → `visible`. Legacy `"0"` → the hidden flavor this surface can recover from: `handle` when
- * the primary input is touch (tap the grabber), `hidden-key` on a keyboard device (Option/Alt+M). Legacy
- * `"hidden"` (written by early builds of this branch, before the flavor split) → `hidden-key`: the exit it
- * was told is unknowable, so we take the conservative branch, because `hidden-key` is the one that
- * {@link fabVisibilityForDevice} will rescue on a keyboardless device. Undoing one unreleased build's state
- * beats leaving somebody on a blank screen.
+ * Legacy `"1"` → `visible`. Legacy `"0"` → the hidden flavor this surface can recover from: `handle`
+ * wherever a touchscreen exists (tap the grabber), `hidden-key` only on a device with no coarse pointer at
+ * all. `touchCapable`, not touch-primary, for the reason spelled out on {@link fabHideOptions}: a tablet
+ * driven by a mouse reports a fine primary pointer and may still have no keyboard, so migrating its old
+ * `"0"` to `hidden-key` would hand it a promise it cannot keep — and unlike the popup row, this one it never
+ * agreed to. Legacy `"hidden"` (written by early builds of this branch, before the flavor split) →
+ * `hidden-key`: the exit it was told is unknowable, so we take the branch {@link fabVisibilityForDevice}
+ * rescues on a keyboardless device. Undoing one unreleased build's state beats leaving somebody on a blank
+ * screen.
  *
  * The migration is derived at READ time and never written back, so one synced profile opened on a phone and
  * on a laptop leaves each surface with a working recovery path instead of freezing the first reader's guess.
  */
 export function readStoredFabVisibility(
   sessionId: string | undefined,
-  touchPrimary: boolean,
+  touchCapable: boolean,
   storage: AnnotationModeStorage | undefined = safeLocalStorage()
 ): FabVisibility | undefined {
   if (!storage) return undefined
@@ -324,7 +340,7 @@ export function readStoredFabVisibility(
     const value = storage.getItem(fabVisibleStorageKey(sessionId))
     if (FAB_VISIBILITIES.includes(value as FabVisibility)) return value as FabVisibility
     if (value === "1") return "visible"
-    if (value === "0") return touchPrimary ? "handle" : "hidden-key"
+    if (value === "0") return touchCapable ? "handle" : "hidden-key"
     if (value === "hidden") return "hidden-key" // pre-split builds of this branch; see the doc comment
     return undefined
   } catch {
@@ -360,13 +376,21 @@ export type FabHideTarget = Exclude<FabVisibility, "visible">
  * The hide targets the '?' popup offers, in row order — each one named for the exit it promises, so the row
  * the user reads and the state it produces cannot drift apart.
  *
- * Split by PRIMARY input, not touch capability: a hybrid touchscreen laptop has a keyboard, so it gets the
- * desktop treatment — one row straight to `hidden-key`, recoverable by the shortcut. A touch-primary device
- * has no keyboard, so its full hide is `hidden-url`, whose exit works everywhere; it also gets the edge
- * handle, the only recovery that costs a single tap.
+ * Split by touch CAPABILITY (`any-pointer: coarse`), not by the primary pointer, because the two failures
+ * are not the same size. Offering a tappable exit to someone holding a keyboard costs one extra row in a
+ * popup. Offering a keyboard exit to someone without one costs them the page. A tablet paired with a mouse
+ * or stylus reports a fine primary pointer and no hover, so a primary-input split handed it `hidden-key` as
+ * its ONLY row: every control gone, and the promised way back a key it has no way to press. Capability puts
+ * the finger-reachable rows wherever a finger exists and never withholds them on a guess.
+ *
+ * So: a touchscreen device — phone, tablet, or hybrid laptop — gets the edge handle (the only recovery that
+ * costs a single tap) and `hidden-url`, whose exit is a fragment anyone can type. A device with no coarse
+ * pointer at all gets one row straight to `hidden-key`. That branch is safe by construction: touch-primary
+ * implies touch-capable, so `!touchCapable` implies `!touchPrimary`, which is exactly the condition under
+ * which the shortcut listener binds — {@link formatFabShortcut} always has a real key to name in that row.
  */
-export function fabHideOptions(touchPrimary: boolean): FabHideTarget[] {
-  return touchPrimary ? ["handle", "hidden-url"] : ["hidden-key"]
+export function fabHideOptions(touchCapable: boolean): FabHideTarget[] {
+  return touchCapable ? ["handle", "hidden-url"] : ["hidden-key"]
 }
 
 /**

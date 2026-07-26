@@ -49,16 +49,16 @@ describe("hide copy names each recovery exactly once, in the row that performs i
     expect(tip).toBe("点选元素或截图，把意见直接发给 Agent")
   })
 
-  it("desktop gets ONE destructive row naming the platform shortcut — and no handle option", () => {
-    const options = fabHideOptions(false)
-    expect(options).toEqual(["hidden-key"]) // desktop cannot CREATE a handle state
+  it("a screen with no touch gets ONE destructive row naming the platform shortcut — and no handle option", () => {
+    const options = fabHideOptions(false) // no coarse pointer anywhere on this device
+    expect(options).toEqual(["hidden-key"]) // a mouse-only screen cannot CREATE a handle state
 
     expect(hideRowLabel("hidden-key", formatFabShortcut({ platform: "macOS" }))).toBe("隐藏标注按钮（按 Option+M 恢复）")
     expect(hideRowLabel("hidden-key", formatFabShortcut({ platform: "Windows" }))).toBe("隐藏标注按钮（按 Alt+M 恢复）")
   })
 
-  it("touch gets TWO rows, handle first, neither mentioning a keyboard it does not have", () => {
-    const options = fabHideOptions(true)
+  it("a touchscreen gets TWO rows, handle first, neither mentioning a keyboard it may not have", () => {
+    const options = fabHideOptions(true) // any-pointer:coarse — phone, tablet, or hybrid laptop
     expect(options).toEqual(["handle", "hidden-url"]) // order is the rendered order
 
     const shortcut = formatFabShortcut({ platform: "iPhone", touchPrimary: true }) // undefined
