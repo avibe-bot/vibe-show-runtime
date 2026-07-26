@@ -212,17 +212,33 @@ function presentFabFlags(query: string | undefined, bareOnly: boolean): Set<stri
 }
 
 /**
- * The flag a single query segment carries, if any. When BOTH are present the RESCUE wins.
+ * Every flag this URL carries, across BOTH segments one can legitimately land in — the search (tolerant, the
+ * names were ours before the flavor split) and the hash's own query (bare presence only, because that segment
+ * belongs to the host's router). One set, so nothing downstream has to know there were ever two places.
+ */
+function urlFabFlags(url: FabParamUrl): Set<string> {
+  const flags = presentFabFlags(url.search, false)
+  for (const flag of presentFabFlags(splitHash(url.hash).query, true)) flags.add(flag)
+  return flags
+}
+
+/**
+ * The flag a set carries, if any. When BOTH are present the RESCUE wins.
  *
  * That precedence is the opposite of what it was, and deliberately so. Both flags coexist in exactly one
  * situation: the persistence write failed, so we left `?unmark` in the URL as the reload fallback, and the
- * user then followed the printed exit and appended `mark` to that same tail. If `unmark` still outranked it,
- * the advertised way back would be unreachable for the one state whose entire promise is that its exit
- * always works — this PR's own defect, re-entered through the back door. Being wrongly visible costs a
- * second hide; being wrongly hidden with your rescue outranked is the blank screen we exist to prevent.
+ * user then followed the printed exit and appended `mark`. If `unmark` still outranked it, the advertised way
+ * back would be unreachable for the one state whose entire promise is that its exit always works — this PR's
+ * own defect, re-entered through the back door. Being wrongly visible costs a second hide; being wrongly
+ * hidden with your rescue outranked is the blank screen we exist to prevent.
+ *
+ * It takes a SET rather than a segment, so that argument decides the case it was made for. Ruling on one
+ * segment at a time and then ranking the segments meant `/page?unmark#/route?mark` — a page linked with
+ * `unmark`, a failed write, and then the exact append the copy prints, since "the end of the address bar" is
+ * the hash on a hash-routed page — still resolved to `hidden`: rescue-wins twice, over nothing, and then a
+ * coin-flip between segments overrode both. The segment a flag landed in was never part of the argument.
  */
-function readFabFlag(query: string | undefined, bareOnly: boolean): FabVisibility | undefined {
-  const flags = presentFabFlags(query, bareOnly)
+function readFabFlag(flags: Set<string>): FabVisibility | undefined {
   if (flags.has(ANNOTATION_FAB_PARAM_SHOW)) return "visible"
   // `?unmark` → `hidden-url`, never `hidden-key`: whoever typed this flag already holds the URL vocabulary,
   // so the URL is demonstrably an exit they can use — and unlike the shortcut it works on every device.
@@ -241,9 +257,7 @@ function readFabFlag(query: string | undefined, bareOnly: boolean): FabVisibilit
  * `?unmark` → `?unmark&mark` is genuinely a new one.
  */
 export function fabFlagToken(url: FabParamUrl): string {
-  const flags = presentFabFlags(url.search, false)
-  for (const flag of presentFabFlags(splitHash(url.hash).query, true)) flags.add(flag)
-  return [...flags].sort().join("+")
+  return [...urlFabFlags(url)].sort().join("+")
 }
 
 /**
@@ -292,9 +306,10 @@ export function activeFabToast(
  * lands: on a hash-routed page (`/p/x#/route`, the ordinary Show Page shape) `location.search` is empty and an
  * appended `?mark` becomes part of the hash. Looking in one place only would strand `hidden` — the single
  * state with neither an on-screen handle nor a guaranteed keyboard shortcut — on whichever shape wasn't
- * checked. Both segments go through the same `URLSearchParams` parse, so reading twice widens WHERE we look
- * without widening WHAT counts. The search wins when the two disagree: a fixed priority, pinned by a test,
- * rather than an accident of evaluation order.
+ * checked. They are read as ONE set ({@link urlFabFlags}), the same set {@link fabFlagToken} builds its
+ * identity from, so the two cannot disagree about what a URL carries; the rescue-wins ruling in
+ * {@link readFabFlag} then decides once, over everything present, rather than per segment and then again
+ * between segments.
  *
  * Pure; the caller reads `location`, persists, and strips the flag from whichever segment held it.
  */
@@ -302,7 +317,7 @@ export function resolveFabVisibility(
   url: FabParamUrl,
   stored: FabVisibility | undefined
 ): { visibility: FabVisibility; persist: FabVisibility | null } {
-  const flag = readFabFlag(url.search, false) ?? readFabFlag(splitHash(url.hash).query, true)
+  const flag = readFabFlag(urlFabFlags(url))
   if (flag) return { visibility: flag, persist: flag }
   return { visibility: stored ?? "visible", persist: null }
 }

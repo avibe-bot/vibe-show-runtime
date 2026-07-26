@@ -1628,9 +1628,17 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
       }
     }
     const onNavigate = () => apply(true)
-    apply(false)
+    // SUBSCRIBE FIRST, then read. The boot pass ends by re-issuing the events `replaceState` withheld, and we
+    // are one of the subscribers that has to hear them: it is the clean pass that erases the memo. Registering
+    // afterwards made the very first pass the one case that never got its own clearing edge — so a page opened
+    // AT `#/route?mark` (the printed recovery, followed with a reload) left the memo holding `mark` for the
+    // rest of the session, and the user's next `?mark` matched a spent token and was swallowed. The fix is not
+    // to clear the memo here as a special case; it is that there is no special case — every pass, boot
+    // included, now observes the same sequence the tests already pin. The re-entry is bounded: the flag is
+    // gone by then, so the second pass persists nothing, rewrites nothing, and dispatches nothing.
     window.addEventListener("hashchange", onNavigate)
     window.addEventListener("popstate", onNavigate)
+    apply(false)
     return () => {
       window.removeEventListener("hashchange", onNavigate)
       window.removeEventListener("popstate", onNavigate)
@@ -2011,8 +2019,13 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // while the user is typing or holding another modifier. Bound only where a shortcut EXISTS — a touch-primary
   // device has no keyboard, and its copy never mentions one, so there is nothing to listen for. It also
   // rescues a `handle` state (created on a phone, opened here) straight back to visible.
+  //
+  // `available` gates it for the same reason the render does: a visitor who cannot annotate has no chrome, so
+  // the shortcut has nothing to toggle. Unbound rather than harmless — it wrote `hidden-key` to storage and
+  // raised a toast, which is annotation UI shown to someone the owner ruled should see none, and it left a
+  // hidden state behind for the author's next authenticated visit.
   React.useEffect(() => {
-    if (host !== "standalone" || typeof document === "undefined" || !shortcut) return
+    if (host !== "standalone" || typeof document === "undefined" || !shortcut || !available) return
     function onKeyDown(event: KeyboardEvent) {
       if (!shouldToggleFabShortcut(event, event.target)) return
       event.preventDefault()
@@ -2022,7 +2035,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     }
     document.addEventListener("keydown", onKeyDown)
     return () => document.removeEventListener("keydown", onKeyDown)
-  }, [host, shortcut, fabVisibility.visibility, hideFab, restoreFab])
+  }, [host, shortcut, available, fabVisibility.visibility, hideFab, restoreFab])
 
   // A hide toast is on screen for 3.2s and narrates ONE state ("已隐藏，…恢复"). Whoever moves the user out of
   // that state makes it a lie — including the paths with no handler to clear it from: a `?mark` typed into the
@@ -2045,6 +2058,15 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     )
   }
 
+  // Standalone tab: an anonymous public visitor can't write. Annotation is an author's tool, so a visitor
+  // has no reason to learn it exists — render nothing at all, not an empty box (owner ruling, 2026-07-26).
+  //
+  // FIRST, above every visibility branch, because "nothing at all" has to mean nothing: below this line sits
+  // the hidden-state branch, which still renders a toast on purpose, and that toast is annotation UI. One gate
+  // for the whole component beats one guard per branch that renders something — the next branch added inherits
+  // it instead of needing to remember.
+  if (!available) return null
+
   // The ?unmark / hide-row switch gates ALL standalone chrome — the collapsed FAB and the expanded toolbar
   // alike — so it hides everything, not just the FAB (#3637621031 / #3637478399); the disable effect above
   // stops capture too. The toast still renders so the confirmation shows even after the chrome is gone.
@@ -2054,19 +2076,13 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     // screen — they differ only in the exit they promise, never in pixels (see isFabHidden).
     return (
       <>
-        {host === "standalone" && available && fabVisibility.visibility === "handle" ? (
-          // Only when the viewer can actually annotate — an anonymous viewer has no chrome at all, so a
-          // recovery handle there would restore to nothing.
+        {fabVisibility.visibility === "handle" ? (
           <FabEdgeHandle label={labels.restoreHandle} drag={fabDrag} touchCapable={touchCapable} claimFocus={claimFocus} onRestore={restoreFab} />
         ) : null}
         {statusToast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{statusToast}</div> : null}
       </>
     )
   }
-
-  // Standalone tab: an anonymous public visitor can't write. Annotation is an author's tool, so a visitor
-  // has no reason to learn it exists — render nothing at all, not an empty box (owner ruling, 2026-07-26).
-  if (!available) return null
 
   // Standalone chrome (visible + available). The collapsed FAB is the draggable form; enabling expands
   // the toolbar, which reuses the FAB's edge placement.

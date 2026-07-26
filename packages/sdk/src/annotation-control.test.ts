@@ -543,21 +543,50 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
     expect(resolveFabVisibility({ hash: "#/route?foo=mark" }, "hidden-url")).toEqual({ visibility: "hidden-url", persist: null })
   })
 
-  // Two places can disagree; that has to be a decision, not an accident of evaluation order.
-  it("when both places carry a flag, the SEARCH wins — a fixed, explicitly tested priority", () => {
+  // Two places can disagree; that has to be a decision, not an accident of evaluation order. The decision is
+  // the SAME one round 8 made inside a single segment — the rescue wins — because the argument for it never
+  // mentioned segments: being wrongly visible costs a second hide, being wrongly hidden with your rescue
+  // outranked is the blank screen this whole state exists to avoid. It replaces an earlier "the search wins",
+  // which was a coin-flip dressed as a priority, and which made the ONE URL that can carry both a dead end.
+  it("when the two places disagree, the RESCUE wins — the same rule, now indifferent to which segment holds it", () => {
+    // The reachable shape, and the whole reason this changed: a host links `/page?unmark`, the persistence
+    // write fails, so the flag deliberately stays in the search as the reload fallback. The user is now
+    // `hidden-url` and is told to append `?mark` at the end — which on a hash-routed page lands in the hash.
+    // Under search-first, the only exit we advertise for the one state with no other exit was outranked.
     expect(resolveFabVisibility({ search: "?unmark", hash: "#/route?mark" }, undefined)).toEqual({
-      visibility: "hidden-url",
-      persist: "hidden-url",
+      visibility: "visible",
+      persist: "visible",
     })
     expect(resolveFabVisibility({ search: "?mark", hash: "#/route?unmark" }, undefined)).toEqual({
       visibility: "visible",
       persist: "visible",
+    })
+    // Agreement is unaffected, in either direction.
+    expect(resolveFabVisibility({ search: "?unmark", hash: "#/route?unmark" }, undefined)).toEqual({
+      visibility: "hidden-url",
+      persist: "hidden-url",
     })
     // Only a flag outranks the hash — an unrelated search param does not suppress it.
     expect(resolveFabVisibility({ search: "?foo=1", hash: "#/route?unmark" }, undefined)).toEqual({
       visibility: "hidden-url",
       persist: "hidden-url",
     })
+    // The hash stays bare-only wherever it is read: a host's `#/review?mark=42` is a row id, not our switch,
+    // so it cannot rescue across segments either. Same predicate, one place, both readers.
+    expect(resolveFabVisibility({ search: "?unmark", hash: "#/review?mark=42" }, undefined)).toEqual({
+      visibility: "hidden-url",
+      persist: "hidden-url",
+    })
+  })
+
+  // `fabFlagToken` (the "have I answered this occurrence" identity) already unions both segments. When
+  // `resolveFabVisibility` read them in priority order instead, one URL had two readings: the identity said
+  // "search+hash, a new occurrence", the resolver said "search, hidden". Both now go through the same set, so
+  // what we remember and what we decide cannot come apart — the same closure the formatter got in round 11.
+  it("the identity and the decision read the SAME flag set, so one URL cannot have two readings", () => {
+    const url = { search: "?unmark", hash: "#/route?mark" }
+    expect(fabFlagToken(url)).toBe("mark+unmark") // both, order-independent
+    expect(resolveFabVisibility(url, undefined).visibility).toBe("visible") // and the rescue in it wins
   })
 
   it("no param honors the stored state (including 'handle'), else defaults visible, persisting nothing new", () => {
@@ -987,8 +1016,12 @@ describe("a stale URL flag must not outlive the choice it recorded (Lane U, roun
     expect(resolveFabVisibility({ hash: "#/r?unmark&mark" }, undefined).visibility).toBe("visible")
   })
 
-  it("still gives the SEARCH the last word across segments — that precedence is unchanged", () => {
-    expect(resolveFabVisibility({ search: "?unmark", hash: "#/r?mark" }, undefined).visibility).toBe("hidden-url")
+  // Round 8 applied that ruling INSIDE a segment and left "the search wins" standing between segments, which
+  // is where it did the least good: `?unmark&mark` in one tail is a shape nothing produces, while
+  // `/page?unmark#/route?mark` is what the printed copy actually makes a hash-routed reader type. Same rule,
+  // now over the union — see the resolver's own test above.
+  it("and wins across segments too, since the argument for it never mentioned segments", () => {
+    expect(resolveFabVisibility({ search: "?unmark", hash: "#/r?mark" }, undefined).visibility).toBe("visible")
   })
 
   it("tokenizes what the URL carries, so 'unmark' and 'unmark then mark' are different occurrences", () => {
