@@ -281,10 +281,14 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   hideToHandleAction: "隐藏至把手",
   hideToHandleHint: "点把手可恢复",
   hideCompletelyAction: "完全隐藏",
-  hideCompletelyHint: "网址加 ?mark 恢复",
+  // Names the PARAMETER, not a separator: a page that already has a query string turns a literal "?mark"
+  // into `?foo=1?mark`, which URLSearchParams reads as one `foo` value — no `mark` key, so the stored
+  // `hidden` survives the reload. This is the one hide with no handle and no shortcut, so a hint that only
+  // works on a clean URL is a dead end.
+  hideCompletelyHint: "网址加 mark 参数恢复",
   hiddenShortcutToast: (shortcut) => `已隐藏，按 ${shortcut} 恢复`,
   handleToast: "已缩至边缘把手，轻点可恢复",
-  hiddenToast: "已完全隐藏，网址加 ?mark 可恢复",
+  hiddenToast: "已完全隐藏，网址加 mark 参数可恢复",
   helpTrigger: "帮助"
 }
 
@@ -1806,6 +1810,13 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     if (toastTimer.current) clearTimeout(toastTimer.current)
     toastTimer.current = setTimeout(() => setToast(null), 3200)
   }, [])
+  // Drop a toast BEFORE its timer: every toast here narrates the hidden state ("已隐藏，按 …恢复"), so once
+  // the user leaves that state the message is describing somewhere they no longer are.
+  const clearToast = React.useCallback(() => {
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = undefined
+    setToast(null)
+  }, [])
   // Hiding and restoring the FAB both swap the control the user is on (toolbar/FAB ⇄ edge handle); on either
   // user-initiated swap the successor claims focus via this one controller, so a keyboard user is never dropped
   // on <body>. chromeFocusRef is the shared callback ref both the handle and the restored FAB attach.
@@ -1815,7 +1826,12 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // nothing is left capturing, and arms focus for whichever control takes over.
   const hideFab = React.useCallback(
     (next: "handle" | "hidden") => {
-      requestChromeFocus()
+      // Arm focus ONLY for `handle`, the one target that mounts a successor to receive it. `hidden` renders
+      // nothing, so a request armed here would stay pending indefinitely and be consumed by the next
+      // unrelated mount — an SPA swapping `sessionId` to a session stored `visible` would steal focus, and a
+      // session stored `handle` would even pulse, for something the user never did. An actual restoration
+      // arms its own request in restoreFab.
+      if (next === "handle") requestChromeFocus()
       onDisable?.()
       fabVisibility.set(next)
       const message =
@@ -1827,8 +1843,12 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // Restore the FAB (edge-handle tap/Enter, or the shortcut): arm focus so the re-rendered FAB — not <body> — receives it.
   const restoreFab = React.useCallback(() => {
     requestChromeFocus()
+    // A hide toast can still be on screen (3.2s) when the user restores — via the shortcut pressed twice, or
+    // a handle tap right after collapsing. Restoring no longer flashes its own toast, so nothing would
+    // replace that stale "已隐藏…" status; clear it here instead of letting the timer narrate the past.
+    clearToast()
     fabVisibility.set("visible")
-  }, [requestChromeFocus, fabVisibility])
+  }, [requestChromeFocus, clearToast, fabVisibility])
   // If ?unmark applies (or a hide row fires) WHILE a session is active, the hide switch must also stop
   // capture — not just hide the collapsed FAB — so the documented switch works mid-session (#3637478399).
   React.useEffect(() => {

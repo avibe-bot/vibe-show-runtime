@@ -48,11 +48,27 @@ describe("hide copy names each recovery exactly once, in the row that performs i
 
     const shortcut = formatFabShortcut({ platform: "iPhone", touchPrimary: true }) // undefined
     const rows = options.map((target) => hideRowLabel(target, shortcut))
-    expect(rows).toEqual(["隐藏至把手（点把手可恢复）", "完全隐藏（网址加 ?mark 恢复）"])
+    expect(rows).toEqual(["隐藏至把手（点把手可恢复）", "完全隐藏（网址加 mark 参数恢复）"])
     for (const row of rows) {
       expect(row).not.toContain("Alt+M")
       expect(row).not.toContain("Option+M")
     }
+  })
+
+  // A page that already has a query string turns a literal "?mark" into `?foo=1?mark`, which URLSearchParams
+  // reads as a single `foo` value — no `mark` key, so the stored `hidden` survives the reload. Full-hide is the
+  // one state with neither a handle nor a shortcut, so a hint that only works on a clean URL strands the user.
+  it("the full-hide hint names the PARAMETER, never a separator that depends on the current URL", () => {
+    const L = DEFAULT_ANNOTATION_LABELS
+    for (const copy of [L.hideCompletelyHint, L.hiddenToast]) {
+      expect(copy).toContain("mark") // still concrete about WHICH parameter
+      expect(copy).not.toContain("?mark") // ...but never prescribes the separator
+      expect(copy).not.toContain("&mark")
+    }
+    // The premise, pinned so nobody "restores" the friendlier-looking literal: appending it to an existing
+    // query silently yields no `mark` key at all.
+    expect(new URLSearchParams("?foo=1?mark").has("mark")).toBe(false)
+    expect(new URLSearchParams("?foo=1&mark").has("mark")).toBe(true)
   })
 
   it("each toast repeats the hint for the state just entered, and nothing else", () => {
@@ -60,7 +76,7 @@ describe("hide copy names each recovery exactly once, in the row that performs i
     expect(L.hiddenShortcutToast("Option+M")).toBe("已隐藏，按 Option+M 恢复")
     expect(L.hiddenShortcutToast("Alt+M")).toBe("已隐藏，按 Alt+M 恢复")
     expect(L.handleToast).toBe("已缩至边缘把手，轻点可恢复")
-    expect(L.hiddenToast).toBe("已完全隐藏，网址加 ?mark 可恢复")
+    expect(L.hiddenToast).toBe("已完全隐藏，网址加 mark 参数可恢复")
 
     // The handle toast is the touch path; it must not advertise a shortcut, and the desktop toast must not
     // advertise a grabber the desktop never renders.
@@ -147,6 +163,28 @@ describe("createChromeFocusController: focus follows the control that replaces t
     const node = { focus: vi.fn() }
     c.claim(node)
     expect(node.focus).not.toHaveBeenCalled()
+  })
+
+  // Why hideFab arms ONLY for the `handle` target: a request stays pending until *something* mounts, so
+  // arming with no successor (the fully hidden state renders nothing) leaves it live indefinitely, and the
+  // next unrelated mount consumes it — an SPA swapping sessionId would steal focus, and because claim()'s
+  // return value is also the pulse signal, a handle would announce itself for an action the user never took.
+  it("an unconsumed request survives to be claimed by an unrelated LATER mount — hence: don't arm without a successor", () => {
+    const c = createChromeFocusController()
+    const unrelated = { focus: vi.fn() }
+    c.request() // armed, but nothing mounts to consume it
+    expect(c.claim(unrelated)).toBe(true) // ...so a much later, unrelated mount takes it
+    expect(unrelated.focus).toHaveBeenCalledTimes(1)
+  })
+
+  it("claim() reports whether it consumed a request — the 'user-initiated' signal the handle pulse rides", () => {
+    const c = createChromeFocusController()
+    const node = { focus: vi.fn() }
+    expect(c.claim(node)).toBe(false) // page load: no request, no pulse
+    c.request()
+    expect(c.claim(node)).toBe(true) // user-initiated swap: pulse
+    expect(c.claim(node)).toBe(false) // consumed once only
+    expect(c.claim(null)).toBe(false) // a detaching node never counts as user-initiated
   })
 
   it("a null node (the outgoing control unmounting) is a no-op and keeps the request armed for the successor", () => {
