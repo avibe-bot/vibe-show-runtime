@@ -38,6 +38,8 @@ import {
   withParenthetical,
   stripFabParamsFromHash,
   stripFabParamsFromSearch,
+  stripFabParamsFromUrl,
+  fabUrlChangeEvents,
   isEditableTarget,
   shouldToggleFabShortcut,
   snapToNearestEdge,
@@ -895,5 +897,63 @@ describe("draggable floating chrome: snap + threshold + position storage (Lane R
     expect(readStoredFloatPlacement("fab", "ses_1", storage)).toBeUndefined()
     storage.setItem(floatPositionStorageKey("fab", "ses_1"), JSON.stringify({ left: 20, top: 5 })) // old shape, no edge
     expect(readStoredFloatPlacement("fab", "ses_1", storage)).toBeUndefined() // rejects malformed / legacy
+  })
+})
+
+describe("the address bar is a live input, not a boot-time constant (Lane U, round 7)", () => {
+  // The `?mark` exit is advertised as "type it at the end of the address bar". On a hash-routed page that
+  // edit is a same-document fragment change: no reload, no remount, so a boot-only read never sees it and
+  // the one state whose exit is supposed to work everywhere — `hidden-url` — is the one that strands.
+  // These pin the two pure halves the effect leans on: what the cleaned URL is, and who must be told.
+
+  it("rebuilds the whole URL after dropping our flag, wherever it sat", () => {
+    // hash query only — the ordinary Show Page shape, where `location.search` is empty
+    expect(stripFabParamsFromUrl({ pathname: "/p/x", search: "", hash: "#/route?mark" })).toBe("/p/x#/route")
+    // search only
+    expect(stripFabParamsFromUrl({ pathname: "/p/x", search: "?mark", hash: "" })).toBe("/p/x")
+    // both segments carry it; both get cleaned in one rewrite
+    expect(stripFabParamsFromUrl({ pathname: "/p/x", search: "?mark", hash: "#/route?unmark" })).toBe("/p/x#/route")
+  })
+
+  it("keeps every byte that is not ours", () => {
+    expect(stripFabParamsFromUrl({ pathname: "/p/x", search: "?a=1&mark&b=2", hash: "#/r?c=3" })).toBe(
+      "/p/x?a=1&b=2#/r?c=3"
+    )
+    // a hash ROUTE that merely looks like a query is not touched
+    expect(stripFabParamsFromUrl({ pathname: "/p/x", search: "?mark", hash: "#/redirect=/a?mark" })).toBe(
+      "/p/x#/redirect=/a"
+    )
+  })
+
+  it("returns null when there is nothing of ours to strip, so the caller skips the rewrite entirely", () => {
+    expect(stripFabParamsFromUrl({ pathname: "/p/x", search: "?a=1", hash: "#/route" })).toBeNull()
+    expect(stripFabParamsFromUrl({ pathname: "/p/x", search: "", hash: "" })).toBeNull()
+  })
+
+  it("tells hash routers only when the hash actually moved", () => {
+    // replaceState fires neither event; we re-issue what the browser withheld. `hashchange` is a claim about
+    // the fragment, so it may only be made when the fragment really changed — otherwise it is a lie a
+    // subscriber will act on.
+    expect(fabUrlChangeEvents({ search: "?mark", hash: "#/route" }, { search: "", hash: "#/route" })).toEqual([
+      "popstate",
+    ])
+    expect(fabUrlChangeEvents({ search: "", hash: "#/route?mark" }, { search: "", hash: "#/route" })).toEqual([
+      "popstate",
+      "hashchange",
+    ])
+  })
+
+  it("stays silent when nothing moved, so our own rewrite cannot echo forever", () => {
+    expect(fabUrlChangeEvents({ search: "?a=1", hash: "#/r" }, { search: "?a=1", hash: "#/r" })).toEqual([])
+  })
+
+  it("is idempotent, which is what BOUNDS the echo rather than any timing assumption", () => {
+    // The handler re-issues the events replaceState withheld, and those wake the handler again. What stops
+    // that is not a guard or a debounce: a second pass finds no flag left to strip, so it rewrites nothing
+    // and therefore dispatches nothing. Depth is bounded by the flag's own disappearance.
+    const first = stripFabParamsFromUrl({ pathname: "/p/x", search: "?a=1&mark", hash: "#/r?unmark" })
+    expect(first).toBe("/p/x?a=1#/r")
+    const url = new URL(`https://h${first}`)
+    expect(stripFabParamsFromUrl({ pathname: url.pathname, search: url.search, hash: url.hash })).toBeNull()
   })
 })

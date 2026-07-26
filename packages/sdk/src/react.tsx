@@ -75,8 +75,8 @@ import {
   type FabParamUrl,
   toggleFabVisibilityByShortcut,
   withParenthetical,
-  stripFabParamsFromHash,
-  stripFabParamsFromSearch,
+  stripFabParamsFromUrl,
+  fabUrlChangeEvents,
   shouldToggleFabShortcut,
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
@@ -1520,7 +1520,8 @@ function currentUrl(): FabParamUrl {
 
 /** Standalone-only chrome visibility (visible | handle | hidden-key | hidden-url) from the frozen
  *  ?mark / ?unmark flag: an
- *  explicit flag flips it AND persists the choice, then is stripped from the URL at boot (one-time switch);
+ *  explicit flag flips it AND persists the choice, then is stripped from the URL (one-time per occurrence —
+ *  watched, not sampled at boot, because appending it to a hash route never reloads the page);
  *  a flag-free load honors the stored state. Read from the search AND from the hash's own query segment,
  *  because "append to the end of the address bar" lands in the hash on a hash-routed page — the vocabulary
  *  is still two words and the hash ROUTE is never touched, only its query. Embedded host is always visible.
@@ -1543,34 +1544,65 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
     // through untouched — its exit is in the address bar, which every device has.
     return fabVisibilityForDevice(resolved.visibility, !touchPrimary)
   })
-  // Read the ?mark / ?unmark switch ONCE at boot: apply it, persist the choice, then STRIP the flag via
-  // replaceState so the URL returns clean. It's a one-time switch, so there is no ongoing listener.
+  // Apply the ?mark / ?unmark switch: adopt it, persist the choice, then STRIP the flag via replaceState so
+  // the URL returns clean.
+  //
+  // This SUBSCRIBES rather than reading once at boot, because the exit we advertise — "append it at the end
+  // of the address bar" — is not a page load on a hash-routed page. `/p/x#/route` → `/p/x#/route?mark` is a
+  // same-document fragment change: nothing remounts, so a boot-only read never sees the token the user was
+  // told to type, and `hidden-url` — the one state kept undegraded precisely BECAUSE its exit works on every
+  // device — is the one that strands on a blank screen. Handling `hashchange` and `popstate` puts the read
+  // where the change actually happens; the switch is still one-time per occurrence, just no longer
+  // one-time per mount.
   React.useEffect(() => {
     if (host !== "standalone" || typeof window === "undefined") return
-    const stored = readStoredFabVisibility(sessionId, touchPrimaryRef.current, storage)
-    const resolved = resolveFabVisibility(currentUrl(), stored)
-    setVisibility(fabVisibilityForDevice(resolved.visibility, !touchPrimaryRef.current))
-    if (resolved.persist === null) return // no ?mark/?unmark this load → nothing to persist or strip
-    // Strip the one-time flag ONLY once the choice is durable: if the write failed (no storage / quota),
-    // leave ?mark/?unmark in the URL so a reload still carries the intent instead of silently reverting.
-    if (!writeStoredFabVisibility(sessionId, resolved.persist, storage)) return
-    try {
-      const strippedSearch = stripFabParamsFromSearch(window.location.search)
-      const nextSearch = strippedSearch ? `?${strippedSearch}` : ""
-      // The strip reaches wherever the read reaches. Clean only the search and an `unmark` that arrived in the
-      // hash sits there forever: no longer one-time, and the `mark` appended to that same tail next would be
-      // answering a flag that never left. Route path and foreign keys survive byte-for-byte; replaceState
-      // fires neither `hashchange` nor `popstate`, so the router is not kicked — its own navigate() has to
-      // dispatch PopStateEvent by hand for exactly that reason, and it reads pathname, which we never touch.
-      const strippedHash = stripFabParamsFromHash(window.location.hash)
-      const nextHash = strippedHash ? `#${strippedHash}` : ""
-      if (nextSearch !== window.location.search || nextHash !== window.location.hash) {
+    const apply = (fromEvent: boolean) => {
+      const stored = readStoredFabVisibility(sessionId, touchPrimaryRef.current, storage)
+      const resolved = resolveFabVisibility(currentUrl(), stored)
+      if (resolved.persist === null) {
+        // No flag right now. At boot that means "honor what was stored"; on a later navigation it must mean
+        // NOTHING. Re-asserting the stored value on every popstate would let a host's own routing overwrite a
+        // choice the user just made whenever the write behind it failed (private mode, quota) — the listener
+        // exists to catch a flag the browser did not reload for, not to police visibility.
+        if (!fromEvent) setVisibility(fabVisibilityForDevice(resolved.visibility, !touchPrimaryRef.current))
+        return
+      }
+      setVisibility(fabVisibilityForDevice(resolved.visibility, !touchPrimaryRef.current))
+      // Strip the one-time flag ONLY once the choice is durable: if the write failed (no storage / quota),
+      // leave ?mark/?unmark in the URL so a reload still carries the intent instead of silently reverting.
+      if (!writeStoredFabVisibility(sessionId, resolved.persist, storage)) return
+      try {
+        // The strip reaches wherever the read reaches. Clean only the search and an `unmark` that arrived in
+        // the hash sits there forever: no longer one-time, and the `mark` appended to that same tail next
+        // would be answering a flag that never left. Route path and foreign keys survive byte-for-byte.
+        const before = { search: window.location.search, hash: window.location.hash }
+        const next = stripFabParamsFromUrl({ pathname: window.location.pathname, ...before })
+        if (next === null) return // nothing of ours in the URL — do not fake a navigation
         // Drop ONLY our flag: keep the app's other params (surgical string strip, no re-encode) and its
         // existing history.state (a history router may keep location keys / scroll data there).
-        window.history.replaceState(window.history.state, "", `${window.location.pathname}${nextSearch}${nextHash}`)
+        window.history.replaceState(window.history.state, "", next)
+        // replaceState fires neither event, so any router subscribed to them would keep serving the URL we
+        // just rewrote — a hash router would hold our `mark` in its route query forever. Re-issue exactly
+        // what the browser withheld. These wake `apply` again, harmlessly: the flag is gone by now, so the
+        // next pass persists nothing and rewrites nothing.
+        for (const type of fabUrlChangeEvents(before, { search: window.location.search, hash: window.location.hash })) {
+          window.dispatchEvent(
+            type === "hashchange"
+              ? new HashChangeEvent("hashchange", { oldURL: `${window.location.origin}${window.location.pathname}${before.search}${before.hash}`, newURL: window.location.href })
+              : new PopStateEvent("popstate", { state: window.history.state })
+          )
+        }
+      } catch {
+        /* best-effort — a blocked replaceState / URL parse must not break visibility */
       }
-    } catch {
-      /* best-effort — a blocked replaceState / URL parse must not break visibility */
+    }
+    const onNavigate = () => apply(true)
+    apply(false)
+    window.addEventListener("hashchange", onNavigate)
+    window.addEventListener("popstate", onNavigate)
+    return () => {
+      window.removeEventListener("hashchange", onNavigate)
+      window.removeEventListener("popstate", onNavigate)
     }
   }, [host, sessionId, storage])
   const set = React.useCallback(

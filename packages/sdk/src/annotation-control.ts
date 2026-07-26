@@ -336,6 +336,50 @@ export function stripFabParamsFromHash(hash: string | undefined): string {
   return rest ? `${route}?${rest}` : route
 }
 
+/**
+ * Both strips at once, reassembled into the URL to hand `replaceState` — or `null` when the URL holds
+ * nothing of ours and must not be rewritten at all.
+ *
+ * The two segments are cleaned together because the flag legitimately lands in either and a load can carry
+ * one in each; rewriting them in two passes would put a half-cleaned URL in the address bar in between. The
+ * `null` return is the load-bearing part: it is what lets the caller distinguish "already clean" from
+ * "cleaned to the same string", so an untouched URL never reaches `replaceState` and never fakes a
+ * navigation for the host's router.
+ */
+export function stripFabParamsFromUrl(url: { pathname?: string; search?: string; hash?: string }): string | null {
+  const strippedSearch = stripFabParamsFromSearch(url.search)
+  const nextSearch = strippedSearch ? `?${strippedSearch}` : ""
+  const strippedHash = stripFabParamsFromHash(url.hash)
+  const nextHash = strippedHash ? `#${strippedHash}` : ""
+  if (nextSearch === (url.search ?? "") && nextHash === (url.hash ?? "")) return null
+  return `${url.pathname ?? ""}${nextSearch}${nextHash}`
+}
+
+/**
+ * Which events the browser owes a subscriber after we rewrite the URL ourselves — and which we must
+ * therefore re-issue by hand.
+ *
+ * `history.replaceState` fires neither `popstate` nor `hashchange`, so a host router that subscribes to
+ * either keeps serving a location we have already changed. The scaffold router in `packages/runtime` reads
+ * `pathname` and is unaffected, but the SDK's public surface permits a hash router, and that one would keep
+ * a stale `mark` in its route query forever.
+ *
+ * `popstate` covers the history routers (and matches what the scaffold's own `navigate()` hand-dispatches
+ * for exactly this reason). `hashchange` is a narrower claim — that the FRAGMENT moved — so it is only made
+ * when the fragment really moved; announcing it otherwise sends a hash router chasing a change that did not
+ * happen. An unchanged URL yields nothing, which is also what keeps our own re-issued events from echoing:
+ * the handler they wake re-reads a URL with no flag left in it and rewrites nothing.
+ */
+export function fabUrlChangeEvents(
+  before: { search?: string; hash?: string },
+  after: { search?: string; hash?: string }
+): ("popstate" | "hashchange")[] {
+  const searchMoved = (before.search ?? "") !== (after.search ?? "")
+  const hashMoved = (before.hash ?? "") !== (after.hash ?? "")
+  if (!searchMoved && !hashMoved) return []
+  return hashMoved ? ["popstate", "hashchange"] : ["popstate"]
+}
+
 // ── Standalone FAB visibility keyboard shortcut (Alt+M / ⌥M) ──────────────────────────────
 // Alt+M toggles the FAB the same way ?mark/?unmark and the ✕ button do (standalone host only). Alt is the
 // SOLE modifier. macOS Option+M emits key "µ" in some layouts, so we match the physical `code === "KeyM"`
