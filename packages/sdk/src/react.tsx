@@ -76,6 +76,7 @@ import {
   withParenthetical,
   stripFabParamsFromUrl,
   activeFabToast,
+  copyRestoreLink,
   fabToastDurationMs,
   shouldToggleFabShortcut,
   readStoredFloatPlacement,
@@ -251,8 +252,16 @@ export type AnnotationOverlayLabels = {
   hiddenShortcutToast?: (shortcut: string) => string
   /** Toast after collapsing to the edge strip. */
   handleToast?: string
-  /** Toast for `hidden-url` — carries the whole restore URL, which is the only way back to this state. */
-  hiddenToast?: (markUrl: string) => string
+  /**
+   * Toast for `hidden-url`. A plain string, not a URL template: the link is no longer punctuation inside a
+   * sentence but a line of its own with a copy button on it, so this sentence's job is to explain the RULE
+   * (what the flag is and where it goes) while the button hands over a link that already obeys it.
+   */
+  hiddenToast?: string
+  /** Copy button on the `hidden-url` toast — the one gesture that gets the restore link off the screen. */
+  copyLinkAction?: string
+  /** What that button says once the link is on the clipboard. */
+  copiedLabel?: string
   /** Accessible name for the '?' help trigger, used when a host suppresses the visible tip copy. */
   helpTrigger?: string
 }
@@ -298,7 +307,17 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   hideCompletelyHint: "隐藏后给出恢复链接",
   hiddenShortcutToast: (shortcut) => `已隐藏，按 ${shortcut} 恢复`,
   handleToast: "已收到侧边，轻点细条恢复",
-  hiddenToast: (markUrl) => `已完全隐藏，保存此链接恢复：${markUrl}`,
+  // States the RULE rather than narrating the link, because the link is right underneath with a copy button
+  // on it and does not need introducing. Naming `?mark` is the point: it is the difference between a magic
+  // address the user has to keep somewhere forever and a five-character flag they can reproduce on any page
+  // of this Show Page. Caveat this sentence deliberately does not carry — appending the flag by hand to a
+  // `#/route` URL lands it inside the fragment, which is the host router's and which we do not read — is why
+  // the copied link exists: it puts the flag in the real query position, and copying is the path of least
+  // resistance anyway. Whoever ignores the button and types is the case the rule serves, on the URL shapes
+  // where typing works at all.
+  hiddenToast: "已完全隐藏。网址后面加 ?mark 就能把按钮调回来",
+  copyLinkAction: "复制链接",
+  copiedLabel: "已复制",
   helpTrigger: "帮助"
 }
 
@@ -1487,11 +1506,24 @@ export function fabHideRowLabel(
     : withParenthetical(labels.hideCompletelyAction, labels.hideCompletelyHint)
 }
 
+/** What a toast shows: the sentence, plus the restore link for the states whose exit IS a link. */
+export interface FabToastContent {
+  /** The sentence naming the state just entered and its way out. */
+  message: string
+  /** The whole restore URL, rendered as its own line with a copy button. Absent when the exit is on-device. */
+  link?: string
+}
+
 /**
  * The toast for a visibility state — a pure FUNCTION of the state, not something a handler remembers to set.
  * Every toast here narrates "you are now in state X, and here is the way out of it", so deriving it from X
  * makes a stale one structurally impossible: a toast naming a vanished shortcut can only exist if the state
  * still claims that shortcut, and {@link fabVisibilityForDevice} rules that state out on such a device.
+ *
+ * Sentence and link come out of ONE switch rather than from two functions the caller pairs up, because the
+ * only interesting bug here is a mismatch between them — a toast explaining the URL exit with no link under
+ * it, or a link offered beside "press ⌥M to restore". Two functions over the same enum drift the moment a
+ * branch is added to one; one return value cannot.
  *
  * `null` for `visible`: nothing is hidden, so there is no exit to advertise — the caller CLEARS instead.
  */
@@ -1500,13 +1532,15 @@ export function fabToastFor(
   shortcut: string | undefined,
   markUrl: string,
   labels: FabHideLabels
-): string | null {
+): FabToastContent | null {
   if (visibility === "visible") return null
-  if (visibility === "handle") return labels.handleToast
-  if (visibility === "hidden-url") return labels.hiddenToast(markUrl)
+  if (visibility === "handle") return { message: labels.handleToast }
+  if (visibility === "hidden-url") return { message: labels.hiddenToast, link: markUrl }
   // `hidden-key` without a shortcut is unreachable — fabVisibilityForDevice degrades it to `handle` before
   // any render — but naming the URL exit rather than a missing key keeps the function total and safe.
-  return shortcut ? labels.hiddenShortcutToast(shortcut) : labels.hiddenToast(markUrl)
+  return shortcut
+    ? { message: labels.hiddenShortcutToast(shortcut) }
+    : { message: labels.hiddenToast, link: markUrl }
 }
 
 /**
@@ -1769,6 +1803,58 @@ function FabEdgeHandle({ label, drag, touchCapable, claimFocus, onRestore }: { l
   )
 }
 
+/**
+ * The status toast. For every state but one it is a sentence read once that then gets out of the way; for
+ * `hidden-url` it is also the delivery of the restore link — the only way back into a chrome that renders
+ * nothing at all — so it carries the whole URL and a button that puts it on the clipboard in one tap.
+ *
+ * The link stays PRINTED and selectable next to the button rather than being folded into it. A button alone
+ * would be the entire exit riding on an API that is undefined on an insecure origin and can be refused by a
+ * permissions policy, for the one state that has no second way out; and a link the user can see is a link
+ * they can judge before they trust it. So the button is a shortcut past a manual selection, never the route
+ * itself — which is also why a rejected copy changes nothing on screen: the fallback is already there, being
+ * looked at.
+ *
+ * `copied` confirms the tap before {@link AnnotationOverlay}'s handler retires the toast. Without it the only
+ * evidence of a successful copy is the toast disappearing, which is indistinguishable from it timing out.
+ */
+function FabToast({
+  content,
+  labels,
+  onCopied
+}: {
+  content: FabToastContent
+  labels: Pick<Required<AnnotationOverlayLabels>, "copyLinkAction" | "copiedLabel">
+  onCopied: () => void
+}) {
+  const [copied, setCopied] = React.useState(false)
+  const link = content.link
+  const copyLink = React.useCallback(() => {
+    if (!link) return
+    const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard
+    // A refused or unavailable clipboard changes nothing on screen: the printed link beside this button is
+    // the fallback, and it is already there being looked at. See copyRestoreLink.
+    void copyRestoreLink(link, clipboard).then((ok) => {
+      if (!ok) return
+      setCopied(true)
+      onCopied()
+    })
+  }, [link, onCopied])
+  return (
+    <div data-show-annotation-ui="" role="status" style={toastStyle}>
+      <span>{content.message}</span>
+      {link ? (
+        <span style={toastLinkRowStyle}>
+          <span style={toastLinkStyle}>{link}</span>
+          <button type="button" style={toastCopyStyle} onClick={copyLink}>
+            {copied ? labels.copiedLabel : labels.copyLinkAction}
+          </button>
+        </span>
+      ) : null}
+    </div>
+  )
+}
+
 // A touch above the old 20px: a down-biased drop shadow needs clearance from the viewport bottom or its
 // lower half is clipped (owner mobile report). This inset is the floating-chrome margin AND the drag
 // bottom bound, so the shadow renders fully at the resting position and at any snapped position.
@@ -1908,19 +1994,31 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   )
   // The toast carries the SESSION it was raised for, not just the state. An SPA can swap `sessionId` under a
   // mounted overlay; if the new session resolves to the same state, a match on state alone would keep the old
-  // session's message on screen — and for `hidden-url` that message is a whole restore URL pointing at the
-  // page the user just left. See activeFabToast.
-  const [toast, setToast] = React.useState<{ message: string; state: FabVisibility; sessionId: string | undefined } | null>(null)
+  // session's message on screen — and for `hidden-url` that message carries a restore URL pointing at the
+  // page the user just left, one tap from the clipboard. See activeFabToast.
+  const [toast, setToast] = React.useState<(FabToastContent & { state: FabVisibility; sessionId: string | undefined }) | null>(null)
   const toastTimer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   React.useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
-  const flashToast = React.useCallback((message: string, state: FabVisibility) => {
-    setToast({ message, state, sessionId })
+  const flashToast = React.useCallback((content: FabToastContent, state: FabVisibility) => {
+    setToast({ ...content, state, sessionId })
     if (toastTimer.current) clearTimeout(toastTimer.current)
     // How long it stays is a property of WHAT IT SAYS — see fabToastDurationMs. Most of these confirm
     // something and vanish; the `hidden-url` one carries the only copy of the way back, so it dwells long
-    // enough to be selected and copied.
+    // enough to be noticed and its copy button tapped.
     toastTimer.current = setTimeout(() => setToast(null), fabToastDurationMs(state))
   }, [sessionId])
+  // Copying the restore link is the toast's whole purpose, so a successful copy RETIRES it instead of leaving
+  // it to time out — the owner's objection to the previous round was an opaque pill sitting over the page long
+  // after it had nothing left to give. The brief delay is the confirmation: with an instant dismissal the only
+  // evidence the tap did anything is the toast vanishing, which is exactly what a timeout looks like.
+  //
+  // A rejected copy (no permission, or an insecure context where `navigator.clipboard` is not even defined)
+  // leaves the toast up and the button unchanged. The link is still on screen and still selectable, which is
+  // the pre-button behavior — the button is a shortcut past a manual selection, never the only way through.
+  const dismissToast = React.useCallback(() => {
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast(null), 900)
+  }, [])
   // Hiding and restoring the FAB both swap the control the user is on (toolbar/FAB ⇄ edge handle); on either
   // user-initiated swap the successor claims focus via this one controller, so a keyboard user is never dropped
   // on <body>. chromeFocusRef is the shared callback ref both the handle and the restored FAB attach.
@@ -1942,8 +2040,8 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
       // The restore URL is composed HERE, in the handler, from the URL as it stands at the instant of the
       // hide — the one moment it is guaranteed current — and kept verbatim in the toast state from then on,
       // never re-derived at render time.
-      const message = fabToastFor(next, shortcut, formatMarkUrl(currentHref()), labels)
-      if (message) flashToast(message, next)
+      const content = fabToastFor(next, shortcut, formatMarkUrl(currentHref()), labels)
+      if (content) flashToast(content, next)
     },
     [requestChromeFocus, onDisable, fabVisibility, flashToast, shortcut, labels]
   )
@@ -1971,8 +2069,8 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     // The toast names the state just entered, like every other transition here — but unlike the others this
     // one is not user-initiated, so an unannounced handle appearing on screen would be a second puzzle.
     // Deriving it from the new state answers both at once: what this is, and how to get out.
-    const message = fabToastFor(rescued, shortcut, formatMarkUrl(currentHref()), labels)
-    if (message) flashToast(message, rescued)
+    const content = fabToastFor(rescued, shortcut, formatMarkUrl(currentHref()), labels)
+    if (content) flashToast(content, rescued)
   }, [host, shortcut, fabVisibility.visibility, fabVisibility.set, flashToast, labels])
   // Option/Alt+M toggles the chrome (standalone only), mirroring ?mark/?unmark and the '?' popup's hide row.
   // Registered at the document level so it works even while the chrome is hidden; the pure guard blocks it
@@ -2039,7 +2137,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
         {fabVisibility.visibility === "handle" ? (
           <FabEdgeHandle label={labels.restoreHandle} drag={fabDrag} touchCapable={touchCapable} claimFocus={claimFocus} onRestore={restoreFab} />
         ) : null}
-        {statusToast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{statusToast}</div> : null}
+        {statusToast ? <FabToast key={statusToast.link ?? statusToast.message} content={statusToast} labels={labels} onCopied={dismissToast} /> : null}
       </>
     )
   }
@@ -2087,7 +2185,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   return (
     <>
       {content}
-      {statusToast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{statusToast}</div> : null}
+      {statusToast ? <FabToast key={statusToast.link ?? statusToast.message} content={statusToast} labels={labels} onCopied={dismissToast} /> : null}
     </>
   )
 }
@@ -3624,14 +3722,20 @@ const toastStyle: React.CSSProperties = {
   width: "fit-content",
   maxWidth: "calc(100vw - 24px)",
   padding: "10px 16px",
-  // Selectable, and wrapping at any character: the `hidden-url` toast carries a whole URL the user has to
-  // copy, and a URL has no spaces to break at — left to the default it would overflow its own pill on a
-  // phone. Radius 20 rather than the pill's 999 for the same reason: this box is allowed to be several
-  // lines tall, and a stadium shape that tall reads as a mistake.
+  // Selectable, and wrapping at any character: the `hidden-url` toast carries a whole URL, and a URL has no
+  // spaces to break at — left to the default it would overflow its own pill on a phone. It stays selectable
+  // even with a copy button next to it, because that button is the shortcut and manual selection is the
+  // fallback under it. Radius 20 rather than the pill's 999 for the same reason: this box is allowed to be
+  // several lines tall, and a stadium shape that tall reads as a mistake.
   borderRadius: 20,
   userSelect: "text",
   WebkitUserSelect: "text",
   overflowWrap: "anywhere",
+  // Column, because the URL line is a second block under the sentence rather than punctuation inside it.
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  gap: 8,
   background: COLORS.surfacePopover,
   border: `1px solid ${COLORS.border}`,
   color: COLORS.textPrimary,
@@ -3641,6 +3745,41 @@ const toastStyle: React.CSSProperties = {
   WebkitBackdropFilter: "blur(16px)",
   zIndex: CARD_Z,
   textAlign: "center"
+}
+
+// The URL and its copy button on one line, wrapping to two when the URL is long and the viewport is a phone
+// — `minWidth: 0` so the URL is what shrinks and the button keeps its full label rather than being squeezed
+// to an ellipsis. Centered when it wraps, so the button never ends up orphaned against an edge.
+const toastLinkRowStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  flexWrap: "wrap",
+  gap: 10,
+  maxWidth: "100%"
+}
+
+const toastLinkStyle: React.CSSProperties = {
+  minWidth: 0,
+  overflowWrap: "anywhere",
+  color: COLORS.textMuted,
+  font: `500 12px/1.4 ${FONT_STACK}`
+}
+
+// The one action in the box, so it gets the annotation accent rather than the quiet treatment the toolbar's
+// secondary buttons use. 32px tall and never shrinking: this is tapped with a thumb, on the screen where
+// missing it means losing the only exit.
+const toastCopyStyle: React.CSSProperties = {
+  flexShrink: 0,
+  minHeight: 32,
+  padding: "0 14px",
+  borderRadius: 999,
+  border: 0,
+  whiteSpace: "nowrap",
+  background: COLORS.human,
+  color: COLORS.onAccent,
+  font: `600 12px/1 ${FONT_STACK}`,
+  cursor: "pointer"
 }
 
 // Violet agent-mark badge — soft violet glow, tabular count, sized/weighted to match the FAB family.

@@ -13,6 +13,7 @@ import {
   TOUCH_CAPABLE_QUERY
 } from "./react.js"
 import {
+  ANNOTATION_FAB_PARAM_SHOW,
   fabHideOptions,
   formatFabShortcut,
   formatMarkUrl,
@@ -32,7 +33,7 @@ function hideRowLabel(target: FabHideTarget, shortcut: string | undefined): stri
 }
 
 /** The toast for a state, same defaults. The URL only matters for the states whose exit IS a URL. */
-function toastFor(state: FabVisibility, shortcut?: string, href: string = CLEAN): string | null {
+function toastFor(state: FabVisibility, shortcut?: string, href: string = CLEAN) {
   return fabToastFor(state, shortcut, formatMarkUrl(href), DEFAULT_ANNOTATION_LABELS)
 }
 
@@ -84,49 +85,85 @@ describe("hide copy names each recovery exactly once, in the row that performs i
     }
   })
 
-  // The link itself is delivered by the toast, at the moment of hiding, whole — because that is the only
-  // exit from the only state with nothing on screen, and users copy links rather than transcribe suffixes.
-  it("the toast hands over the WHOLE restore URL, with the flag in the real query position", () => {
+  // The link itself is delivered by the toast, at the moment of hiding, whole — because that is the only exit
+  // from the only state with nothing on screen. It is a LINE of its own with a copy button on it, not
+  // punctuation inside a sentence, so the sentence is free to state the rule and the button to hand over an
+  // address that already obeys it.
+  it("the sentence states the RULE and names the flag; the link rides beside it, not inside it", () => {
     const L = DEFAULT_ANNOTATION_LABELS
-    expect(L.hiddenToast(formatMarkUrl(CLEAN))).toBe("已完全隐藏，保存此链接恢复：https://h/p/abc?mark")
+    expect(L.hiddenToast).toBe("已完全隐藏。网址后面加 ?mark 就能把按钮调回来")
+    // The flag is named. A user who reads this once can reproduce the exit on any page of this Show Page,
+    // instead of owning one magic address they have to keep somewhere forever. Pinned against the CONSTANT,
+    // not the literal: this sentence is the one place the flag is spelled out in prose rather than built by
+    // formatMarkUrl, so renaming the param would leave it quietly instructing the user to type a dead word.
+    expect(L.hiddenToast).toContain(`?${ANNOTATION_FAB_PARAM_SHOW}`)
+    // …and the sentence is URL-free, so it cannot go stale against the page it was raised on. Every earlier
+    // round's bugs were a printed address drifting from the reader's actual one.
+    expect(L.hiddenToast).not.toContain("http")
+  })
+
+  it("the toast hands over the WHOLE restore URL, with the flag in the real query position", () => {
+    expect(toastFor("hidden-url")?.link).toBe("https://h/p/abc?mark")
     // A page that already has a query keeps it; the flag joins with '&'.
-    expect(L.hiddenToast(formatMarkUrl(`${CLEAN}?foo=1`))).toBe("已完全隐藏，保存此链接恢复：https://h/p/abc?foo=1&mark")
+    expect(toastFor("hidden-url", undefined, `${CLEAN}?foo=1`)?.link).toBe("https://h/p/abc?foo=1&mark")
     // A hash-routed page: the flag goes in front of the route, where our query string lives, and the route
     // rides along untouched. This is the shape every earlier round printed a suffix for and got wrong.
-    expect(L.hiddenToast(formatMarkUrl(`${CLEAN}#/route?a=1`))).toBe(
-      "已完全隐藏，保存此链接恢复：https://h/p/abc?mark#/route?a=1"
-    )
+    expect(toastFor("hidden-url", undefined, `${CLEAN}#/route?a=1`)?.link).toBe("https://h/p/abc?mark#/route?a=1")
     // The premise, pinned so nobody "simplifies" the link back to an appended literal: a suffix typed at the
     // tail of a hash route lands in the fragment, which is the host router's and which we no longer read.
+    // It is also the one case the sentence's rule does not cover, and the reason the copy button exists:
+    // the offered link puts the flag in the query position on every shape, so the shortest path is correct.
     expect(new URL("https://h/p/abc#/route?mark").search).toBe("")
     expect(new URL("https://h/p/abc?mark#/route").search).toBe("?mark")
+  })
+
+  // Sentence and link come from ONE switch, so the only interesting bug — an explanation of the URL exit with
+  // no link under it, or a link offered next to "press ⌥M" — is not expressible. The states whose way back is
+  // still on the device carry NO link: an address to copy beside a working shortcut is a second exit the user
+  // has to choose between, for a state they can leave by pressing a key.
+  it("a link is present exactly for the states whose exit IS a link", () => {
+    expect(toastFor("hidden-url")?.link).toBeTruthy()
+    expect(toastFor("hidden-key", undefined)?.link).toBeTruthy() // falls back to the URL exit — see below
+    // `toEqual` on the whole object, not `?.link === undefined`: optional chaining over a null return would
+    // read as "no link" and pass for a toast that does not exist at all.
+    expect(toastFor("hidden-key", "Option+M")).toEqual({ message: expect.any(String) })
+    expect(toastFor("handle")).toEqual({ message: expect.any(String) })
+    expect(toastFor("visible", "Option+M")).toBeNull()
   })
 
   // The toast is a pure FUNCTION of the state, not something a handler remembers to set — which is what
   // makes a stale toast structurally impossible rather than merely cleaned up. One case per state.
   it("each toast is derived from the state just entered, naming that state's own exit", () => {
-    expect(toastFor("hidden-key", "Option+M")).toBe("已隐藏，按 Option+M 恢复")
-    expect(toastFor("hidden-key", "Alt+M")).toBe("已隐藏，按 Alt+M 恢复")
-    expect(toastFor("handle")).toBe("已收到侧边，轻点细条恢复")
-    expect(toastFor("hidden-url")).toBe("已完全隐藏，保存此链接恢复：https://h/p/abc?mark")
-    // Same state, a page that already has a query → the same link, built on the URL the user is actually on.
-    expect(toastFor("hidden-url", undefined, `${CLEAN}?foo=1`)).toBe(
-      "已完全隐藏，保存此链接恢复：https://h/p/abc?foo=1&mark"
-    )
+    expect(toastFor("hidden-key", "Option+M")).toEqual({ message: "已隐藏，按 Option+M 恢复" })
+    expect(toastFor("hidden-key", "Alt+M")).toEqual({ message: "已隐藏，按 Alt+M 恢复" })
+    expect(toastFor("handle")).toEqual({ message: "已收到侧边，轻点细条恢复" })
+    expect(toastFor("hidden-url")).toEqual({
+      message: "已完全隐藏。网址后面加 ?mark 就能把按钮调回来",
+      link: "https://h/p/abc?mark"
+    })
+    // Same state, a page that already has a query → the same sentence, and a link built on the URL the user
+    // is actually on. The sentence no longer varies with the page; only the link does.
+    expect(toastFor("hidden-url", undefined, `${CLEAN}?foo=1`)).toEqual({
+      message: "已完全隐藏。网址后面加 ?mark 就能把按钮调回来",
+      link: "https://h/p/abc?foo=1&mark"
+    })
     // `visible` has nothing hidden and therefore no exit to advertise: the caller CLEARS, never flashes.
     expect(toastFor("visible", "Option+M")).toBeNull()
 
     // Each state names ONE way back — never a device's affordance it does not have.
-    expect(toastFor("handle")).not.toContain("+M")
-    expect(toastFor("hidden-key", "Option+M")).not.toContain("侧边")
-    expect(toastFor("hidden-url")).not.toContain("+M")
+    expect(toastFor("handle")?.message).not.toContain("+M")
+    expect(toastFor("hidden-key", "Option+M")?.message).not.toContain("侧边")
+    expect(toastFor("hidden-url")?.message).not.toContain("+M")
   })
 
   // Totality guard, not a reachable path: fabVisibilityForDevice degrades `hidden-key` to `handle` before
   // any keyboardless render. If that rule ever regressed, the fallback still hands back a usable exit
   // instead of naming a key this device cannot produce.
   it("never names a shortcut the device does not have, even off the reachable path", () => {
-    expect(toastFor("hidden-key", undefined)).toBe("已完全隐藏，保存此链接恢复：https://h/p/abc?mark")
+    expect(toastFor("hidden-key", undefined)).toEqual({
+      message: "已完全隐藏。网址后面加 ?mark 就能把按钮调回来",
+      link: "https://h/p/abc?mark"
+    })
     expect(hideRowLabel("hidden-key", undefined)).toBe("完全隐藏（隐藏后给出恢复链接）")
   })
 

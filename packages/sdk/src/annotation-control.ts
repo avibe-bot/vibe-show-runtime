@@ -244,21 +244,26 @@ function readFabFlag(flags: Set<string>): FabVisibility | undefined {
  * A toast belongs to a SESSION as much as to a state. An SPA can swap `sessionId` under a mounted overlay,
  * which re-resolves the visibility from the new session's storage — and when the new session happens to
  * resolve to the same state, a match on state alone kept the old session's message alive. For `hidden-url`
- * that message is a whole restore URL, captured from the page it was raised on, sitting for fifteen seconds
- * as the only thing on a screen that now belongs to a different page: the user copies a link back to where
- * they were, not a way out of where they are.
+ * that message carries a restore URL captured from the page it was raised on, sitting behind a copy button
+ * on a screen that now belongs to a different page: one tap and the user has a link back to where they
+ * were, not a way out of where they are. A copy button makes that failure quieter and therefore worse —
+ * nothing on screen says the address is stale.
  *
  * The identity is the session, not the URL, and the difference is which changes invalidate the message. A
- * host route change inside one session does not: the flag works on any route of that page, so the printed
+ * host route change inside one session does not: the flag works on any route of that page, so the captured
  * link still restores. A session swap does: that chrome, that storage key, that exit are all somebody
  * else's now.
+ *
+ * Generic over the payload because the guard is about IDENTITY, not content: it decides whether a captured
+ * toast still describes where the user is, and hands back whatever was captured — sentence, link, and any
+ * later addition — rather than picking a field and forcing every new one through this signature.
  */
-export function activeFabToast(
-  toast: { message: string; state: FabVisibility; sessionId: string | undefined } | null | undefined,
+export function activeFabToast<T extends { state: FabVisibility; sessionId: string | undefined }>(
+  toast: T | null | undefined,
   current: FabVisibility,
   sessionId: string | undefined
-): string | null {
-  return toast && toast.state === current && toast.sessionId === sessionId ? toast.message : null
+): T | null {
+  return toast && toast.state === current && toast.sessionId === sessionId ? toast : null
 }
 
 /**
@@ -266,16 +271,51 @@ export function activeFabToast(
  *
  * Every other toast confirms a transition whose way back is still on the device (a key to press, a strip to
  * tap); it is read once and wants to get out of the way. The `hidden-url` toast is the only delivery of the
- * only exit from the only state with nothing on screen, and since this round it carries a whole URL rather
- * than a five-character suffix — something to select and copy, not to memorize. On the old 3.2s it would
- * hand the user their way back and take it away before they could use it.
+ * only exit from the only state with nothing on screen, so it still gets the longer dwell — but the dwell is
+ * sized to the GESTURE it has to survive, and the gesture got shorter. The previous round printed a URL and
+ * asked the reader to select it by hand, a drag on a phone, which needed something like fifteen seconds; the
+ * link now sits behind a copy button, so noticing it and tapping once is the whole interaction. Owner
+ * feedback on that round was that fifteen seconds of an opaque pill over the page is its own problem, and
+ * they were right: past the point where the exit is reachable, extra dwell buys nothing and costs the view.
+ *
+ * Not the shared 3.2s, though — that is roughly the time to notice a toast and read it, with nothing left
+ * over to act. Overshooting the dwell obscures the page for a few seconds; undershooting it strands the user
+ * in the one state that has no other way back. The asymmetry, not a preference for round numbers, is what
+ * puts this above the baseline. A copy also RETIRES the toast (see the overlay's copy handler), so the
+ * common path is far shorter than either bound.
  *
  * It still expires, which is a bounded race rather than a guarantee, and that is deliberate: a toast that
  * waited for a dismissal would need a document-level listener to hear one, and this control plane's whole
  * invariant is that it attaches nothing to the host it does not have to. A dwell needs no listener.
  */
 export function fabToastDurationMs(visibility: FabVisibility): number {
-  return visibility === "hidden-url" ? 15000 : 3200
+  return visibility === "hidden-url" ? 6000 : 3200
+}
+
+/**
+ * Put the restore link on the clipboard, reporting whether it actually got there.
+ *
+ * Split out of the button so the part with a decision in it is testable without a DOM: the button is then a
+ * label and a click, and everything that can go wrong lives here. `clipboard` is injected rather than read
+ * from `navigator` for the same reason — the failures worth pinning are "the API is not there" and "the API
+ * said no", and both are ordinary arguments to this function while being awkward globals to fake.
+ *
+ * Absent on any insecure origin, and refusable by a permissions policy — neither is exotic for a Show Page
+ * opened over plain HTTP on a phone. Both come back `false` rather than throwing, because the caller's whole
+ * response to a failed copy is to leave the printed link on screen: the copy is a shortcut past selecting it
+ * by hand, never the only way out of a chrome that renders nothing.
+ */
+export async function copyRestoreLink(
+  text: string,
+  clipboard: { writeText(text: string): Promise<void> } | undefined
+): Promise<boolean> {
+  if (!clipboard) return false
+  try {
+    await clipboard.writeText(text)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**

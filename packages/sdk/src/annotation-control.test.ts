@@ -46,6 +46,7 @@ import {
   withParenthetical,
   stripFabParamsFromSearch,
   activeFabToast,
+  copyRestoreLink,
   fabToastDurationMs,
   stripFabParamsFromUrl,
   isEditableTarget,
@@ -998,8 +999,10 @@ describe("a toast narrates ONE state of ONE session, so it expires when either d
   // message from the current state means no restore path can forget to clear it: not the shortcut, not the
   // handle, not the restore link (which reloads the page outright), and not whichever path gets added next.
   it("shows the message only while the state it describes is still the current one", () => {
-    const raised = { message: "已完全隐藏，保存此链接恢复：https://h/p/x?mark", state: "hidden-url" as const, sessionId: "ses_1" }
-    expect(activeFabToast(raised, "hidden-url", "ses_1")).toBe(raised.message)
+    const raised = { message: "已完全隐藏。网址后面加 ?mark 就能把按钮调回来", link: "https://h/p/x?mark", state: "hidden-url" as const, sessionId: "ses_1" }
+    // Hands back what was captured, whole. The guard is about IDENTITY — does this still describe where the
+    // user is — so the sentence, the link, and anything added later ride along without touching it.
+    expect(activeFabToast(raised, "hidden-url", "ses_1")).toBe(raised)
     expect(activeFabToast(raised, "visible", "ses_1")).toBeNull()
     // A mid-session device degrade moves hidden-key → handle; the old exit is wrong there too.
     expect(activeFabToast({ message: "按 Option+M 恢复", state: "hidden-key", sessionId: "ses_1" }, "handle", "ses_1")).toBeNull()
@@ -1011,11 +1014,12 @@ describe("a toast narrates ONE state of ONE session, so it expires when either d
     // `hidden-url` that message is a whole restore URL for the page the user just left, sitting there as
     // the only thing on screen. The identity is the SESSION: a host route change inside one session does
     // not invalidate the link, a session swap does.
-    const raised = { message: "已完全隐藏，保存此链接恢复：https://h/p/OLD?mark", state: "hidden-url" as const, sessionId: "ses_old" }
+    const raised = { message: "已完全隐藏。网址后面加 ?mark 就能把按钮调回来", link: "https://h/p/OLD?mark", state: "hidden-url" as const, sessionId: "ses_old" }
     expect(activeFabToast(raised, "hidden-url", "ses_new")).toBeNull()
     expect(activeFabToast(raised, "hidden-url", undefined)).toBeNull()
     // …and a session-less overlay (no sessionId at all) still matches itself.
-    expect(activeFabToast({ ...raised, sessionId: undefined }, "hidden-url", undefined)).toBe(raised.message)
+    const sessionless = { ...raised, sessionId: undefined }
+    expect(activeFabToast(sessionless, "hidden-url", undefined)).toBe(sessionless)
   })
 
   it("is null when nothing was raised", () => {
@@ -1023,15 +1027,43 @@ describe("a toast narrates ONE state of ONE session, so it expires when either d
     expect(activeFabToast(undefined, "hidden-url", "ses_1")).toBeNull()
   })
 
-  // The dwell is a property of what the toast SAYS. Every other one confirms a transition whose way back is
-  // still on the device and wants to get out of the way; `hidden-url`'s is the only delivery of the only exit
-  // from the only state with nothing on screen, and since this round it carries a whole URL to select and
-  // copy rather than a five-character suffix to memorize. On the shared 3.2s it handed the user their way
-  // back and took it away before they could use it.
-  it("gives the URL toast long enough to be copied, and keeps every other one brief", () => {
-    expect(fabToastDurationMs("hidden-url")).toBeGreaterThanOrEqual(15000)
+  // The dwell is a property of what the toast SAYS — and, for the one toast that carries an action, of how
+  // long that action takes. Every other toast confirms a transition whose way back is still on the device and
+  // wants out of the way; `hidden-url`'s is the only delivery of the only exit from the only state with
+  // nothing on screen. It is sized to the gesture, and the gesture is now noticing a button and tapping it,
+  // not dragging a text selection across a URL — so it sits above the shared baseline and far below the
+  // fifteen seconds the select-by-hand round needed. Overshooting covers the page; undershooting strands the
+  // user. That asymmetry is the whole justification for the gap, so the test states it as a RANGE rather than
+  // freezing a preference: any value inside it is a legitimate tuning, either edge is a regression.
+  it("gives the URL toast time to be tapped without parking a pill over the page", () => {
+    const dwell = fabToastDurationMs("hidden-url")
+    expect(dwell).toBeGreaterThan(3200) // 3.2s is notice-and-read; there has to be room left to act
+    expect(dwell).toBeLessThanOrEqual(8000) // owner feedback: a long dwell blocks the view and is its own bug
     for (const state of ["visible", "handle", "hidden-key"] as const) {
       expect(fabToastDurationMs(state)).toBe(3200)
     }
+  })
+
+  // The copy button's whole job, minus the button. A Show Page opened over plain HTTP on a phone has no
+  // `navigator.clipboard` at all, and a permissions policy can refuse the write on one that does — for the
+  // ONE state with no other way back, so what happens then is the part worth pinning, not the happy path.
+  it("reports whether the link actually reached the clipboard, and never throws when it did not", async () => {
+    const written: string[] = []
+    const ok = { writeText: async (text: string) => void written.push(text) }
+    await expect(copyRestoreLink("https://h/p/x?mark", ok)).resolves.toBe(true)
+    expect(written).toEqual(["https://h/p/x?mark"])
+
+    // Insecure origin: the API is simply not there. `false`, not a crash — the caller leaves the printed
+    // link up, which is the pre-button behavior and still a complete way out.
+    await expect(copyRestoreLink("https://h/p/x?mark", undefined)).resolves.toBe(false)
+
+    // Present but refused (permissions policy, or a document that is not focused).
+    const refused = { writeText: async () => { throw new Error("NotAllowedError") } }
+    await expect(copyRestoreLink("https://h/p/x?mark", refused)).resolves.toBe(false)
+
+    // Some implementations throw synchronously rather than rejecting; a `false` either way is what lets the
+    // caller have exactly one failure path instead of a try/catch AND a rejection handler.
+    const throwsSync = { writeText: () => { throw new Error("boom") } } as unknown as { writeText(t: string): Promise<void> }
+    await expect(copyRestoreLink("https://h/p/x?mark", throwsSync)).resolves.toBe(false)
   })
 })
