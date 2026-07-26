@@ -483,31 +483,54 @@ export function stripFabParamsFromHash(hash: string | undefined): string {
 }
 
 /**
- * Both strips at once, reassembled into the URL to hand `replaceState` — or `null` when the URL holds
+ * Both strips at once, reassembled into the URL to hand `replaceState` — or `null` when the href holds
  * nothing of ours and must not be rewritten at all.
  *
  * The two segments are cleaned together because the flag legitimately lands in either and a load can carry
  * one in each; rewriting them in two passes would put a half-cleaned URL in the address bar in between. The
  * `null` return is the load-bearing part: it is what lets the caller distinguish "already clean" from
  * "cleaned to the same string", so an untouched URL never reaches `replaceState` and never fakes a
- * navigation for the host's router.
+ * navigation for the host's router. Here it is simply "the rebuild is the input", which is the strongest
+ * form of that claim available: nothing can be quietly normalized on a URL we then declare unchanged.
  *
- * Reassembly asks {@link keepsQueryDelimiter}, not whether the stripped text is non-empty. Emptiness is the
- * wrong question because we are undoing OUR OWN append: on a page whose search is already `?`, the printed
- * exit is `&mark` (an empty query still has its delimiter), so the URL to clean is `/page?&mark` — and
- * truthiness handed the host back `/page`, quietly deleting a `?` that was theirs before we arrived. What
- * this function must restore is the page's own URL, not a normalized guess at it.
+ * It takes the RAW HREF, for the reason {@link formatMarkParam} already takes one, and it is the same
+ * defect read backwards. `location.search` is `""` for both "no query" and "an empty query" and
+ * `location.hash` is `""` for both "no fragment" and "an empty one" — so a decomposed input cannot
+ * distinguish `/p/x?#/route` from `/p/x#/route`, and this function's whole job is to hand back THE PAGE'S OWN
+ * URL rather than a normalized guess at it. Reading `{search, hash}` bought one more enumerated shape per
+ * round (`?&mark`, then `#?mark`) and could never reach `?#`. An href loses nothing, so the rule below is
+ * total, and printer and stripper now read the one source — which is what the round-trip property rests on.
+ *
+ * Everything left of the first `?` or `#` is copied through untouched, so an absolute href stays absolute and
+ * a path-relative one stays relative; this function has no opinion about the origin.
+ *
+ * Each segment gets the same three-way decision, and the middle branch is the one emptiness cannot express:
+ *
+ *   no delimiter at all       → nothing to keep
+ *   nothing of ours was there → hand the segment back byte-for-byte, delimiter included
+ *   we removed something      → {@link keepsQueryDelimiter} decides whether the `?` was ours to remove too
  */
-export function stripFabParamsFromUrl(url: { pathname?: string; search?: string; hash?: string }): string | null {
-  const strippedSearch = stripFabParamsFromSearch(url.search)
-  const nextSearch = keepsQueryDelimiter(url.search, false) ? `?${strippedSearch}` : ""
-  const strippedHash = stripFabParamsFromHash(url.hash)
-  // Same rule for the fragment's own delimiter, and simpler: `formatMarkParam` emits `?mark` / `&mark` and
-  // never a `#`, so a `#` in front of us is always one the page already had. `/page#` + `?mark` reads back as
-  // `/page#?mark`, whose body strips to "" — truthiness would call that "no fragment" and hand back `/page`.
-  const nextHash = strippedHash ? `#${strippedHash}` : url.hash ? "#" : ""
-  if (nextSearch === (url.search ?? "") && nextHash === (url.hash ?? "")) return null
-  return `${url.pathname ?? ""}${nextSearch}${nextHash}`
+export function stripFabParamsFromUrl(href: string): string | null {
+  const fragment = hrefFragment(href)
+  const head = fragment === undefined ? href : href.slice(0, href.length - fragment.length)
+  const cut = head.indexOf("?")
+  const search = cut === -1 ? undefined : head.slice(cut + 1)
+  const strippedSearch = search === undefined ? undefined : stripFabParamsFromSearch(search)
+  const nextSearch =
+    search === undefined || strippedSearch === undefined
+      ? ""
+      : strippedSearch === search
+        ? `?${search}`
+        : keepsQueryDelimiter(search, false)
+          ? `?${strippedSearch}`
+          : ""
+  // The fragment's own delimiter needs no such vote: `formatMarkParam` emits `?mark` / `&mark` and never a
+  // `#`, so a `#` in front of us is always one the page already had and always survives. What it could not
+  // survive was being read off `location.hash`, which reports "" for the `/p/x#` that owns it.
+  const strippedHash = stripFabParamsFromHash(fragment)
+  const nextHash = fragment === undefined ? "" : strippedHash ? `#${strippedHash}` : "#"
+  const next = `${cut === -1 ? head : head.slice(0, cut)}${nextSearch}${nextHash}`
+  return next === href ? null : next
 }
 
 /**

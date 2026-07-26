@@ -1602,8 +1602,14 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
           // The strip reaches wherever the read reaches. Clean only the search and an `unmark` that arrived in
           // the hash sits there forever: no longer one-time, and the `mark` appended to that same tail next
           // would be answering a flag that never left. Route path and foreign keys survive byte-for-byte.
+          //
+          // It gets the HREF, not `{pathname, search, hash}`: the page's own `?` and `#` are what this rewrite
+          // has to give back, and those two accessors report "" for an empty one exactly as they do for a
+          // missing one — see `stripFabParamsFromUrl`. The decomposed pair below is a different question
+          // (which events moved), and one the accessors can still answer.
+          const beforeHref = window.location.href
           const before = { search: window.location.search, hash: window.location.hash }
-          const next = stripFabParamsFromUrl({ pathname: window.location.pathname, ...before })
+          const next = stripFabParamsFromUrl(beforeHref)
           if (next === null) return // nothing of ours in the URL — do not fake a navigation
           // Drop ONLY our flag: keep the app's other params (surgical string strip, no re-encode) and its
           // existing history.state (a history router may keep location keys / scroll data there).
@@ -1615,7 +1621,7 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
           for (const type of fabUrlChangeEvents(before, { search: window.location.search, hash: window.location.hash })) {
             window.dispatchEvent(
               type === "hashchange"
-                ? new HashChangeEvent("hashchange", { oldURL: `${window.location.origin}${window.location.pathname}${before.search}${before.hash}`, newURL: window.location.href })
+                ? new HashChangeEvent("hashchange", { oldURL: beforeHref, newURL: window.location.href })
                 : new PopStateEvent("popstate", { state: window.history.state })
             )
           }
