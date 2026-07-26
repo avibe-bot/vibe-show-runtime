@@ -43,7 +43,7 @@ function toastFor(state: FabVisibility, shortcut?: string, href: string = CLEAN)
 describe("hide copy names each recovery exactly once, in the row that performs it (Lane U)", () => {
   it("fabTip describes what annotation DOES — no shortcut, no handle, no query-param jargon", () => {
     const tip = DEFAULT_ANNOTATION_LABELS.fabTip
-    for (const leaked of ["细条", "侧边", "Alt+M", "Option+M", "⌥M", "?mark", "?unmark"]) {
+    for (const leaked of ["细条", "侧边", "Alt+M", "Option+M", "⌥M", "?vibe-mark", "?vibe-unmark"]) {
       expect(tip).not.toContain(leaked)
     }
     expect(tip).toBe("点选元素或截图，把意见直接发给 Agent")
@@ -65,28 +65,28 @@ describe("hide copy names each recovery exactly once, in the row that performs i
     const rows = options.map((target) => hideRowLabel(target, shortcut))
     // One thing, one name: the 5px strip at the edge is 「侧边细条」 in every row and every toast. Nobody
     // calls it a 「把手」 — a word for a shape the user is never shown.
-    expect(rows).toEqual(["隐藏至侧边（轻点侧边细条恢复）", "完全隐藏（网址末尾加 ?mark 恢复）"])
+    expect(rows).toEqual(["隐藏至侧边（轻点侧边细条恢复）", "完全隐藏（网址末尾加 ?vibe-mark 恢复）"])
     for (const row of rows) {
       expect(row).not.toContain("Alt+M")
       expect(row).not.toContain("Option+M")
     }
   })
 
-  // A literal "?mark" appended to a page that already has a query string yields `?foo=1?mark`, which
-  // URLSearchParams reads as a single `foo` value — no `mark` key, so the stored `hidden` survives the reload.
+  // A literal "?vibe-mark" appended to a page that already has a query string yields `?foo=1?vibe-mark`, which
+  // URLSearchParams reads as a single `foo` value — no `vibe-mark` key, so the stored `hidden` survives the reload.
   // Full-hide is the one state with neither a handle nor a shortcut, so the hint has to be copy-pasteable on
   // the URL actually in front of the reader, not merely correct on a clean one.
   it("the full-hide hint adapts its separator to the URL the reader is on", () => {
     const L = DEFAULT_ANNOTATION_LABELS
     // Clean URL → the friendly literal.
-    expect(hideRowLabel("hidden-url", undefined, CLEAN)).toBe("完全隐藏（网址末尾加 ?mark 恢复）")
-    expect(L.hiddenToast(formatMarkParam(CLEAN))).toBe("已完全隐藏，网址末尾加 ?mark 恢复")
-    // Query string already present → "&mark", in BOTH the row and its toast.
-    expect(hideRowLabel("hidden-url", undefined, `${CLEAN}?foo=1`)).toBe("完全隐藏（网址末尾加 &mark 恢复）")
-    expect(L.hiddenToast(formatMarkParam(`${CLEAN}?vibe-embed=1&debug`))).toBe("已完全隐藏，网址末尾加 &mark 恢复")
+    expect(hideRowLabel("hidden-url", undefined, CLEAN)).toBe("完全隐藏（网址末尾加 ?vibe-mark 恢复）")
+    expect(L.hiddenToast(formatMarkParam(CLEAN))).toBe("已完全隐藏，网址末尾加 ?vibe-mark 恢复")
+    // Query string already present → "&vibe-mark", in BOTH the row and its toast.
+    expect(hideRowLabel("hidden-url", undefined, `${CLEAN}?foo=1`)).toBe("完全隐藏（网址末尾加 &vibe-mark 恢复）")
+    expect(L.hiddenToast(formatMarkParam(`${CLEAN}?vibe-embed=1&debug`))).toBe("已完全隐藏，网址末尾加 &vibe-mark 恢复")
     // The premise, pinned so nobody "simplifies" this back to a hardcoded literal.
-    expect(new URLSearchParams("?foo=1?mark").has("mark")).toBe(false)
-    expect(new URLSearchParams("?foo=1&mark").has("mark")).toBe(true)
+    expect(new URLSearchParams("?foo=1?vibe-mark").has("vibe-mark")).toBe(false)
+    expect(new URLSearchParams("?foo=1&vibe-mark").has("vibe-mark")).toBe(true)
   })
 
   // The copy is unchanged; what changed is where the separator is measured. On a hash-routed page the reader
@@ -97,12 +97,12 @@ describe("hide copy names each recovery exactly once, in the row that performs i
   // rendered copy visibly differs on.
   it("on a hash route the hint describes the FRAGMENT's tail, not the search's", () => {
     // Search has a query, fragment has none: the append lands in the fragment → the clean literal is correct.
-    expect(hideRowLabel("hidden-url", undefined, `${CLEAN}?foo=1#/route`)).toBe("完全隐藏（网址末尾加 ?mark 恢复）")
-    // The fragment already carries its own query → "&mark", regardless of the search.
-    expect(hideRowLabel("hidden-url", undefined, `${CLEAN}#/route?a=1`)).toBe("完全隐藏（网址末尾加 &mark 恢复）")
+    expect(hideRowLabel("hidden-url", undefined, `${CLEAN}?foo=1#/route`)).toBe("完全隐藏（网址末尾加 ?vibe-mark 恢复）")
+    // The fragment already carries its own query → "&vibe-mark", regardless of the search.
+    expect(hideRowLabel("hidden-url", undefined, `${CLEAN}#/route?a=1`)).toBe("完全隐藏（网址末尾加 &vibe-mark 恢复）")
     // A bare trailing '#' is an EMPTY fragment, not an absent one: the append still lands there, so the search's
     // own '?' must not decide. `location.hash` is '' for both, which is why the formatter reads the href.
-    expect(hideRowLabel("hidden-url", undefined, `${CLEAN}?foo=1#`)).toBe("完全隐藏（网址末尾加 ?mark 恢复）")
+    expect(hideRowLabel("hidden-url", undefined, `${CLEAN}?foo=1#`)).toBe("完全隐藏（网址末尾加 ?vibe-mark 恢复）")
   })
 
   // The toast is a pure FUNCTION of the state, not something a handler remembers to set — which is what
@@ -111,9 +111,9 @@ describe("hide copy names each recovery exactly once, in the row that performs i
     expect(toastFor("hidden-key", "Option+M")).toBe("已隐藏，按 Option+M 恢复")
     expect(toastFor("hidden-key", "Alt+M")).toBe("已隐藏，按 Alt+M 恢复")
     expect(toastFor("handle")).toBe("已收到侧边，轻点细条恢复")
-    expect(toastFor("hidden-url")).toBe("已完全隐藏，网址末尾加 ?mark 恢复")
+    expect(toastFor("hidden-url")).toBe("已完全隐藏，网址末尾加 ?vibe-mark 恢复")
     // Same state, a URL that already has a query → the separator its own row printed.
-    expect(toastFor("hidden-url", undefined, `${CLEAN}?foo=1`)).toBe("已完全隐藏，网址末尾加 &mark 恢复")
+    expect(toastFor("hidden-url", undefined, `${CLEAN}?foo=1`)).toBe("已完全隐藏，网址末尾加 &vibe-mark 恢复")
     // `visible` has nothing hidden and therefore no exit to advertise: the caller CLEARS, never flashes.
     expect(toastFor("visible", "Option+M")).toBeNull()
 
@@ -127,8 +127,8 @@ describe("hide copy names each recovery exactly once, in the row that performs i
   // any keyboardless render. If that rule ever regressed, the fallback still hands back a usable exit
   // instead of naming a key this device cannot produce.
   it("never names a shortcut the device does not have, even off the reachable path", () => {
-    expect(toastFor("hidden-key", undefined)).toBe("已完全隐藏，网址末尾加 ?mark 恢复")
-    expect(hideRowLabel("hidden-key", undefined)).toBe("完全隐藏（网址末尾加 ?mark 恢复）")
+    expect(toastFor("hidden-key", undefined)).toBe("已完全隐藏，网址末尾加 ?vibe-mark 恢复")
+    expect(hideRowLabel("hidden-key", undefined)).toBe("完全隐藏（网址末尾加 ?vibe-mark 恢复）")
   })
 
   it("labels stay ADDITIVE, so overriding one string cannot cost a host the platform behavior", () => {
@@ -138,7 +138,7 @@ describe("hide copy names each recovery exactly once, in the row that performs i
     // Same for the URL clause: renaming the row keeps the separator the current URL earned.
     expect(
       withParenthetical(copy.hideCompletelyAction, copy.hideCompletelyHint(formatMarkParam(`${CLEAN}?foo=1`)))
-    ).toBe("Hide for good（网址末尾加 &mark 恢复）")
+    ).toBe("Hide for good（网址末尾加 &vibe-mark 恢复）")
     expect(copy.handleToast).toBe(DEFAULT_ANNOTATION_LABELS.handleToast) // untouched fields keep defaults
   })
 

@@ -2300,4 +2300,50 @@ function unionContentRect(element: Element): DOMRect | undefined {
 
 // Annotation control plane (phase 1 contract §2/§3/§4). Kept in a focused module; re-exported
 // here so `@avibe/show-sdk` consumers get the control API from the package root.
-export * from "./annotation-control.js"
+//
+// The list is written out on purpose. `export *` publishes whatever the module happens to define, so every
+// helper added there becomes package API by accident — nobody decides it, and nobody can tell from this file
+// what the package promises. `annotation-control.ts` holds two populations: this control plane, and the
+// standalone overlay's own machinery (FAB visibility, the URL flag and its round trip, the shortcut, drag
+// placement, mode storage). The second is implementation of one component. Its only consumer is `react.tsx`
+// in this same package, which imports it from `./annotation-control.js` directly and never needed the root
+// path — so re-exporting it bought nothing and promised a lot. Widening this list is a decision; make it here.
+export {
+  // Mode vocabulary
+  ANNOTATION_MODES,
+  DEFAULT_ANNOTATION_MODE,
+  isAnnotationMode,
+  // Host detection
+  ANNOTATION_EMBED_QUERY_PARAM,
+  detectAnnotationHost,
+  // Control/query/state messages over the embed boundary
+  ANNOTATION_CONTROL_MESSAGE,
+  ANNOTATION_QUERY_MESSAGE,
+  ANNOTATION_STATE_MESSAGE,
+  annotationControlActionFromPayload,
+  annotationControlActionFromEvent,
+  annotationControlActionFromMessage,
+  isAnnotationQueryMessage,
+  annotationStateMessage,
+  // State reduction and event ordering
+  reduceAnnotationState,
+  isLiveControlEvent,
+  isBatchControlNewer,
+  // Submission gate
+  APPROVE_INTENT,
+  canSubmitAnnotation,
+  // Access + write token
+  fetchAnnotationAccess,
+  probeAnnotationAccess,
+  resolveWriteToken,
+  // Controller and its bindings
+  createAnnotationController,
+  attachAnnotationWindowApi,
+  connectAnnotationHostBridge,
+  type AnnotationHost,
+  type AnnotationStateMessage,
+  type AnnotationController,
+  type AnnotationControllerDeps,
+  type AnnotationMessageTarget,
+  type AnnotationBroadcastTarget
+} from "./annotation-control.js"

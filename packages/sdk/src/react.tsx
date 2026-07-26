@@ -246,7 +246,7 @@ export type AnnotationOverlayLabels = {
   hideToHandleHint?: string
   /** '?' popup row for `hidden-url`: hide everything, with no on-screen way back. */
   hideCompletelyAction?: string
-  /** Its recovery clause, given the exact fragment to append for THIS url ("?mark" / "&mark"). */
+  /** Its recovery clause, given the exact fragment to append for THIS url ("?vibe-mark" / "&vibe-mark"). */
   hideCompletelyHint?: (markParam: string) => string
   /** Toast for `hidden-key` — repeats the row's own shortcut hint. */
   hiddenShortcutToast?: (shortcut: string) => string
@@ -292,13 +292,13 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   hideCompletelyAction: "完全隐藏",
   // The fragment is computed from the RAW HREF in front of the reader (formatMarkParam), against the segment
   // their append actually lands in — the search on a plain page, the fragment on a `#/…` route, since the end
-  // of that address bar is what they are typing at. A page that already has a query string there reads "&mark"
-  // instead of a "?mark" that would land as `?foo=1?mark`: one `foo` value, no `mark` key, chrome stays hidden.
+  // of that address bar is what they are typing at. A page that already has a query string there reads "&vibe-mark"
+  // instead of a "?vibe-mark" that would land as `?foo=1?vibe-mark`: one `foo` value, no `vibe-mark` key, chrome stays hidden.
   // The href rather than a decomposed `{search, hash}` because `location.hash` cannot tell "no fragment" from
   // "empty fragment", and those two want opposite separators. This is the one hide with neither a handle nor a
   // shortcut behind it, so the hint has to be copy-pasteable rather than merely correct in the abstract.
   // 「末尾」 is deliberate: it names WHERE to type, which is the half of the instruction a bare
-  // "网址加 ?mark" leaves the reader to guess.
+  // "网址加 ?vibe-mark" leaves the reader to guess.
   hideCompletelyHint: (markParam) => `网址末尾加 ${markParam} 恢复`,
   hiddenShortcutToast: (shortcut) => `已隐藏，按 ${shortcut} 恢复`,
   handleToast: "已收到侧边，轻点细条恢复",
@@ -1516,7 +1516,7 @@ export function fabToastFor(
  * captured at mount: the boot strip below rewrites `location.search` after the chrome first renders, and a
  * host router may change it again, so a fragment baked early can name the wrong separator.
  */
-/** The URL as it stands right now, in both segments a `mark` / `unmark` flag can occupy. */
+/** The URL as it stands right now, in both segments a `vibe-mark` / `vibe-unmark` flag can occupy. */
 function currentUrl(): FabParamUrl {
   if (typeof window === "undefined") return {}
   return { search: window.location.search, hash: window.location.hash }
@@ -1533,7 +1533,7 @@ function currentHref(): string {
 }
 
 /** Standalone-only chrome visibility (visible | handle | hidden-key | hidden-url) from the frozen
- *  ?mark / ?unmark flag: an
+ *  ?vibe-mark / ?vibe-unmark flag: an
  *  explicit flag flips it AND persists the choice, then is stripped from the URL (one-time per occurrence —
  *  watched, not sampled at boot, because appending it to a hash route never reloads the page);
  *  a flag-free load honors the stored state. Read from the search AND from the hash's own query segment,
@@ -1561,11 +1561,11 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
     // through untouched — its exit is in the address bar, which every device has.
     return fabVisibilityForDevice(resolved.visibility, !touchPrimary)
   })
-  // Apply the ?mark / ?unmark switch: adopt it, persist the choice, then STRIP the flag via replaceState so
+  // Apply the ?vibe-mark / ?vibe-unmark switch: adopt it, persist the choice, then STRIP the flag via replaceState so
   // the URL returns clean.
   //
   // This SUBSCRIBES rather than reading once at boot, because the exit we advertise — "append it at the end
-  // of the address bar" — is not a page load on a hash-routed page. `/p/x#/route` → `/p/x#/route?mark` is a
+  // of the address bar" — is not a page load on a hash-routed page. `/p/x#/route` → `/p/x#/route?vibe-mark` is a
   // same-document fragment change: nothing remounts, so a boot-only read never sees the token the user was
   // told to type, and `hidden-url` — the one state kept undegraded precisely BECAUSE its exit works on every
   // device — is the one that strands on a blank screen. Handling `hashchange` and `popstate` puts the read
@@ -1578,7 +1578,7 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
       const token = fabFlagToken(url)
       const stored = readStoredFabVisibility(sessionId, touchPrimaryRef.current, storage)
       // A flag is spent once per OCCURRENCE, not once per read. The two correct decisions above collide
-      // otherwise: when the write fails we leave `?unmark` in the URL on purpose (the reload fallback), and
+      // otherwise: when the write fails we leave `?vibe-unmark` in the URL on purpose (the reload fallback), and
       // since round 7 we also listen for navigation — so without an identity to compare against, the user
       // restores the chrome with the shortcut and the host's very next route change re-reads that same
       // stale token and hides it again.
@@ -1596,11 +1596,11 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
         }
         setVisibility(fabVisibilityForDevice(resolved.visibility, !touchPrimaryRef.current))
         // Strip the one-time flag ONLY once the choice is durable: if the write failed (no storage / quota),
-        // leave ?mark/?unmark in the URL so a reload still carries the intent instead of silently reverting.
+        // leave ?vibe-mark/?vibe-unmark in the URL so a reload still carries the intent instead of silently reverting.
         if (!writeStoredFabVisibility(sessionId, resolved.persist, storage)) return
         try {
-          // The strip reaches wherever the read reaches. Clean only the search and an `unmark` that arrived in
-          // the hash sits there forever: no longer one-time, and the `mark` appended to that same tail next
+          // The strip reaches wherever the read reaches. Clean only the search and a `vibe-unmark` that arrived in
+          // the hash sits there forever: no longer one-time, and the `vibe-mark` appended to that same tail next
           // would be answering a flag that never left. Route path and foreign keys survive byte-for-byte.
           //
           // It gets the HREF, not `{pathname, search, hash}`: the page's own `?` and `#` are what this rewrite
@@ -1615,7 +1615,7 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
           // existing history.state (a history router may keep location keys / scroll data there).
           window.history.replaceState(window.history.state, "", next)
           // replaceState fires neither event, so any router subscribed to them would keep serving the URL we
-          // just rewrote — a hash router would hold our `mark` in its route query forever. Re-issue exactly
+          // just rewrote — a hash router would hold our `vibe-mark` in its route query forever. Re-issue exactly
           // what the browser withheld. These wake `apply` again, harmlessly: the flag is gone by now, so the
           // next pass persists nothing and rewrites nothing.
           for (const type of fabUrlChangeEvents(before, { search: window.location.search, hash: window.location.hash })) {
@@ -1633,7 +1633,7 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
         // "the occurrence currently in the URL that we have already answered", so it is DERIVED FROM THE URL
         // AS IT NOW STANDS rather than from the token we read on the way in. Those two differ in exactly the
         // case that matters: a successful strip leaves nothing behind, so the answer is `undefined` — and a
-        // page opened AT `#/route?mark` no longer holds `mark` for the rest of the session, swallowing the
+        // page opened AT `#/route?vibe-mark` no longer holds `vibe-mark` for the rest of the session, swallowing the
         // user's next append as an echo of their first.
         //
         // Deriving it here rather than fixing the listener registration order is the difference between a
@@ -2005,7 +2005,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     requestChromeFocus()
     fabVisibility.set("visible")
   }, [requestChromeFocus, fabVisibility])
-  // If ?unmark applies (or a hide row fires) WHILE a session is active, the hide switch must also stop
+  // If ?vibe-unmark applies (or a hide row fires) WHILE a session is active, the hide switch must also stop
   // capture — not just hide the collapsed FAB — so the documented switch works mid-session (#3637478399).
   React.useEffect(() => {
     if (host === "standalone" && fabVisibility.visibility !== "visible" && enabled) onDisable?.()
@@ -2027,7 +2027,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     const message = fabToastFor(rescued, shortcut, formatMarkParam(currentHref()), labels)
     if (message) flashToast(message, rescued)
   }, [host, shortcut, fabVisibility.visibility, fabVisibility.set, flashToast, labels])
-  // Option/Alt+M toggles the chrome (standalone only), mirroring ?mark/?unmark and the '?' popup's hide row.
+  // Option/Alt+M toggles the chrome (standalone only), mirroring ?vibe-mark/?vibe-unmark and the '?' popup's hide row.
   // Registered at the document level so it works even while the chrome is hidden; the pure guard blocks it
   // while the user is typing or holding another modifier. Bound only where a shortcut EXISTS — a touch-primary
   // device has no keyboard, and its copy never mentions one, so there is nothing to listen for. It also
@@ -2051,7 +2051,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   }, [host, shortcut, available, fabVisibility.visibility, hideFab, restoreFab])
 
   // A hide toast is on screen for 3.2s and narrates ONE state ("已隐藏，…恢复"). Whoever moves the user out of
-  // that state makes it a lie — including the paths with no handler to clear it from: a `?mark` typed into the
+  // that state makes it a lie — including the paths with no handler to clear it from: a `?vibe-mark` typed into the
   // address bar restores through the URL listener without touching any callback here. Deriving the live
   // message from the current state retires the stale one everywhere at once, rather than per call site.
   const statusToast = activeFabToast(toast, fabVisibility.visibility)
@@ -2080,7 +2080,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // it instead of needing to remember.
   if (!available) return null
 
-  // The ?unmark / hide-row switch gates ALL standalone chrome — the collapsed FAB and the expanded toolbar
+  // The ?vibe-unmark / hide-row switch gates ALL standalone chrome — the collapsed FAB and the expanded toolbar
   // alike — so it hides everything, not just the FAB (#3637621031 / #3637478399); the disable effect above
   // stops capture too. The toast still renders so the confirmation shows even after the chrome is gone.
   if (fabVisibility.visibility !== "visible") {
