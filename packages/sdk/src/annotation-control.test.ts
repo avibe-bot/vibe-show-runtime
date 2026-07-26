@@ -671,47 +671,57 @@ describe("platform-split hide options (Lane U)", () => {
     expect(fabHideOptions(true)).toEqual(["handle", "hidden-url"])
   })
 
-  it("formatMarkParam picks the separator for the segment the user APPENDS to — the hash when there is one", () => {
-    // Same shape as formatFabShortcut one axis over — compute the exact token the user must reproduce
-    // instead of making them derive it. There it's the platform's modifier; here it's the URL's separator.
-    // The user types at the END of the address bar, so the segment that decides is whichever one ends the URL.
-    expect(formatMarkParam({})).toBe("?mark") // no query, no hash
-    expect(formatMarkParam({ search: "?foo=1" })).toBe("&mark") // query, no hash → search decides
-    expect(formatMarkParam({ hash: "#/route" })).toBe("?mark") // hash route, no query of its own
-    expect(formatMarkParam({ hash: "#/route?a=1" })).toBe("&mark") // hash route already carrying a query
-    // The one that is easiest to write backwards: the SEARCH has a query, but the append lands past it, in a
-    // hash that has none. Reading `search` here would hand out '&mark' and produce `#/route&mark` — no flag.
-    expect(formatMarkParam({ search: "?foo=1", hash: "#/route" })).toBe("?mark")
-    expect(formatMarkParam({ search: "?foo=1", hash: "#/route?a=1" })).toBe("&mark")
-    // Degenerate shapes read as "no segment", per the URL spec's own normalization.
-    expect(formatMarkParam({ search: "?", hash: "" })).toBe("?mark")
-    expect(formatMarkParam({ search: "foo=1" })).toBe("&mark") // tolerates a missing leading '?'
-    // Already carrying the flag → still '&'. A duplicate key keeps has('mark') true, whereas special-casing it
-    // back to '?' would emit the broken form for a URL that demonstrably has a query string.
-    expect(formatMarkParam({ search: "?mark" })).toBe("&mark")
-    expect(formatMarkParam({ hash: "#/route?mark" })).toBe("&mark")
-  })
-
-  it("what formatMarkParam hands out parses back on EVERY real URL shape — the whole reason it exists", () => {
-    // The bug it closes: a literal '?mark' appended to a URL that already has a query string yields
-    // `?foo=1?mark`, which URLSearchParams reads as ONE `foo` value. No `mark` key, so the stored `hidden`
-    // survives the reload — on the one hidden state with neither a handle nor a shortcut to fall back on.
-    expect(new URLSearchParams("?foo=1?mark").has("mark")).toBe(false)
-    // The full loop, exactly as a user drives it: append the token we printed to the end of the address bar,
-    // let the URL parser split the result, and require the reader to see it. `new URL()` does the splitting so
-    // the test asserts against real browser semantics rather than our own idea of them.
-    for (const href of [
+  it("what we print parses back — ONE property over every URL shape, which is what closes this family", () => {
+    // Four review rounds found four URL shapes where the printed token was not a token. Each was answered by
+    // handling one more shape, which is why there was always a fifth. This is the assertion that ends that:
+    // not a list of shapes with their expected separators, but the round trip the user actually performs —
+    //
+    //     parse(append(url, format(url))) === restored
+    //
+    // — required to hold over a matrix. A new shape is one line of data, and no new expectation to get right.
+    // Pure string work, so it runs in a package with no jsdom: rounds 7, 8 and 10 were all caught by a human
+    // reading the code, and this is the first thing here a machine can catch instead.
+    const SHAPES = [
       "https://h/p/abc",
       "https://h/p/abc?foo=1",
+      "https://h/p/abc#", // a bare trailing '#' — an EMPTY fragment, which `location.hash` reports as ''
+      "https://h/p/abc?foo=1#", // ← round 10: '' from `.hash` meant "no fragment", so the search decided. Wrong.
       "https://h/p/abc#/route",
       "https://h/p/abc#/route?a=1",
+      "https://h/p/abc#/route?a=1#x", // ← a second '#'. The fragment starts at the FIRST one; see below.
       "https://h/p/abc?foo=1#/route", // ← the shape rounds 1–3 kept missing
       "https://h/p/abc?foo=1#/route?a=1",
       "https://h/p/abc#section",
-    ]) {
-      const appended = new URL(`${href}${formatMarkParam(new URL(href))}`)
+      // …and each of them as the user actually meets it: still carrying the `unmark` a failed write left
+      // behind, which is the ONLY situation in which the printed rescue is ever typed.
+      "https://h/p/abc?unmark",
+      "https://h/p/abc?foo=1#?unmark",
+      "https://h/p/abc#/route?unmark",
+      "https://h/p/abc#/route?a=1&unmark",
+      "https://h/p/abc#/route?a=1#x&unmark",
+    ]
+    for (const href of SHAPES) {
+      const appended = new URL(`${href}${formatMarkParam(href)}`)
       expect(resolveFabVisibility(appended, "hidden-url"), href).toEqual({ visibility: "visible", persist: "visible" })
     }
+  })
+
+  it("the fragment begins at the FIRST '#', because that is where the reader's parser begins it", () => {
+    // The separator question is "does the segment I am appending to already have a '?'", and the segment is
+    // decided by the same rule the reader uses — `location.hash` is everything after the first '#'. Anchoring
+    // on the LAST one instead reads a different string, and the two disagree the moment a URL has two.
+    const href = "https://h/p/abc#/route?a=1#x"
+    expect(formatMarkParam(href)).toBe("&mark") // first '#' → the fragment `/route?a=1#x` already has a '?'
+    // The counterfactual, so this is not a rule anyone has to take on faith: anchoring on the last '#' sees
+    // no '?' after it and prints '?mark'. The reader splits the fragment at ITS first '?', so URLSearchParams
+    // is handed `a=1#x?mark` — one key `a`, and no `mark` at all.
+    expect(new URL(`${href}?mark`).hash).toBe("#/route?a=1#x?mark")
+    expect(resolveFabVisibility(new URL(`${href}?mark`), "hidden-url").visibility).toBe("hidden-url")
+    // No '#' at all → the append lands in the search, and the href's own '?' decides. Includes the SSR case,
+    // where there is no URL to read and nothing has a query.
+    expect(formatMarkParam("")).toBe("?mark")
+    expect(formatMarkParam("https://h/p/abc")).toBe("?mark")
+    expect(formatMarkParam("https://h/p/abc?foo=1")).toBe("&mark")
   })
 
   it("withParenthetical composes a base action with its recovery clause, and degrades to bare base", () => {

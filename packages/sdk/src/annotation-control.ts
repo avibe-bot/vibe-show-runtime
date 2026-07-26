@@ -157,11 +157,30 @@ export interface FabParamUrl {
  * to keep parsing as a single `redirect` value — exactly as it already does on the search side — so that a
  * lenient scan can't invent a flag out of a host's parameter, or corrupt one on the way back out. Everything
  * left of the `?` belongs to the hash router and is never read or rewritten here.
+ *
+ * `hasQuery` is reported separately from `query` because an empty query is not the absence of one:
+ * `#/route?` already carries the `?` that decides the next separator. Reader and writer share this one split
+ * precisely so they cannot answer that question differently — see {@link formatMarkParam}.
  */
-function splitHash(hash: string | undefined): { route: string; query: string } {
+function splitHash(hash: string | undefined): { route: string; query: string; hasQuery: boolean } {
   const raw = (hash ?? "").replace(/^#/, "")
   const start = raw.indexOf("?")
-  return start === -1 ? { route: raw, query: "" } : { route: raw.slice(0, start), query: raw.slice(start + 1) }
+  if (start === -1) return { route: raw, query: "", hasQuery: false }
+  return { route: raw.slice(0, start), query: raw.slice(start + 1), hasQuery: true }
+}
+
+/**
+ * The fragment of a raw href in `location.hash` form — leading `#` included — or `undefined` when the href has
+ * no fragment at all.
+ *
+ * The FIRST `#` is the anchor, because that is where the URL spec puts the fragment and therefore where the
+ * reader's parser starts. On `#/route?a=1#x` the last `#` would name a different string, one with no `?` in
+ * it, and the two answers diverge: we would print `?mark`, the reader would split at the fragment's first `?`
+ * and hand `URLSearchParams` the value `1#x?mark` — a single `a` key, no flag.
+ */
+function hrefFragment(href: string): string | undefined {
+  const start = href.indexOf("#")
+  return start === -1 ? undefined : href.slice(start)
 }
 
 /**
@@ -515,13 +534,25 @@ export function formatFabShortcut(
  * Which separator is right is decided by the segment the user APPENDS TO — the end of the address bar. On a
  * hash-routed page that is the hash, not the search, and the two can disagree: `/p/x?foo=1#/route` has a
  * query string yet its tail has none, so the answer there is `?mark`, and reading `search` would hand out
- * `&mark` and produce `#/route&mark` — one more shape where the flag silently isn't a flag. Only when there
- * is no hash at all does the search decide.
+ * `&mark` and produce `#/route&mark` — one more shape where the flag silently isn't a flag.
+ *
+ * It takes the RAW HREF, and that is the point rather than a convenience. Four review rounds each found one
+ * more URL shape this got wrong, and the reason was never the rule — it was the input. `URL.hash` is `""`
+ * for BOTH "there is no fragment" and "there is an empty fragment" (`/page?foo=1#`), and those two demand
+ * opposite separators, so no rule reading a decomposed `{search, hash}` can be right about both; every round
+ * could only enumerate one more shape. An href loses nothing, so one rule covers every shape there is:
+ *
+ *   no `#`  → the append lands in the search   → `&` if the href already has a `?`
+ *   a `#`   → the append lands in the fragment → `&` if that fragment already has a `?`
+ *
+ * Both halves go through the reader's own {@link splitHash} and {@link hrefFragment}, so what we print and
+ * what we accept cannot disagree — a printed instruction the parser rejects is the whole failure mode here.
+ * The property test over the shape matrix is the thing that keeps it that way; prefer adding a row there to
+ * adding a branch here.
  */
-export function formatMarkParam(url: FabParamUrl): string {
-  const hash = (url.hash ?? "").replace(/^#/, "")
-  const search = (url.search ?? "").replace(/^\?/, "")
-  const tailHasQuery = hash ? hash.includes("?") : search !== ""
+export function formatMarkParam(href: string): string {
+  const fragment = hrefFragment(href)
+  const tailHasQuery = fragment === undefined ? href.includes("?") : splitHash(fragment).hasQuery
   return `${tailHasQuery ? "&" : "?"}${ANNOTATION_FAB_PARAM_SHOW}`
 }
 

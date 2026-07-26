@@ -290,13 +290,15 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   hideToHandleAction: "隐藏至侧边",
   hideToHandleHint: "轻点侧边细条恢复",
   hideCompletelyAction: "完全隐藏",
-  // The fragment is computed for the URL in front of the reader (formatMarkParam), against the segment their
-  // append actually lands in: a page that already has a query string reads "&mark" instead of a "?mark" that
-  // would land as `?foo=1?mark` — one `foo` value, no `mark` key, chrome stays hidden — and a page on a
-  // `#/…` route is measured by its hash, which is what the end of that address bar belongs to. This is the
-  // one hide with neither a handle nor a shortcut behind it, so the hint has to be copy-pasteable rather
-  // than merely correct in the abstract. 「末尾」 is deliberate: it names WHERE to type, which is the half of
-  // the instruction a bare "网址加 ?mark" leaves the reader to guess.
+  // The fragment is computed from the RAW HREF in front of the reader (formatMarkParam), against the segment
+  // their append actually lands in — the search on a plain page, the fragment on a `#/…` route, since the end
+  // of that address bar is what they are typing at. A page that already has a query string there reads "&mark"
+  // instead of a "?mark" that would land as `?foo=1?mark`: one `foo` value, no `mark` key, chrome stays hidden.
+  // The href rather than a decomposed `{search, hash}` because `location.hash` cannot tell "no fragment" from
+  // "empty fragment", and those two want opposite separators. This is the one hide with neither a handle nor a
+  // shortcut behind it, so the hint has to be copy-pasteable rather than merely correct in the abstract.
+  // 「末尾」 is deliberate: it names WHERE to type, which is the half of the instruction a bare
+  // "网址加 ?mark" leaves the reader to guess.
   hideCompletelyHint: (markParam) => `网址末尾加 ${markParam} 恢复`,
   hiddenShortcutToast: (shortcut) => `已隐藏，按 ${shortcut} 恢复`,
   handleToast: "已收到侧边，轻点细条恢复",
@@ -1520,6 +1522,16 @@ function currentUrl(): FabParamUrl {
   return { search: window.location.search, hash: window.location.hash }
 }
 
+/**
+ * The same URL, undecomposed — what the token we PRINT has to be computed from.
+ *
+ * `location.hash` is `""` for both "no fragment" and "an empty fragment" (`/page?foo=1#`), and those two want
+ * opposite separators, so the pair above cannot answer that question. The href can. See `formatMarkParam`.
+ */
+function currentHref(): string {
+  return typeof window === "undefined" ? "" : window.location.href
+}
+
 /** Standalone-only chrome visibility (visible | handle | hidden-key | hidden-url) from the frozen
  *  ?mark / ?unmark flag: an
  *  explicit flag flips it AND persists the choice, then is stripped from the URL (one-time per occurrence —
@@ -1962,7 +1974,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
       fabVisibility.set(next)
       // The URL fragment is resolved HERE, in the handler, against the URL as it stands at the instant of the
       // hide — the one moment it is guaranteed current.
-      const message = fabToastFor(next, shortcut, formatMarkParam(currentUrl()), labels)
+      const message = fabToastFor(next, shortcut, formatMarkParam(currentHref()), labels)
       if (message) flashToast(message, next)
     },
     [requestChromeFocus, onDisable, fabVisibility, flashToast, shortcut, labels]
@@ -1991,7 +2003,7 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
     // The toast names the state just entered, like every other transition here — but unlike the others this
     // one is not user-initiated, so an unannounced handle appearing on screen would be a second puzzle.
     // Deriving it from the new state answers both at once: what this is, and how to get out.
-    const message = fabToastFor(rescued, shortcut, formatMarkParam(currentUrl()), labels)
+    const message = fabToastFor(rescued, shortcut, formatMarkParam(currentHref()), labels)
     if (message) flashToast(message, rescued)
   }, [host, shortcut, fabVisibility.visibility, fabVisibility.set, flashToast, labels])
   // Option/Alt+M toggles the chrome (standalone only), mirroring ?mark/?unmark and the '?' popup's hide row.
@@ -2163,7 +2175,7 @@ function ToolbarHelp({ tip, hideOptions, triggerLabel, onHide }: { tip: string; 
   const [snapshot, setSnapshot] = React.useState<{ style: React.CSSProperties; markParam: string } | null>(null)
   const open = snapshot !== null
   const openTip = React.useCallback(() => {
-    const markParam = formatMarkParam(currentUrl())
+    const markParam = formatMarkParam(currentHref())
     const button = btnRef.current
     if (!button || typeof window === "undefined") {
       setSnapshot({ style: {}, markParam })
