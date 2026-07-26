@@ -2,35 +2,117 @@ import { describe, expect, it, vi } from "vitest"
 import {
   DEFAULT_ANNOTATION_LABELS,
   disabledButtonStyle,
+  mergeAnnotationLabels,
   modePillLabel,
   tooltipPlacement,
   edgeHandleAnchor,
+  edgeHandleVisual,
   createChromeFocusController,
   TOUCH_CAPABLE_QUERY
 } from "./react.js"
+import { fabHideOptions, formatFabShortcut, withParenthetical } from "./annotation-control.js"
 
-// Overlay uses inline styles (no `:disabled` stylesheet), so the disabled LOOK is applied explicitly.
-// These pure assertions run in CI (the browser layout check does not), locking the visual contract the
-// owner flagged: a disabled send must read dimmed/gray, never the bright mint of an enabled action.
-describe("FAB copy leads with the edge handle; '?' popup owns the hide action (Lane R12/R13)", () => {
-  it("both the tip and the hidden toast name the edge handle + Alt+M, with no query-param jargon", () => {
-    for (const copy of [DEFAULT_ANNOTATION_LABELS.fabTip, DEFAULT_ANNOTATION_LABELS.fabHiddenToast]) {
-      expect(copy).toContain("把手") // the edge handle is THE cross-platform recovery, mentioned first
-      expect(copy).toContain("Alt+M") // desktop shortcut retained
+/** The row label the '?' popup renders for one hide target — the same composition AnnotationChrome does. */
+function hideRowLabel(target: "handle" | "hidden", shortcut: string | undefined): string {
+  const L = DEFAULT_ANNOTATION_LABELS
+  if (target === "handle") return withParenthetical(L.hideToHandleAction, L.hideToHandleHint)
+  return shortcut
+    ? withParenthetical(L.hideAction, L.hideActionHint(shortcut))
+    : withParenthetical(L.hideCompletelyAction, L.hideCompletelyHint)
+}
+
+// Recovery hints live in the PARENTHESES of the button that hides, named ONCE. Before Lane U the tip and
+// the toast each recited the shortcut AND the handle, so a desktop user was told about a grabber they never
+// get and read '⌥M' three times. These assertions lock the final user-visible strings — composed through the
+// same helpers the component uses, so drift in either the base or the clause fails here.
+describe("hide copy names each recovery exactly once, in the row that performs it (Lane U)", () => {
+  it("fabTip describes what annotation DOES — no shortcut, no handle, no query-param jargon", () => {
+    const tip = DEFAULT_ANNOTATION_LABELS.fabTip
+    for (const leaked of ["把手", "Alt+M", "Option+M", "⌥M", "?mark", "?unmark"]) {
+      expect(tip).not.toContain(leaked)
     }
-    expect(DEFAULT_ANNOTATION_LABELS.fabTip).toContain("⌥M") // macOS glyph kept in the (longer) tip
-    // query params stay the programmatic path but must not be the user-facing copy
-    expect(DEFAULT_ANNOTATION_LABELS.fabTip).not.toContain("?unmark")
-    expect(DEFAULT_ANNOTATION_LABELS.fabHiddenToast).not.toContain("?mark")
+    expect(tip).toBe("点选元素或截图，把意见直接发给 Agent")
   })
 
-  it("the '?' popup hide row carries a distinct destructive label (no longer a bare ✕)", () => {
-    expect(DEFAULT_ANNOTATION_LABELS.hideAction).toBe("隐藏标注按钮")
+  it("desktop gets ONE destructive row naming the platform shortcut — and no handle option", () => {
+    const options = fabHideOptions(false)
+    expect(options).toEqual(["hidden"]) // desktop cannot CREATE a handle state
+
+    expect(hideRowLabel("hidden", formatFabShortcut({ platform: "macOS" }))).toBe("隐藏标注按钮（Option+M 恢复）")
+    expect(hideRowLabel("hidden", formatFabShortcut({ platform: "Windows" }))).toBe("隐藏标注按钮（Alt+M 恢复）")
+  })
+
+  it("touch gets TWO rows, handle first, neither mentioning a keyboard it does not have", () => {
+    const options = fabHideOptions(true)
+    expect(options).toEqual(["handle", "hidden"]) // order is the rendered order
+
+    const shortcut = formatFabShortcut({ platform: "iPhone", touchPrimary: true }) // undefined
+    const rows = options.map((target) => hideRowLabel(target, shortcut))
+    expect(rows).toEqual(["隐藏至把手（点把手可恢复）", "完全隐藏（网址加 ?mark 恢复）"])
+    for (const row of rows) {
+      expect(row).not.toContain("Alt+M")
+      expect(row).not.toContain("Option+M")
+    }
+  })
+
+  it("each toast repeats the hint for the state just entered, and nothing else", () => {
+    const L = DEFAULT_ANNOTATION_LABELS
+    expect(L.hiddenShortcutToast("Option+M")).toBe("已隐藏，按 Option+M 恢复")
+    expect(L.hiddenShortcutToast("Alt+M")).toBe("已隐藏，按 Alt+M 恢复")
+    expect(L.handleToast).toBe("已缩至边缘把手，轻点可恢复")
+    expect(L.hiddenToast).toBe("已完全隐藏，网址加 ?mark 可恢复")
+
+    // The handle toast is the touch path; it must not advertise a shortcut, and the desktop toast must not
+    // advertise a grabber the desktop never renders.
+    expect(L.handleToast).not.toContain("+M")
+    expect(L.hiddenShortcutToast("Option+M")).not.toContain("把手")
+  })
+
+  it("labels stay ADDITIVE, so overriding one string cannot cost a host the platform behavior", () => {
+    // A host renaming the base action keeps the auto-detected parenthetical clause.
+    const copy = mergeAnnotationLabels({ hideAction: "Hide" })
+    expect(withParenthetical(copy.hideAction, copy.hideActionHint("Alt+M"))).toBe("Hide（Alt+M 恢复）")
+    expect(copy.handleToast).toBe(DEFAULT_ANNOTATION_LABELS.handleToast) // untouched fields keep defaults
+  })
+
+  it("mergeAnnotationLabels fills EVERY field, so a newly added label can never render blank", () => {
+    const copy = mergeAnnotationLabels(undefined)
+    for (const key of Object.keys(DEFAULT_ANNOTATION_LABELS)) {
+      expect(copy[key as keyof typeof copy], key).toBeDefined()
+    }
+    // An explicitly-undefined override is an absent override, not a blank string.
+    expect(mergeAnnotationLabels({ hideAction: undefined }).hideAction).toBe(DEFAULT_ANNOTATION_LABELS.hideAction)
+    // exitShort still falls back through `exit` before the default.
+    expect(mergeAnnotationLabels({ exit: "Done" }).exitShort).toBe("Done")
   })
 
   it("the '?' trigger has a fallback accessible name for when a host suppresses the tip copy", () => {
     // With an empty fabTip the trigger's aria-label falls back to this so a screen reader never reads bare '?'.
     expect(DEFAULT_ANNOTATION_LABELS.helpTrigger).toBe("帮助")
+  })
+})
+
+// The handle is the only chrome a user can hide INTO and tap back out of, so a user-initiated collapse pulses
+// once (~1.5s) to show where it went. Rest/hover geometry is browser-verified; this locks the three visual
+// states so a refactor can't make the pulse indistinguishable from rest.
+describe("edgeHandleVisual: the collapse target announces itself once, then recedes (Lane U)", () => {
+  it("pulses widest + fully opaque, outranking hover, and settles to a faint resting sliver", () => {
+    const pulsing = edgeHandleVisual({ pulsing: true })
+    const active = edgeHandleVisual({ active: true })
+    const rest = edgeHandleVisual({})
+
+    expect(pulsing).toEqual({ width: 9, opacity: 1 })
+    expect(active).toEqual({ width: 7, opacity: 0.55 })
+    expect(rest).toEqual({ width: 5, opacity: 0.2 })
+
+    expect(pulsing.width).toBeGreaterThan(active.width)
+    expect(active.width).toBeGreaterThan(rest.width)
+    expect(pulsing.opacity).toBeGreaterThan(active.opacity)
+    expect(active.opacity).toBeGreaterThan(rest.opacity)
+  })
+
+  it("pulse wins even while hovered, so the attention cue is never swallowed by a resting pointer", () => {
+    expect(edgeHandleVisual({ active: true, pulsing: true })).toEqual({ width: 9, opacity: 1 })
   })
 })
 
@@ -160,6 +242,9 @@ describe("'?' tooltip placement stays within the viewport (Lane R12 round 2/3)",
   })
 })
 
+// Overlay uses inline styles (no `:disabled` stylesheet), so the disabled LOOK is applied explicitly.
+// These pure assertions run in CI (the browser layout check does not), locking the visual contract the
+// owner flagged: a disabled send must read dimmed/gray, never the bright mint of an enabled action.
 describe("screenshot comment card polish (Lane R8)", () => {
   const primary = { color: "#080812", background: "#5BFFA0", boxShadow: "0 8px 24px x", cursor: "pointer" }
 

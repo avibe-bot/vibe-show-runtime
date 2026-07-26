@@ -65,14 +65,20 @@ import {
   resolveWriteToken,
   safeLocalStorage,
   resolveFabVisibility,
-  readStoredFabVisible,
-  writeStoredFabVisible,
+  readStoredFabVisibility,
+  writeStoredFabVisibility,
+  fabHideOptions,
+  formatFabShortcut,
+  toggleFabVisibilityByShortcut,
+  withParenthetical,
   stripFabParamsFromSearch,
   shouldToggleFabShortcut,
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
   snapToNearestEdge,
   exceedsDragThreshold,
+  type FabHideTarget,
+  type FabVisibility,
   type FloatPosition,
   type FloatPlacement,
   type AnnotationController,
@@ -212,14 +218,32 @@ export type AnnotationOverlayLabels = {
   approve?: string
   /** Affordance to reveal the optional note field on the approve fast path. */
   addNote?: string
-  /** One-line tip shown by the toolbar '?' affordance. */
+  /** One-line tip shown by the toolbar '?' affordance: what annotation DOES, nothing about recovery. */
   fabTip?: string
-  /** Toast shown after hiding the FAB. */
-  fabHiddenToast?: string
-  /** Accessible name for the edge-handle grabber that restores a hidden FAB. */
+  /** Accessible name for the edge-handle grabber that restores the chrome. */
   restoreHandle?: string
-  /** Destructive action-row label inside the '?' popup that hides the FAB. */
+  // The hide rows and their toasts are ADDITIVE pairs: a base action + the parenthetical recovery clause
+  // its device earned (composed by withParenthetical). A host overriding one base sentence therefore keeps
+  // the platform behavior instead of freezing one platform's wording. The shortcut is named in exactly one
+  // place — formatFabShortcut() — and interpolated into the two labels that mention it.
+  /** Keyboard-device '?' popup row: hide the chrome entirely. */
   hideAction?: string
+  /** Its recovery clause, given the detected shortcut ("Option+M" / "Alt+M"). */
+  hideActionHint?: (shortcut: string) => string
+  /** Touch-device '?' popup row: collapse the chrome to the edge handle. */
+  hideToHandleAction?: string
+  /** Its recovery clause. */
+  hideToHandleHint?: string
+  /** Touch-device '?' popup row: hide everything, with no on-screen way back. */
+  hideCompletelyAction?: string
+  /** Its recovery clause. */
+  hideCompletelyHint?: string
+  /** Toast after a keyboard-device hide — repeats the row's own shortcut hint. */
+  hiddenShortcutToast?: (shortcut: string) => string
+  /** Toast after collapsing to the edge handle. */
+  handleToast?: string
+  /** Toast after a touch-device full hide (no shortcut exists to name). */
+  hiddenToast?: string
   /** Accessible name for the '?' help trigger, used when a host suppresses the visible tip copy. */
   helpTrigger?: string
 }
@@ -250,11 +274,39 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   enterToSend: "Enter 发送 · Esc 取消",
   approve: "批准",
   addNote: "添加备注",
-  fabTip: "点选元素或截图，把意见直接发给 Agent；隐藏后轻点边缘把手可恢复（桌面 Alt+M，macOS ⌥M）",
-  fabHiddenToast: "已隐藏，轻点边缘把手恢复（桌面也可按 Alt+M）",
+  fabTip: "点选元素或截图，把意见直接发给 Agent",
   restoreHandle: "显示标注按钮",
   hideAction: "隐藏标注按钮",
+  hideActionHint: (shortcut) => `${shortcut} 恢复`,
+  hideToHandleAction: "隐藏至把手",
+  hideToHandleHint: "点把手可恢复",
+  hideCompletelyAction: "完全隐藏",
+  hideCompletelyHint: "网址加 ?mark 恢复",
+  hiddenShortcutToast: (shortcut) => `已隐藏，按 ${shortcut} 恢复`,
+  handleToast: "已缩至边缘把手，轻点可恢复",
+  hiddenToast: "已完全隐藏，网址加 ?mark 可恢复",
   helpTrigger: "帮助"
+}
+
+/**
+ * The ONE place a host's partial label object becomes a complete one. Fills every field generically rather
+ * than through a hand-maintained list of fallbacks: a plain `{...defaults, ...labels}` lets a host that
+ * passes an explicit `undefined` (trivial to produce from a `Partial`) blank a label at runtime, and every
+ * new optional field would otherwise need its own line here — the step that is silently forgotten, leaving
+ * a blank button nobody notices. Downstream components take `Required<>` and never re-check.
+ */
+export function mergeAnnotationLabels(
+  labels: Partial<AnnotationOverlayLabels> | undefined
+): Required<AnnotationOverlayLabels> {
+  const merged: Required<AnnotationOverlayLabels> = { ...DEFAULT_ANNOTATION_LABELS }
+  for (const key of Object.keys(DEFAULT_ANNOTATION_LABELS) as Array<keyof AnnotationOverlayLabels>) {
+    const override = labels?.[key]
+    if (override !== undefined) (merged as Record<string, unknown>)[key] = override
+  }
+  // If a host localized `exit` but not `exitShort`, use their `exit` on touch too (avoid mixed languages
+  // after upgrade); fall back to the built-in short label only when neither is provided.
+  merged.exitShort = labels?.exitShort ?? labels?.exit ?? DEFAULT_ANNOTATION_LABELS.exitShort
+  return merged
 }
 
 export type AnnotationOverlayProps = {
@@ -778,22 +830,7 @@ export function AnnotationOverlay({
   onSubmitted
 }: AnnotationOverlayProps) {
   const context = React.useContext(ShowSessionContext)
-  const copy = React.useMemo(() => {
-    const merged = { ...DEFAULT_ANNOTATION_LABELS, ...labels }
-    // If a host localized `exit` but not `exitShort`, use their `exit` on touch too (avoid mixed
-    // languages after upgrade); fall back to the built-in short label only when neither is provided.
-    merged.exitShort = labels?.exitShort ?? labels?.exit ?? DEFAULT_ANNOTATION_LABELS.exitShort
-    // The optional approve-path labels always resolve to a string (a host may omit them, or pass
-    // undefined in a Partial), so the buttons never render blank.
-    merged.approve = labels?.approve ?? DEFAULT_ANNOTATION_LABELS.approve
-    merged.addNote = labels?.addNote ?? DEFAULT_ANNOTATION_LABELS.addNote
-    merged.fabTip = labels?.fabTip ?? DEFAULT_ANNOTATION_LABELS.fabTip
-    merged.fabHiddenToast = labels?.fabHiddenToast ?? DEFAULT_ANNOTATION_LABELS.fabHiddenToast
-    merged.restoreHandle = labels?.restoreHandle ?? DEFAULT_ANNOTATION_LABELS.restoreHandle
-    merged.hideAction = labels?.hideAction ?? DEFAULT_ANNOTATION_LABELS.hideAction
-    merged.helpTrigger = labels?.helpTrigger ?? DEFAULT_ANNOTATION_LABELS.helpTrigger
-    return merged
-  }, [labels])
+  const copy = React.useMemo(() => mergeAnnotationLabels(labels), [labels])
   const intentOptions = intents ?? DEFAULT_ANNOTATION_INTENTS
   // Controlled when `enabled`/`mode` are supplied (the control-plane wrapper); otherwise uncontrolled
   // with internal state so a direct `<AnnotationOverlay />` consumer can still toggle via the FAB.
@@ -1381,7 +1418,8 @@ type AnnotationChromeProps = {
   available: boolean
   mode: AnnotationMode
   touchInput: boolean
-  labels: AnnotationOverlayLabels
+  // Complete: mergeAnnotationLabels() filled every field at the overlay boundary, so nothing downstream re-checks.
+  labels: Required<AnnotationOverlayLabels>
   sessionId?: string
   onEnable?: (mode?: AnnotationMode) => void
   onDisable?: () => void
@@ -1402,27 +1440,34 @@ export function modePillLabel(
   return touchInput ? labels.smart : `${labels.annotating} · ${labels.smart}`
 }
 
-/** Standalone-only FAB visibility from the frozen ?mark / ?unmark query param: an explicit param flips it
- *  AND persists the choice, then is stripped from the URL at boot (one-time switch); a param-free load
- *  honors the stored choice. Query param, not the hash, so it never collides with the Show Page hash
- *  router. Embedded host is always visible. `hide()` is the ✕ button (≡ ?unmark, persisted). */
-function useFabVisibility(host: AnnotationHost, sessionId: string | undefined) {
+/** Standalone-only chrome visibility (visible | handle | hidden) from the frozen ?mark / ?unmark query
+ *  param: an explicit param flips it AND persists the choice, then is stripped from the URL at boot
+ *  (one-time switch); a param-free load honors the stored state. Query param, not the hash, so it never
+ *  collides with the Show Page hash router. Embedded host is always visible. `set()` is every UI path — the
+ *  '?' popup hide rows, the handle's restore tap, Alt+M — persisting so the choice survives a reload. */
+function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, touchPrimary: boolean) {
   const storage = React.useMemo(() => safeLocalStorage(), [])
-  const [visible, setVisible] = React.useState<boolean>(() => {
-    if (host !== "standalone" || typeof window === "undefined") return true
-    return resolveFabVisibility(window.location.search, readStoredFabVisible(sessionId, storage)).visible
+  // `touchPrimary` only selects which hidden flavor a LEGACY boolean migrates to, so it is read fresh
+  // rather than tracked: re-resolving on a media-query flip would stomp a choice the user just made.
+  const touchPrimaryRef = React.useRef(touchPrimary)
+  touchPrimaryRef.current = touchPrimary
+  const [visibility, setVisibility] = React.useState<FabVisibility>(() => {
+    if (host !== "standalone" || typeof window === "undefined") return "visible"
+    return resolveFabVisibility(window.location.search, readStoredFabVisibility(sessionId, touchPrimary, storage))
+      .visibility
   })
   // Read the ?mark / ?unmark switch ONCE at boot: apply it, persist the choice, then STRIP the param via
   // replaceState so the URL returns clean — keeping any other query params AND the hash route (#/…) intact,
   // since the Show Page hash router owns the hash. It's a one-time switch, so there is no ongoing listener.
   React.useEffect(() => {
     if (host !== "standalone" || typeof window === "undefined") return
-    const resolved = resolveFabVisibility(window.location.search, readStoredFabVisible(sessionId, storage))
-    setVisible(resolved.visible)
+    const stored = readStoredFabVisibility(sessionId, touchPrimaryRef.current, storage)
+    const resolved = resolveFabVisibility(window.location.search, stored)
+    setVisibility(resolved.visibility)
     if (resolved.persist === null) return // no ?mark/?unmark this load → nothing to persist or strip
     // Strip the one-time flag ONLY once the choice is durable: if the write failed (no storage / quota),
     // leave ?mark/?unmark in the URL so a reload still carries the intent instead of silently reverting.
-    if (!writeStoredFabVisible(sessionId, resolved.persist, storage)) return
+    if (!writeStoredFabVisibility(sessionId, resolved.persist, storage)) return
     try {
       const stripped = stripFabParamsFromSearch(window.location.search)
       const nextSearch = stripped ? `?${stripped}` : ""
@@ -1439,18 +1484,16 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined) {
       /* best-effort — a blocked replaceState / URL parse must not break visibility */
     }
   }, [host, sessionId, storage])
-  const hide = React.useCallback(() => {
-    // ✕ affordance: persist hidden + hide. The URL is already param-clean (stripped at boot), so there is
-    // nothing to neutralize — the stored preference wins on the next param-free load.
-    writeStoredFabVisible(sessionId, false, storage)
-    setVisible(false)
-  }, [sessionId, storage])
-  const show = React.useCallback(() => {
-    // Alt+M reveal: persist visible (same store as ?mark) so it survives a reload.
-    writeStoredFabVisible(sessionId, true, storage)
-    setVisible(true)
-  }, [sessionId, storage])
-  return { visible, hide, show }
+  const set = React.useCallback(
+    (next: FabVisibility) => {
+      // Persist first, then render: the URL is already param-clean (stripped at boot), so the stored
+      // preference is what wins on the next param-free load.
+      writeStoredFabVisibility(sessionId, next, storage)
+      setVisibility(next)
+    },
+    [sessionId, storage]
+  )
+  return { visibility, set }
 }
 
 /**
@@ -1468,22 +1511,32 @@ export function createChromeFocusController() {
     request() {
       pending = true
     },
-    claim(node: { focus: () => void } | null) {
-      if (!node || !pending) return
+    /** Returns whether this mount actually consumed a pending request — i.e. it follows a USER action. */
+    claim(node: { focus: () => void } | null): boolean {
+      if (!node || !pending) return false
       pending = false
       node.focus()
+      return true
     }
   }
 }
 
-/** React binding for {@link createChromeFocusController}: a stable request() + a callback ref that claims focus. */
+/**
+ * React binding for {@link createChromeFocusController}: a stable request(), a callback ref that claims
+ * focus, and the raw claim() for a control that also needs the "was this user-initiated?" answer (the edge
+ * handle pulses only then). `claimRef` deliberately swallows the boolean: React 19 treats a callback ref's
+ * return value as a cleanup function, so a ref must return nothing.
+ */
 function usePendingChromeFocus() {
   const controller = React.useRef<ReturnType<typeof createChromeFocusController> | null>(null)
   if (!controller.current) controller.current = createChromeFocusController()
   const request = React.useCallback(() => controller.current!.request(), [])
   // A stable callback ref → fires only on mount/unmount, not every render (a drag re-renders the FAB often).
-  const claimRef = React.useCallback((node: HTMLElement | null) => controller.current!.claim(node), [])
-  return { request, claimRef }
+  const claimRef = React.useCallback((node: HTMLElement | null) => {
+    controller.current!.claim(node)
+  }, [])
+  const claimFocus = React.useCallback((node: HTMLElement | null) => controller.current!.claim(node), [])
+  return { request, claimRef, claimFocus }
 }
 
 /**
@@ -1514,18 +1567,34 @@ export function edgeHandleAnchor(
   return { ...side, ...vertical }
 }
 
+/** How long the handle stays in its attention state after a user-initiated hide-to-handle. */
+export const EDGE_HANDLE_PULSE_MS = 1500
+
 /**
- * The minimal grabber left at the screen edge when the FAB is hidden — the PRIMARY cross-platform recovery
- * path, and the ONLY one on touch (where Alt+M doesn't exist). A ~5px strip at the FAB's last snapped edge;
- * tapping it restores the FAB (same persistence). Barely visible at rest, a touch stronger on hover / press.
+ * The edge handle's mint strip: barely there at rest, a touch stronger on hover/press, and briefly full and
+ * wider right after a user-initiated hide so the eye can find where the chrome went. Pure so the three
+ * states are asserted in CI (the transition itself is CSS).
  */
-function FabEdgeHandle({ sessionId, label, placement, touchCapable, focusRef, onRestore }: { sessionId: string | undefined; label: string; placement: FloatPlacement | null; touchCapable: boolean; focusRef: (node: HTMLButtonElement | null) => void; onRestore: () => void }) {
-  const storage = React.useMemo(() => safeLocalStorage(), [])
-  const stored = React.useMemo(() => readStoredFloatPlacement("fab", sessionId, storage) ?? null, [sessionId, storage])
-  // Prefer the FAB's LIVE placement (from useDraggable): a drag whose storage write failed still moved the FAB
-  // in memory, so re-reading storage here would strand the handle at a stale edge. Fall back to the stored value.
-  const resolved = placement ?? stored
+export function edgeHandleVisual(state: { active?: boolean; pulsing?: boolean }): { width: number; opacity: number } {
+  if (state.pulsing) return { width: 9, opacity: 1 }
+  return state.active ? { width: 7, opacity: 0.55 } : { width: 5, opacity: 0.2 }
+}
+
+/**
+ * The minimal grabber the chrome collapses to in the `handle` state — the ONLY recovery on touch, where no
+ * keyboard shortcut exists. A ~5px strip flush to the FAB's last snapped edge; tapping it restores the FAB.
+ *
+ * It renders on STATE, not platform: a `handle` set on a phone must still show on a desktop that opens the
+ * same session (desktop simply cannot CREATE the state, and can also recover with the shortcut).
+ *
+ * It shares the FAB's `useDraggable` instance — one position concept, not two states over one storage key:
+ * dragging the handle moves where the restored FAB appears, and vice versa. Only the resting STYLE differs
+ * (the FAB rests inset from the edge, the handle flush against it), so the hook's drag math, threshold and
+ * `consumeDragClick` are reused verbatim and a drag never fires the restore.
+ */
+function FabEdgeHandle({ label, drag, touchCapable, claimFocus, onRestore }: { label: string; drag: DraggableResult; touchCapable: boolean; claimFocus: (node: HTMLButtonElement | null) => boolean; onRestore: () => void }) {
   const [active, setActive] = React.useState(false)
+  const [pulsing, setPulsing] = React.useState(false)
   // Track the viewport height so a stored top is re-clamped on resize/rotate and the handle can't drift off-screen.
   const [viewportHeight, setViewportHeight] = React.useState<number | undefined>(() => (typeof window !== "undefined" ? window.innerHeight : undefined))
   React.useEffect(() => {
@@ -1534,27 +1603,56 @@ function FabEdgeHandle({ sessionId, label, placement, touchCapable, focusRef, on
     window.addEventListener("resize", onResize)
     return () => window.removeEventListener("resize", onResize)
   }, [])
-  const anchor = edgeHandleAnchor(resolved, viewportHeight)
-  const edge = resolved?.edge ?? "right"
-  const visualWidth = active ? 7 : 5
+  // Claiming a PENDING focus request is exactly the "the user just did this" signal — so the pulse rides the
+  // mechanism that already distinguishes a user-initiated chrome swap from a page load, with no second flag.
+  const mountRef = React.useCallback((node: HTMLButtonElement | null) => {
+    if (claimFocus(node)) setPulsing(true)
+  }, [claimFocus])
+  React.useEffect(() => {
+    if (!pulsing) return
+    const timer = setTimeout(() => setPulsing(false), EDGE_HANDLE_PULSE_MS)
+    return () => clearTimeout(timer)
+  }, [pulsing])
+  const anchor = edgeHandleAnchor(drag.placement, viewportHeight)
+  const edge = drag.placement?.edge ?? "right"
+  const visual = edgeHandleVisual({ active, pulsing })
   // The BUTTON is a transparent hit target — ~44px wide on any touch-CAPABLE device (incl. mouse-primary hybrids,
   // where it may still be finger-tapped) so the only mobile recovery control is actually tappable; a thin mint
   // strip sits flush to the screen edge inside it. A real box, not a pseudo-element, because elementFromPoint (and
-  // taps) ignore pseudo-elements. A pure pointer-only device keeps hit == visual. focusRef lands keyboard focus
+  // taps) ignore pseudo-elements. A pure pointer-only device keeps hit == visual. mountRef lands keyboard focus
   // here after a user-initiated hide (see usePendingChromeFocus); never on initial page load.
   return (
     <button
-      ref={focusRef}
+      ref={mountRef}
       type="button"
       data-show-annotation-ui=""
       aria-label={label}
-      style={{ ...fabEdgeHandleStyle, top: anchor.top, ...(edge === "left" ? { left: 0, justifyContent: "flex-start" } : { right: 0, justifyContent: "flex-end" }), width: touchCapable ? 44 : visualWidth }}
+      style={{
+        ...fabEdgeHandleStyle,
+        // While dragging, follow the pointer (the hook's absolute style); at rest sit FLUSH at the edge —
+        // the hook's own resting style is inset by FLOAT_INSET, which is the FAB's geometry, not the handle's.
+        ...(drag.dragging ? drag.style : { top: anchor.top, ...(edge === "left" ? { left: 0, right: "auto" } : { right: 0, left: "auto" }) }),
+        justifyContent: edge === "left" ? "flex-start" : "flex-end",
+        width: touchCapable ? 44 : visual.width,
+        touchAction: "none"
+      }}
+      {...drag.pointerHandlers}
       onPointerEnter={() => setActive(true)}
       onPointerLeave={() => setActive(false)}
-      onPointerDown={() => setActive(true)}
-      onClick={onRestore}
+      onPointerDown={(event) => {
+        setActive(true)
+        drag.pointerHandlers.onPointerDown?.(event)
+      }}
+      onPointerCancel={(event) => {
+        setActive(false)
+        drag.pointerHandlers.onPointerCancel?.(event)
+      }}
+      onClick={() => {
+        if (drag.consumeDragClick()) return // the gesture moved the handle; don't also restore
+        onRestore()
+      }}
     >
-      <span aria-hidden="true" style={{ ...fabEdgeHandleVisualStyle, width: visualWidth, borderRadius: anchor.borderRadius, opacity: active ? 0.55 : 0.2 }} />
+      <span aria-hidden="true" style={{ ...fabEdgeHandleVisualStyle, width: visual.width, borderRadius: anchor.borderRadius, opacity: visual.opacity }} />
     </button>
   )
 }
@@ -1675,9 +1773,31 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // on input capability, not layout, so a narrow desktop window still shows the clickable "Esc" label.
   const exitLabel = touchInput ? labels.exitShort : labels.exit
   // Hooks must be unconditional (called before the host/availability early returns below).
-  const fabVisibility = useFabVisibility(host, sessionId)
+  const fabVisibility = useFabVisibility(host, sessionId, touchInput)
+  // ONE draggable instance for the FAB and the edge handle it collapses to: two instances over the same
+  // storage key would each hold their own state, so dragging the handle would leave the FAB's placement
+  // stale and the restored FAB would reappear at the old spot.
   const fabDrag = useDraggable("fab", sessionId, 52) // FAB is 52px tall
   const touchCapable = useTouchCapable() // any-pointer:coarse → enlarge the edge-handle hit box even on hybrids
+  // How this device recovers a fully hidden chrome. `undefined` on touch-primary (no keyboard) — which is
+  // also exactly when the '?' popup offers the handle row, so the two stay consistent by construction.
+  const shortcut = React.useMemo(() => formatFabShortcut({ touchPrimary: touchInput }), [touchInput])
+  // The '?' popup's hide rows: the platform's targets, each composed as base action + the recovery clause
+  // its device earned. `shortcut === undefined` ⟺ touch-primary ⟺ the handle row exists, so the row set and
+  // the row copy cannot drift apart.
+  const hideOptions = React.useMemo(
+    () =>
+      fabHideOptions(touchInput).map((target) => ({
+        target,
+        label:
+          target === "handle"
+            ? withParenthetical(labels.hideToHandleAction, labels.hideToHandleHint)
+            : shortcut
+              ? withParenthetical(labels.hideAction, labels.hideActionHint(shortcut))
+              : withParenthetical(labels.hideCompletelyAction, labels.hideCompletelyHint)
+      })),
+    [touchInput, shortcut, labels]
+  )
   const [toast, setToast] = React.useState<string | null>(null)
   const toastTimer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   React.useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
@@ -1689,44 +1809,47 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // Hiding and restoring the FAB both swap the control the user is on (toolbar/FAB ⇄ edge handle); on either
   // user-initiated swap the successor claims focus via this one controller, so a keyboard user is never dropped
   // on <body>. chromeFocusRef is the shared callback ref both the handle and the restored FAB attach.
-  const { request: requestChromeFocus, claimRef: chromeFocusRef } = usePendingChromeFocus()
-  // Hide the FAB (≡ #unmark, persisted) and confirm with a brief toast so the user knows how to bring it back.
-  // Also disables an active session so nothing is left capturing, and arms focus for the recovery handle.
-  const hideFab = React.useCallback(() => {
-    requestChromeFocus()
-    onDisable?.()
-    fabVisibility.hide()
-    if (labels.fabHiddenToast) flashToast(labels.fabHiddenToast)
-  }, [requestChromeFocus, onDisable, fabVisibility, flashToast, labels.fabHiddenToast])
-  // Restore the FAB (edge-handle tap/Enter, or Alt+M): arm focus so the re-rendered FAB — not <body> — receives it.
+  const { request: requestChromeFocus, claimRef: chromeFocusRef, claimFocus } = usePendingChromeFocus()
+  // Hide the chrome to `handle` or `hidden` and confirm with a toast that repeats THIS state's recovery —
+  // the same hint the row that fired it already carried, and nothing else. Also disables an active session so
+  // nothing is left capturing, and arms focus for whichever control takes over.
+  const hideFab = React.useCallback(
+    (next: "handle" | "hidden") => {
+      requestChromeFocus()
+      onDisable?.()
+      fabVisibility.set(next)
+      const message =
+        next === "handle" ? labels.handleToast : shortcut ? labels.hiddenShortcutToast(shortcut) : labels.hiddenToast
+      if (message) flashToast(message)
+    },
+    [requestChromeFocus, onDisable, fabVisibility, flashToast, shortcut, labels.handleToast, labels.hiddenShortcutToast, labels.hiddenToast]
+  )
+  // Restore the FAB (edge-handle tap/Enter, or the shortcut): arm focus so the re-rendered FAB — not <body> — receives it.
   const restoreFab = React.useCallback(() => {
     requestChromeFocus()
-    fabVisibility.show()
+    fabVisibility.set("visible")
   }, [requestChromeFocus, fabVisibility])
-  // If the hash flips to #unmark (or the ✕ fires) WHILE a session is active, the hide switch must also
-  // stop capture — not just hide the collapsed FAB — so the documented switch works mid-session (#3637478399).
+  // If ?unmark applies (or a hide row fires) WHILE a session is active, the hide switch must also stop
+  // capture — not just hide the collapsed FAB — so the documented switch works mid-session (#3637478399).
   React.useEffect(() => {
-    if (host === "standalone" && !fabVisibility.visible && enabled) onDisable?.()
-  }, [host, fabVisibility.visible, enabled, onDisable])
-  // Alt+M (macOS ⌥M) toggles the FAB (standalone only), mirroring ?mark/?unmark and the ✕ button.
-  // Registered at the document level so it works even while the collapsed FAB is hidden; the pure guard
-  // blocks it while the user is typing or holding another modifier. Revealing from hidden re-surfaces the
-  // tip so the toggle is rediscoverable, and hiding routes through hideFab so an active capture stops too.
+    if (host === "standalone" && fabVisibility.visibility !== "visible" && enabled) onDisable?.()
+  }, [host, fabVisibility.visibility, enabled, onDisable])
+  // Option/Alt+M toggles the chrome (standalone only), mirroring ?mark/?unmark and the '?' popup's hide row.
+  // Registered at the document level so it works even while the chrome is hidden; the pure guard blocks it
+  // while the user is typing or holding another modifier. Bound only where a shortcut EXISTS — a touch-primary
+  // device has no keyboard, and its copy never mentions one, so there is nothing to listen for. It also
+  // rescues a `handle` state (created on a phone, opened here) straight back to visible.
   React.useEffect(() => {
-    if (host !== "standalone" || typeof document === "undefined") return
+    if (host !== "standalone" || typeof document === "undefined" || !shortcut) return
     function onKeyDown(event: KeyboardEvent) {
       if (!shouldToggleFabShortcut(event, event.target)) return
       event.preventDefault()
-      if (fabVisibility.visible) {
-        hideFab()
-      } else {
-        restoreFab()
-        if (labels.fabTip) flashToast(labels.fabTip)
-      }
+      if (toggleFabVisibilityByShortcut(fabVisibility.visibility) === "visible") restoreFab()
+      else hideFab("hidden")
     }
     document.addEventListener("keydown", onKeyDown)
     return () => document.removeEventListener("keydown", onKeyDown)
-  }, [host, fabVisibility, hideFab, restoreFab, flashToast, labels.fabTip])
+  }, [host, shortcut, fabVisibility.visibility, hideFab, restoreFab])
 
   if (host === "embedded") {
     // Embedded in the chat iframe: the chat header owns enable/disable; the overlay only shows a
@@ -1736,27 +1859,26 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
       <div data-show-annotation-ui="" style={modePillStyle} onClick={(event) => event.stopPropagation()}>
         <span style={{ ...modePillDotStyle, background: COLORS.human }} />
         <span style={modePillLabelStyle}>
-          {modePillLabel(mode, touchInput, labels as Required<AnnotationOverlayLabels>)}
+          {modePillLabel(mode, touchInput, labels)}
         </span>
         <button type="button" style={modePillExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
       </div>
     )
   }
 
-  // The hash / ✕ hide switch gates ALL standalone chrome — the collapsed FAB, the expanded toolbar, AND
-  // the anonymous login hint below — so #unmark hides everything, not just the FAB (#3637621031 /
-  // #3637478399); the disable effect above stops capture too. The toast still renders so the ✕
-  // confirmation shows even after the chrome is hidden.
-  if (!fabVisibility.visible) {
-    // Hidden FAB: leave a minimal edge-handle grabber (standalone) — the PRIMARY recovery path, and the ONLY
-    // one on touch, where Alt+M doesn't exist. Tapping it restores the FAB. The toast still renders so the
-    // ✕ / Alt+M confirmation shows even after the chrome is hidden.
+  // The ?unmark / hide-row switch gates ALL standalone chrome — the collapsed FAB, the expanded toolbar, AND
+  // the anonymous login hint below — so it hides everything, not just the FAB (#3637621031 / #3637478399);
+  // the disable effect above stops capture too. The toast still renders so the confirmation shows even after
+  // the chrome is gone.
+  if (fabVisibility.visibility !== "visible") {
+    // The handle renders on STATE, not platform: `handle` is created only on touch, but a desktop opening the
+    // same session must still show (and be able to drag) it. `hidden` leaves nothing at all on screen.
     return (
       <>
-        {host === "standalone" && available ? (
+        {host === "standalone" && available && fabVisibility.visibility === "handle" ? (
           // Only when the viewer can actually annotate — an anonymous viewer's FAB is a login hint, not the
-          // real FAB, so a recovery handle there would restore to nothing useful. Prefer the live drag placement.
-          <FabEdgeHandle sessionId={sessionId} label={labels.restoreHandle ?? DEFAULT_ANNOTATION_LABELS.restoreHandle} placement={fabDrag.placement} touchCapable={touchCapable} focusRef={chromeFocusRef} onRestore={restoreFab} />
+          // real FAB, so a recovery handle there would restore to nothing useful.
+          <FabEdgeHandle label={labels.restoreHandle} drag={fabDrag} touchCapable={touchCapable} claimFocus={claimFocus} onRestore={restoreFab} />
         ) : null}
         {toast ? <div data-show-annotation-ui="" role="status" style={toastStyle}>{toast}</div> : null}
       </>
@@ -1804,10 +1926,10 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
         <ModeTab active={mode === "smart"} onClick={() => onSetMode?.("smart")} icon={<SparkleIcon />} label={labels.smart} compact={touchInput} />
         <ModeTab active={mode === "screenshot"} onClick={() => onSetMode?.("screenshot")} icon={<CameraIcon />} label={labels.screenshot} compact={touchInput} />
         <span aria-hidden="true" style={toolbarDividerStyle} />
-        {/* '?' popup holds the one-line tip AND a deliberate red "hide" row — the ✕ used to sit next to 退出
-            and read as a second "close", so hiding is now a two-step (tap ? → tap the red row). 退出 sits at
-            the far right (owner mobile order) so the row reads [toggle][Smart][截图][divider][?][退出]. */}
-        <ToolbarHelp tip={labels.fabTip ?? ""} hideLabel={labels.hideAction ?? DEFAULT_ANNOTATION_LABELS.hideAction} triggerLabel={labels.helpTrigger ?? DEFAULT_ANNOTATION_LABELS.helpTrigger} onHide={hideFab} />
+        {/* '?' popup holds the one-line tip AND the deliberate red "hide" row(s) — the ✕ used to sit next to
+            退出 and read as a second "close", so hiding is now a two-step (tap ? → tap the red row). 退出 sits
+            at the far right (owner mobile order) so the row reads [toggle][Smart][截图][divider][?][退出]. */}
+        <ToolbarHelp tip={labels.fabTip} hideOptions={hideOptions} triggerLabel={labels.helpTrigger} onHide={hideFab} />
         <button type="button" style={toolbarExitStyle} onClick={() => onDisable?.()}>{exitLabel}</button>
       </div>
     )
@@ -1860,13 +1982,14 @@ export function tooltipPlacement(
 }
 
 /**
- * The toolbar '?' affordance: click/tap to open a compact popup holding the one-line tip AND a single,
- * DELIBERATE red "hide" action row. The ✕ used to sit next to 退出 and read as a second "close", so users
- * mis-clicked between them; moving hide behind a two-step (tap ? → tap the red row) removes that adjacent
- * twin. Portaled to <body> so `position: fixed` escapes the toolbar's backdrop-filter containing block;
- * closes on an outside pointer-down.
+ * The toolbar '?' affordance: click/tap to open a compact popup holding the one-line tip AND the DELIBERATE
+ * red hide row(s) this device offers — one on a keyboard device (straight to hidden, shortcut recovers it),
+ * two on touch (to the handle, or fully hidden). The ✕ used to sit next to 退出 and read as a second "close",
+ * so users mis-clicked between them; moving hide behind a two-step (tap ? → tap the red row) removes that
+ * adjacent twin. Portaled to <body> so `position: fixed` escapes the toolbar's backdrop-filter containing
+ * block; closes on an outside pointer-down.
  */
-function ToolbarHelp({ tip, hideLabel, triggerLabel, onHide }: { tip: string; hideLabel: string; triggerLabel: string; onHide: () => void }) {
+function ToolbarHelp({ tip, hideOptions, triggerLabel, onHide }: { tip: string; hideOptions: Array<{ target: FabHideTarget; label: string }>; triggerLabel: string; onHide: (target: FabHideTarget) => void }) {
   const btnRef = React.useRef<HTMLButtonElement>(null)
   const popRef = React.useRef<HTMLDivElement>(null)
   const hideRowRef = React.useRef<HTMLButtonElement>(null)
@@ -1885,10 +2008,13 @@ function ToolbarHelp({ tip, hideLabel, triggerLabel, onHide }: { tip: string; hi
     setPlacement(
       tooltipPlacement(
         { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom },
-        { width: window.innerWidth, height: window.innerHeight }
+        { width: window.innerWidth, height: window.innerHeight },
+        // Bias the above/below flip by the ACTUAL row count — a touch device shows two hide rows, so the
+        // one-row estimate would pick a side that can't hold the popup and rely on maxHeight scrolling.
+        { estimatedHeight: 84 + hideOptions.length * 36 }
       )
     )
-  }, [])
+  }, [hideOptions.length])
   const closeTip = React.useCallback(() => setPlacement(null), [])
   // Close on a pointer down outside the button + popup (the popup is portaled, so it isn't a DOM descendant).
   React.useEffect(() => {
@@ -1947,10 +2073,18 @@ function ToolbarHelp({ tip, hideLabel, triggerLabel, onHide }: { tip: string; hi
         ? createPortal(
             <div ref={popRef} role="dialog" aria-label={tip || triggerLabel} data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>
               {tip ? <div style={helpTipTextStyle}>{tip}</div> : null}
-              <button ref={hideRowRef} type="button" style={helpHideRowStyle} onClick={() => { restoreFocusRef.current = false; closeTip(); onHide() }}>
-                <EyeOffIcon />
-                <span>{hideLabel}</span>
-              </button>
+              {hideOptions.map((option, index) => (
+                <button
+                  key={option.target}
+                  ref={index === 0 ? hideRowRef : undefined}
+                  type="button"
+                  style={helpHideRowStyle}
+                  onClick={() => { restoreFocusRef.current = false; closeTip(); onHide(option.target) }}
+                >
+                  <EyeOffIcon />
+                  <span>{option.label}</span>
+                </button>
+              ))}
             </div>,
             document.body
           )
@@ -2090,7 +2224,8 @@ type ScreenshotBatchCardProps = {
   draft: ScreenshotDraft
   comment: string
   submitting: boolean
-  labels: AnnotationOverlayLabels
+  // Complete: mergeAnnotationLabels() filled every field at the overlay boundary, so nothing downstream re-checks.
+  labels: Required<AnnotationOverlayLabels>
   onCommentChange: (value: string) => void
   onAddComment: () => void
   onRemoveItem: (id: string) => void

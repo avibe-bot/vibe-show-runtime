@@ -26,8 +26,13 @@ import {
   showAnnotationMeUrl,
   writeStoredAnnotationMode,
   resolveFabVisibility,
-  readStoredFabVisible,
-  writeStoredFabVisible,
+  readStoredFabVisibility,
+  writeStoredFabVisibility,
+  fabVisibleStorageKey,
+  fabHideOptions,
+  toggleFabVisibilityByShortcut,
+  formatFabShortcut,
+  withParenthetical,
   stripFabParamsFromSearch,
   isEditableTarget,
   shouldToggleFabShortcut,
@@ -465,44 +470,74 @@ describe("uniform write-token resolution (contract §5 v2)", () => {
   })
 })
 
-describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R11)", () => {
+describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R11, tri-state in U)", () => {
   it("a query param WINS (bare presence) and dictates what to persist (one-time switch)", () => {
-    expect(resolveFabVisibility("?unmark", undefined)).toEqual({ visible: false, persist: false })
-    expect(resolveFabVisibility("?mark", undefined)).toEqual({ visible: true, persist: true })
+    expect(resolveFabVisibility("?unmark", undefined)).toEqual({ visibility: "hidden", persist: "hidden" })
+    expect(resolveFabVisibility("?mark", undefined)).toEqual({ visibility: "visible", persist: "visible" })
     // param overrides a conflicting stored choice AND re-persists it; coexists with other params.
-    expect(resolveFabVisibility("?mark", false)).toEqual({ visible: true, persist: true })
-    expect(resolveFabVisibility("?vibe-embed=1&unmark", true)).toEqual({ visible: false, persist: false })
-    expect(resolveFabVisibility("unmark", undefined)).toEqual({ visible: false, persist: false }) // no leading '?'
+    expect(resolveFabVisibility("?mark", "hidden")).toEqual({ visibility: "visible", persist: "visible" })
+    expect(resolveFabVisibility("?mark", "handle")).toEqual({ visibility: "visible", persist: "visible" })
+    expect(resolveFabVisibility("?vibe-embed=1&unmark", "visible")).toEqual({ visibility: "hidden", persist: "hidden" })
+    expect(resolveFabVisibility("unmark", undefined)).toEqual({ visibility: "hidden", persist: "hidden" }) // no leading '?'
   })
 
-  it("no param honors the stored choice, else defaults visible, and persists nothing new", () => {
-    expect(resolveFabVisibility("", undefined)).toEqual({ visible: true, persist: null }) // default visible
-    expect(resolveFabVisibility(undefined, false)).toEqual({ visible: false, persist: null })
-    expect(resolveFabVisibility("?other=1", true)).toEqual({ visible: true, persist: null }) // unknown param ignored
-    expect(resolveFabVisibility("#/some/hash-route", undefined)).toEqual({ visible: true, persist: null }) // a hash route is NOT a param
+  it("no param honors the stored state (including 'handle'), else defaults visible, persisting nothing new", () => {
+    expect(resolveFabVisibility("", undefined)).toEqual({ visibility: "visible", persist: null }) // default visible
+    expect(resolveFabVisibility(undefined, "hidden")).toEqual({ visibility: "hidden", persist: null })
+    expect(resolveFabVisibility(undefined, "handle")).toEqual({ visibility: "handle", persist: null })
+    expect(resolveFabVisibility("?other=1", "visible")).toEqual({ visibility: "visible", persist: null }) // unknown param ignored
+    expect(resolveFabVisibility("#/some/hash-route", undefined)).toEqual({ visibility: "visible", persist: null }) // a hash route is NOT a param
   })
 
-  it("persisted visibility round-trips as 1/0 and ignores garbage", () => {
+  it("there is NO third query param — 'handle' is reachable only from the UI, and ?mark still wins over it", () => {
+    // Owner-frozen: the URL vocabulary stays two words. `?handle` is just an unknown param.
+    expect(resolveFabVisibility("?handle", undefined)).toEqual({ visibility: "visible", persist: null })
+    expect(resolveFabVisibility("?handle", "hidden")).toEqual({ visibility: "hidden", persist: null })
+  })
+
+  it("persisted visibility round-trips all three states and ignores garbage", () => {
     const storage = memoryStorage()
-    writeStoredFabVisible("ses_1", false, storage)
-    expect(readStoredFabVisible("ses_1", storage)).toBe(false)
-    writeStoredFabVisible("ses_1", true, storage)
-    expect(readStoredFabVisible("ses_1", storage)).toBe(true)
-    expect(readStoredFabVisible("ses_absent", storage)).toBeUndefined()
+    for (const state of ["visible", "handle", "hidden"] as const) {
+      writeStoredFabVisibility("ses_1", state, storage)
+      expect(readStoredFabVisibility("ses_1", false, storage)).toBe(state)
+      expect(readStoredFabVisibility("ses_1", true, storage)).toBe(state) // platform only matters for LEGACY values
+    }
+    expect(readStoredFabVisibility("ses_absent", false, storage)).toBeUndefined()
+    expect(readStoredFabVisibility("ses_1", false, memoryStorage({ [fabVisibleStorageKey("ses_1")]: "yes" }))).toBeUndefined()
   })
 
-  it("writeStoredFabVisible reports whether the choice was durably stored", () => {
+  it("migrates a LEGACY boolean value per surface, so an already-hidden user keeps a recovery path", () => {
+    // Same key prefix as the boolean era: "1"/"0" written by an older build must still mean something.
+    const key = fabVisibleStorageKey("ses_1")
+    // Legacy truthy → visible, on either surface.
+    expect(readStoredFabVisibility("ses_1", false, memoryStorage({ [key]: "1" }))).toBe("visible")
+    expect(readStoredFabVisibility("ses_1", true, memoryStorage({ [key]: "1" }))).toBe("visible")
+    // Legacy falsy → the platform-appropriate equivalent: a touch user gets the tappable handle back,
+    // a keyboard user gets true-hidden (Option/Alt+M is their recovery).
+    expect(readStoredFabVisibility("ses_1", true, memoryStorage({ [key]: "0" }))).toBe("handle")
+    expect(readStoredFabVisibility("ses_1", false, memoryStorage({ [key]: "0" }))).toBe("hidden")
+  })
+
+  it("migration does NOT rewrite storage — the same legacy value re-derives per surface on every read", () => {
+    // A phone and a laptop can share one synced profile; freezing the first reader's platform into storage
+    // would strand the other. Re-deriving keeps both surfaces recoverable.
+    const storage = memoryStorage({ [fabVisibleStorageKey("ses_1")]: "0" })
+    expect(readStoredFabVisibility("ses_1", true, storage)).toBe("handle")
+    expect(readStoredFabVisibility("ses_1", false, storage)).toBe("hidden") // unchanged by the first read
+  })
+
+  it("writeStoredFabVisibility reports whether the choice was durably stored", () => {
     // The boot effect only strips ?mark/?unmark from the URL when this returns true — a failed write must
     // keep the flag in the URL so a reload still carries the intent.
-    expect(writeStoredFabVisible("ses_1", false, memoryStorage())).toBe(true)
-    expect(writeStoredFabVisible("ses_1", false, undefined)).toBe(false) // no storage at all
+    expect(writeStoredFabVisibility("ses_1", "hidden", memoryStorage())).toBe(true)
+    expect(writeStoredFabVisibility("ses_1", "hidden", undefined)).toBe(false) // no storage at all
     const throwing: AnnotationModeStorage = {
       getItem: () => null,
       setItem: () => {
         throw new Error("quota / private mode")
       }
     }
-    expect(writeStoredFabVisible("ses_1", false, throwing)).toBe(false)
+    expect(writeStoredFabVisibility("ses_1", "hidden", throwing)).toBe(false)
   })
 
   it("stripFabParamsFromSearch removes ONLY our flag, preserving other params byte-for-byte", () => {
@@ -521,7 +556,46 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
   })
 })
 
+// The '?' popup's hide rows split by PRIMARY input, not by touch capability: a hybrid touchscreen laptop
+// has a keyboard, so it gets the desktop treatment (one destructive row, shortcut recovery, no handle).
+describe("platform-split hide options (Lane U)", () => {
+  it("a keyboard device offers exactly ONE hide row: straight to fully hidden (no handle)", () => {
+    expect(fabHideOptions(false)).toEqual(["hidden"])
+  })
+
+  it("a touch-primary device offers TWO rows, handle first, then complete hide", () => {
+    expect(fabHideOptions(true)).toEqual(["handle", "hidden"])
+  })
+
+  it("withParenthetical composes a base action with its recovery clause, and degrades to bare base", () => {
+    // Labels stay ADDITIVE: a host overriding only the base action keeps the platform-derived clause.
+    expect(withParenthetical("隐藏标注按钮", "Option+M 恢复")).toBe("隐藏标注按钮（Option+M 恢复）")
+    expect(withParenthetical("隐藏标注按钮", undefined)).toBe("隐藏标注按钮")
+    expect(withParenthetical("隐藏标注按钮", "")).toBe("隐藏标注按钮")
+    expect(withParenthetical("", "Alt+M 恢复")).toBe("（Alt+M 恢复）")
+  })
+})
+
 describe("Alt+M FAB toggle shortcut guard (Lane R12)", () => {
+  it("formatFabShortcut names the modifier ONCE, per platform, and omits it on keyboard-less devices", () => {
+    // Apple platforms print the Option key; everything else prints Alt.
+    expect(formatFabShortcut({ platform: "macOS", touchPrimary: false })).toBe("Option+M")
+    expect(formatFabShortcut({ platform: "MacIntel", touchPrimary: false })).toBe("Option+M") // navigator.platform fallback
+    expect(formatFabShortcut({ platform: "Windows", touchPrimary: false })).toBe("Alt+M")
+    expect(formatFabShortcut({ platform: "Linux x86_64", touchPrimary: false })).toBe("Alt+M")
+    expect(formatFabShortcut({ platform: "", touchPrimary: false })).toBe("Alt+M") // unknown platform → the common label
+    // Touch-PRIMARY means no keyboard: the clause is OMITTED entirely, never reworded for a phone.
+    expect(formatFabShortcut({ platform: "iPhone", touchPrimary: true })).toBeUndefined()
+    expect(formatFabShortcut({ platform: "macOS", touchPrimary: true })).toBeUndefined()
+  })
+
+  it("toggleFabVisibilityByShortcut flips visible⇄hidden and rescues a handle state back to visible", () => {
+    expect(toggleFabVisibilityByShortcut("visible")).toBe("hidden")
+    expect(toggleFabVisibilityByShortcut("hidden")).toBe("visible")
+    // A `handle` set on a phone then opened on a laptop: the shortcut must RESTORE, not re-hide.
+    expect(toggleFabVisibilityByShortcut("handle")).toBe("visible")
+  })
+
   it("isEditableTarget: true for input / textarea / select / contenteditable, false otherwise", () => {
     expect(isEditableTarget({ tagName: "INPUT" })).toBe(true)
     expect(isEditableTarget({ tagName: "textarea" })).toBe(true) // case-insensitive

@@ -103,67 +103,109 @@ export function writeStoredAnnotationMode(
 // The param is a ONE-TIME switch: read at overlay boot, persisted per session, then stripped from the URL
 // (history.replaceState) so the URL returns clean and a later param-free load honors the stored choice.
 // Standalone host only; coexists with `?vibe-embed=1` (the embedded host ignores these entirely).
+//
+// Visibility is TRI-state (Lane U): `visible` (FAB/toolbar), `handle` (collapsed to the draggable edge
+// grabber — a touch-created state) and `hidden` (nothing on screen). The URL vocabulary stays TWO words:
+// `?mark` → visible, `?unmark` → hidden. `handle` is reachable only from the '?' popup on a touch device.
 export const ANNOTATION_FAB_PARAM_SHOW = "mark"
 export const ANNOTATION_FAB_PARAM_HIDE = "unmark"
 export const ANNOTATION_FAB_VISIBLE_STORAGE_PREFIX = "avibe:fab-visible:"
+
+/** What the standalone annotation chrome shows: the full FAB/toolbar, just the edge handle, or nothing. */
+export type FabVisibility = "visible" | "handle" | "hidden"
+
+const FAB_VISIBILITIES: readonly FabVisibility[] = ["visible", "handle", "hidden"]
 
 export function fabVisibleStorageKey(sessionId: string | undefined): string {
   return `${ANNOTATION_FAB_VISIBLE_STORAGE_PREFIX}${sessionId ?? "default"}`
 }
 
 /**
- * Resolve whether the standalone FAB is visible from the URL search string. Precedence: an explicit
- * `?unmark` / `?mark` (bare presence) WINS and dictates what to persist (`persist` = the boolean to write,
- * so the switch survives a later param-free load); else honor the stored choice; else default visible
+ * Resolve the standalone chrome's visibility from the URL search string. Precedence: an explicit
+ * `?unmark` / `?mark` (bare presence) WINS and dictates what to persist (`persist` = the state to write,
+ * so the switch survives a later param-free load); else honor the stored state; else default visible
  * (`persist: null` ⇒ write nothing). Pure; the caller reads `location.search`, persists, and strips the param.
  */
 export function resolveFabVisibility(
   search: string | undefined,
-  stored: boolean | undefined
-): { visible: boolean; persist: boolean | null } {
+  stored: FabVisibility | undefined
+): { visibility: FabVisibility; persist: FabVisibility | null } {
   let params: URLSearchParams | undefined
   try {
     params = new URLSearchParams(search ?? "") // tolerates a leading "?" and a bare key (no value)
   } catch {
     params = undefined
   }
-  if (params?.has(ANNOTATION_FAB_PARAM_HIDE)) return { visible: false, persist: false }
-  if (params?.has(ANNOTATION_FAB_PARAM_SHOW)) return { visible: true, persist: true }
-  return { visible: stored ?? true, persist: null }
+  if (params?.has(ANNOTATION_FAB_PARAM_HIDE)) return { visibility: "hidden", persist: "hidden" }
+  if (params?.has(ANNOTATION_FAB_PARAM_SHOW)) return { visibility: "visible", persist: "visible" }
+  return { visibility: stored ?? "visible", persist: null }
 }
 
-export function readStoredFabVisible(
+/**
+ * Read the persisted visibility, migrating the pre-tri-state BOOLEAN format under the same key.
+ *
+ * Legacy `"1"` → `visible`. Legacy `"0"` → whichever hidden flavor this surface can recover from:
+ * `handle` when the primary input is touch (tap the grabber), `hidden` on a keyboard device (Option/Alt+M).
+ * The migration is derived at READ time and never written back, so one synced profile opened on a phone and
+ * on a laptop leaves each surface with a working recovery path instead of freezing the first reader's guess.
+ */
+export function readStoredFabVisibility(
   sessionId: string | undefined,
+  touchPrimary: boolean,
   storage: AnnotationModeStorage | undefined = safeLocalStorage()
-): boolean | undefined {
+): FabVisibility | undefined {
   if (!storage) return undefined
   try {
     const value = storage.getItem(fabVisibleStorageKey(sessionId))
-    return value === "1" ? true : value === "0" ? false : undefined
+    if (FAB_VISIBILITIES.includes(value as FabVisibility)) return value as FabVisibility
+    if (value === "1") return "visible"
+    if (value === "0") return touchPrimary ? "handle" : "hidden"
+    return undefined
   } catch {
     return undefined
   }
 }
 
 /**
- * Persist the FAB visibility choice. Returns whether it was actually stored: `false` when no storage
- * exists or `setItem` throws (private-mode / quota). The caller uses this to decide whether the URL flag
- * is now durable enough to strip — if the write failed, `?mark` / `?unmark` must stay in the URL so a
- * reload still carries the intent.
+ * Persist the visibility choice. Returns whether it was actually stored: `false` when no storage exists or
+ * `setItem` throws (private-mode / quota). The caller uses this to decide whether the URL flag is now
+ * durable enough to strip — if the write failed, `?mark` / `?unmark` must stay in the URL so a reload still
+ * carries the intent.
  */
-export function writeStoredFabVisible(
+export function writeStoredFabVisibility(
   sessionId: string | undefined,
-  visible: boolean,
+  visibility: FabVisibility,
   storage: AnnotationModeStorage | undefined = safeLocalStorage()
 ): boolean {
   if (!storage) return false
   try {
-    storage.setItem(fabVisibleStorageKey(sessionId), visible ? "1" : "0")
+    storage.setItem(fabVisibleStorageKey(sessionId), visibility)
     return true
   } catch {
     // Best-effort — losing the visibility memory must never break the overlay.
     return false
   }
+}
+
+/** A state the '?' popup's hide rows can move to — never `visible`, which is what they move away from. */
+export type FabHideTarget = Exclude<FabVisibility, "visible">
+
+/**
+ * The hide targets the '?' popup offers, in row order. Split by PRIMARY input, not touch capability: a
+ * hybrid touchscreen laptop has a keyboard, so it gets the desktop treatment — one destructive row straight
+ * to `hidden`, recoverable by the shortcut. Only a touch-primary device is offered the edge handle, because
+ * there the handle is the ONLY recovery an unhidden URL can't provide.
+ */
+export function fabHideOptions(touchPrimary: boolean): FabHideTarget[] {
+  return touchPrimary ? ["handle", "hidden"] : ["hidden"]
+}
+
+/**
+ * Alt+M semantics over the tri-state: it toggles `visible` ⇄ `hidden`, and rescues `handle` back to
+ * `visible` — a state a phone can create and a laptop can only recover from.
+ */
+export function toggleFabVisibilityByShortcut(current: FabVisibility): FabVisibility {
+  return current === "visible" ? "hidden" : "visible"
 }
 
 /**
@@ -191,6 +233,44 @@ export function stripFabParamsFromSearch(search: string | undefined): string {
 // as well as the character — the residual µ-in-a-custom-editor collision is accepted by the owner and, as
 // defense in depth, the toggle never fires while an editable element is focused.
 export const ANNOTATION_FAB_SHORTCUT_KEY = "m"
+
+/** Apple platforms print the Option key; every other keyboard prints Alt. */
+const APPLE_PLATFORM_PATTERN = /mac|iphone|ipad|ipod/i
+
+/**
+ * The platform string, preferring the structured `navigator.userAgentData.platform` ("macOS", "Windows")
+ * and falling back to the deprecated-but-universal `navigator.platform` ("MacIntel", "iPhone"). Never the
+ * full UA string: that is the sniffing this helper exists to avoid.
+ */
+export function detectPlatformLabel(
+  nav: { userAgentData?: { platform?: string }; platform?: string } | undefined = typeof navigator === "undefined"
+    ? undefined
+    : (navigator as { userAgentData?: { platform?: string }; platform?: string })
+): string {
+  return nav?.userAgentData?.platform || nav?.platform || ""
+}
+
+/**
+ * How to NAME the FAB shortcut for this device — the single source for that string, so the modifier is
+ * spelled once and every label interpolates it. `"Option+M"` on Apple platforms, `"Alt+M"` elsewhere, and
+ * `undefined` on a touch-PRIMARY device: no keyboard means the clause is omitted, not reworded.
+ */
+export function formatFabShortcut(
+  options: { platform?: string; touchPrimary?: boolean } = {}
+): string | undefined {
+  if (options.touchPrimary) return undefined
+  const platform = options.platform ?? detectPlatformLabel()
+  return APPLE_PLATFORM_PATTERN.test(platform) ? "Option+M" : "Alt+M"
+}
+
+/**
+ * Compose an action label with its recovery clause: `base（clause）`, or bare `base` when there is none.
+ * Keeps the platform copy ADDITIVE — a host that overrides only the base sentence still gets the clause its
+ * device earned, instead of freezing one platform's wording into the override.
+ */
+export function withParenthetical(base: string, clause: string | undefined): string {
+  return clause ? `${base}（${clause}）` : base
+}
 
 /** Whether an event target is a text-editable element (typing there must not trigger the shortcut). */
 export function isEditableTarget(target: unknown): boolean {
