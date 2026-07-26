@@ -69,6 +69,7 @@ import {
   writeStoredFabVisibility,
   fabHideOptions,
   formatFabShortcut,
+  formatMarkParam,
   toggleFabVisibilityByShortcut,
   withParenthetical,
   stripFabParamsFromSearch,
@@ -224,8 +225,9 @@ export type AnnotationOverlayLabels = {
   restoreHandle?: string
   // The hide rows and their toasts are ADDITIVE pairs: a base action + the parenthetical recovery clause
   // its device earned (composed by withParenthetical). A host overriding one base sentence therefore keeps
-  // the platform behavior instead of freezing one platform's wording. The shortcut is named in exactly one
-  // place — formatFabShortcut() — and interpolated into the two labels that mention it.
+  // the platform behavior instead of freezing one platform's wording. Each recovery TOKEN is computed in
+  // exactly one place — formatFabShortcut() for the key to press, formatMarkParam() for the URL fragment to
+  // paste — and interpolated into the labels that name it, so no clause hardcodes a device or a URL shape.
   /** Keyboard-device '?' popup row: hide the chrome entirely. */
   hideAction?: string
   /** Its recovery clause, given the detected shortcut ("Option+M" / "Alt+M"). */
@@ -236,14 +238,14 @@ export type AnnotationOverlayLabels = {
   hideToHandleHint?: string
   /** Touch-device '?' popup row: hide everything, with no on-screen way back. */
   hideCompletelyAction?: string
-  /** Its recovery clause. */
-  hideCompletelyHint?: string
+  /** Its recovery clause, given the exact fragment to append for THIS url ("?mark" / "&mark"). */
+  hideCompletelyHint?: (markParam: string) => string
   /** Toast after a keyboard-device hide — repeats the row's own shortcut hint. */
   hiddenShortcutToast?: (shortcut: string) => string
   /** Toast after collapsing to the edge handle. */
   handleToast?: string
-  /** Toast after a touch-device full hide (no shortcut exists to name). */
-  hiddenToast?: string
+  /** Toast after a touch-device full hide (no shortcut exists to name) — repeats that same fragment. */
+  hiddenToast?: (markParam: string) => string
   /** Accessible name for the '?' help trigger, used when a host suppresses the visible tip copy. */
   helpTrigger?: string
 }
@@ -281,14 +283,14 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   hideToHandleAction: "隐藏至把手",
   hideToHandleHint: "点把手可恢复",
   hideCompletelyAction: "完全隐藏",
-  // Names the PARAMETER, not a separator: a page that already has a query string turns a literal "?mark"
-  // into `?foo=1?mark`, which URLSearchParams reads as one `foo` value — no `mark` key, so the stored
-  // `hidden` survives the reload. This is the one hide with no handle and no shortcut, so a hint that only
-  // works on a clean URL is a dead end.
-  hideCompletelyHint: "网址加 mark 参数恢复",
+  // The fragment is computed for the URL in front of the reader (formatMarkParam), so a page that already has
+  // a query string reads "&mark" instead of a "?mark" that would land as `?foo=1?mark` — one `foo` value,
+  // no `mark` key, chrome stays hidden. This is the one hide with neither a handle nor a shortcut behind it,
+  // so the hint has to be copy-pasteable rather than merely correct in the abstract.
+  hideCompletelyHint: (markParam) => `网址加 ${markParam} 恢复`,
   hiddenShortcutToast: (shortcut) => `已隐藏，按 ${shortcut} 恢复`,
   handleToast: "已缩至边缘把手，轻点可恢复",
-  hiddenToast: "已完全隐藏，网址加 mark 参数可恢复",
+  hiddenToast: (markParam) => `已完全隐藏，网址加 ${markParam} 可恢复`,
   helpTrigger: "帮助"
 }
 
@@ -1444,6 +1446,15 @@ export function modePillLabel(
   return touchInput ? labels.smart : `${labels.annotating} · ${labels.smart}`
 }
 
+/**
+ * The live query string ("" with no window). Always read at the moment a recovery hint is DISPLAYED, never
+ * captured at mount: the boot strip below rewrites `location.search` after the chrome first renders, and a
+ * host router may change it again, so a fragment baked early can name the wrong separator.
+ */
+function currentSearch(): string {
+  return typeof window === "undefined" ? "" : window.location.search
+}
+
 /** Standalone-only chrome visibility (visible | handle | hidden) from the frozen ?mark / ?unmark query
  *  param: an explicit param flips it AND persists the choice, then is stripped from the URL at boot
  *  (one-time switch); a param-free load honors the stored state. Query param, not the hash, so it never
@@ -1788,17 +1799,18 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   const shortcut = React.useMemo(() => formatFabShortcut({ touchPrimary: touchInput }), [touchInput])
   // The '?' popup's hide rows: the platform's targets, each composed as base action + the recovery clause
   // its device earned. `shortcut === undefined` ⟺ touch-primary ⟺ the handle row exists, so the row set and
-  // the row copy cannot drift apart.
+  // the row copy cannot drift apart. Each label stays a FUNCTION of the URL fragment rather than a finished
+  // string, because only the popup knows when it is being read — see the snapshot in ToolbarHelp.
   const hideOptions = React.useMemo(
     () =>
       fabHideOptions(touchInput).map((target) => ({
         target,
-        label:
+        label: (markParam: string) =>
           target === "handle"
             ? withParenthetical(labels.hideToHandleAction, labels.hideToHandleHint)
             : shortcut
               ? withParenthetical(labels.hideAction, labels.hideActionHint(shortcut))
-              : withParenthetical(labels.hideCompletelyAction, labels.hideCompletelyHint)
+              : withParenthetical(labels.hideCompletelyAction, labels.hideCompletelyHint(markParam))
       })),
     [touchInput, shortcut, labels]
   )
@@ -1834,8 +1846,14 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
       if (next === "handle") requestChromeFocus()
       onDisable?.()
       fabVisibility.set(next)
+      // The URL fragment is resolved HERE, in the handler, against the URL as it stands at the instant of the
+      // hide — the one moment it is guaranteed current.
       const message =
-        next === "handle" ? labels.handleToast : shortcut ? labels.hiddenShortcutToast(shortcut) : labels.hiddenToast
+        next === "handle"
+          ? labels.handleToast
+          : shortcut
+            ? labels.hiddenShortcutToast(shortcut)
+            : labels.hiddenToast(formatMarkParam(currentSearch()))
       if (message) flashToast(message)
     },
     [requestChromeFocus, onDisable, fabVisibility, flashToast, shortcut, labels.handleToast, labels.hiddenShortcutToast, labels.hiddenToast]
@@ -2009,33 +2027,38 @@ export function tooltipPlacement(
  * adjacent twin. Portaled to <body> so `position: fixed` escapes the toolbar's backdrop-filter containing
  * block; closes on an outside pointer-down.
  */
-function ToolbarHelp({ tip, hideOptions, triggerLabel, onHide }: { tip: string; hideOptions: Array<{ target: FabHideTarget; label: string }>; triggerLabel: string; onHide: (target: FabHideTarget) => void }) {
+function ToolbarHelp({ tip, hideOptions, triggerLabel, onHide }: { tip: string; hideOptions: Array<{ target: FabHideTarget; label: (markParam: string) => string }>; triggerLabel: string; onHide: (target: FabHideTarget) => void }) {
   const btnRef = React.useRef<HTMLButtonElement>(null)
   const popRef = React.useRef<HTMLDivElement>(null)
   const hideRowRef = React.useRef<HTMLButtonElement>(null)
   const restoreFocusRef = React.useRef(true) // false when dismissed by an outside click, so that target keeps focus
-  // Placement is measured on open; null means closed. Fixed-positioned off the button's viewport rect so the
-  // popup never spills off a ~320px screen regardless of where the draggable toolbar is docked.
-  const [placement, setPlacement] = React.useState<React.CSSProperties | null>(null)
-  const open = placement !== null
+  // Snapshotted on OPEN; null means closed. Both fields are properties of *the moment the user opens this* —
+  // the button's viewport rect (fixed-positioned off it so the popup never spills off a ~320px screen wherever
+  // the draggable toolbar is docked), and the URL fragment the hide row must name for the URL they are on right
+  // now. The fragment can't be computed with the chrome's other labels: the boot strip rewrites the query
+  // string after the chrome renders, and opening the popup is local state that re-renders nothing above.
+  const [snapshot, setSnapshot] = React.useState<{ style: React.CSSProperties; markParam: string } | null>(null)
+  const open = snapshot !== null
   const openTip = React.useCallback(() => {
+    const markParam = formatMarkParam(currentSearch())
     const button = btnRef.current
     if (!button || typeof window === "undefined") {
-      setPlacement({})
+      setSnapshot({ style: {}, markParam })
       return
     }
     const rect = button.getBoundingClientRect()
-    setPlacement(
-      tooltipPlacement(
+    setSnapshot({
+      style: tooltipPlacement(
         { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom },
         { width: window.innerWidth, height: window.innerHeight },
         // Bias the above/below flip by the ACTUAL row count — a touch device shows two hide rows, so the
         // one-row estimate would pick a side that can't hold the popup and rely on maxHeight scrolling.
         { estimatedHeight: 84 + hideOptions.length * 36 }
-      )
-    )
+      ),
+      markParam
+    })
   }, [hideOptions.length])
-  const closeTip = React.useCallback(() => setPlacement(null), [])
+  const closeTip = React.useCallback(() => setSnapshot(null), [])
   // Close on a pointer down outside the button + popup (the popup is portaled, so it isn't a DOM descendant).
   React.useEffect(() => {
     if (!open || typeof document === "undefined") return
@@ -2089,9 +2112,9 @@ function ToolbarHelp({ tip, hideOptions, triggerLabel, onHide }: { tip: string; 
       >
         ?
       </button>
-      {open && typeof document !== "undefined"
+      {snapshot && typeof document !== "undefined"
         ? createPortal(
-            <div ref={popRef} role="dialog" aria-label={tip || triggerLabel} data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...placement }}>
+            <div ref={popRef} role="dialog" aria-label={tip || triggerLabel} data-show-annotation-ui="" style={{ ...toolbarHelpTipStyle, ...snapshot.style }}>
               {tip ? <div style={helpTipTextStyle}>{tip}</div> : null}
               {hideOptions.map((option, index) => (
                 <button
@@ -2102,7 +2125,7 @@ function ToolbarHelp({ tip, hideOptions, triggerLabel, onHide }: { tip: string; 
                   onClick={() => { restoreFocusRef.current = false; closeTip(); onHide(option.target) }}
                 >
                   <EyeOffIcon />
-                  <span>{option.label}</span>
+                  <span>{option.label(snapshot.markParam)}</span>
                 </button>
               ))}
             </div>,

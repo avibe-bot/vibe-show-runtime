@@ -32,6 +32,7 @@ import {
   fabHideOptions,
   toggleFabVisibilityByShortcut,
   formatFabShortcut,
+  formatMarkParam,
   withParenthetical,
   stripFabParamsFromSearch,
   isEditableTarget,
@@ -565,6 +566,32 @@ describe("platform-split hide options (Lane U)", () => {
 
   it("a touch-primary device offers TWO rows, handle first, then complete hide", () => {
     expect(fabHideOptions(true)).toEqual(["handle", "hidden"])
+  })
+
+  it("formatMarkParam hands out the exact fragment to append: '?mark' on a clean URL, '&mark' once params exist", () => {
+    // Same shape as formatFabShortcut one axis over — compute the exact token the user must reproduce
+    // instead of making them derive it. There it's the platform's modifier; here it's the URL's separator.
+    expect(formatMarkParam("")).toBe("?mark")
+    expect(formatMarkParam(undefined)).toBe("?mark")
+    expect(formatMarkParam("?")).toBe("?mark") // an empty query reads as "" per the URL spec; a bare ? means the same
+    expect(formatMarkParam("?foo=1")).toBe("&mark")
+    expect(formatMarkParam("foo=1")).toBe("&mark") // tolerates a missing leading '?', like stripFabParamsFromSearch
+    expect(formatMarkParam("?vibe-embed=1&debug")).toBe("&mark")
+    // Already carrying the flag → still '&'. A duplicate key keeps has('mark') true, whereas special-casing it
+    // back to '?' would emit the broken form for a URL that demonstrably has a query string.
+    expect(formatMarkParam("?mark")).toBe("&mark")
+    expect(formatMarkParam("?foo=1&mark")).toBe("&mark")
+  })
+
+  it("what formatMarkParam hands out parses back — the whole reason it exists", () => {
+    // The bug it closes: a literal '?mark' appended to a URL that already has a query string yields
+    // `?foo=1?mark`, which URLSearchParams reads as ONE `foo` value. No `mark` key, so the stored `hidden`
+    // survives the reload — on the one hidden state with neither a handle nor a shortcut to fall back on.
+    expect(new URLSearchParams("?foo=1?mark").has("mark")).toBe(false)
+    // Composed the documented way, every starting URL round-trips.
+    for (const search of ["", "?foo=1", "?a=%20b&debug", "?vibe-embed=1"]) {
+      expect(new URLSearchParams(`${search}${formatMarkParam(search)}`).has("mark"), search).toBe(true)
+    }
   })
 
   it("withParenthetical composes a base action with its recovery clause, and degrades to bare base", () => {

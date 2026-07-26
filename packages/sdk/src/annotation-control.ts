@@ -264,6 +264,23 @@ export function formatFabShortcut(
 }
 
 /**
+ * The exact URL fragment to APPEND to bring a fully hidden chrome back: `"?mark"` on a URL with no query
+ * string, `"&mark"` on one that already has parameters. Same job as `formatFabShortcut` one axis over — that
+ * one computes the exact key the user must press, this one the exact text they must paste; platform-derived
+ * there, URL-derived here.
+ *
+ * Prescribing a bare `"?mark"` is a dead end on a page that already has a query string: the result is
+ * `?foo=1?mark`, which `URLSearchParams` reads as a single `foo="1?mark"` — no `mark` key, so the stored
+ * `hidden` survives the reload. That is the one hidden state with neither an edge handle nor a keyboard
+ * shortcut, so its hint has to work on the URL the reader is actually looking at. Callers must read
+ * `location.search` at DISPLAY time, not at mount: the boot strip rewrites it.
+ */
+export function formatMarkParam(search: string | undefined): string {
+  const raw = (search ?? "").replace(/^\?/, "")
+  return `${raw ? "&" : "?"}${ANNOTATION_FAB_PARAM_SHOW}`
+}
+
+/**
  * Compose an action label with its recovery clause: `base（clause）`, or bare `base` when there is none.
  * Keeps the platform copy ADDITIVE — a host that overrides only the base sentence still gets the clause its
  * device earned, instead of freezing one platform's wording into the override.

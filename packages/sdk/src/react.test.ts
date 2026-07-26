@@ -10,15 +10,18 @@ import {
   createChromeFocusController,
   TOUCH_CAPABLE_QUERY
 } from "./react.js"
-import { fabHideOptions, formatFabShortcut, withParenthetical } from "./annotation-control.js"
+import { fabHideOptions, formatFabShortcut, formatMarkParam, withParenthetical } from "./annotation-control.js"
 
-/** The row label the '?' popup renders for one hide target — the same composition AnnotationChrome does. */
-function hideRowLabel(target: "handle" | "hidden", shortcut: string | undefined): string {
+/**
+ * The row label the '?' popup renders for one hide target — the same composition AnnotationChrome does,
+ * against `search` as the URL stands when the popup is opened (ToolbarHelp snapshots it there).
+ */
+function hideRowLabel(target: "handle" | "hidden", shortcut: string | undefined, search = ""): string {
   const L = DEFAULT_ANNOTATION_LABELS
   if (target === "handle") return withParenthetical(L.hideToHandleAction, L.hideToHandleHint)
   return shortcut
     ? withParenthetical(L.hideAction, L.hideActionHint(shortcut))
-    : withParenthetical(L.hideCompletelyAction, L.hideCompletelyHint)
+    : withParenthetical(L.hideCompletelyAction, L.hideCompletelyHint(formatMarkParam(search)))
 }
 
 // Recovery hints live in the PARENTHESES of the button that hides, named ONCE. Before Lane U the tip and
@@ -48,25 +51,26 @@ describe("hide copy names each recovery exactly once, in the row that performs i
 
     const shortcut = formatFabShortcut({ platform: "iPhone", touchPrimary: true }) // undefined
     const rows = options.map((target) => hideRowLabel(target, shortcut))
-    expect(rows).toEqual(["隐藏至把手（点把手可恢复）", "完全隐藏（网址加 mark 参数恢复）"])
+    expect(rows).toEqual(["隐藏至把手（点把手可恢复）", "完全隐藏（网址加 ?mark 恢复）"])
     for (const row of rows) {
       expect(row).not.toContain("Alt+M")
       expect(row).not.toContain("Option+M")
     }
   })
 
-  // A page that already has a query string turns a literal "?mark" into `?foo=1?mark`, which URLSearchParams
-  // reads as a single `foo` value — no `mark` key, so the stored `hidden` survives the reload. Full-hide is the
-  // one state with neither a handle nor a shortcut, so a hint that only works on a clean URL strands the user.
-  it("the full-hide hint names the PARAMETER, never a separator that depends on the current URL", () => {
+  // A literal "?mark" appended to a page that already has a query string yields `?foo=1?mark`, which
+  // URLSearchParams reads as a single `foo` value — no `mark` key, so the stored `hidden` survives the reload.
+  // Full-hide is the one state with neither a handle nor a shortcut, so the hint has to be copy-pasteable on
+  // the URL actually in front of the reader, not merely correct on a clean one.
+  it("the full-hide hint adapts its separator to the URL the reader is on", () => {
     const L = DEFAULT_ANNOTATION_LABELS
-    for (const copy of [L.hideCompletelyHint, L.hiddenToast]) {
-      expect(copy).toContain("mark") // still concrete about WHICH parameter
-      expect(copy).not.toContain("?mark") // ...but never prescribes the separator
-      expect(copy).not.toContain("&mark")
-    }
-    // The premise, pinned so nobody "restores" the friendlier-looking literal: appending it to an existing
-    // query silently yields no `mark` key at all.
+    // Clean URL → the friendly literal.
+    expect(hideRowLabel("hidden", undefined, "")).toBe("完全隐藏（网址加 ?mark 恢复）")
+    expect(L.hiddenToast(formatMarkParam(""))).toBe("已完全隐藏，网址加 ?mark 可恢复")
+    // Query string already present → "&mark", in BOTH the row and its toast.
+    expect(hideRowLabel("hidden", undefined, "?foo=1")).toBe("完全隐藏（网址加 &mark 恢复）")
+    expect(L.hiddenToast(formatMarkParam("?vibe-embed=1&debug"))).toBe("已完全隐藏，网址加 &mark 可恢复")
+    // The premise, pinned so nobody "simplifies" this back to a hardcoded literal.
     expect(new URLSearchParams("?foo=1?mark").has("mark")).toBe(false)
     expect(new URLSearchParams("?foo=1&mark").has("mark")).toBe(true)
   })
@@ -76,7 +80,7 @@ describe("hide copy names each recovery exactly once, in the row that performs i
     expect(L.hiddenShortcutToast("Option+M")).toBe("已隐藏，按 Option+M 恢复")
     expect(L.hiddenShortcutToast("Alt+M")).toBe("已隐藏，按 Alt+M 恢复")
     expect(L.handleToast).toBe("已缩至边缘把手，轻点可恢复")
-    expect(L.hiddenToast).toBe("已完全隐藏，网址加 mark 参数可恢复")
+    expect(L.hiddenToast("?mark")).toBe("已完全隐藏，网址加 ?mark 可恢复")
 
     // The handle toast is the touch path; it must not advertise a shortcut, and the desktop toast must not
     // advertise a grabber the desktop never renders.
@@ -86,8 +90,12 @@ describe("hide copy names each recovery exactly once, in the row that performs i
 
   it("labels stay ADDITIVE, so overriding one string cannot cost a host the platform behavior", () => {
     // A host renaming the base action keeps the auto-detected parenthetical clause.
-    const copy = mergeAnnotationLabels({ hideAction: "Hide" })
+    const copy = mergeAnnotationLabels({ hideAction: "Hide", hideCompletelyAction: "Hide for good" })
     expect(withParenthetical(copy.hideAction, copy.hideActionHint("Alt+M"))).toBe("Hide（Alt+M 恢复）")
+    // Same for the URL clause: renaming the row keeps the separator the current URL earned.
+    expect(withParenthetical(copy.hideCompletelyAction, copy.hideCompletelyHint(formatMarkParam("?foo=1")))).toBe(
+      "Hide for good（网址加 &mark 恢复）"
+    )
     expect(copy.handleToast).toBe(DEFAULT_ANNOTATION_LABELS.handleToast) // untouched fields keep defaults
   })
 
