@@ -48,6 +48,8 @@ import {
   activeFabToast,
   copyRestoreLink,
   toastDwellMs,
+  settledCopyState,
+  mergeCopyState,
   fabToastDurationMs,
   stripFabParamsFromUrl,
   isEditableTarget,
@@ -57,7 +59,8 @@ import {
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
   floatPositionStorageKey,
-  type AnnotationModeStorage
+  type AnnotationModeStorage,
+  type ToastCopyState
 } from "./annotation-control.js"
 
 function memoryStorage(initial: Record<string, string> = {}): AnnotationModeStorage {
@@ -1101,5 +1104,88 @@ describe("a toast narrates ONE state of ONE session, so it expires when either d
         expect(toastDwellMs(visibility, copy)).toBe(dwell)
       }
     }
+  })
+
+  // The button stays enabled while a copy is pending — deliberately, since a `writeText` that never settles
+  // would otherwise lock the user out of the only exit `hidden-url` has — so two writes can be in flight and
+  // settle in either order. "Newest tap wins" is symmetric; the outcomes are not. A success is a fact about
+  // the CLIPBOARD and stays true however many taps followed it. A refusal is a fact about ONE attempt and
+  // says nothing about the rest.
+  it("lets a success speak even after a newer tap started, and keeps a stale refusal to itself", () => {
+    expect(settledCopyState(true, true)).toBe("copied")
+    expect(settledCopyState(true, false)).toBe("copied") // overtaken, but the link IS on the clipboard
+    expect(settledCopyState(false, true)).toBe("failed")
+    expect(settledCopyState(false, false)).toBeNull() // describes an attempt nobody is waiting on any more
+  })
+
+  // The other half of the same rule, on the receiving side: a write that succeeded cannot be undone by a
+  // write that failed, because a failed `writeText` does not empty the clipboard. Terminal for the life of
+  // ONE toast — a fresh raise starts from `idle` again, since it is a fresh link and a fresh clipboard claim.
+  it("cannot un-copy a clipboard", () => {
+    for (const next of ["idle", "pending", "copied", "failed"] as const) {
+      expect(mergeCopyState("copied", next)).toBe("copied")
+    }
+    expect(mergeCopyState("idle", "pending")).toBe("pending")
+    expect(mergeCopyState("pending", "failed")).toBe("failed")
+    expect(mergeCopyState("failed", "pending")).toBe("pending") // a retry re-opens the clock
+    expect(mergeCopyState("failed", "copied")).toBe("copied")
+  })
+
+  // The two rules replayed as the component composes them: tap, tap again, and let the writes settle in each
+  // order. Before this, the loser's refusal was applied and the winner's success discarded, so the pill sat
+  // on "请手动复制" for 15 seconds over a link the user already had — and the manual selection it asked for
+  // was of a link that had scrolled away with the toast.
+  it("ends on 已复制 whichever of two overlapping taps reaches the clipboard", () => {
+    function overlappingTaps() {
+      let attempts = 0
+      let copy: ToastCopyState = "idle"
+      const report = (next: ToastCopyState) => void (copy = mergeCopyState(copy, next))
+      const tap = () => {
+        const attempt = (attempts += 1)
+        report("pending")
+        return (ok: boolean) => {
+          const next = settledCopyState(ok, attempt === attempts)
+          if (next) report(next)
+        }
+      }
+      return { tap, settled: () => copy }
+    }
+
+    // Reported case: the SECOND write rejects first, then the first one lands.
+    const late = overlappingTaps()
+    const first = late.tap()
+    const second = late.tap()
+    second(false)
+    expect(late.settled()).toBe("failed")
+    first(true)
+    expect(late.settled()).toBe("copied")
+
+    // Mirror: the newer tap lands and an older refusal arrives afterwards.
+    const stale = overlappingTaps()
+    const older = stale.tap()
+    const newer = stale.tap()
+    newer(true)
+    older(false)
+    expect(stale.settled()).toBe("copied")
+
+    // Both taps refused: nothing reached the clipboard, so the manual-selection dwell is the right answer.
+    const refused = overlappingTaps()
+    const a = refused.tap()
+    const b = refused.tap()
+    a(false)
+    b(false)
+    expect(refused.settled()).toBe("failed")
+
+    // Not an overlap at all — the ordinary "tap again to be sure" within the 900ms the pill is up. The retry
+    // reports `pending`, which stops the clock, and can then be refused; neither may take the toast back off
+    // a clipboard that already has the link.
+    const retry = overlappingTaps()
+    const landed = retry.tap()
+    landed(true)
+    expect(retry.settled()).toBe("copied")
+    const again = retry.tap()
+    expect(retry.settled()).toBe("copied") // `pending` would have held the toast open with no deadline
+    again(false)
+    expect(retry.settled()).toBe("copied")
   })
 })

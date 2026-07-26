@@ -359,6 +359,43 @@ export function toastDwellMs(visibility: FabVisibility, copy: ToastCopyState): n
 }
 
 /**
+ * What a settled copy attempt is entitled to claim — or `null` for "this one has nothing to say".
+ *
+ * Nothing stops a second tap while the first `writeText` is still pending, and the two can settle in either
+ * order. The obvious rule for that is "only the newest tap may speak", and it is wrong, because the two
+ * outcomes are not the same KIND of fact:
+ *
+ * - A success is a fact about the CLIPBOARD. The link is on it. Which tap put it there, and whether a newer
+ *   tap has since been started, changes nothing about that — so a superseded attempt still reports it.
+ * - A refusal is a fact about ONE ATTEMPT, and only that one. A refusal from an attempt that has already been
+ *   superseded says nothing about the newer write still in flight, so it stays quiet rather than telling the
+ *   user to select a link by hand that may be about to land on the clipboard anyway.
+ *
+ * Treating the two alike is exactly what let a later refusal discard an earlier success — the clipboard
+ * holding the link while the toast asked for it to be copied by hand. See {@link mergeCopyState} for the
+ * other half of the rule.
+ */
+export function settledCopyState(ok: boolean, isLatestAttempt: boolean): ToastCopyState | null {
+  if (ok) return "copied"
+  return isLatestAttempt ? "failed" : null
+}
+
+/**
+ * What the toast accepts, given what it already knows.
+ *
+ * `copied` is terminal for the life of one toast: a write that succeeded cannot be undone by a later write
+ * that failed, because a failed `writeText` does not empty the clipboard. Without this, tapping twice —
+ * first succeeds, second refused — ends with the link on the clipboard and a pill insisting it has to be
+ * copied by hand. Every other transition is just the newest report.
+ *
+ * The toast's identity is checked by the caller: a new toast is a new token, so `idle` never has to be
+ * merged through here.
+ */
+export function mergeCopyState(prev: ToastCopyState, next: ToastCopyState): ToastCopyState {
+  return prev === "copied" ? "copied" : next
+}
+
+/**
  * Resolve the standalone chrome's visibility from `location.search` — the Show Page's own query string, and
  * the only URL surface this control plane reads. Precedence: an explicit `unmark` / `mark` WINS and dictates
  * what to persist (`persist` = the state to write, so the switch survives a later flag-free load); else honor

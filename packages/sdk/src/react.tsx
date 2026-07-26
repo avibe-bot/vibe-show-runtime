@@ -78,6 +78,8 @@ import {
   activeFabToast,
   copyRestoreLink,
   toastDwellMs,
+  settledCopyState,
+  mergeCopyState,
   shouldToggleFabShortcut,
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
@@ -1832,12 +1834,13 @@ function FabEdgeHandle({ label, drag, touchCapable, claimFocus, onRestore }: { l
  * own idea of what it was doing would be a second writer to a state the toast's clock also reads, which is
  * exactly the split this seam kept producing bugs from. Here the button reports; `toastDwellMs` decides.
  *
- * `attempts` is the one piece of local truth left, and it is about ORDERING, not state. Nothing stops a
- * second tap while the first `writeText` is still pending, the two can settle out of order, and an earlier
- * refusal landing after a later success would overwrite "已复制" with "请手动复制" for a link that is on the
- * clipboard. Only the newest tap may speak: older ones return without reporting anything. Comparing a
- * captured attempt against the same ref that minted it is a within-instance ordering check, not a read of
- * some other render's state — which is why it can be a ref at all.
+ * `attempts` is the one piece of local truth left, and it is about ORDERING, not state: it answers "has a
+ * newer tap started since this one?" and nothing else. Comparing a captured attempt against the same ref that
+ * minted it is a within-instance ordering check, not a read of some other render's state — which is why it
+ * can be a ref at all. What that ordering is worth differs per outcome, and this component does not decide
+ * that either: {@link settledCopyState} says what an attempt may claim, {@link mergeCopyState} says what the
+ * toast will accept. Both are pure, so the rule that a copied clipboard cannot be un-copied by a later
+ * refusal is a tested branch rather than a shape of this callback.
  *
  * Focus follows the control. `hideFab` skips its usual focus transfer for hidden states — correct when they
  * rendered nothing, wrong now that `hidden-url` renders the only exit: focus would fall to <body> and Tab
@@ -1871,8 +1874,8 @@ function FabToast({
     onCopy(token, "pending")
     const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard
     void copyRestoreLink(link, clipboard).then((ok) => {
-      if (attempt !== attempts.current) return
-      onCopy(token, ok ? "copied" : "failed")
+      const next = settledCopyState(ok, attempt === attempts.current)
+      if (next) onCopy(token, next)
     })
   }, [link, token, onCopy])
   return (
@@ -2164,8 +2167,13 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   // created cannot do — a pending copy keeps its callback alive, so a captured token ages out alongside the
   // toast it came from and then matches everything. Nothing is read from a ref here, so there is no shadow of
   // the state to fall out of date with it.
+  //
+  // Matching the token says the report is about THIS toast; `mergeCopyState` says whether this toast will take
+  // it. A raise starts at `idle` (flashToast), and within that one raise a copy that reached the clipboard is
+  // the end of the story — no later refusal can empty it — so overlapping taps cannot walk the pill back to
+  // "请手动复制" over a link the user already has.
   const setToastCopy = React.useCallback((token: number, copy: ToastCopyState) => {
-    setToast((prev) => (prev && prev.token === token ? { ...prev, copy } : prev))
+    setToast((prev) => (prev && prev.token === token ? { ...prev, copy: mergeCopyState(prev.copy, copy) } : prev))
   }, [])
 
   if (host === "embedded") {
