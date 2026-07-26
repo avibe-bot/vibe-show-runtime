@@ -1120,3 +1120,96 @@ describe("a toast narrates ONE state, so it expires when that state does (Lane U
     expect(activeFabToast(undefined, "hidden-url")).toBeNull()
   })
 })
+
+describe("an occurrence identity may not dedupe what tells occurrences apart (Lane U, round 12)", () => {
+  // Same shape as round 11, one layer up. There the reader stood on `URL.hash`, which cannot tell "no
+  // fragment" from "empty fragment". Here it stood on a SET, which cannot tell one `mark` from two — and the
+  // memo compares identities, so information the identity drops is information the memo cannot act on.
+  //
+  // The stranding: persistence is failing, so `unmark` stays in the URL by design. The user follows the
+  // printed exit, gets `?unmark&mark`, is rescued, and hides again — the flag never left, so they are now at
+  // `?unmark&mark` and hidden. They follow the SAME printed exit a second time. As a set that URL still reads
+  // `{mark, unmark}`, identical to the spent token, so the rescue is swallowed. `hidden-url` is the one state
+  // with neither a handle nor a guaranteed shortcut: its URL exit is the whole exit, and it just stopped
+  // working on the repeat — which is exactly when a user leans on it hardest.
+  it("counts repeats: appending the printed exit a SECOND time is a second occurrence", () => {
+    const stale = fabFlagToken({ hash: "#/route?unmark&mark" })
+    const repeated = fabFlagToken({ hash: "#/route?unmark&mark&mark" })
+    expect(repeated).not.toBe(stale)
+    expect(shouldApplyFabFlag(repeated, nextAppliedFlag(stale))).toBe(true)
+  })
+
+  it("counts them across segments too, since the append lands in whichever tail the reader is holding", () => {
+    const stale = fabFlagToken({ search: "?unmark", hash: "#/route?mark" })
+    const repeated = fabFlagToken({ search: "?unmark", hash: "#/route?mark&mark" })
+    expect(repeated).not.toBe(stale)
+    expect(shouldApplyFabFlag(repeated, nextAppliedFlag(stale))).toBe(true)
+  })
+
+  it("keeps every property the identity was built for — it is a multiset now, not a different thing", () => {
+    // Round 8: a flag that never left is still ONE occurrence however the host re-navigates around it.
+    expect(fabFlagToken({ hash: "#/a?unmark" })).toBe(fabFlagToken({ hash: "#/b?unmark" }))
+    // Order-independence: our two names are a set within one append, only the COUNT was load-bearing.
+    expect(fabFlagToken({ search: "?unmark&mark" })).toBe(fabFlagToken({ search: "?mark&unmark" }))
+    // Round 9: no flag, no occurrence — the memo still erases itself.
+    expect(fabFlagToken({ search: "?a=1", hash: "#/route" })).toBe("")
+    // Round 8's other half: a host parameter that merely shares our name is not ours to count.
+    expect(fabFlagToken({ hash: "#/review?mark=42&mark" })).toBe(fabFlagToken({ hash: "#/x?mark" }))
+  })
+
+  it("still reads the DECISION over a deduped set — multiplicity identifies, it does not vote", () => {
+    expect(resolveFabVisibility({ hash: "#/route?unmark&mark&mark" }, undefined).visibility).toBe("visible")
+    expect(resolveFabVisibility({ search: "?unmark&unmark" }, undefined).visibility).toBe("hidden-url")
+  })
+})
+
+describe("an empty query is not the absence of one, on the way out either (Lane U, round 12)", () => {
+  // The counterpart to round 11's separator ruling, on the strip side. `formatMarkParam` correctly prints
+  // `&mark` for a URL whose tail is already `?` — an empty query still has its delimiter — so the recovery
+  // URL is `/page?&mark`. Reconstructing by truthiness ("no pairs left ⇒ no `?`") then hands the host back
+  // `/page`, deleting a delimiter that was theirs before we appended. Round-tripping our own printed exit
+  // must return the page's own URL, not a normalized guess at it.
+  it("restores the page's own URL after stripping the exit we told the user to type", () => {
+    expect(stripFabParamsFromUrl({ pathname: "/p/x", search: "?&mark", hash: "" })).toBe("/p/x?")
+    expect(stripFabParamsFromUrl({ pathname: "/p/x", search: "", hash: "#/route?&mark" })).toBe("/p/x#/route?")
+  })
+
+  it("still deletes a delimiter that was OURS — `?mark` was appended to a page that had no query", () => {
+    expect(stripFabParamsFromUrl({ pathname: "/p/x", search: "?mark", hash: "" })).toBe("/p/x")
+    expect(stripFabParamsFromUrl({ pathname: "/p/x", search: "", hash: "#/route?mark" })).toBe("/p/x#/route")
+  })
+
+  // The property, over the same matrix round 11 pinned the printer against: for every shape, appending what
+  // we print and then stripping it must return THE PAGE'S OWN URL. Printer and stripper are one round trip,
+  // so they have to be tested as one — pinning each alone is what let the pair drift.
+  //
+  // The expectation is taken off the href by string surgery, never rebuilt from `new URL(...)`: that rebuild
+  // reports `search === ""` for a page at `/p/x?` and `hash === ""` for one at `/p/x#`, so it would erase the
+  // exact delimiters under test and agree with the bug.
+  const ORIGIN = "https://h"
+  const SHAPES = ["/p/x", "/p/x?", "/p/x?foo=1", "/p/x#", "/p/x#/r", "/p/x#/r?", "/p/x#/r?a=1"]
+
+  it("round-trips every shape the formatter can print, which is the property the two rules share", () => {
+    for (const shape of SHAPES) {
+      const recovered = new URL(ORIGIN + shape + formatMarkParam(ORIGIN + shape))
+      const stripped = stripFabParamsFromUrl({
+        pathname: recovered.pathname,
+        search: recovered.search,
+        hash: recovered.hash,
+      })
+      expect(stripped, `round trip of ${shape}`).toBe(shape)
+    }
+  })
+
+  it("cannot round-trip `?#` — the ONE shape whose delimiter is invisible to a decomposed read", () => {
+    // Named rather than omitted, because a silent gap in a property matrix reads as coverage. `/p/x?#` has an
+    // empty query AND an empty fragment; `location.search` is "" for it, so the `?` is not in this function's
+    // input at all and no rule here can preserve it. The printer already solved this class by reading the raw
+    // href (round 11); the stripper still reads `{pathname, search, hash}`. Closing it means giving the
+    // stripper the href too — the same move, one function over, and a change to its signature and its caller.
+    const recovered = new URL(`${ORIGIN}/p/x?#${formatMarkParam(`${ORIGIN}/p/x?#`)}`)
+    expect(
+      stripFabParamsFromUrl({ pathname: recovered.pathname, search: recovered.search, hash: recovered.hash })
+    ).toBe("/p/x#") // the page's own URL was "/p/x?#"
+  })
+})

@@ -200,26 +200,28 @@ function isFabParamPair(pair: string, bareOnly: boolean): boolean {
   return bareOnly ? eq === -1 || eq === pair.length - 1 : true // "mark" / "mark=" are bare; "mark=42" is not
 }
 
-/** Which of our flags a single query segment carries, deduped, in no particular order. */
-function presentFabFlags(query: string | undefined, bareOnly: boolean): Set<string> {
+/** Our flag keys in one query segment, in the order written, WITH repeats. */
+function fabFlagKeys(query: string | undefined, bareOnly: boolean): string[] {
   const raw = (query ?? "").replace(/^\?/, "")
-  const found = new Set<string>()
-  if (!raw) return found
-  for (const pair of raw.split("&")) {
-    if (isFabParamPair(pair, bareOnly)) found.add(pair.split("=")[0])
-  }
-  return found
+  if (!raw) return []
+  return raw
+    .split("&")
+    .filter((pair) => isFabParamPair(pair, bareOnly))
+    .map((pair) => pair.split("=")[0])
 }
 
 /**
- * Every flag this URL carries, across BOTH segments one can legitimately land in — the search (tolerant, the
- * names were ours before the flavor split) and the hash's own query (bare presence only, because that segment
- * belongs to the host's router). One set, so nothing downstream has to know there were ever two places.
+ * Every flag key this URL carries, across BOTH segments one can legitimately land in — the search (tolerant,
+ * the names were ours before the flavor split) and the hash's own query (bare presence only, because that
+ * segment belongs to the host's router). One list, so nothing downstream has to know there were ever two.
+ *
+ * A list and not a set. The two readers below want different things from it — the decision wants presence,
+ * the identity wants the whole observation — and only one of those can be recovered from the other. Deduping
+ * here served the decision and quietly cost the identity a repeat it needed (round 12); this returns what was
+ * actually there and lets each reader narrow it for itself.
  */
-function urlFabFlags(url: FabParamUrl): Set<string> {
-  const flags = presentFabFlags(url.search, false)
-  for (const flag of presentFabFlags(splitHash(url.hash).query, true)) flags.add(flag)
-  return flags
+function urlFabFlagKeys(url: FabParamUrl): string[] {
+  return [...fabFlagKeys(url.search, false), ...fabFlagKeys(splitHash(url.hash).query, true)]
 }
 
 /**
@@ -232,6 +234,7 @@ function urlFabFlags(url: FabParamUrl): Set<string> {
  * own defect, re-entered through the back door. Being wrongly visible costs a second hide; being wrongly
  * hidden with your rescue outranked is the blank screen we exist to prevent.
  *
+ * Presence is all this reader needs, so it takes the deduped SET — a second `mark` does not out-vote a first.
  * It takes a SET rather than a segment, so that argument decides the case it was made for. Ruling on one
  * segment at a time and then ranking the segments meant `/page?unmark#/route?mark` — a page linked with
  * `unmark`, a failed write, and then the exact append the copy prints, since "the end of the address bar" is
@@ -255,9 +258,16 @@ function readFabFlag(flags: Set<string>): FabVisibility | undefined {
  * compare against, every later `popstate` re-applies the same stale token — silently undoing a restore the
  * user just performed. Order-independent, so `?unmark&mark` and `?mark&unmark` are one occurrence, while
  * `?unmark` → `?unmark&mark` is genuinely a new one.
+ *
+ * A sorted MULTISET, not a sorted set. The identity has to survive everything that is not a new append —
+ * a host route change around a flag that never left is still one occurrence, hence keys and not the raw URL —
+ * while distinguishing everything that is one. A repeat is the second kind: with persistence failing, the
+ * flag stays put, so following the printed exit twice reads `?unmark&mark` then `?unmark&mark&mark`, and
+ * deduping made those one token. The second rescue matched a spent memo and was swallowed — on the one state
+ * that has no handle and no guaranteed shortcut, where the URL exit is the entire exit (round 12).
  */
 export function fabFlagToken(url: FabParamUrl): string {
-  return [...urlFabFlags(url)].sort().join("+")
+  return [...urlFabFlagKeys(url)].sort().join("+")
 }
 
 /**
@@ -306,10 +316,10 @@ export function activeFabToast(
  * lands: on a hash-routed page (`/p/x#/route`, the ordinary Show Page shape) `location.search` is empty and an
  * appended `?mark` becomes part of the hash. Looking in one place only would strand `hidden` — the single
  * state with neither an on-screen handle nor a guaranteed keyboard shortcut — on whichever shape wasn't
- * checked. They are read as ONE set ({@link urlFabFlags}), the same set {@link fabFlagToken} builds its
+ * checked. They are read as ONE list ({@link urlFabFlagKeys}), the same list {@link fabFlagToken} builds its
  * identity from, so the two cannot disagree about what a URL carries; the rescue-wins ruling in
  * {@link readFabFlag} then decides once, over everything present, rather than per segment and then again
- * between segments.
+ * between segments. It narrows to a set on the way in, because presence is the whole of its question.
  *
  * Pure; the caller reads `location`, persists, and strips the flag from whichever segment held it.
  */
@@ -317,7 +327,7 @@ export function resolveFabVisibility(
   url: FabParamUrl,
   stored: FabVisibility | undefined
 ): { visibility: FabVisibility; persist: FabVisibility | null } {
-  const flag = readFabFlag(urlFabFlags(url))
+  const flag = readFabFlag(new Set(urlFabFlagKeys(url)))
   if (flag) return { visibility: flag, persist: flag }
   return { visibility: stored ?? "visible", persist: null }
 }
@@ -435,6 +445,23 @@ export function stripFabParamsFromSearch(search: string | undefined, bareOnly = 
 }
 
 /**
+ * Did this segment still have a query after the strip — INCLUDING an empty one?
+ *
+ * The delimiter and its contents are two different facts, and only the second one survives a join: `?` and
+ * `?mark` both strip to `""`, but the first page owned a `?` before we arrived and the second did not. Callers
+ * that reconstruct from truthiness collapse them and hand the host back a URL it never had. That is the same
+ * distinction round 11 made on the way in — an empty query is not the absence of one — which is why
+ * `formatMarkParam` prints `&mark` for a URL ending in `?`: this is that append, read back off.
+ *
+ * Shares {@link isFabParamPair} with the strip itself, so the two cannot disagree about which pairs were ours.
+ */
+function keepsQueryDelimiter(query: string | undefined, bareOnly: boolean): boolean {
+  const raw = (query ?? "").replace(/^\?/, "")
+  if (!raw) return false
+  return raw.split("&").some((pair) => !isFabParamPair(pair, bareOnly))
+}
+
+/**
  * The same strip, one segment over: remove our flag from the hash's own query while leaving the ROUTE and
  * every foreign key byte-for-byte intact. Returns the hash body WITHOUT a leading "#" ("" if empty).
  *
@@ -444,14 +471,15 @@ export function stripFabParamsFromSearch(search: string | undefined, bareOnly = 
  * stripper rather than re-implemented, so both sides drop exactly the same key tokens and re-encode nothing.
  * When there was nothing of ours to remove, the ORIGINAL string is handed back rather than a reassembled
  * one — the common case for a flag that arrived in the search — so a hash we have no business rewriting
- * cannot be perturbed by the round trip. Only when a token really is dropped is the hash rebuilt, and a
- * segment emptied by that drop loses its now-meaningless `?` with it.
+ * cannot be perturbed by the round trip. Only when a token really is dropped is the hash rebuilt, and a `?`
+ * that existed only to carry our flag goes with it — while one the route already had stays, which is what
+ * {@link keepsQueryDelimiter} is for and what emptiness alone could not tell us.
  */
 export function stripFabParamsFromHash(hash: string | undefined): string {
   const { route, query } = splitHash(hash)
   const rest = stripFabParamsFromSearch(query, true) // host router's namespace: bare flags only
   if (rest === query) return (hash ?? "").replace(/^#/, "")
-  return rest ? `${route}?${rest}` : route
+  return keepsQueryDelimiter(query, true) ? `${route}?${rest}` : route
 }
 
 /**
@@ -463,12 +491,21 @@ export function stripFabParamsFromHash(hash: string | undefined): string {
  * `null` return is the load-bearing part: it is what lets the caller distinguish "already clean" from
  * "cleaned to the same string", so an untouched URL never reaches `replaceState` and never fakes a
  * navigation for the host's router.
+ *
+ * Reassembly asks {@link keepsQueryDelimiter}, not whether the stripped text is non-empty. Emptiness is the
+ * wrong question because we are undoing OUR OWN append: on a page whose search is already `?`, the printed
+ * exit is `&mark` (an empty query still has its delimiter), so the URL to clean is `/page?&mark` — and
+ * truthiness handed the host back `/page`, quietly deleting a `?` that was theirs before we arrived. What
+ * this function must restore is the page's own URL, not a normalized guess at it.
  */
 export function stripFabParamsFromUrl(url: { pathname?: string; search?: string; hash?: string }): string | null {
   const strippedSearch = stripFabParamsFromSearch(url.search)
-  const nextSearch = strippedSearch ? `?${strippedSearch}` : ""
+  const nextSearch = keepsQueryDelimiter(url.search, false) ? `?${strippedSearch}` : ""
   const strippedHash = stripFabParamsFromHash(url.hash)
-  const nextHash = strippedHash ? `#${strippedHash}` : ""
+  // Same rule for the fragment's own delimiter, and simpler: `formatMarkParam` emits `?mark` / `&mark` and
+  // never a `#`, so a `#` in front of us is always one the page already had. `/page#` + `?mark` reads back as
+  // `/page#?mark`, whose body strips to "" — truthiness would call that "no fragment" and hand back `/page`.
+  const nextHash = strippedHash ? `#${strippedHash}` : url.hash ? "#" : ""
   if (nextSearch === (url.search ?? "") && nextHash === (url.hash ?? "")) return null
   return `${url.pathname ?? ""}${nextSearch}${nextHash}`
 }
