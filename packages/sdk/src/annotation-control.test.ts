@@ -30,6 +30,7 @@ import {
   writeStoredFabVisibility,
   fabVisibleStorageKey,
   fabHideOptions,
+  fabVisibilityAfterShortcutLoss,
   toggleFabVisibilityByShortcut,
   formatFabShortcut,
   formatMarkParam,
@@ -621,6 +622,26 @@ describe("Alt+M FAB toggle shortcut guard (Lane R12)", () => {
     expect(toggleFabVisibilityByShortcut("hidden")).toBe("visible")
     // A `handle` set on a phone then opened on a laptop: the shortcut must RESTORE, not re-hide.
     expect(toggleFabVisibilityByShortcut("handle")).toBe("visible")
+  })
+
+  it("fabVisibilityAfterShortcutLoss rescues a hidden chrome when the keyboard that was its exit goes away", () => {
+    // The whole point: a keyboard/trackpad detaches mid-session, the primary pointer flips to touch, and the
+    // shortcut the user was PROMISED stops existing. `hidden` renders nothing, so the chrome has no exit left.
+    expect(fabVisibilityAfterShortcutLoss("hidden", "Option+M", undefined)).toBe("handle")
+    expect(fabVisibilityAfterShortcutLoss("hidden", "Alt+M", undefined)).toBe("handle")
+  })
+
+  it("fabVisibilityAfterShortcutLoss keys on the LOSS, so it never undoes a touch user's deliberate full hide", () => {
+    // A touch-primary device has no shortcut and never had one, yet `fabHideOptions(true)` still offers it
+    // the full hide. Testing `!shortcut` instead of the transition would flip that choice back on the very
+    // next render — the row would be unusable on exactly the devices that are offered it.
+    expect(fabVisibilityAfterShortcutLoss("hidden", undefined, undefined)).toBeNull()
+    // Nothing was lost while the shortcut is still there, and GAINING one strands nobody.
+    expect(fabVisibilityAfterShortcutLoss("hidden", "Option+M", "Option+M")).toBeNull()
+    expect(fabVisibilityAfterShortcutLoss("hidden", undefined, "Alt+M")).toBeNull()
+    // Only `hidden` is exit-less; the other two states are recoverable on screen and must be left alone.
+    expect(fabVisibilityAfterShortcutLoss("visible", "Option+M", undefined)).toBeNull()
+    expect(fabVisibilityAfterShortcutLoss("handle", "Option+M", undefined)).toBeNull()
   })
 
   it("isEditableTarget: true for input / textarea / select / contenteditable, false otherwise", () => {

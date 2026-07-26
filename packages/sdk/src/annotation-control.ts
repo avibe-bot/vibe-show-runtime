@@ -209,6 +209,26 @@ export function toggleFabVisibilityByShortcut(current: FabVisibility): FabVisibi
 }
 
 /**
+ * A `hidden` chrome must not outlive the keyboard that is its on-screen-free exit. Detach a keyboard or
+ * trackpad mid-session and the primary pointer flips to touch: the shortcut we PROMISED in the hide row
+ * stops existing, its document listener unbinds, and `hidden` renders nothing to tap — a screen with no way
+ * back. Degrading to `handle` restores an exit the device can actually use.
+ *
+ * Keyed on the LOSS (had one, now doesn't), not on `!shortcut`: a touch-primary device never has a shortcut
+ * and is still offered the full hide by {@link fabHideOptions}, so a plain state test would flip that
+ * deliberate choice back on the very next render and make the row unusable exactly where it is offered.
+ * Returns the state to move to, or `null` to stay put.
+ */
+export function fabVisibilityAfterShortcutLoss(
+  current: FabVisibility,
+  previousShortcut: string | undefined,
+  nextShortcut: string | undefined
+): FabVisibility | null {
+  if (current !== "hidden") return null // `visible` and `handle` are both recoverable on screen
+  return previousShortcut && !nextShortcut ? "handle" : null
+}
+
+/**
  * Remove ONLY the overlay's own `mark` / `unmark` flag from a raw `location.search`, leaving every other
  * parameter byte-for-byte intact. We split on `&` and drop the tokens whose KEY is ours, rather than
  * round-tripping through `URLSearchParams.toString()` — that round-trip re-encodes existing escapes and

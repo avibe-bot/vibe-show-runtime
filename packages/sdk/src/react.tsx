@@ -68,6 +68,7 @@ import {
   readStoredFabVisibility,
   writeStoredFabVisibility,
   fabHideOptions,
+  fabVisibilityAfterShortcutLoss,
   formatFabShortcut,
   formatMarkParam,
   toggleFabVisibilityByShortcut,
@@ -1872,6 +1873,19 @@ function AnnotationChrome({ host, enabled, available, mode, touchInput, labels, 
   React.useEffect(() => {
     if (host === "standalone" && fabVisibility.visibility !== "visible" && enabled) onDisable?.()
   }, [host, fabVisibility.visibility, enabled, onDisable])
+  // The other half of the shortcut's contract: it must not be able to vanish while it is the only way back.
+  // Detaching a keyboard/trackpad flips `touchInput` to touch-primary, so `shortcut` goes undefined and the
+  // listener below unbinds — and a `hidden` chrome renders nothing to tap, stranding the user on a screen
+  // with no exit. The previous value is tracked so the rescue fires on the LOSS rather than on `!shortcut`,
+  // which would undo a touch user's deliberate full hide; the rule itself lives in annotation-control.
+  const previousShortcutRef = React.useRef(shortcut)
+  React.useEffect(() => {
+    const previous = previousShortcutRef.current
+    previousShortcutRef.current = shortcut
+    if (host !== "standalone") return
+    const rescued = fabVisibilityAfterShortcutLoss(fabVisibility.visibility, previous, shortcut)
+    if (rescued) fabVisibility.set(rescued)
+  }, [host, shortcut, fabVisibility.visibility, fabVisibility.set])
   // Option/Alt+M toggles the chrome (standalone only), mirroring ?mark/?unmark and the '?' popup's hide row.
   // Registered at the document level so it works even while the chrome is hidden; the pure guard blocks it
   // while the user is typing or holding another modifier. Bound only where a shortcut EXISTS — a touch-primary
