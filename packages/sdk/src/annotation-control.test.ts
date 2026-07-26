@@ -38,6 +38,8 @@ import {
   withParenthetical,
   stripFabParamsFromHash,
   stripFabParamsFromSearch,
+  fabFlagToken,
+  shouldApplyFabFlag,
   stripFabParamsFromUrl,
   fabUrlChangeEvents,
   isEditableTarget,
@@ -640,7 +642,8 @@ describe("standalone FAB visibility via ?mark / ?unmark query param (Lane R10/R1
     // Foreign keys and their escapes are preserved byte-for-byte, same discipline as the search side.
     expect(stripFabParamsFromHash("#/route?a=1&unmark")).toBe("/route?a=1")
     expect(stripFabParamsFromHash("#/route?debug&mark")).toBe("/route?debug") // bare flag stays bare
-    expect(stripFabParamsFromHash("#/route?a=%20b&mark=1")).toBe("/route?a=%20b")
+    // A VALUED `mark` in the hash is the host's, not ours (round 8) — it survives untouched, escapes and all.
+    expect(stripFabParamsFromHash("#/route?a=%20b&mark=1")).toBe("/route?a=%20b&mark=1")
     // No flag of ours ⇒ the hash comes back exactly as it went in, down to a bare trailing '?' the host wrote.
     // (Reached whenever the flag arrived in the SEARCH: the hash strip still runs, and must be a no-op.)
     expect(stripFabParamsFromHash("#/route")).toBe("/route")
@@ -955,5 +958,64 @@ describe("the address bar is a live input, not a boot-time constant (Lane U, rou
     expect(first).toBe("/p/x?a=1#/r")
     const url = new URL(`https://h${first}`)
     expect(stripFabParamsFromUrl({ pathname: url.pathname, search: url.search, hash: url.hash })).toBeNull()
+  })
+})
+
+describe("a stale URL flag must not outlive the choice it recorded (Lane U, round 8)", () => {
+  // The wound: when the storage write fails we deliberately LEAVE ?unmark in the URL so a reload still
+  // carries the intent. Round 7 then made the overlay subscribe to navigation — and those two correct
+  // decisions combine into a trap: every later popstate re-reads the same stale token.
+
+  it("lets the RESCUE flag win when both sit in one segment, because being wrongly hidden is the trap", () => {
+    // Failed persistence leaves `unmark` behind; the user follows the printed exit and appends `mark` to
+    // that same tail. If `unmark` still outranked it, the advertised exit would be unreachable — the exact
+    // defect this PR exists to close, reintroduced through the back door.
+    expect(resolveFabVisibility({ search: "?unmark&mark" }, undefined).visibility).toBe("visible")
+    expect(resolveFabVisibility({ search: "?mark&unmark" }, undefined).visibility).toBe("visible")
+    expect(resolveFabVisibility({ hash: "#/r?unmark&mark" }, undefined).visibility).toBe("visible")
+  })
+
+  it("still gives the SEARCH the last word across segments — that precedence is unchanged", () => {
+    expect(resolveFabVisibility({ search: "?unmark", hash: "#/r?mark" }, undefined).visibility).toBe("hidden-url")
+  })
+
+  it("tokenizes what the URL carries, so 'unmark' and 'unmark then mark' are different occurrences", () => {
+    expect(fabFlagToken({ search: "?unmark" })).toBe("unmark")
+    expect(fabFlagToken({ search: "?unmark&mark" })).toBe("mark+unmark")
+    expect(fabFlagToken({ search: "?mark&unmark" })).toBe("mark+unmark") // order-independent identity
+    expect(fabFlagToken({ hash: "#/r?mark" })).toBe("mark")
+    expect(fabFlagToken({ search: "?a=1", hash: "#/route" })).toBe("")
+  })
+
+  it("applies an occurrence once: the same token never fires twice, a changed one always does", () => {
+    expect(shouldApplyFabFlag("unmark", undefined)).toBe(true) // boot
+    expect(shouldApplyFabFlag("unmark", "unmark")).toBe(false) // the stale re-read that hid a restored FAB
+    expect(shouldApplyFabFlag("mark+unmark", "unmark")).toBe(true) // the user just typed the exit
+    expect(shouldApplyFabFlag("", "unmark")).toBe(false) // stripped clean — nothing to apply
+    expect(shouldApplyFabFlag("", undefined)).toBe(false)
+  })
+})
+
+describe("the hash belongs to the host router; we may only claim the bare flag there (Lane U, round 8)", () => {
+  it("ignores a host's own valued parameter that happens to be named mark", () => {
+    // `#/review?mark=42` is a route with a row id, not our switch. URLSearchParams.has() cannot tell the
+    // difference, which is why recognition is by BARE presence.
+    expect(resolveFabVisibility({ hash: "#/review?mark=42" }, undefined).persist).toBeNull()
+    expect(resolveFabVisibility({ hash: "#/review?unmark=1" }, undefined).persist).toBeNull()
+    expect(fabFlagToken({ hash: "#/review?mark=42" })).toBe("")
+  })
+
+  it("still honors the bare flag the recovery flow actually produces", () => {
+    expect(resolveFabVisibility({ hash: "#/review?mark" }, undefined).visibility).toBe("visible")
+    expect(resolveFabVisibility({ hash: "#/review?a=1&unmark" }, undefined).visibility).toBe("hidden-url")
+  })
+
+  it("leaves a host's valued parameter in place when stripping, so route state survives", () => {
+    expect(stripFabParamsFromHash("#/review?mark=42")).toBe("/review?mark=42")
+    expect(stripFabParamsFromHash("#/review?mark=42&mark")).toBe("/review?mark=42")
+  })
+
+  it("keeps location.search tolerant — that namespace was reserved before this PR, the hash was not", () => {
+    expect(resolveFabVisibility({ search: "?mark=1" }, undefined).visibility).toBe("visible")
   })
 })

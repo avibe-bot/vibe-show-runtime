@@ -164,19 +164,77 @@ function splitHash(hash: string | undefined): { route: string; query: string } {
   return start === -1 ? { route: raw, query: "" } : { route: raw.slice(0, start), query: raw.slice(start + 1) }
 }
 
-/** The flag a single query segment carries, if any. `unmark` outranks `mark` when both are present. */
-function readFabFlag(query: string | undefined): FabVisibility | undefined {
-  let params: URLSearchParams | undefined
-  try {
-    params = new URLSearchParams(query ?? "") // tolerates a leading "?" and a bare key (no value)
-  } catch {
-    return undefined
+/**
+ * Is this `key=value` pair one of ours?
+ *
+ * `bareOnly` is the difference between a namespace we own and one we borrow. In `location.search` the two
+ * names have been reserved since before the flavor split, so any shape counts. In the HASH they have not:
+ * that segment belongs to the host's router, and `#/review?mark=42` is a route carrying a row id, not our
+ * switch. `URLSearchParams.has()` cannot tell those apart, so hash recognition is by BARE presence — which
+ * is all the recovery flow ever produces (`formatMarkParam` emits `?mark` / `&mark`, and the printed copy
+ * says exactly that). The asymmetry tracks ownership, not tidiness: claim the least in someone else's space.
+ */
+function isFabParamPair(pair: string, bareOnly: boolean): boolean {
+  const eq = pair.indexOf("=")
+  const key = eq === -1 ? pair : pair.slice(0, eq)
+  if (key !== ANNOTATION_FAB_PARAM_SHOW && key !== ANNOTATION_FAB_PARAM_HIDE) return false
+  return bareOnly ? eq === -1 || eq === pair.length - 1 : true // "mark" / "mark=" are bare; "mark=42" is not
+}
+
+/** Which of our flags a single query segment carries, deduped, in no particular order. */
+function presentFabFlags(query: string | undefined, bareOnly: boolean): Set<string> {
+  const raw = (query ?? "").replace(/^\?/, "")
+  const found = new Set<string>()
+  if (!raw) return found
+  for (const pair of raw.split("&")) {
+    if (isFabParamPair(pair, bareOnly)) found.add(pair.split("=")[0])
   }
+  return found
+}
+
+/**
+ * The flag a single query segment carries, if any. When BOTH are present the RESCUE wins.
+ *
+ * That precedence is the opposite of what it was, and deliberately so. Both flags coexist in exactly one
+ * situation: the persistence write failed, so we left `?unmark` in the URL as the reload fallback, and the
+ * user then followed the printed exit and appended `mark` to that same tail. If `unmark` still outranked it,
+ * the advertised way back would be unreachable for the one state whose entire promise is that its exit
+ * always works — this PR's own defect, re-entered through the back door. Being wrongly visible costs a
+ * second hide; being wrongly hidden with your rescue outranked is the blank screen we exist to prevent.
+ */
+function readFabFlag(query: string | undefined, bareOnly: boolean): FabVisibility | undefined {
+  const flags = presentFabFlags(query, bareOnly)
+  if (flags.has(ANNOTATION_FAB_PARAM_SHOW)) return "visible"
   // `?unmark` → `hidden-url`, never `hidden-key`: whoever typed this flag already holds the URL vocabulary,
   // so the URL is demonstrably an exit they can use — and unlike the shortcut it works on every device.
-  if (params.has(ANNOTATION_FAB_PARAM_HIDE)) return "hidden-url"
-  if (params.has(ANNOTATION_FAB_PARAM_SHOW)) return "visible"
+  if (flags.has(ANNOTATION_FAB_PARAM_HIDE)) return "hidden-url"
   return undefined
+}
+
+/**
+ * A stable identity for "the flags this URL carries right now" — `""` when it carries none.
+ *
+ * The caller keeps the last token it ACTED on, so a flag is consumed once per occurrence instead of once per
+ * read. That distinction only became load-bearing when the overlay started subscribing to navigation: if the
+ * write failed we leave the flag in the URL on purpose (the reload fallback), and without an identity to
+ * compare against, every later `popstate` re-applies the same stale token — silently undoing a restore the
+ * user just performed. Order-independent, so `?unmark&mark` and `?mark&unmark` are one occurrence, while
+ * `?unmark` → `?unmark&mark` is genuinely a new one.
+ */
+export function fabFlagToken(url: FabParamUrl): string {
+  const flags = presentFabFlags(url.search, false)
+  for (const flag of presentFabFlags(splitHash(url.hash).query, true)) flags.add(flag)
+  return [...flags].sort().join("+")
+}
+
+/**
+ * Should this pass act on the URL flag? Only when there IS one and it is not the one we already applied.
+ *
+ * Deliberately in-memory and per page load: a reload starts with no memory, re-reads the URL, and the
+ * failed-persistence fallback still works. What it cannot survive is a stale token firing twice.
+ */
+export function shouldApplyFabFlag(token: string, lastApplied: string | undefined): boolean {
+  return token !== "" && token !== lastApplied
 }
 
 /**
@@ -198,7 +256,7 @@ export function resolveFabVisibility(
   url: FabParamUrl,
   stored: FabVisibility | undefined
 ): { visibility: FabVisibility; persist: FabVisibility | null } {
-  const flag = readFabFlag(url.search) ?? readFabFlag(splitHash(url.hash).query)
+  const flag = readFabFlag(url.search, false) ?? readFabFlag(splitHash(url.hash).query, true)
   if (flag) return { visibility: flag, persist: flag }
   return { visibility: stored ?? "visible", persist: null }
 }
@@ -304,15 +362,14 @@ export function fabVisibilityForDevice(visibility: FabVisibility, shortcutAvaila
  * rewrites bare flags (`?debug` → `?debug=`), mutating query strings the host app may read raw. Matches a
  * full key token only, so `?foo=mark` is untouched. Returns the search WITHOUT a leading "?" ("" if empty).
  */
-export function stripFabParamsFromSearch(search: string | undefined): string {
+export function stripFabParamsFromSearch(search: string | undefined, bareOnly = false): string {
   const raw = (search ?? "").replace(/^\?/, "")
   if (!raw) return ""
+  // Strip exactly what we recognize — otherwise the hash reader would ignore a host's `mark=42` while the
+  // stripper deleted it, which is worse than either rule alone.
   return raw
     .split("&")
-    .filter((pair) => {
-      const key = pair.split("=")[0]
-      return key !== ANNOTATION_FAB_PARAM_SHOW && key !== ANNOTATION_FAB_PARAM_HIDE
-    })
+    .filter((pair) => !isFabParamPair(pair, bareOnly))
     .join("&")
 }
 
@@ -331,7 +388,7 @@ export function stripFabParamsFromSearch(search: string | undefined): string {
  */
 export function stripFabParamsFromHash(hash: string | undefined): string {
   const { route, query } = splitHash(hash)
-  const rest = stripFabParamsFromSearch(query)
+  const rest = stripFabParamsFromSearch(query, true) // host router's namespace: bare flags only
   if (rest === query) return (hash ?? "").replace(/^#/, "")
   return rest ? `${route}?${rest}` : route
 }

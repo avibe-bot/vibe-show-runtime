@@ -77,6 +77,8 @@ import {
   withParenthetical,
   stripFabParamsFromUrl,
   fabUrlChangeEvents,
+  fabFlagToken,
+  shouldApplyFabFlag,
   shouldToggleFabShortcut,
   readStoredFloatPlacement,
   writeStoredFloatPlacement,
@@ -1535,6 +1537,9 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
   // that DOES follow a live flip, and it lives in its own effect for exactly that reason.
   const touchPrimaryRef = React.useRef(touchPrimary)
   touchPrimaryRef.current = touchPrimary
+  // The last URL-flag occurrence we ACTED on. In memory only, and deliberately so: a reload starts blank and
+  // re-reads the address bar, which is what keeps the failed-persistence fallback below working.
+  const appliedFlagRef = React.useRef<string | undefined>(undefined)
   const [visibility, setVisibility] = React.useState<FabVisibility>(() => {
     if (host !== "standalone" || typeof window === "undefined") return "visible"
     const resolved = resolveFabVisibility(currentUrl(), readStoredFabVisibility(sessionId, touchPrimary, storage))
@@ -1557,8 +1562,17 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
   React.useEffect(() => {
     if (host !== "standalone" || typeof window === "undefined") return
     const apply = (fromEvent: boolean) => {
+      const url = currentUrl()
       const stored = readStoredFabVisibility(sessionId, touchPrimaryRef.current, storage)
-      const resolved = resolveFabVisibility(currentUrl(), stored)
+      // A flag is spent once per OCCURRENCE, not once per read. The two correct decisions above collide
+      // otherwise: when the write fails we leave `?unmark` in the URL on purpose (the reload fallback), and
+      // since round 7 we also listen for navigation — so without an identity to compare against, the user
+      // restores the chrome with the shortcut and the host's very next route change re-reads that same
+      // stale token and hides it again.
+      const resolved: { visibility: FabVisibility; persist: FabVisibility | null } =
+        shouldApplyFabFlag(fabFlagToken(url), appliedFlagRef.current)
+          ? resolveFabVisibility(url, stored)
+          : { visibility: stored ?? "visible", persist: null }
       if (resolved.persist === null) {
         // No flag right now. At boot that means "honor what was stored"; on a later navigation it must mean
         // NOTHING. Re-asserting the stored value on every popstate would let a host's own routing overwrite a
@@ -1568,6 +1582,8 @@ function useFabVisibility(host: AnnotationHost, sessionId: string | undefined, t
         return
       }
       setVisibility(fabVisibilityForDevice(resolved.visibility, !touchPrimaryRef.current))
+      // Spent BEFORE the write is attempted: whether or not it persists, this occurrence has been answered.
+      appliedFlagRef.current = fabFlagToken(url)
       // Strip the one-time flag ONLY once the choice is durable: if the write failed (no storage / quota),
       // leave ?mark/?unmark in the URL so a reload still carries the intent instead of silently reverting.
       if (!writeStoredFabVisibility(sessionId, resolved.persist, storage)) return
