@@ -43,11 +43,21 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
   })
   if (context.colorScheme) style.colorScheme = context.colorScheme
   if (context.color) style.color = context.color
+  if (context.fontFamily) style.fontFamily = context.fontFamily
   if (context.fontSize) style.fontSize = context.fontSize
+  if (context.fontStretch) style.fontStretch = context.fontStretch
+  if (context.fontStyle) style.fontStyle = context.fontStyle
+  if (context.fontVariant) style.fontVariant = context.fontVariant
+  if (context.fontWeight) style.fontWeight = context.fontWeight
+  if (context.lineHeight) style.lineHeight = context.lineHeight
   const dark = Boolean(source.tokens.closest('.dark, [data-theme="dark"]'))
+  const fontContext = [
+    context.fontFamily, context.fontSize, context.fontStretch, context.fontStyle,
+    context.fontVariant, context.fontWeight, context.lineHeight
+  ].join("|")
   return {
     dark,
-    signature: `${dark}|${context.colorScheme}|${context.color}|${context.fontSize}|${values.join("|")}`,
+    signature: `${dark}|${context.colorScheme}|${context.color}|${fontContext}|${values.join("|")}`,
     style
   }
 }
@@ -135,8 +145,12 @@ function PortalThemeBridge({
       if (target instanceof HTMLLinkElement && target.relList.contains("stylesheet")) refreshStylesheets()
     }
     document.addEventListener("load", handleLoad, true)
-    const interactionEvents = ["pointerover", "pointerout", "pointerdown", "pointerup", "focusin", "focusout", "input", "change", "toggle"]
-    for (const event of interactionEvents) document.addEventListener(event, update, true)
+    const stateChangeEvents = [
+      "pointerover", "pointerout", "pointerdown", "pointerup", "focusin", "focusout",
+      "input", "change", "toggle", "animationstart", "animationiteration", "animationend",
+      "animationcancel", "transitionrun", "transitionstart", "transitionend", "transitioncancel"
+    ]
+    for (const event of stateChangeEvents) document.addEventListener(event, update, true)
     window.addEventListener("hashchange", update)
     window.addEventListener("resize", update)
 
@@ -145,7 +159,7 @@ function PortalThemeBridge({
       stylesheetObserver.disconnect()
       stopMediaChanges()
       document.removeEventListener("load", handleLoad, true)
-      for (const event of interactionEvents) document.removeEventListener(event, update, true)
+      for (const event of stateChangeEvents) document.removeEventListener(event, update, true)
       window.removeEventListener("hashchange", update)
       window.removeEventListener("resize", update)
     }

@@ -46,6 +46,24 @@ describe("ThemeProvider", () => {
     expect(markup).toContain("--avs-success:158 /* hue */ 64% 24%")
   })
 
+  it("fans out legacy channel shorthands without replacing explicit standard companions", () => {
+    const markup = renderToStaticMarkup(
+      <ThemeProvider theme={{ colors: {
+        background: "222 47% 11%",
+        foreground: "210 40% 98%",
+        muted: "217 33% 18%",
+        border: "217 33% 22%",
+        card: "oklch(0.3 0.02 250)"
+      } }}>content</ThemeProvider>
+    )
+    expect(markup).toContain("--background:hsl(222 47% 11%)")
+    expect(markup).toContain("--popover:hsl(222 47% 11%)")
+    expect(markup).toContain("--card:oklch(0.3 0.02 250)")
+    expect(markup).toContain("--card-foreground:hsl(210 40% 98%)")
+    expect(markup).toContain("--secondary:hsl(217 33% 18%)")
+    expect(markup).toContain("--input:hsl(217 33% 22%)")
+  })
+
   it("delegates presets to dark-aware CSS instead of inline light colors", () => {
     const markup = renderToStaticMarkup(<ThemeProvider preset="zinc">content</ThemeProvider>)
     expect(markup).toContain('data-theme-preset="zinc"')

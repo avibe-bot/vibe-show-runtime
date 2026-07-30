@@ -99,6 +99,13 @@ const legacyColorVars: Partial<Record<ThemeColor, string>> = {
   destructive: "--avs-destructive"
 }
 
+const legacyColorFanOut: Partial<Record<ThemeColor, readonly ThemeColor[]>> = {
+  background: ["card", "popover"],
+  foreground: ["cardForeground", "popoverForeground", "secondaryForeground", "accentForeground"],
+  muted: ["secondary", "accent"],
+  border: ["input"]
+}
+
 function splitTopLevel(value: string, delimiter: string): string[] {
   const parts: string[] = []
   let depth = 0
@@ -157,12 +164,19 @@ function toStyle(theme?: ShowTheme): React.CSSProperties {
     style["--radius"] = theme.radius
     style["--avs-radius"] = theme.radius
   }
-  for (const [key, value] of Object.entries(theme.colors ?? {}) as [ThemeColor, string][]) {
+  const colors = theme.colors ?? {}
+  const explicitColors = new Set(Object.keys(colors) as ThemeColor[])
+  for (const [key, value] of Object.entries(colors) as [ThemeColor, string][]) {
     if (!value) continue
     const legacyChannels = usesLegacyHslChannels(value)
-    style[colorVars[key]] = legacyChannels ? `hsl(${value})` : value
+    const standardValue = legacyChannels ? `hsl(${value})` : value
+    style[colorVars[key]] = standardValue
     const legacyVar = legacyColorVars[key]
-    if (legacyChannels && legacyVar) style[legacyVar] = value
+    if (!legacyChannels || !legacyVar) continue
+    style[legacyVar] = value
+    for (const companion of legacyColorFanOut[key] ?? []) {
+      if (!explicitColors.has(companion)) style[colorVars[companion]] = standardValue
+    }
   }
   return style
 }
