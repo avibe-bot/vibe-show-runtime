@@ -22,14 +22,20 @@ describe("ThemeProvider", () => {
     expect(markup).toContain("--card-foreground:#102030")
   })
 
-  it("normalizes legacy HSL channels and mirrors them for old workspaces", () => {
+  it("normalizes literal and variable-backed HSL channels for old workspaces", () => {
     const markup = renderToStaticMarkup(
-      <ThemeProvider preset="blue" theme={{ colors: { ring: "199 89% 48%" } }}>content</ThemeProvider>
+      <ThemeProvider theme={{ colors: { primary: "var(--brand-hsl)", ring: "199 89% 48%" } }}>content</ThemeProvider>
     )
-    expect(markup).toContain("--primary:hsl(221 83% 53%)")
-    expect(markup).toContain("--avs-primary:221 83% 53%")
+    expect(markup).toContain("--primary:hsl(var(--brand-hsl))")
+    expect(markup).toContain("--avs-primary:var(--brand-hsl)")
     expect(markup).toContain("--ring:hsl(199 89% 48%)")
     expect(markup).toContain("--avs-ring:199 89% 48%")
+  })
+
+  it("delegates presets to dark-aware CSS instead of inline light colors", () => {
+    const markup = renderToStaticMarkup(<ThemeProvider preset="zinc">content</ThemeProvider>)
+    expect(markup).toContain('data-theme-preset="zinc"')
+    expect(markup).not.toContain("--primary")
   })
 })
 
@@ -51,5 +57,11 @@ describe("theme.css", () => {
     expect(css).toContain("\n:root {\n  color-scheme: light;")
     expect(css).toContain("\n.dark,\n[data-theme=\"dark\"] {\n  color-scheme: dark;")
     expect(css).toContain("--background: hsl(")
+  })
+
+  it("supports dark utilities on theme roots and dark-aware presets", () => {
+    expect(css).toContain('@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *))')
+    expect(css).toContain('.dark .avs-theme[data-theme-preset="zinc"],')
+    expect(css).toContain('[data-theme="dark"] .avs-theme[data-theme-preset="blue"]')
   })
 })

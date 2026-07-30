@@ -116,7 +116,9 @@ The same values drive Tailwind semantic utilities and native CSS:
 
 An optional provider is available through the normal component alias when a
 subtree needs a preset or runtime-computed values. It writes the same standard
-variables; complete CSS colors are preferred:
+variables; complete CSS colors are preferred. Presets follow an ancestor
+`.dark` class or `data-theme="dark"` attribute automatically, while explicit
+`theme` values intentionally override either palette:
 
 ```tsx
 import { ThemeProvider } from "@/components/ui/theme"

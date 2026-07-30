@@ -1145,9 +1145,11 @@ export default function App() {
 import { ThemeProvider } from "@/components/ui/theme"
 export default function App() {
   return (
-    <ThemeProvider theme={{ colors: { primary: "oklch(0.62 0.19 255)" } }}>
-      <Button className="bg-red-500 text-foreground dark:bg-primary" style={{ borderColor: "var(--border)" }}>Ship</Button>
-    </ThemeProvider>
+    <main data-theme="dark" className="dark:bg-primary">
+      <ThemeProvider preset="blue" theme={{ colors: { ring: "oklch(0.62 0.19 255)" } }}>
+        <Button className="bg-red-500 text-foreground" style={{ borderColor: "var(--border)" }}>Ship</Button>
+      </ThemeProvider>
+    </main>
   )
 }
 `)

@@ -45,13 +45,6 @@ export type ShowTheme = {
   colors?: Partial<Record<ThemeColor, string>>
 }
 
-const presets: Record<ThemePreset, ShowTheme> = {
-  zinc: { colors: { primary: "240 5% 10%", ring: "240 5% 64%" } },
-  slate: { colors: { primary: "222 47% 11%", ring: "215 20% 65%" } },
-  green: { colors: { primary: "158 64% 24%", ring: "158 64% 40%" } },
-  blue: { colors: { primary: "221 83% 53%", ring: "221 83% 63%" } }
-}
-
 const colorVars: Record<ThemeColor, string> = {
   background: "--background",
   foreground: "--foreground",
@@ -106,6 +99,11 @@ const legacyColorVars: Partial<Record<ThemeColor, string>> = {
 }
 
 const LEGACY_HSL_CHANNELS = /^\s*-?(?:\d+(?:\.\d+)?|\.\d+)(?:deg|grad|rad|turn)?\s+-?(?:\d+(?:\.\d+)?|\.\d+)%\s+-?(?:\d+(?:\.\d+)?|\.\d+)%(?:\s*\/\s*(?:\d+(?:\.\d+)?|\.\d+)%?)?\s*$/
+const LEGACY_HSL_REFERENCE = /^\s*(?:var|calc)\(/i
+
+function usesLegacyHslChannels(value: string): boolean {
+  return LEGACY_HSL_CHANNELS.test(value) || LEGACY_HSL_REFERENCE.test(value)
+}
 
 function toStyle(theme?: ShowTheme): React.CSSProperties {
   const style = {} as React.CSSProperties & Record<string, string>
@@ -116,7 +114,7 @@ function toStyle(theme?: ShowTheme): React.CSSProperties {
   }
   for (const [key, value] of Object.entries(theme.colors ?? {}) as [ThemeColor, string][]) {
     if (!value) continue
-    const legacyChannels = LEGACY_HSL_CHANNELS.test(value)
+    const legacyChannels = usesLegacyHslChannels(value)
     style[colorVars[key]] = legacyChannels ? `hsl(${value})` : value
     const legacyVar = legacyColorVars[key]
     if (legacyChannels && legacyVar) style[legacyVar] = value
@@ -133,5 +131,5 @@ export function ThemeProvider({
   theme?: ShowTheme
   children: React.ReactNode
 }) {
-  return <div className="avs-theme" style={{ ...toStyle(preset ? presets[preset] : undefined), ...toStyle(theme) }}>{children}</div>
+  return <div className="avs-theme" data-theme-preset={preset} style={toStyle(theme)}>{children}</div>
 }

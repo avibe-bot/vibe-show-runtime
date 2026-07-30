@@ -392,7 +392,9 @@ prefer normal semantic utilities and complete CSS color values:
 
 These values work through both Tailwind (`bg-background`, `text-foreground`)
 and native CSS (`var(--background)`). An optional provider supports subtree
-presets and runtime-computed overrides through the same standard variables:
+presets and runtime-computed overrides through the same standard variables.
+Presets follow an ancestor `.dark` class or `data-theme="dark"` attribute;
+explicit `theme` values intentionally override either palette:
 
 ```tsx
 import { ThemeProvider } from "@/components/ui/theme"

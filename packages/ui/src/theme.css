@@ -8,7 +8,7 @@
  * plain `var(...)` outside Tailwind.
  */
 
-@custom-variant dark (&:is(.dark *, [data-theme="dark"] *));
+@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *));
 
 @theme inline {
   --color-background: var(--background);
@@ -163,6 +163,67 @@
   --avs-success: 158 64% 52%;
   --avs-warning: 38 92% 50%;
   --avs-destructive: 0 63% 31%;
+}
+
+/* ThemeProvider presets are CSS-owned so they can follow the active palette. */
+.avs-theme[data-theme-preset="zinc"] {
+  --primary: hsl(240 5% 10%);
+  --ring: hsl(240 5% 64%);
+  --avs-primary: 240 5% 10%;
+  --avs-ring: 240 5% 64%;
+}
+
+.avs-theme[data-theme-preset="slate"] {
+  --primary: hsl(222 47% 11%);
+  --ring: hsl(215 20% 65%);
+  --avs-primary: 222 47% 11%;
+  --avs-ring: 215 20% 65%;
+}
+
+.avs-theme[data-theme-preset="green"] {
+  --primary: hsl(158 64% 24%);
+  --ring: hsl(158 64% 40%);
+  --avs-primary: 158 64% 24%;
+  --avs-ring: 158 64% 40%;
+}
+
+.avs-theme[data-theme-preset="blue"] {
+  --primary: hsl(221 83% 53%);
+  --ring: hsl(221 83% 63%);
+  --avs-primary: 221 83% 53%;
+  --avs-ring: 221 83% 63%;
+}
+
+.dark .avs-theme[data-theme-preset="zinc"],
+[data-theme="dark"] .avs-theme[data-theme-preset="zinc"] {
+  --primary: hsl(0 0% 98%);
+  --ring: hsl(240 5% 64%);
+  --avs-primary: 0 0% 98%;
+  --avs-ring: 240 5% 64%;
+}
+
+.dark .avs-theme[data-theme-preset="slate"],
+[data-theme="dark"] .avs-theme[data-theme-preset="slate"] {
+  --primary: hsl(210 40% 98%);
+  --ring: hsl(215 20% 65%);
+  --avs-primary: 210 40% 98%;
+  --avs-ring: 215 20% 65%;
+}
+
+.dark .avs-theme[data-theme-preset="green"],
+[data-theme="dark"] .avs-theme[data-theme-preset="green"] {
+  --primary: hsl(158 64% 52%);
+  --ring: hsl(158 64% 52%);
+  --avs-primary: 158 64% 52%;
+  --avs-ring: 158 64% 52%;
+}
+
+.dark .avs-theme[data-theme-preset="blue"],
+[data-theme="dark"] .avs-theme[data-theme-preset="blue"] {
+  --primary: hsl(221 83% 63%);
+  --ring: hsl(221 83% 63%);
+  --avs-primary: 221 83% 63%;
+  --avs-ring: 221 83% 63%;
 }
 
 /*
