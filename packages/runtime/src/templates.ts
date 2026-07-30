@@ -26,6 +26,8 @@ function escapeRegExp(value: string): string {
 const LEADING_CHARSET_PATTERN = /^@charset\s+["'][^"']*["'];[ \t]*\r?\n?/i
 // UTF-8 byte order mark, preserved at position 0 when re-emitting an existing file.
 const BOM = "\ufeff"
+const THEME_MIGRATION_MARKER = /^avibe-generated-theme\s+(--[\w-]+)\s+(--[\w-]+)$/
+const themeMigrationMarker = (source: string, target: string) => `avibe-generated-theme ${source} ${target}`
 export async function ensureSessionTemplate(workspace: string, uiPackageName: string = DEFAULT_UI_PACKAGE) {
   await mkdir(join(workspace, "src"), { recursive: true })
   await mkdir(join(workspace, "api"), { recursive: true })
@@ -135,14 +137,26 @@ function migrateLegacyThemeDeclarations(contents: string): string {
         .map((declaration) => declaration.prop)
     )
     for (const node of [...rule.nodes]) {
-      if (node.type !== "decl") continue
-      for (const [source, targets] of Object.entries(LEGACY_THEME_MIGRATIONS)) {
-        if (legacyProps.has(source) || !targets.includes(node.prop)) continue
-        const generatedValue = node.prop === "--radius" ? `var(${source})` : `hsl(var(${source}))`
-        if (node.value.trim() !== generatedValue) continue
+      if (node.type !== "comment") continue
+      const marker = THEME_MIGRATION_MARKER.exec(node.text.trim())
+      if (!marker) continue
+      const [, source, target] = marker
+      const declaration = node.next()
+      const targets = LEGACY_THEME_MIGRATIONS[source]
+      const generatedValue = target === "--radius" ? `var(${source})` : `hsl(var(${source}))`
+      const ownsDeclaration = declaration?.type === "decl"
+        && declaration.prop === target
+        && declaration.value.trim() === generatedValue
+        && targets?.includes(target)
+      if (!ownsDeclaration) {
         node.remove()
         changed = true
-        break
+        continue
+      }
+      if (!legacyProps.has(source)) {
+        declaration.remove()
+        node.remove()
+        changed = true
       }
     }
     const existing = new Set(
@@ -156,8 +170,10 @@ function migrateLegacyThemeDeclarations(contents: string): string {
       for (const target of targets) {
         if (existing.has(target)) continue
         const value = target === "--radius" ? `var(${node.prop})` : `hsl(var(${node.prop}))`
+        const marker = postcss.comment({ text: themeMigrationMarker(node.prop, target) })
         const migrated = node.clone({ prop: target, value })
-        rule.insertAfter(anchor, migrated)
+        rule.insertAfter(anchor, marker)
+        rule.insertAfter(marker, migrated)
         anchor = migrated
         existing.add(target)
         changed = true

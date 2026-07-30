@@ -135,6 +135,9 @@ function PortalThemeBridge({
       if (target instanceof HTMLLinkElement && target.relList.contains("stylesheet")) refreshStylesheets()
     }
     document.addEventListener("load", handleLoad, true)
+    const interactionEvents = ["pointerover", "pointerout", "pointerdown", "pointerup", "focusin", "focusout", "input", "change", "toggle"]
+    for (const event of interactionEvents) document.addEventListener(event, update, true)
+    window.addEventListener("hashchange", update)
     window.addEventListener("resize", update)
 
     return () => {
@@ -142,6 +145,8 @@ function PortalThemeBridge({
       stylesheetObserver.disconnect()
       stopMediaChanges()
       document.removeEventListener("load", handleLoad, true)
+      for (const event of interactionEvents) document.removeEventListener(event, update, true)
+      window.removeEventListener("hashchange", update)
       window.removeEventListener("resize", update)
     }
   }, [getSource])
@@ -156,12 +161,31 @@ function PortalThemeBridge({
   )
 }
 
-const DialogScopeContext = React.createContext<React.RefObject<HTMLElement | null> | null>(null)
+type DialogScope = {
+  activeTrigger: React.RefObject<HTMLElement | null>
+  triggers: Set<HTMLElement>
+}
+
+const DialogScopeContext = React.createContext<DialogScope | null>(null)
+
+function activeDialogTrigger(scope: DialogScope | null): HTMLElement | null {
+  const active = scope?.activeTrigger.current
+  if (active?.isConnected) return active
+  let only: HTMLElement | null = null
+  for (const trigger of scope?.triggers ?? []) {
+    if (!trigger.isConnected) continue
+    if (only) return null
+    only = trigger
+  }
+  return only
+}
 
 export function Dialog(props: React.ComponentPropsWithoutRef<typeof DialogPrimitive.Root>) {
-  const triggerRef = React.useRef<HTMLElement>(null)
+  const activeTrigger = React.useRef<HTMLElement>(null)
+  const triggers = React.useRef(new Set<HTMLElement>()).current
+  const scope = React.useMemo(() => ({ activeTrigger, triggers }), [triggers])
   return (
-    <DialogScopeContext.Provider value={triggerRef}>
+    <DialogScopeContext.Provider value={scope}>
       <DialogPrimitive.Root {...props} />
     </DialogScopeContext.Provider>
   )
@@ -170,10 +194,23 @@ export function Dialog(props: React.ComponentPropsWithoutRef<typeof DialogPrimit
 export const DialogTrigger = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Trigger>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Trigger>
->((props, forwardedRef) => {
-  const source = React.useContext(DialogScopeContext)
-  const ref = useComposedRefs(forwardedRef, source)
-  return <DialogPrimitive.Trigger ref={ref} {...props} />
+>(({ onClick, ...props }, forwardedRef) => {
+  const scope = React.useContext(DialogScopeContext)
+  const localRef = React.useRef<HTMLElement>(null)
+  const setLocalRef = React.useCallback((node: HTMLElement | null) => {
+    const previous = localRef.current
+    const wasActive = scope?.activeTrigger.current === previous
+    if (previous) scope?.triggers.delete(previous)
+    localRef.current = node
+    if (node) scope?.triggers.add(node)
+    if (wasActive && scope) scope.activeTrigger.current = node
+  }, [scope])
+  const ref = useComposedRefs(forwardedRef, setLocalRef)
+  const handleClick: NonNullable<React.ComponentPropsWithoutRef<typeof DialogPrimitive.Trigger>["onClick"]> = (event) => {
+    onClick?.(event)
+    if (!event.defaultPrevented && localRef.current && scope) scope.activeTrigger.current = localRef.current
+  }
+  return <DialogPrimitive.Trigger ref={ref} onClick={handleClick} {...props} />
 })
 DialogTrigger.displayName = "DialogTrigger"
 
@@ -189,7 +226,7 @@ export const DialogContent = React.forwardRef<
   const getSource = React.useCallback(
     (): PortalThemeSource => {
       const fallback = themeScope?.current ?? document.documentElement
-      const trigger = triggerScope?.current
+      const trigger = activeDialogTrigger(triggerScope)
       return trigger
         ? { tokens: trigger, context: trigger.parentElement ?? fallback }
         : { tokens: fallback, context: fallback }

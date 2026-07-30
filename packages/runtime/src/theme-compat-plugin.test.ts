@@ -24,6 +24,15 @@ class TestStyle {
   setProperty(name: string, value: string, priority = "") {
     this.declarations.set(name, { value, priority })
   }
+
+  get cssText() {
+    return Array.from(this.declarations, ([name, declaration]) => `${name}: ${declaration.value}`).join("; ")
+  }
+
+  set cssText(value: string | null) {
+    this.declarations.clear()
+    if (value) this.declarations.set("text", { value: String(value), priority: "" })
+  }
 }
 
 function loadClientCode() {
@@ -132,6 +141,7 @@ describe("dynamic legacy theme compatibility", () => {
     const animated = new TestStyle()
     animated.setProperty("opacity", "0.5")
     expect(animated.reads).toBe(0)
+    expect(() => { animated.cssText = null }).not.toThrow()
 
     const dynamic = new TestStyle()
     dynamic.setProperty("--avs-primary", "221 83% 53%")

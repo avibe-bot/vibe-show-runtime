@@ -162,9 +162,9 @@ if (typeof document !== "undefined" && !globalThis.__avibeShowThemeCompatInstall
       Object.defineProperty(stylePrototype, "cssText", {
         ...cssText,
         set(value) {
-          const needsSync = value.includes("--avs-") || ownedDeclarations.has(this);
+          const wasOwned = ownedDeclarations.has(this);
           cssText.set.call(this, value);
-          if (needsSync) syncLegacyDeclaration(this);
+          if (wasOwned || cssText.get.call(this).includes("--avs-")) syncLegacyDeclaration(this);
         }
       });
     }
