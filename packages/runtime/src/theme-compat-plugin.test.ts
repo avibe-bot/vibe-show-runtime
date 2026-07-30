@@ -82,6 +82,15 @@ describe("dynamic legacy theme compatibility", () => {
     class TestStyleSheet {
       cssRules: Array<Record<string, unknown>> = []
       nextStyle?: TestStyle
+      private disabledValue = false
+
+      get disabled() {
+        return this.disabledValue
+      }
+
+      set disabled(value: boolean) {
+        this.disabledValue = Boolean(value)
+      }
 
       insertRule(_rule?: string) {
         if (this.nextStyle) this.cssRules.push({ style: this.nextStyle })
@@ -90,6 +99,18 @@ describe("dynamic legacy theme compatibility", () => {
 
       deleteRule(index: number) {
         this.cssRules.splice(index, 1)
+      }
+    }
+    class TestKeyframesRule {
+      cssRules: Array<Record<string, unknown>> = []
+      nextStyle?: TestStyle
+
+      appendRule() {
+        if (this.nextStyle) this.cssRules.push({ style: this.nextStyle })
+      }
+
+      deleteRule() {
+        this.cssRules.pop()
       }
     }
     class TestGroupingRule {
@@ -114,6 +135,8 @@ describe("dynamic legacy theme compatibility", () => {
     rule.setProperty("--avs-ring", "199 89% 48%")
     const directRule = new TestStyle()
     directRule.setProperty("--avs-primary", "221 83% 53%")
+    const emptyLegacyRule = new TestStyle()
+    emptyLegacyRule.setProperty("--avs-primary", "")
     const emptyStandardRule = new TestStyle()
     emptyStandardRule.setProperty("--avs-primary", "221 83% 53%")
     emptyStandardRule.setProperty("--primary", "")
@@ -131,6 +154,7 @@ describe("dynamic legacy theme compatibility", () => {
     const directSheet = new TestStyleSheet()
     directSheet.cssRules.push(
       { style: directRule },
+      { style: emptyLegacyRule },
       { style: emptyStandardRule },
       { style: generatedRule },
       { style: unrelatedInitialRule },
@@ -147,8 +171,13 @@ describe("dynamic legacy theme compatibility", () => {
     shadowHost.shadowRoot = existingShadow
     root.descendants.push(shadowHost)
     const events: string[] = []
+    const lateAdoptedRule = new TestStyle()
+    lateAdoptedRule.setProperty("--avs-success", "142 71% 45%")
+    const lateAdoptedSheet = new TestStyleSheet()
+    lateAdoptedSheet.cssRules.push({ style: lateAdoptedRule })
     const context = {
       CSSGroupingRule: TestGroupingRule,
+      CSSKeyframesRule: TestKeyframesRule,
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: TestStyleSheet,
       Element: TestElement,
@@ -158,8 +187,9 @@ describe("dynamic legacy theme compatibility", () => {
       HTMLLinkElement: class {},
       MutationObserver: TestMutationObserver,
       ShadowRoot: TestShadowRoot,
+      StyleSheet: TestStyleSheet,
       document: {
-        adoptedStyleSheets: [],
+        adoptedStyleSheets: [] as TestStyleSheet[],
         addEventListener() {},
         dispatchEvent(event: { type: string }) { events.push(event.type) },
         documentElement: root,
@@ -169,6 +199,7 @@ describe("dynamic legacy theme compatibility", () => {
     runInNewContext(loadClientCode(), context)
 
     expect(directRule.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    expect(emptyLegacyRule.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(emptyStandardRule.getPropertyValue("--primary")).toBe("")
     expect(emptyStandardRule.hasProperty("--primary")).toBe(true)
     expect(shadowRule.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
@@ -189,6 +220,11 @@ describe("dynamic legacy theme compatibility", () => {
     expect(generatedRule.getPropertyValue("--primary")).toBe("")
     expect(nestedRule.getPropertyValue("--radius")).toBe("var(--avs-radius)")
     expect(importedRule.getPropertyValue("--input")).toBe("hsl(var(--avs-border))")
+
+    const beforeAdoption = events.length
+    context.document.adoptedStyleSheets.push(lateAdoptedSheet)
+    expect(lateAdoptedRule.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
+    expect(events.length).toBe(beforeAdoption + 1)
 
     const animated = new TestStyle()
     animated.setProperty("opacity", "0.5")
@@ -223,6 +259,21 @@ describe("dynamic legacy theme compatibility", () => {
     const beforeDelete = events.length
     sheet.deleteRule(0)
     expect(events.length).toBe(beforeDelete + 1)
+
+    const keyframes = new TestKeyframesRule()
+    const keyframeRule = new TestStyle()
+    keyframeRule.setProperty("--avs-warning", "32 95% 44%")
+    keyframes.nextStyle = keyframeRule
+    const beforeKeyframe = events.length
+    keyframes.appendRule()
+    expect(keyframeRule.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
+    expect(events.length).toBe(beforeKeyframe + 1)
+    keyframes.deleteRule()
+    expect(events.length).toBe(beforeKeyframe + 2)
+
+    const beforeDisabled = events.length
+    sheet.disabled = true
+    expect(events.length).toBe(beforeDisabled + 1)
 
     const grouping = new TestGroupingRule()
     const groupedRule = new TestStyle()

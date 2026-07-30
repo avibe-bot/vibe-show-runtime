@@ -39,8 +39,11 @@ function installLegacyThemeCompatibilityWithMigrations(
   runtime.__avibeShowThemeCompatInstalled = true
 
   const legacySources = Object.keys(migrations)
+  const legacySourceSet = new Set(legacySources)
   const migratedTargets = new Set(Object.values(migrations).flat())
   const ownedDeclarations = new WeakMap<CSSStyleDeclaration, Map<string, OwnedDeclaration>>()
+  const observedAdoptedLists = new WeakSet<object>()
+  const patchedDisabledPrototypes = new WeakSet<object>()
   const themeChangeEvent = "avibe:show-theme-change"
   const stylePrototype = globalThis.CSSStyleDeclaration?.prototype
   const nativeSetProperty = stylePrototype?.setProperty
@@ -62,7 +65,10 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
 
   function hasLegacyDeclaration(style: CSSStyleDeclaration) {
-    return legacySources.some((source) => style.getPropertyValue(source).trim())
+    for (let index = 0; index < style.length; index += 1) {
+      if (legacySourceSet.has(style.item(index))) return true
+    }
+    return false
   }
 
   function declaredProperties(style: CSSStyleDeclaration) {
@@ -83,8 +89,8 @@ function installLegacyThemeCompatibilityWithMigrations(
     const declared = declaredProperties(style)
 
     for (const [source, targets] of Object.entries(migrations)) {
-      const sourceValue = style.getPropertyValue(source).trim()
       const sourcePriority = style.getPropertyPriority(source)
+      const sourceDeclared = declared.has(source)
       for (const target of targets) {
         const currentValue = style.getPropertyValue(target).trim()
         const currentPriority = style.getPropertyPriority(target)
@@ -98,7 +104,7 @@ function installLegacyThemeCompatibilityWithMigrations(
         }
         const stillOwned = previous?.value === currentValue && previous.priority === currentPriority
 
-        if (!sourceValue) {
+        if (!sourceDeclared) {
           if (stillOwned) {
             if (nativeRemoveProperty) nativeRemoveProperty.call(style, target)
             else style.removeProperty(target)
@@ -192,6 +198,73 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
+  function patchKeyframesRule(input: object | undefined) {
+    if (!input) return
+    const prototype = input as CSSKeyframesRule
+    const appendRule = prototype.appendRule
+    if (typeof appendRule === "function") {
+      prototype.appendRule = function(this: CSSKeyframesRule, rule: string) {
+        const previousLength = this.cssRules.length
+        appendRule.call(this, rule)
+        for (let index = previousLength; index < this.cssRules.length; index += 1) {
+          const insertedRule = this.cssRules[index]
+          if (insertedRule) syncLegacyRuleList([insertedRule])
+        }
+        notifyThemeChange()
+      }
+    }
+    const deleteRule = prototype.deleteRule
+    if (typeof deleteRule === "function") {
+      prototype.deleteRule = function(this: CSSKeyframesRule, select: string) {
+        deleteRule.call(this, select)
+        notifyThemeChange()
+      }
+    }
+  }
+
+  function patchStylesheetDisabled(input: object | undefined) {
+    if (!input) return
+    let prototype: object | null = input
+    let descriptor = Object.getOwnPropertyDescriptor(prototype, "disabled")
+    while (!descriptor && (prototype = Object.getPrototypeOf(prototype))) {
+      descriptor = Object.getOwnPropertyDescriptor(prototype, "disabled")
+    }
+    if (!descriptor?.get || !descriptor.set) return
+    if (!prototype || patchedDisabledPrototypes.has(prototype)) return
+    patchedDisabledPrototypes.add(prototype)
+    Object.defineProperty(prototype, "disabled", {
+      ...descriptor,
+      set(value: boolean) {
+        descriptor.set?.call(this, value)
+        notifyThemeChange()
+      }
+    })
+  }
+
+  function observeAdoptedStyleSheetList(list: CSSStyleSheet[]) {
+    if (observedAdoptedLists.has(list)) return
+    observedAdoptedLists.add(list)
+    const methods = ["copyWithin", "fill", "pop", "push", "reverse", "shift", "sort", "splice", "unshift"] as const
+    for (const name of methods) {
+      const method = list[name]
+      if (typeof method !== "function") continue
+      try {
+        Object.defineProperty(list, name, {
+          configurable: true,
+          writable: true,
+          value: function(this: CSSStyleSheet[], ...args: unknown[]) {
+            const result = (method as (...values: unknown[]) => unknown).apply(this, args)
+            for (const sheet of Array.from(this)) syncLegacyStyleSheet(sheet)
+            notifyThemeChange()
+            return result
+          }
+        })
+      } catch {
+        // Older FrozenArray implementations cannot be mutated in place.
+      }
+    }
+  }
+
   function patchAdoptedStyleSheets(input: object | undefined) {
     if (!input) return
     const descriptor = Object.getOwnPropertyDescriptor(input, "adoptedStyleSheets")
@@ -200,7 +273,9 @@ function installLegacyThemeCompatibilityWithMigrations(
       ...descriptor,
       set(value: CSSStyleSheet[]) {
         descriptor.set?.call(this, value)
-        for (const sheet of descriptor.get?.call(this) ?? []) syncLegacyStyleSheet(sheet)
+        const list = descriptor.get?.call(this) ?? []
+        observeAdoptedStyleSheetList(list)
+        for (const sheet of list) syncLegacyStyleSheet(sheet)
         notifyThemeChange()
       }
     })
@@ -233,7 +308,7 @@ function installLegacyThemeCompatibilityWithMigrations(
           const previous = cssText.get?.call(this) ?? ""
           cssText.set?.call(this, value)
           const current = cssText.get?.call(this) ?? ""
-          if (wasOwned || current.includes("--avs-")) syncLegacyDeclaration(this)
+          if (wasOwned || current.includes("--avs-")) syncLegacyDeclaration(this, current.includes("--avs-"))
           if (this.parentRule && (previous.includes("--") || current.includes("--"))) notifyThemeChange()
         }
       })
@@ -243,6 +318,9 @@ function installLegacyThemeCompatibilityWithMigrations(
   const sheetPrototype = globalThis.CSSStyleSheet?.prototype
   patchRuleContainer(sheetPrototype)
   patchRuleContainer(globalThis.CSSGroupingRule?.prototype)
+  patchKeyframesRule(globalThis.CSSKeyframesRule?.prototype)
+  patchStylesheetDisabled(sheetPrototype)
+  patchStylesheetDisabled(globalThis.StyleSheet?.prototype)
   if (sheetPrototype?.replaceSync) {
     const replaceSync = sheetPrototype.replaceSync
     sheetPrototype.replaceSync = function(text: string) {
@@ -311,7 +389,9 @@ function installLegacyThemeCompatibilityWithMigrations(
     scanLegacyStyleSheets(container)
     const styleSheets = root === document ? document.styleSheets : []
     for (const sheet of Array.from(styleSheets)) syncLegacyStyleSheet(sheet)
-    for (const sheet of Array.from(root.adoptedStyleSheets ?? [])) syncLegacyStyleSheet(sheet)
+    const adoptedStyleSheets = root.adoptedStyleSheets ?? []
+    observeAdoptedStyleSheetList(adoptedStyleSheets)
+    for (const sheet of Array.from(adoptedStyleSheets)) syncLegacyStyleSheet(sheet)
     scanShadowRoots(container)
     observer.observe(container, {
       attributes: true,

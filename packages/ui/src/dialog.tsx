@@ -52,7 +52,7 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
   if (context.fontVariant) style.fontVariant = context.fontVariant
   if (context.fontWeight) style.fontWeight = context.fontWeight
   if (context.lineHeight) style.lineHeight = context.lineHeight
-  const dark = Boolean(source.tokens.closest('.dark, [data-theme="dark"]'))
+  const dark = hasComposedDarkTheme(source.tokens)
   const fontContext = [
     context.fontFamily, context.fontSize, context.fontStretch, context.fontStyle,
     context.fontVariant, context.fontWeight, context.lineHeight
@@ -106,6 +106,16 @@ function composedParentNode(node: Node): Node | null {
     if (typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot) return root
   }
   return typeof ShadowRoot !== "undefined" && node instanceof ShadowRoot ? node.host : null
+}
+
+function hasComposedDarkTheme(element: Element): boolean {
+  for (let node: Node | null = element; node; node = composedParentNode(node)) {
+    if (node instanceof Element
+      && (node.classList.contains("dark") || node.getAttribute("data-theme") === "dark")) {
+      return true
+    }
+  }
+  return false
 }
 
 function containsStylesheet(node: Node): boolean {
