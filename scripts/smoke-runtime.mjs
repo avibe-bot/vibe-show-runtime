@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs"
 import { request as httpRequest } from "node:http"
 import { isFileLoadingAllowed } from "vite"
 import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
+import { showThemeCompatibilityPlugin } from "../packages/runtime/dist/theme-compat-plugin.js"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
 import { cn } from "../packages/ui/dist/utils.js"
 import { dependencyFingerprint, pruneSupersededCacheDirs } from "../packages/runtime/dist/vendor.js"
@@ -103,6 +104,21 @@ const defaultHmrStyleTag = !Array.isArray(defaultHmrIndexHtml) && typeof default
   : undefined
 if (!defaultHmrStyleTag?.children?.includes("avs-show-fallback-recovery-in 0.22s ease 5s forwards")) {
   throw new Error("Expected standalone runtime fallback recovery delay to default to 5 seconds")
+}
+
+const themeCompatPlugin = showThemeCompatibilityPlugin()
+const themeCompatClientCode = themeCompatPlugin.load?.("\0virtual:avibe-show-theme-compat-client")
+const themeCompatIndexHtml = themeCompatPlugin.transformIndexHtml?.()
+const themeCompatScriptTag = Array.isArray(themeCompatIndexHtml)
+  ? themeCompatIndexHtml.find((tag) => tag.tag === "script")
+  : undefined
+if (
+  typeof themeCompatClientCode !== "string" ||
+  !themeCompatClientCode.includes("ownedDeclarations") ||
+  !themeCompatClientCode.includes("style.setProperty(target, value, sourcePriority)") ||
+  !themeCompatScriptTag?.attrs?.src?.includes("virtual:avibe-show-theme-compat-client")
+) {
+  throw new Error("Expected the runtime to install the one-way dynamic legacy theme migration")
 }
 
 const hmrPlugin = showHmrTransitionPlugin({ fallbackDelaySeconds: 30 })
@@ -1160,6 +1176,10 @@ export default function App() {
   const shadcnEnsure = await fetch(`${runtime.url}/sessions/shadcn/ensure`, { method: "POST" }).then((res) => res.json())
   if (shadcnEnsure.state !== "active") {
     throw new Error(`Expected shadcn session to warm active, got ${JSON.stringify(shadcnEnsure)}`)
+  }
+  const shadcnDocument = await fetch(`${runtime.url}/sessions/shadcn/app/`).then((res) => res.text())
+  if (!shadcnDocument.includes("virtual:avibe-show-theme-compat-client")) {
+    throw new Error("Expected the live runtime document to install dynamic legacy theme compatibility")
   }
   const shadcnStyles = await readFile(join(root, "shadcn", "src", "styles.css"), "utf8")
   if (!/@import\s+["']tailwindcss["']/.test(shadcnStyles) || !/@import\s+["']@avibe\/show-ui\/theme\.css["']/.test(shadcnStyles)) {

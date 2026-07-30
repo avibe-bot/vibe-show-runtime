@@ -24,7 +24,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-annotation-bootstrap.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run src/templates.test.ts"
+    "test": "vitest run src/templates.test.ts src/theme-compat-plugin.test.ts"
   },
   "dependencies": {
     "@avibe/show-sdk": "0.0.0",

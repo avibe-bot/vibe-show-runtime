@@ -1,6 +1,7 @@
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import postcss from "postcss"
+import { LEGACY_THEME_MIGRATIONS } from "./theme-compat-plugin.js"
 
 const DEFAULT_UI_PACKAGE = "@avibe/show-ui"
 const TAILWIND_IMPORT = `@import "tailwindcss";`
@@ -25,22 +26,6 @@ function escapeRegExp(value: string): string {
 const LEADING_CHARSET_PATTERN = /^@charset\s+["'][^"']*["'];[ \t]*\r?\n?/i
 // UTF-8 byte order mark, preserved at position 0 when re-emitting an existing file.
 const BOM = "\ufeff"
-// Preserve each old declaration's selector by adding its standard equivalent in the same rule.
-const LEGACY_THEME_MIGRATIONS: Record<string, readonly string[]> = {
-  "--avs-background": ["--background", "--card", "--popover"],
-  "--avs-foreground": ["--foreground", "--card-foreground", "--popover-foreground", "--secondary-foreground", "--accent-foreground"],
-  "--avs-muted": ["--secondary", "--muted", "--accent"],
-  "--avs-muted-foreground": ["--muted-foreground"],
-  "--avs-border": ["--border", "--input"],
-  "--avs-primary": ["--primary"],
-  "--avs-primary-foreground": ["--primary-foreground"],
-  "--avs-ring": ["--ring"],
-  "--avs-success": ["--success"],
-  "--avs-warning": ["--warning"],
-  "--avs-destructive": ["--destructive"],
-  "--avs-radius": ["--radius"]
-}
-
 export async function ensureSessionTemplate(workspace: string, uiPackageName: string = DEFAULT_UI_PACKAGE) {
   await mkdir(join(workspace, "src"), { recursive: true })
   await mkdir(join(workspace, "api"), { recursive: true })

@@ -1,5 +1,6 @@
 import * as React from "react"
 import * as DialogPrimitive from "@radix-ui/react-dialog"
+import { useComposedRefs } from "@radix-ui/react-compose-refs"
 import { X } from "lucide-react"
 import { ThemeScopeContext } from "./theme-context"
 import { cn } from "./utils"
@@ -49,6 +50,7 @@ function collectMediaQueries(rules: CSSRuleList, queries: Set<string>) {
 }
 
 function subscribeToMediaChanges(update: () => void): () => void {
+  if (typeof window.matchMedia !== "function") return () => undefined
   const queries = new Set([
     "(prefers-color-scheme: dark)",
     "(prefers-contrast: more)",
@@ -141,20 +143,12 @@ export function Dialog(props: React.ComponentPropsWithoutRef<typeof DialogPrimit
   )
 }
 
-function assignRef<T>(ref: React.ForwardedRef<T>, value: T | null) {
-  if (typeof ref === "function") ref(value)
-  else if (ref) ref.current = value
-}
-
 export const DialogTrigger = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Trigger>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Trigger>
 >((props, forwardedRef) => {
   const source = React.useContext(DialogScopeContext)
-  const ref = React.useCallback((element: React.ElementRef<typeof DialogPrimitive.Trigger> | null) => {
-    if (source) source.current = element
-    assignRef(forwardedRef, element)
-  }, [forwardedRef, source])
+  const ref = useComposedRefs(forwardedRef, source)
   return <DialogPrimitive.Trigger ref={ref} {...props} />
 })
 DialogTrigger.displayName = "DialogTrigger"
