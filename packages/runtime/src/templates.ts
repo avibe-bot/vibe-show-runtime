@@ -1,7 +1,10 @@
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import postcss from "postcss"
-import { LEGACY_THEME_MIGRATIONS } from "./theme-compat-plugin.js"
+import {
+  LEGACY_THEME_MIGRATIONS,
+  legacyThemeOwnershipMarker
+} from "./theme-compat-plugin.js"
 
 const DEFAULT_UI_PACKAGE = "@avibe/show-ui"
 const TAILWIND_IMPORT = `@import "tailwindcss";`
@@ -145,6 +148,11 @@ function migrateLegacyThemeDeclarations(contents: string): string {
       if (!marker) continue
       const [, source, target] = marker
       const declaration = node.next()
+      const ownership = declaration?.next()
+      const ownershipProperty = legacyThemeOwnershipMarker(target)
+      const ownsMarker = ownership?.type === "decl"
+        && ownership.prop === ownershipProperty
+        && ownership.value.trim() === source
       const targets = LEGACY_THEME_MIGRATIONS[source]
       const generatedValue = target === "--radius" ? `var(${source})` : `hsl(var(${source}))`
       const ownsDeclaration = declaration?.type === "decl"
@@ -152,18 +160,26 @@ function migrateLegacyThemeDeclarations(contents: string): string {
         && declaration.value.trim() === generatedValue
         && targets?.includes(target)
       if (!ownsDeclaration) {
+        if (ownsMarker) ownership.remove()
         node.remove()
         changed = true
         continue
       }
       const sourceDeclaration = legacyDeclarations.get(source)
       if (!sourceDeclaration) {
+        if (ownsMarker) ownership.remove()
         declaration.remove()
         node.remove()
         changed = true
-      } else if (declaration.important !== sourceDeclaration.important) {
-        declaration.important = sourceDeclaration.important
-        changed = true
+      } else {
+        if (!ownsMarker) {
+          rule.insertAfter(declaration, postcss.decl({ prop: ownershipProperty, value: source }))
+          changed = true
+        }
+        if (declaration.important !== sourceDeclaration.important) {
+          declaration.important = sourceDeclaration.important
+          changed = true
+        }
       }
     }
     const existing = new Set(
@@ -177,9 +193,11 @@ function migrateLegacyThemeDeclarations(contents: string): string {
         const value = target === "--radius" ? `var(${node.prop})` : `hsl(var(${node.prop}))`
         const marker = postcss.comment({ text: themeMigrationMarker(node.prop, target) })
         const migrated = node.clone({ prop: target, value })
+        const ownership = postcss.decl({ prop: legacyThemeOwnershipMarker(target), value: node.prop })
         rule.insertAfter(anchor, marker)
         rule.insertAfter(marker, migrated)
-        anchor = migrated
+        rule.insertAfter(migrated, ownership)
+        anchor = ownership
         existing.add(target)
         changed = true
       }

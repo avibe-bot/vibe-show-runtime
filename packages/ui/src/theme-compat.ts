@@ -13,6 +13,12 @@ export const LEGACY_THEME_MIGRATIONS: Record<string, readonly string[]> = {
   "--avs-radius": ["--radius"]
 }
 
+export const LEGACY_THEME_OWNERSHIP_PREFIX = "--avibe-show-theme-owner-"
+
+export function legacyThemeOwnershipMarker(target: string): string {
+  return `${LEGACY_THEME_OWNERSHIP_PREFIX}${target.slice(2)}`
+}
+
 type OwnedDeclaration = { value: string; priority: string }
 type RuleContainer = {
   cssRules: CSSRuleList
@@ -21,7 +27,8 @@ type RuleContainer = {
 }
 
 function installLegacyThemeCompatibilityWithMigrations(
-  migrations: Record<string, readonly string[]>
+  migrations: Record<string, readonly string[]>,
+  ownershipPrefix: string
 ) {
   if (typeof document === "undefined") return
 
@@ -43,6 +50,10 @@ function installLegacyThemeCompatibilityWithMigrations(
     return target === "--radius" ? `var(${source})` : `hsl(var(${source}))`
   }
 
+  function ownershipMarker(target: string) {
+    return `${ownershipPrefix}${target.slice(2)}`
+  }
+
   function notifyThemeChange() {
     const EventConstructor = document.defaultView?.Event ?? globalThis.Event
     if (typeof EventConstructor === "function") {
@@ -54,9 +65,9 @@ function installLegacyThemeCompatibilityWithMigrations(
     return legacySources.some((source) => style.getPropertyValue(source).trim())
   }
 
-  function syncLegacyDeclaration(style: CSSStyleDeclaration) {
+  function syncLegacyDeclaration(style: CSSStyleDeclaration, knownCandidate = false) {
     let owned = ownedDeclarations.get(style)
-    if (!owned && !hasLegacyDeclaration(style)) return
+    if (!owned && !knownCandidate && !hasLegacyDeclaration(style)) return
     if (!owned) {
       owned = new Map()
       ownedDeclarations.set(style, owned)
@@ -68,7 +79,13 @@ function installLegacyThemeCompatibilityWithMigrations(
       for (const target of targets) {
         const currentValue = style.getPropertyValue(target).trim()
         const currentPriority = style.getPropertyPriority(target)
-        const previous = owned.get(target)
+        let previous = owned.get(target)
+        if (!previous
+          && style.getPropertyValue(ownershipMarker(target)).trim() === source
+          && currentValue === migratedValue(source, target)) {
+          previous = { value: currentValue, priority: currentPriority }
+          owned.set(target, previous)
+        }
         const stillOwned = previous?.value === currentValue && previous.priority === currentPriority
 
         if (!sourceValue) {
@@ -96,7 +113,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
 
   function syncLegacyTheme(element: Element & { style: CSSStyleDeclaration }) {
-    syncLegacyDeclaration(element.style)
+    syncLegacyDeclaration(element.style, true)
   }
 
   function scanLegacyThemes(root: Node) {
@@ -114,7 +131,9 @@ function installLegacyThemeCompatibilityWithMigrations(
         cssRules?: CSSRuleList
         styleSheet?: CSSStyleSheet | null
       }
-      if (candidate.style) syncLegacyDeclaration(candidate.style)
+      if (candidate.style && (ownedDeclarations.has(candidate.style) || candidate.style.cssText.includes("--avs-"))) {
+        syncLegacyDeclaration(candidate.style, true)
+      }
       if (candidate.cssRules) syncLegacyRuleList(candidate.cssRules)
       if (candidate.styleSheet) syncLegacyStyleSheet(candidate.styleSheet)
     }
@@ -272,11 +291,11 @@ function installLegacyThemeCompatibilityWithMigrations(
 }
 
 export function installLegacyThemeCompatibility() {
-  installLegacyThemeCompatibilityWithMigrations(LEGACY_THEME_MIGRATIONS)
+  installLegacyThemeCompatibilityWithMigrations(LEGACY_THEME_MIGRATIONS, LEGACY_THEME_OWNERSHIP_PREFIX)
 }
 
 export function themeCompatibilityClientScript(): string {
-  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)});`
+  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)},${JSON.stringify(LEGACY_THEME_OWNERSHIP_PREFIX)});`
 }
 
 installLegacyThemeCompatibility()

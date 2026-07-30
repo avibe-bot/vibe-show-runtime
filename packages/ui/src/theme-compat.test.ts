@@ -13,7 +13,7 @@ describe("legacy theme compatibility", () => {
   })
 
   it("installs for direct component and ThemeProvider consumers", () => {
-    for (const source of ["./utils.ts", "./switch.tsx", "./theme.tsx"]) {
+    for (const source of ["./utils.ts", "./switch.tsx", "./theme.tsx", "./animated-text.tsx", "./hmr-transition.ts"]) {
       const contents = readFileSync(new URL(source, import.meta.url), "utf8")
       expect(contents).toContain('import "./theme-compat"')
     }

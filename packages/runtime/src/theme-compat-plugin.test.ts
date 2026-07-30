@@ -88,6 +88,13 @@ describe("dynamic legacy theme compatibility", () => {
     rule.setProperty("--avs-ring", "199 89% 48%")
     const directRule = new TestStyle()
     directRule.setProperty("--avs-primary", "221 83% 53%")
+    const generatedRule = new TestStyle()
+    generatedRule.setProperty("--avs-primary", "221 83% 53%")
+    generatedRule.setProperty("--primary", "hsl(var(--avs-primary))")
+    generatedRule.setProperty("--avibe-show-theme-owner-primary", "--avs-primary")
+    const unrelatedInitialRule = new TestStyle()
+    unrelatedInitialRule.setProperty("color", "red")
+    unrelatedInitialRule.reads = 0
     const nestedRule = new TestStyle()
     nestedRule.setProperty("--avs-radius", "0.75rem")
     const importedRule = new TestStyle()
@@ -95,6 +102,8 @@ describe("dynamic legacy theme compatibility", () => {
     const directSheet = new TestStyleSheet()
     directSheet.cssRules.push(
       { style: directRule },
+      { style: generatedRule },
+      { style: unrelatedInitialRule },
       { cssRules: [{ style: nestedRule }] },
       { styleSheet: { cssRules: [{ style: importedRule }] } }
     )
@@ -120,6 +129,11 @@ describe("dynamic legacy theme compatibility", () => {
     runInNewContext(loadClientCode(), context)
 
     expect(directRule.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    expect(unrelatedInitialRule.reads).toBe(0)
+    generatedRule.setProperty("--avs-primary", "221 83% 53%", "important")
+    expect(generatedRule.getPropertyPriority("--primary")).toBe("important")
+    generatedRule.removeProperty("--avs-primary")
+    expect(generatedRule.getPropertyValue("--primary")).toBe("")
     expect(nestedRule.getPropertyValue("--radius")).toBe("var(--avs-radius)")
     expect(importedRule.getPropertyValue("--input")).toBe("hsl(var(--avs-border))")
 
