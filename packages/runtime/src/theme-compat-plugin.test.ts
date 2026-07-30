@@ -43,61 +43,7 @@ function loadClientCode() {
   return code as string
 }
 
-function loadCompatibilityFunctions() {
-  const code = loadClientCode()
-  return Function(`${code}\nreturn { syncLegacyTheme, syncLegacyRuleList };`)() as {
-    syncLegacyTheme: (element: { style: TestStyle }) => void
-    syncLegacyRuleList: (rules: unknown[]) => void
-  }
-}
-
 describe("dynamic legacy theme compatibility", () => {
-  it("migrates inline legacy tokens one way without replacing authored standard tokens", () => {
-    const { syncLegacyTheme: sync } = loadCompatibilityFunctions()
-    const legacy = { style: new TestStyle() }
-    legacy.style.setProperty("--avs-primary", "221 83% 53%", "important")
-    legacy.style.setProperty("--avs-radius", "0.75rem")
-
-    sync(legacy)
-    expect(legacy.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
-    expect(legacy.style.getPropertyPriority("--primary")).toBe("important")
-    expect(legacy.style.getPropertyValue("--radius")).toBe("var(--avs-radius)")
-
-    legacy.style.removeProperty("--avs-primary")
-    sync(legacy)
-    expect(legacy.style.getPropertyValue("--primary")).toBe("")
-
-    const standard = { style: new TestStyle() }
-    standard.style.setProperty("--avs-primary", "221 83% 53%")
-    standard.style.setProperty("--primary", "oklch(0.62 0.19 255)")
-    sync(standard)
-    expect(standard.style.getPropertyValue("--primary")).toBe("oklch(0.62 0.19 255)")
-  })
-
-  it("migrates legacy tokens in dynamically created and nested stylesheet rules", () => {
-    const { syncLegacyRuleList } = loadCompatibilityFunctions()
-    const direct = new TestStyle()
-    direct.setProperty("--avs-primary", "221 83% 53%")
-    const nested = new TestStyle()
-    nested.setProperty("--avs-radius", "0.75rem")
-    const imported = new TestStyle()
-    imported.setProperty("--avs-border", "214 32% 91%")
-
-    syncLegacyRuleList([
-      { style: direct },
-      { cssRules: [{ style: nested }] },
-      { styleSheet: { cssRules: [{ style: imported }] } }
-    ])
-
-    expect(direct.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
-    expect(nested.getPropertyValue("--radius")).toBe("var(--avs-radius)")
-    expect(imported.getPropertyValue("--input")).toBe("hsl(var(--avs-border))")
-
-    direct.setProperty("--primary", "oklch(0.62 0.19 255)")
-    syncLegacyRuleList([{ style: direct }])
-    expect(direct.getPropertyValue("--primary")).toBe("oklch(0.62 0.19 255)")
-  })
-
   it("installs CSSOM migration without scanning unrelated inline animations", () => {
     class TestElement {
       style = new TestStyle()
@@ -108,12 +54,29 @@ describe("dynamic legacy theme compatibility", () => {
       querySelectorAll() { return [] }
     }
     class TestStyleSheet {
-      cssRules: Array<{ style: TestStyle }> = []
+      cssRules: Array<Record<string, unknown>> = []
       nextStyle?: TestStyle
 
       insertRule(_rule?: string) {
         if (this.nextStyle) this.cssRules.push({ style: this.nextStyle })
         return this.cssRules.length - 1
+      }
+
+      deleteRule(index: number) {
+        this.cssRules.splice(index, 1)
+      }
+    }
+    class TestGroupingRule {
+      cssRules: Array<Record<string, unknown>> = []
+      nextStyle?: TestStyle
+
+      insertRule(_rule?: string) {
+        if (this.nextStyle) this.cssRules.push({ style: this.nextStyle })
+        return this.cssRules.length - 1
+      }
+
+      deleteRule(index: number) {
+        this.cssRules.splice(index, 1)
       }
     }
     class TestMutationObserver {
@@ -123,8 +86,21 @@ describe("dynamic legacy theme compatibility", () => {
     const root = new TestElement()
     const rule = new TestStyle()
     rule.setProperty("--avs-ring", "199 89% 48%")
+    const directRule = new TestStyle()
+    directRule.setProperty("--avs-primary", "221 83% 53%")
+    const nestedRule = new TestStyle()
+    nestedRule.setProperty("--avs-radius", "0.75rem")
+    const importedRule = new TestStyle()
+    importedRule.setProperty("--avs-border", "214 32% 91%")
+    const directSheet = new TestStyleSheet()
+    directSheet.cssRules.push(
+      { style: directRule },
+      { cssRules: [{ style: nestedRule }] },
+      { styleSheet: { cssRules: [{ style: importedRule }] } }
+    )
     const events: string[] = []
     const context = {
+      CSSGroupingRule: TestGroupingRule,
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: TestStyleSheet,
       Element: TestElement,
@@ -138,10 +114,14 @@ describe("dynamic legacy theme compatibility", () => {
         addEventListener() {},
         dispatchEvent(event: { type: string }) { events.push(event.type) },
         documentElement: root,
-        styleSheets: []
+        styleSheets: [directSheet]
       }
     }
     runInNewContext(loadClientCode(), context)
+
+    expect(directRule.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    expect(nestedRule.getPropertyValue("--radius")).toBe("var(--avs-radius)")
+    expect(importedRule.getPropertyValue("--input")).toBe("hsl(var(--avs-border))")
 
     const animated = new TestStyle()
     animated.setProperty("opacity", "0.5")
@@ -149,8 +129,18 @@ describe("dynamic legacy theme compatibility", () => {
     expect(() => { animated.cssText = null }).not.toThrow()
 
     const dynamic = new TestStyle()
-    dynamic.setProperty("--avs-primary", "221 83% 53%")
+    dynamic.setProperty("--avs-primary", "221 83% 53%", "important")
     expect(dynamic.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    expect(dynamic.getPropertyPriority("--primary")).toBe("important")
+    dynamic.removeProperty("--avs-primary")
+    expect(dynamic.getPropertyValue("--primary")).toBe("")
+    expect(() => dynamic.setProperty(null as unknown as string, "ignored")).not.toThrow()
+    expect(() => dynamic.removeProperty(null as unknown as string)).not.toThrow()
+
+    const standard = new TestStyle()
+    standard.setProperty("--avs-primary", "221 83% 53%")
+    standard.setProperty("--primary", "oklch(0.62 0.19 255)")
+    expect(standard.getPropertyValue("--primary")).toBe("oklch(0.62 0.19 255)")
 
     const sheet = new TestStyleSheet()
     const unrelatedRule = new TestStyle()
@@ -162,5 +152,16 @@ describe("dynamic legacy theme compatibility", () => {
     expect(rule.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
     expect(unrelatedRule.reads).toBe(0)
     expect(events).toContain("avibe:show-theme-change")
+
+    const beforeDelete = events.length
+    sheet.deleteRule(0)
+    expect(events.length).toBe(beforeDelete + 1)
+
+    const grouping = new TestGroupingRule()
+    const groupedRule = new TestStyle()
+    groupedRule.setProperty("--avs-border", "214 32% 91%")
+    grouping.nextStyle = groupedRule
+    grouping.insertRule(".nested {}")
+    expect(groupedRule.getPropertyValue("--border")).toBe("hsl(var(--avs-border))")
   })
 })

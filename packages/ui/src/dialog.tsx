@@ -69,11 +69,10 @@ function collectMediaQueries(rules: CSSRuleList, queries: Set<string>, visited: 
     if (rule.type === CSSRule.MEDIA_RULE) queries.add((rule as CSSMediaRule).conditionText)
     const nested = (rule as CSSRule & { cssRules?: CSSRuleList }).cssRules
     if (nested) collectMediaQueries(nested, queries, visited)
-    const imported = (rule as CSSImportRule).styleSheet
-    if (rule.type === CSSRule.IMPORT_RULE && (rule as CSSImportRule).media.mediaText) {
-      queries.add((rule as CSSImportRule).media.mediaText)
-    }
-    if (imported) collectStyleSheetMediaQueries(imported, queries, visited)
+    if (rule.type !== CSSRule.IMPORT_RULE) continue
+    const imported = rule as CSSImportRule
+    if (imported.media.mediaText) queries.add(imported.media.mediaText)
+    if (imported.styleSheet) collectStyleSheetMediaQueries(imported.styleSheet, queries, visited)
   }
 }
 
@@ -98,7 +97,8 @@ function subscribeToMediaChanges(update: () => void): () => void {
     "(forced-colors: active)"
   ])
   const visited = new Set<CSSStyleSheet>()
-  for (const sheet of Array.from(document.styleSheets)) {
+  const sheets = [...Array.from(document.styleSheets), ...Array.from(document.adoptedStyleSheets ?? [])]
+  for (const sheet of sheets) {
     collectStyleSheetMediaQueries(sheet, queries, visited)
   }
   const media = Array.from(queries, (query) => window.matchMedia(query))

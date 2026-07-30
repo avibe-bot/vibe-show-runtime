@@ -411,6 +411,10 @@ A `var(--brand-color)` value is treated as a complete color. Legacy HSL channel
 references remain supported when the custom property name ends in `-hsl` or
 `-channels`.
 
+The legacy-token migration is owned by Show UI and runs for both direct package
+consumers and managed runtime pages. It is a compatibility bridge, not an
+authoring contract; generated pages use only the standard variables.
+
 or override selected tokens:
 
 ```tsx

@@ -1,5 +1,6 @@
 import * as React from "react"
 import { ThemeScopeContext } from "./theme-context"
+import "./theme-compat"
 
 export type ThemePreset = "zinc" | "slate" | "green" | "blue"
 
@@ -154,7 +155,7 @@ function usesLegacyHslChannels(value: string): boolean {
   const spaceChannels = splitSpaceChannels(tokenizable)
   if (spaceChannels.length === 3 || (spaceChannels.length === 5 && spaceChannels[3] === "/")) return true
   const variable = tokenizable.match(/^\s*var\(\s*(--[^,\s)]+)/i)?.[1]
-  return Boolean(variable && /(?:^--avs-|(?:^|[-_])hsl(?:[-_]|$)|(?:^|[-_])channels?(?:[-_]|$))/i.test(variable))
+  return Boolean(variable && /(?:^--avs-|[-_](?:hsl|channels?))$/i.test(variable))
 }
 
 function toStyle(theme?: ShowTheme): React.CSSProperties {

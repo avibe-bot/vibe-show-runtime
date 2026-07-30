@@ -150,6 +150,10 @@ A `var(--brand-color)` theme value is treated as a complete color. Legacy HSL
 channel references remain supported when the custom property name ends in
 `-hsl` or `-channels`.
 
+Show UI installs its legacy-token migration from both direct component entry
+points and the managed runtime. That bridge is compatibility-only; new page
+code should author the standard variables above.
+
 ## Examples
 
 ```bash

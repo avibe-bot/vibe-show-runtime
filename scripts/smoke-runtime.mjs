@@ -114,9 +114,10 @@ const themeCompatScriptTag = Array.isArray(themeCompatIndexHtml)
   : undefined
 if (
   typeof themeCompatClientCode !== "string" ||
-  !themeCompatClientCode.includes("ownedDeclarations") ||
-  !themeCompatClientCode.includes("syncLegacyRuleList") ||
-  !themeCompatClientCode.includes("sheetPrototype.insertRule") ||
+  !themeCompatClientCode.includes("__avibeShowThemeCompatInstalled") ||
+  !themeCompatClientCode.includes("CSSGroupingRule") ||
+  !themeCompatClientCode.includes("adoptedStyleSheets") ||
+  !themeCompatClientCode.includes("avibe:show-theme-change") ||
   !themeCompatScriptTag?.attrs?.src?.includes("virtual:avibe-show-theme-compat-client")
 ) {
   throw new Error("Expected the runtime to install the one-way dynamic legacy theme migration")

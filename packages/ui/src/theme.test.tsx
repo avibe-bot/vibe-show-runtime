@@ -48,6 +48,19 @@ describe("ThemeProvider", () => {
     expect(markup).toContain("--avs-success:158 /* hue */ 64% 24%")
   })
 
+  it("treats only documented variable suffixes as legacy HSL channels", () => {
+    const markup = renderToStaticMarkup(
+      <ThemeProvider theme={{ colors: {
+        primary: "var(--brand-hsl-color)",
+        ring: "var(--brand-hsl)",
+        warning: "var(--brand-channels)"
+      } }}>content</ThemeProvider>
+    )
+    expect(markup).toContain("--primary:var(--brand-hsl-color)")
+    expect(markup).toContain("--ring:hsl(var(--brand-hsl))")
+    expect(markup).toContain("--warning:hsl(var(--brand-channels))")
+  })
+
   it("fans out legacy channel shorthands without replacing explicit standard companions", () => {
     const markup = renderToStaticMarkup(
       <ThemeProvider theme={{ colors: {
