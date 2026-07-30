@@ -21,14 +21,23 @@ describe("legacy theme migration", () => {
 .brand { --avs-primary: 221, 83%, 53%; --avs-border: 214 32% 91%; }
 .modern { --avs-primary: 221 83% 53%; --primary: oklch(0.62 0.19 255); }
 `)
+    await mkdir(join(workspace, "src", "features"), { recursive: true })
+    await writeFile(join(workspace, "src", "theme.css"), `.tenant { --avs-ring: 199 89% 48%; }\n`)
+    await writeFile(join(workspace, "src", "features", "panel.module.css"), `.panel { --avs-muted: 210 40% 96%; }\n`)
 
     await ensureSessionTemplate(workspace)
     const migrated = await readFile(join(workspace, "src", "styles.css"), "utf8")
     expect(migrated).toMatch(/\.brand\s*\{[^}]*--primary:\s*hsl\(var\(--avs-primary\)\)/)
     expect(migrated).toMatch(/\.brand\s*\{[^}]*--input:\s*hsl\(var\(--avs-border\)\)/)
     expect(migrated).toMatch(/\.modern\s*\{[^}]*--primary:\s*oklch\(0\.62 0\.19 255\)/)
+    const theme = await readFile(join(workspace, "src", "theme.css"), "utf8")
+    const module = await readFile(join(workspace, "src", "features", "panel.module.css"), "utf8")
+    expect(theme).toMatch(/\.tenant\s*\{[^}]*--ring:\s*hsl\(var\(--avs-ring\)\)/)
+    expect(module).toMatch(/\.panel\s*\{[^}]*--muted:\s*hsl\(var\(--avs-muted\)\)/)
 
     await ensureSessionTemplate(workspace)
     expect(await readFile(join(workspace, "src", "styles.css"), "utf8")).toBe(migrated)
+    expect(await readFile(join(workspace, "src", "theme.css"), "utf8")).toBe(theme)
+    expect(await readFile(join(workspace, "src", "features", "panel.module.css"), "utf8")).toBe(module)
   })
 })

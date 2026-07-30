@@ -38,6 +38,56 @@ function readPortalTheme(source: HTMLElement): PortalThemeSnapshot {
   return { dark, signature: `${dark}|${computed.colorScheme}|${values.join("|")}`, style }
 }
 
+function PortalThemeBridge({
+  source,
+  children
+}: {
+  source: React.RefObject<HTMLSpanElement | null>
+  children: React.ReactNode
+}) {
+  const [theme, setTheme] = React.useState<PortalThemeSnapshot>()
+
+  React.useLayoutEffect(() => {
+    const marker = source.current
+    if (!marker) return
+    const update = () => {
+      const next = readPortalTheme(marker)
+      setTheme((current) => current?.signature === next.signature ? current : next)
+    }
+    update()
+
+    const ancestorObserver = new MutationObserver(update)
+    for (let element = marker.parentElement; element; element = element.parentElement) {
+      ancestorObserver.observe(element, { attributes: true, attributeFilter: ["class", "data-theme", "style"] })
+    }
+
+    const stylesheetObserver = new MutationObserver(update)
+    stylesheetObserver.observe(document.head, {
+      attributes: true,
+      attributeFilter: ["href", "media", "disabled"],
+      characterData: true,
+      childList: true,
+      subtree: true
+    })
+    document.addEventListener("load", update, true)
+
+    return () => {
+      ancestorObserver.disconnect()
+      stylesheetObserver.disconnect()
+      document.removeEventListener("load", update, true)
+    }
+  }, [source])
+
+  return (
+    <div
+      data-theme={theme?.dark ? "dark" : undefined}
+      style={{ display: "contents", visibility: theme ? undefined : "hidden", ...theme?.style }}
+    >
+      {children}
+    </div>
+  )
+}
+
 export const Dialog = DialogPrimitive.Root
 export const DialogTrigger = DialogPrimitive.Trigger
 export const DialogPortal = DialogPrimitive.Portal
@@ -48,28 +98,12 @@ export const DialogContent = React.forwardRef<
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content>
 >(({ className, children, ...props }, ref) => {
   const markerRef = React.useRef<HTMLSpanElement>(null)
-  const [theme, setTheme] = React.useState<PortalThemeSnapshot>()
-
-  React.useLayoutEffect(() => {
-    const marker = markerRef.current
-    if (!marker) return
-    const update = () => {
-      const next = readPortalTheme(marker)
-      setTheme((current) => current?.signature === next.signature ? current : next)
-    }
-    update()
-    const observer = new MutationObserver(update)
-    for (let element = marker.parentElement; element; element = element.parentElement) {
-      observer.observe(element, { attributes: true, attributeFilter: ["class", "data-theme", "style"] })
-    }
-    return () => observer.disconnect()
-  }, [])
 
   return (
     <>
       <span ref={markerRef} aria-hidden="true" style={{ display: "none" }} />
       <DialogPortal>
-        <div data-theme={theme?.dark ? "dark" : undefined} style={{ display: "contents", ...theme?.style }}>
+        <PortalThemeBridge source={markerRef}>
           <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-[rgb(17_24_39/45%)] animate-[avs-fade-in_0.16s_ease_both] motion-reduce:animate-none" />
           <DialogPrimitive.Content
             ref={ref}
@@ -84,7 +118,7 @@ export const DialogContent = React.forwardRef<
               <X size={16} />
             </DialogPrimitive.Close>
           </DialogPrimitive.Content>
-        </div>
+        </PortalThemeBridge>
       </DialogPortal>
     </>
   )

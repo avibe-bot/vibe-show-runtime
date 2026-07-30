@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, writeFile } from "node:fs/promises"
+import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import postcss from "postcss"
 
@@ -61,6 +61,7 @@ export async function ensureSessionTemplate(workspace: string, uiPackageName: st
   await writeIfMissing(appPath, appTsx())
   await writeIfMissing(join(workspace, "src", "styles.css"), stylesCss(uiPackageName))
   await ensureEntryImports(join(workspace, "src", "styles.css"), uiPackageName)
+  await migrateWorkspaceThemeDeclarations(join(workspace, "src"))
 }
 
 async function fileExists(path: string) {
@@ -91,14 +92,11 @@ async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return
     throw error
   }
-  const original = contents
-  contents = migrateLegacyThemeDeclarations(contents)
   const theme = themeImport(uiPackageName)
   const scanned = maskCssComments(contents)
   const hasTailwind = TAILWIND_IMPORT_PATTERN.test(scanned)
   const hasTheme = themeImportPattern(uiPackageName).test(scanned)
   if (hasTailwind && hasTheme) {
-    if (contents !== original) await writeFile(path, contents, "utf8")
     return
   }
   if (!hasTailwind) {
@@ -111,6 +109,28 @@ async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_
     contents = insertThemeAfterTailwind(contents, theme)
   }
   await writeFile(path, contents, "utf8")
+}
+
+async function migrateWorkspaceThemeDeclarations(path: string): Promise<void> {
+  let entries
+  try {
+    entries = await readdir(path, { withFileTypes: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+    throw error
+  }
+
+  await Promise.all(entries.map(async (entry) => {
+    const entryPath = join(path, entry.name)
+    if (entry.isDirectory()) {
+      await migrateWorkspaceThemeDeclarations(entryPath)
+      return
+    }
+    if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".css")) return
+    const contents = await readFile(entryPath, "utf8")
+    const migrated = migrateLegacyThemeDeclarations(contents)
+    if (migrated !== contents) await writeFile(entryPath, migrated, "utf8")
+  }))
 }
 
 function migrateLegacyThemeDeclarations(contents: string): string {

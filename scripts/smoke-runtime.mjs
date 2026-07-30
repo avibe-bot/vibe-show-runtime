@@ -1189,10 +1189,12 @@ export default function App() {
   // (10) Legacy workspace (predates the theme import): a styles.css with only the Tailwind
   // entry must gain the show-ui theme import on warm so component tokens/utilities work.
   await mkdir(join(root, "shadcn-legacy", "src"), { recursive: true })
+  await mkdir(join(root, "shadcn-legacy", "src", "features"), { recursive: true })
   await writeFile(join(root, "shadcn-legacy", "src", "styles.css"), `@import "tailwindcss";
 .brand { --avs-primary: 221, 83%, 53%; --avs-border: 214 32% 91%; }
 body { margin: 0; }
 `)
+  await writeFile(join(root, "shadcn-legacy", "src", "features", "panel.module.css"), `.panel { --avs-muted: 210 40% 96%; }\n`)
   await writeFile(join(root, "shadcn-legacy", "src", "App.tsx"), `export default function App() {
   return <main className="p-4">legacy</main>
 }
@@ -1207,6 +1209,10 @@ body { margin: 0; }
   }
   if (!shadcnLegacyStyles.includes("--primary: hsl(var(--avs-primary))") || !shadcnLegacyStyles.includes("--input: hsl(var(--avs-border))")) {
     throw new Error("Expected scoped legacy theme declarations to migrate to standard tokens in the same rule")
+  }
+  const shadcnLegacyModule = await readFile(join(root, "shadcn-legacy", "src", "features", "panel.module.css"), "utf8")
+  if (!shadcnLegacyModule.includes("--muted: hsl(var(--avs-muted))")) {
+    throw new Error("Expected legacy theme declarations in nested stylesheets to migrate to standard tokens")
   }
   const shadcnLegacyCss = await fetch(`${runtime.url}/sessions/shadcn-legacy/app/src/styles.css?direct`).then((res) => res.text())
   if (!shadcnLegacyCss.includes(".bg-primary")) {
