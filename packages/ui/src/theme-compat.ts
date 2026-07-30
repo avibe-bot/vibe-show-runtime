@@ -65,6 +65,14 @@ function installLegacyThemeCompatibilityWithMigrations(
     return legacySources.some((source) => style.getPropertyValue(source).trim())
   }
 
+  function declaredProperties(style: CSSStyleDeclaration) {
+    const properties = new Set<string>()
+    for (let index = 0; index < style.length; index += 1) {
+      properties.add(style.item(index))
+    }
+    return properties
+  }
+
   function syncLegacyDeclaration(style: CSSStyleDeclaration, knownCandidate = false) {
     let owned = ownedDeclarations.get(style)
     if (!owned && !knownCandidate && !hasLegacyDeclaration(style)) return
@@ -72,6 +80,7 @@ function installLegacyThemeCompatibilityWithMigrations(
       owned = new Map()
       ownedDeclarations.set(style, owned)
     }
+    const declared = declaredProperties(style)
 
     for (const [source, targets] of Object.entries(migrations)) {
       const sourceValue = style.getPropertyValue(source).trim()
@@ -79,6 +88,7 @@ function installLegacyThemeCompatibilityWithMigrations(
       for (const target of targets) {
         const currentValue = style.getPropertyValue(target).trim()
         const currentPriority = style.getPropertyPriority(target)
+        const currentDeclared = declared.has(target)
         let previous = owned.get(target)
         if (!previous
           && style.getPropertyValue(ownershipMarker(target)).trim() === source
@@ -92,17 +102,19 @@ function installLegacyThemeCompatibilityWithMigrations(
           if (stillOwned) {
             if (nativeRemoveProperty) nativeRemoveProperty.call(style, target)
             else style.removeProperty(target)
+            declared.delete(target)
           }
           owned.delete(target)
           continue
         }
 
-        if (!currentValue || stillOwned) {
+        if (!currentDeclared || stillOwned) {
           const value = migratedValue(source, target)
           if (currentValue !== value || currentPriority !== sourcePriority) {
             if (nativeSetProperty) nativeSetProperty.call(style, target, value, sourcePriority)
             else style.setProperty(target, value, sourcePriority)
           }
+          declared.add(target)
           owned.set(target, { value, priority: sourcePriority })
         } else if (previous) {
           owned.delete(target)
@@ -116,9 +128,10 @@ function installLegacyThemeCompatibilityWithMigrations(
     syncLegacyDeclaration(element.style, true)
   }
 
-  function scanLegacyThemes(root: Node) {
-    if (!(root instanceof Element)) return
-    if (root.getAttribute("style")?.includes("--avs-")) syncLegacyTheme(root as HTMLElement)
+  function scanLegacyThemes(root: Node & ParentNode) {
+    if (root instanceof Element && root.getAttribute("style")?.includes("--avs-")) {
+      syncLegacyTheme(root as HTMLElement)
+    }
     for (const element of root.querySelectorAll<HTMLElement>('[style*="--avs-"]')) {
       syncLegacyTheme(element)
     }
@@ -148,9 +161,8 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
-  function scanLegacyStyleSheets(root: Node) {
-    if (!(root instanceof Element)) return
-    if (root.matches("style, link[rel~=stylesheet]")) {
+  function scanLegacyStyleSheets(root: Node & ParentNode) {
+    if (root instanceof Element && root.matches("style, link[rel~=stylesheet]")) {
       syncLegacyStyleSheet((root as HTMLStyleElement | HTMLLinkElement).sheet)
     }
     for (const element of root.querySelectorAll<HTMLStyleElement | HTMLLinkElement>("style, link[rel~=stylesheet]")) {
@@ -251,10 +263,14 @@ function installLegacyThemeCompatibilityWithMigrations(
 
   patchAdoptedStyleSheets(globalThis.Document?.prototype)
   patchAdoptedStyleSheets(globalThis.ShadowRoot?.prototype)
-  scanLegacyThemes(document.documentElement)
-  for (const sheet of Array.from(document.styleSheets)) syncLegacyStyleSheet(sheet)
-  for (const sheet of Array.from(document.adoptedStyleSheets ?? [])) syncLegacyStyleSheet(sheet)
-  new MutationObserver((records) => {
+  const observedRoots = new WeakSet<Document | ShadowRoot>()
+  const stylesheetLoad = (event: Event) => {
+    const target = event.target
+    if (target instanceof HTMLLinkElement && target.relList.contains("stylesheet")) {
+      syncLegacyStyleSheet(target.sheet)
+    }
+  }
+  const observer = new MutationObserver((records) => {
     for (const record of records) {
       if (record.type === "attributes") {
         if (!(record.target instanceof Element)) continue
@@ -270,24 +286,53 @@ function installLegacyThemeCompatibilityWithMigrations(
           ?? (record.target instanceof Element ? record.target.closest("style") : null)
         if (owner instanceof HTMLStyleElement) syncLegacyStyleSheet(owner.sheet)
         for (const node of record.addedNodes) {
+          if (!(node instanceof Element)) continue
           scanLegacyThemes(node)
           scanLegacyStyleSheets(node)
+          scanShadowRoots(node)
         }
       }
     }
-  }).observe(document.documentElement, {
-    attributes: true,
-    attributeFilter: ["style", "href", "rel", "media", "disabled"],
-    characterData: true,
-    childList: true,
-    subtree: true
   })
-  document.addEventListener("load", (event) => {
-    const target = event.target
-    if (target instanceof HTMLLinkElement && target.relList.contains("stylesheet")) {
-      syncLegacyStyleSheet(target.sheet)
+
+  function scanShadowRoots(root: Node & ParentNode) {
+    const hosts = root instanceof Element ? [root, ...root.querySelectorAll("*")] : Array.from(root.querySelectorAll("*"))
+    for (const host of hosts) {
+      if (host.shadowRoot) observeCompatibilityRoot(host.shadowRoot)
     }
-  }, true)
+  }
+
+  function observeCompatibilityRoot(root: Document | ShadowRoot) {
+    if (observedRoots.has(root)) return
+    const container = root === document ? document.documentElement : root
+    if (!container) return
+    observedRoots.add(root)
+    scanLegacyThemes(container)
+    scanLegacyStyleSheets(container)
+    const styleSheets = root === document ? document.styleSheets : []
+    for (const sheet of Array.from(styleSheets)) syncLegacyStyleSheet(sheet)
+    for (const sheet of Array.from(root.adoptedStyleSheets ?? [])) syncLegacyStyleSheet(sheet)
+    scanShadowRoots(container)
+    observer.observe(container, {
+      attributes: true,
+      attributeFilter: ["style", "href", "rel", "media", "disabled"],
+      characterData: true,
+      childList: true,
+      subtree: true
+    })
+    root.addEventListener("load", stylesheetLoad, true)
+  }
+
+  const elementPrototype = globalThis.Element?.prototype
+  if (elementPrototype?.attachShadow) {
+    const attachShadow = elementPrototype.attachShadow
+    elementPrototype.attachShadow = function(init: ShadowRootInit) {
+      const root = attachShadow.call(this, init)
+      observeCompatibilityRoot(root)
+      return root
+    }
+  }
+  observeCompatibilityRoot(document)
 }
 
 export function installLegacyThemeCompatibility() {

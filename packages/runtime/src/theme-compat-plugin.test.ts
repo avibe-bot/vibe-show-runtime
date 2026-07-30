@@ -6,6 +6,18 @@ class TestStyle {
   private declarations = new Map<string, { value: string; priority: string }>()
   reads = 0
 
+  get length() {
+    return this.declarations.size
+  }
+
+  item(index: number) {
+    return Array.from(this.declarations.keys())[index] ?? ""
+  }
+
+  hasProperty(name: string) {
+    return this.declarations.has(name)
+  }
+
   getPropertyPriority(name: string) {
     return this.declarations.get(name)?.priority ?? ""
   }
@@ -48,9 +60,23 @@ describe("dynamic legacy theme compatibility", () => {
     class TestElement {
       style = new TestStyle()
       parentElement = null
+      descendants: TestElement[] = []
+      shadowRoot: TestShadowRoot | null = null
+      nextShadowRoot: TestShadowRoot | null = null
 
       getAttribute() { return null }
       matches() { return false }
+      querySelectorAll(selector: string) { return selector === "*" ? this.descendants : [] }
+      attachShadow() {
+        this.shadowRoot = this.nextShadowRoot ?? new TestShadowRoot()
+        return this.shadowRoot
+      }
+    }
+    class TestShadowRoot {
+      adoptedStyleSheets: TestStyleSheet[] = []
+      parentElement = null
+
+      addEventListener() {}
       querySelectorAll() { return [] }
     }
     class TestStyleSheet {
@@ -88,6 +114,9 @@ describe("dynamic legacy theme compatibility", () => {
     rule.setProperty("--avs-ring", "199 89% 48%")
     const directRule = new TestStyle()
     directRule.setProperty("--avs-primary", "221 83% 53%")
+    const emptyStandardRule = new TestStyle()
+    emptyStandardRule.setProperty("--avs-primary", "221 83% 53%")
+    emptyStandardRule.setProperty("--primary", "")
     const generatedRule = new TestStyle()
     generatedRule.setProperty("--avs-primary", "221 83% 53%")
     generatedRule.setProperty("--primary", "hsl(var(--avs-primary))")
@@ -102,11 +131,21 @@ describe("dynamic legacy theme compatibility", () => {
     const directSheet = new TestStyleSheet()
     directSheet.cssRules.push(
       { style: directRule },
+      { style: emptyStandardRule },
       { style: generatedRule },
       { style: unrelatedInitialRule },
       { cssRules: [{ style: nestedRule }] },
       { styleSheet: { cssRules: [{ style: importedRule }] } }
     )
+    const shadowRule = new TestStyle()
+    shadowRule.setProperty("--avs-ring", "199 89% 48%")
+    const shadowSheet = new TestStyleSheet()
+    shadowSheet.cssRules.push({ style: shadowRule })
+    const existingShadow = new TestShadowRoot()
+    existingShadow.adoptedStyleSheets.push(shadowSheet)
+    const shadowHost = new TestElement()
+    shadowHost.shadowRoot = existingShadow
+    root.descendants.push(shadowHost)
     const events: string[] = []
     const context = {
       CSSGroupingRule: TestGroupingRule,
@@ -118,6 +157,7 @@ describe("dynamic legacy theme compatibility", () => {
       },
       HTMLLinkElement: class {},
       MutationObserver: TestMutationObserver,
+      ShadowRoot: TestShadowRoot,
       document: {
         adoptedStyleSheets: [],
         addEventListener() {},
@@ -129,6 +169,19 @@ describe("dynamic legacy theme compatibility", () => {
     runInNewContext(loadClientCode(), context)
 
     expect(directRule.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    expect(emptyStandardRule.getPropertyValue("--primary")).toBe("")
+    expect(emptyStandardRule.hasProperty("--primary")).toBe(true)
+    expect(shadowRule.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
+    const lateShadowRule = new TestStyle()
+    lateShadowRule.setProperty("--avs-warning", "32 95% 44%")
+    const lateShadowSheet = new TestStyleSheet()
+    lateShadowSheet.cssRules.push({ style: lateShadowRule })
+    const lateShadow = new TestShadowRoot()
+    lateShadow.adoptedStyleSheets.push(lateShadowSheet)
+    const lateHost = new TestElement()
+    lateHost.nextShadowRoot = lateShadow
+    lateHost.attachShadow()
+    expect(lateShadowRule.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
     expect(unrelatedInitialRule.reads).toBe(0)
     generatedRule.setProperty("--avs-primary", "221 83% 53%", "important")
     expect(generatedRule.getPropertyPriority("--primary")).toBe("important")
