@@ -5,8 +5,6 @@ import { X } from "lucide-react"
 import { ThemeScopeContext } from "./theme-context"
 import { cn } from "./utils"
 
-const THEME_CHANGE_EVENT = "avibe:show-theme-change"
-
 // Radix portals escape scoped inheritance; copy the source theme onto a contents-only bridge.
 const PORTAL_THEME_TOKENS = [
   "--radius", "--background", "--foreground", "--card", "--card-foreground",
@@ -53,51 +51,15 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
   if (context.fontWeight) style.fontWeight = context.fontWeight
   if (context.lineHeight) style.lineHeight = context.lineHeight
   const dark = hasComposedDarkTheme(source.tokens)
-  const fontContext = [
-    context.fontFamily, context.fontSize, context.fontStretch, context.fontStyle,
-    context.fontVariant, context.fontWeight, context.lineHeight
-  ].join("|")
   return {
     dark,
-    signature: `${dark}|${context.colorScheme}|${context.color}|${fontContext}|${values.join("|")}`,
+    signature: JSON.stringify([
+      dark, context.colorScheme, context.color, context.fontFamily, context.fontSize,
+      context.fontStretch, context.fontStyle, context.fontVariant, context.fontWeight,
+      context.lineHeight, ...values
+    ]),
     style
   }
-}
-
-function collectMediaQueries(rules: CSSRuleList, queries: Set<string>, visited: Set<CSSStyleSheet>) {
-  for (const rule of Array.from(rules)) {
-    if (rule.type === CSSRule.MEDIA_RULE) queries.add((rule as CSSMediaRule).conditionText)
-    const nested = (rule as CSSRule & { cssRules?: CSSRuleList }).cssRules
-    if (nested) collectMediaQueries(nested, queries, visited)
-    if (rule.type !== CSSRule.IMPORT_RULE) continue
-    const imported = rule as CSSImportRule
-    if (imported.media.mediaText) queries.add(imported.media.mediaText)
-    if (imported.styleSheet) collectStyleSheetMediaQueries(imported.styleSheet, queries, visited)
-  }
-}
-
-function collectStyleSheetMediaQueries(sheet: CSSStyleSheet, queries: Set<string>, visited: Set<CSSStyleSheet>) {
-  if (visited.has(sheet)) return
-  visited.add(sheet)
-  const ownerMedia = (sheet.ownerNode as HTMLStyleElement | HTMLLinkElement | null)?.media
-  if (ownerMedia) queries.add(ownerMedia)
-  try {
-    collectMediaQueries(sheet.cssRules, queries, visited)
-  } catch (error) {
-    if (typeof DOMException !== "undefined" && error instanceof DOMException && error.name === "SecurityError") return
-    throw error
-  }
-}
-
-function sourceShadowRoots(source: PortalThemeSource): ShadowRoot[] {
-  if (typeof ShadowRoot === "undefined") return []
-  const roots = new Set<ShadowRoot>()
-  for (const element of [source.tokens, source.context]) {
-    for (let node: Node | null = element; node; node = composedParentNode(node)) {
-      if (node instanceof ShadowRoot) roots.add(node)
-    }
-  }
-  return Array.from(roots)
 }
 
 function composedParentNode(node: Node): Node | null {
@@ -126,46 +88,6 @@ function hasComposedDarkTheme(element: Element): boolean {
   return false
 }
 
-function containsStylesheet(node: Node): boolean {
-  if (!(node instanceof Element)) return false
-  return node.matches("style, link[rel~=stylesheet]")
-    || Boolean(node.querySelector("style, link[rel~=stylesheet]"))
-}
-
-function hasStylesheetMutation(records: MutationRecord[]): boolean {
-  return records.some((record) => {
-    if (record.type === "attributes") return containsStylesheet(record.target)
-    if (record.type === "characterData") return Boolean(record.target.parentElement?.closest("style"))
-    if (record.target instanceof HTMLStyleElement) return true
-    return [...record.addedNodes, ...record.removedNodes].some(containsStylesheet)
-  })
-}
-
-function subscribeToMediaChanges(update: () => void, source: PortalThemeSource): () => void {
-  if (typeof window.matchMedia !== "function") return () => undefined
-  const queries = new Set([
-    "(prefers-color-scheme: dark)",
-    "(prefers-contrast: more)",
-    "(forced-colors: active)"
-  ])
-  const visited = new Set<CSSStyleSheet>()
-  const sheets = new Set([...Array.from(document.styleSheets), ...Array.from(document.adoptedStyleSheets ?? [])])
-  for (const root of sourceShadowRoots(source)) {
-    for (const sheet of Array.from(root.adoptedStyleSheets ?? [])) sheets.add(sheet)
-    for (const owner of root.querySelectorAll<HTMLStyleElement | HTMLLinkElement>("style, link[rel~=stylesheet]")) {
-      if (owner.sheet) sheets.add(owner.sheet as CSSStyleSheet)
-    }
-  }
-  for (const sheet of sheets) {
-    collectStyleSheetMediaQueries(sheet, queries, visited)
-  }
-  const media = Array.from(queries, (query) => window.matchMedia(query))
-  for (const item of media) item.addEventListener("change", update)
-  return () => {
-    for (const item of media) item.removeEventListener("change", update)
-  }
-}
-
 function PortalThemeBridge({
   getSource,
   children
@@ -176,97 +98,18 @@ function PortalThemeBridge({
   const [theme, setTheme] = React.useState<PortalThemeSnapshot>()
 
   React.useLayoutEffect(() => {
-    let source = getSource()
-    const ancestorObserver = new MutationObserver(() => update())
-    let stopMediaChanges: () => void = () => undefined
-    let restartMediaChanges: () => void = () => undefined
-    let observeStylesheetRoots: () => void = () => undefined
-    const observeSource = () => {
-      ancestorObserver.disconnect()
-      const observed = new Set<Node>()
-      for (const origin of [source.tokens, source.context]) {
-        for (let node: Node | null = origin; node; node = composedParentNode(node)) {
-          if (observed.has(node)) continue
-          observed.add(node)
-          ancestorObserver.observe(node, node instanceof Element
-            ? { attributes: true, childList: true }
-            : { childList: true })
-        }
-      }
-    }
+    let frame = 0
+    let signature = ""
     const update = () => {
-      const nextSource = getSource()
-      if (nextSource.tokens !== source.tokens || nextSource.context !== source.context) {
-        source = nextSource
-        observeSource()
-        observeStylesheetRoots()
-        restartMediaChanges()
+      const next = readPortalTheme(getSource())
+      if (next.signature !== signature) {
+        signature = next.signature
+        setTheme(next)
       }
-      const next = readPortalTheme(source)
-      setTheme((current) => current?.signature === next.signature ? current : next)
+      frame = window.requestAnimationFrame(update)
     }
-    observeSource()
     update()
-
-    let refreshStylesheets: () => void = () => undefined
-    const stylesheetObserver = new MutationObserver((records) => {
-      if (hasStylesheetMutation(records)) refreshStylesheets()
-    })
-    observeStylesheetRoots = () => {
-      stylesheetObserver.disconnect()
-      stylesheetObserver.observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: ["href", "media", "disabled"],
-        characterData: true,
-        childList: true,
-        subtree: true
-      })
-      for (const root of sourceShadowRoots(source)) {
-        stylesheetObserver.observe(root, {
-          attributes: true,
-          attributeFilter: ["href", "media", "disabled"],
-          characterData: true,
-          childList: true,
-          subtree: true
-        })
-      }
-    }
-    restartMediaChanges = () => {
-      stopMediaChanges()
-      stopMediaChanges = subscribeToMediaChanges(update, source)
-    }
-    refreshStylesheets = () => {
-      update()
-      observeStylesheetRoots()
-      restartMediaChanges()
-    }
-    observeStylesheetRoots()
-    restartMediaChanges()
-    const handleLoad = (event: Event) => {
-      const target = event.target
-      if (target instanceof HTMLLinkElement && target.relList.contains("stylesheet")) refreshStylesheets()
-    }
-    document.addEventListener("load", handleLoad, true)
-    document.addEventListener(THEME_CHANGE_EVENT, refreshStylesheets)
-    const stateChangeEvents = [
-      "pointerover", "pointerout", "pointerdown", "pointerup", "focusin", "focusout",
-      "input", "change", "toggle", "animationstart", "animationiteration", "animationend",
-      "animationcancel", "transitionrun", "transitionstart", "transitionend", "transitioncancel"
-    ]
-    for (const event of stateChangeEvents) document.addEventListener(event, update, true)
-    window.addEventListener("hashchange", update)
-    window.addEventListener("resize", update)
-
-    return () => {
-      ancestorObserver.disconnect()
-      stylesheetObserver.disconnect()
-      stopMediaChanges()
-      document.removeEventListener("load", handleLoad, true)
-      document.removeEventListener(THEME_CHANGE_EVENT, refreshStylesheets)
-      for (const event of stateChangeEvents) document.removeEventListener(event, update, true)
-      window.removeEventListener("hashchange", update)
-      window.removeEventListener("resize", update)
-    }
+    return () => window.cancelAnimationFrame(frame)
   }, [getSource])
 
   return (

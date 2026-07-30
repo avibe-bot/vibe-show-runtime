@@ -117,7 +117,6 @@ if (
   !themeCompatClientCode.includes("__avibeShowThemeCompatInstalled") ||
   !themeCompatClientCode.includes("CSSGroupingRule") ||
   !themeCompatClientCode.includes("adoptedStyleSheets") ||
-  !themeCompatClientCode.includes("avibe:show-theme-change") ||
   !themeCompatScriptTag?.attrs?.src?.includes("virtual:avibe-show-theme-compat-client")
 ) {
   throw new Error("Expected the runtime to install the one-way dynamic legacy theme migration")

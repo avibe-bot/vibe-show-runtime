@@ -82,15 +82,6 @@ describe("dynamic legacy theme compatibility", () => {
     class TestStyleSheet {
       cssRules: Array<Record<string, unknown>> = []
       nextStyle?: TestStyle
-      private disabledValue = false
-
-      get disabled() {
-        return this.disabledValue
-      }
-
-      set disabled(value: boolean) {
-        this.disabledValue = Boolean(value)
-      }
 
       insertRule(_rule?: string) {
         if (this.nextStyle) this.cssRules.push({ style: this.nextStyle })
@@ -112,26 +103,6 @@ describe("dynamic legacy theme compatibility", () => {
       deleteRule() {
         this.cssRules.pop()
       }
-    }
-    class TestStyleRule {
-      private selector = ".theme"
-
-      get selectorText() { return this.selector }
-      set selectorText(value: string) { this.selector = value }
-    }
-    class TestKeyframeRule {
-      private key = "to"
-
-      get keyText() { return this.key }
-      set keyText(value: string) { this.key = value }
-    }
-    class TestMediaList {
-      private text = "screen"
-
-      get mediaText() { return this.text }
-      set mediaText(value: string) { this.text = value }
-      appendMedium(value: string) { this.text += `, ${value}` }
-      deleteMedium(value: string) { this.text = this.text.replace(value, "") }
     }
     class TestGroupingRule {
       cssRules: Array<Record<string, unknown>> = []
@@ -190,31 +161,22 @@ describe("dynamic legacy theme compatibility", () => {
     const shadowHost = new TestElement()
     shadowHost.shadowRoot = existingShadow
     root.descendants.push(shadowHost)
-    const events: string[] = []
     const lateAdoptedRule = new TestStyle()
     lateAdoptedRule.setProperty("--avs-success", "142 71% 45%")
     const lateAdoptedSheet = new TestStyleSheet()
     lateAdoptedSheet.cssRules.push({ style: lateAdoptedRule })
     const context = {
       CSSGroupingRule: TestGroupingRule,
-      CSSKeyframeRule: TestKeyframeRule,
       CSSKeyframesRule: TestKeyframesRule,
-      CSSStyleRule: TestStyleRule,
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: TestStyleSheet,
       Element: TestElement,
-      Event: class {
-        constructor(public type: string) {}
-      },
       HTMLLinkElement: class {},
       MutationObserver: TestMutationObserver,
-      MediaList: TestMediaList,
       ShadowRoot: TestShadowRoot,
-      StyleSheet: TestStyleSheet,
       document: {
         adoptedStyleSheets: [] as TestStyleSheet[],
         addEventListener() {},
-        dispatchEvent(event: { type: string }) { events.push(event.type) },
         documentElement: root,
         styleSheets: [directSheet]
       }
@@ -244,10 +206,8 @@ describe("dynamic legacy theme compatibility", () => {
     expect(nestedRule.getPropertyValue("--radius")).toBe("var(--avs-radius)")
     expect(importedRule.getPropertyValue("--input")).toBe("hsl(var(--avs-border))")
 
-    const beforeAdoption = events.length
     context.document.adoptedStyleSheets.push(lateAdoptedSheet)
     expect(lateAdoptedRule.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
-    expect(events.length).toBe(beforeAdoption + 1)
 
     const animated = new TestStyle()
     animated.setProperty("opacity", "0.5")
@@ -277,41 +237,13 @@ describe("dynamic legacy theme compatibility", () => {
     sheet.insertRule(".brand {}")
     expect(rule.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
     expect(unrelatedRule.reads).toBe(0)
-    expect(events).toContain("avibe:show-theme-change")
-
-    const beforeDelete = events.length
-    sheet.deleteRule(0)
-    expect(events.length).toBe(beforeDelete + 1)
 
     const keyframes = new TestKeyframesRule()
     const keyframeRule = new TestStyle()
     keyframeRule.setProperty("--avs-warning", "32 95% 44%")
     keyframes.nextStyle = keyframeRule
-    const beforeKeyframe = events.length
     keyframes.appendRule()
     expect(keyframeRule.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
-    expect(events.length).toBe(beforeKeyframe + 1)
-    keyframes.deleteRule()
-    expect(events.length).toBe(beforeKeyframe + 2)
-
-    const beforeDisabled = events.length
-    sheet.disabled = true
-    expect(events.length).toBe(beforeDisabled + 1)
-
-    const styleRule = new TestStyleRule()
-    const beforeSelector = events.length
-    styleRule.selectorText = ".active-theme"
-    expect(events.length).toBe(beforeSelector + 1)
-
-    const keyframe = new TestKeyframeRule()
-    keyframe.keyText = "50%"
-    expect(events.length).toBe(beforeSelector + 2)
-
-    const media = new TestMediaList()
-    media.mediaText = "(prefers-color-scheme: dark)"
-    media.appendMedium("print")
-    media.deleteMedium("print")
-    expect(events.length).toBe(beforeSelector + 5)
 
     const grouping = new TestGroupingRule()
     const groupedRule = new TestStyle()

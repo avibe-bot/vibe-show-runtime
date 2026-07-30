@@ -23,7 +23,6 @@ type OwnedDeclaration = { value: string; priority: string }
 type RuleContainer = {
   cssRules: CSSRuleList
   insertRule: (rule: string, index?: number) => number
-  deleteRule: (index: number) => void
 }
 
 function installLegacyThemeCompatibilityWithMigrations(
@@ -43,9 +42,6 @@ function installLegacyThemeCompatibilityWithMigrations(
   const migratedTargets = new Set(Object.values(migrations).flat())
   const ownedDeclarations = new WeakMap<CSSStyleDeclaration, Map<string, OwnedDeclaration>>()
   const observedAdoptedLists = new WeakSet<object>()
-  const patchedAccessors = new WeakMap<object, Set<string>>()
-  const patchedMethods = new WeakMap<object, Set<string>>()
-  const themeChangeEvent = "avibe:show-theme-change"
   const stylePrototype = globalThis.CSSStyleDeclaration?.prototype
   const nativeSetProperty = stylePrototype?.setProperty
   const nativeRemoveProperty = stylePrototype?.removeProperty
@@ -56,13 +52,6 @@ function installLegacyThemeCompatibilityWithMigrations(
 
   function ownershipMarker(target: string) {
     return `${ownershipPrefix}${target.slice(2)}`
-  }
-
-  function notifyThemeChange() {
-    const EventConstructor = document.defaultView?.Event ?? globalThis.Event
-    if (typeof EventConstructor === "function") {
-      document.dispatchEvent(new EventConstructor(themeChangeEvent))
-    }
   }
 
   function hasLegacyDeclaration(style: CSSStyleDeclaration) {
@@ -186,15 +175,7 @@ function installLegacyThemeCompatibilityWithMigrations(
         const insertedIndex = insertRule.call(this, rule, index)
         const insertedRule = this.cssRules[insertedIndex]
         if (insertedRule) syncLegacyRuleList([insertedRule])
-        notifyThemeChange()
         return insertedIndex
-      }
-    }
-    const deleteRule = prototype.deleteRule
-    if (typeof deleteRule === "function") {
-      prototype.deleteRule = function(this: RuleContainer, index: number) {
-        deleteRule.call(this, index)
-        notifyThemeChange()
       }
     }
   }
@@ -211,59 +192,7 @@ function installLegacyThemeCompatibilityWithMigrations(
           const insertedRule = this.cssRules[index]
           if (insertedRule) syncLegacyRuleList([insertedRule])
         }
-        notifyThemeChange()
       }
-    }
-    const deleteRule = prototype.deleteRule
-    if (typeof deleteRule === "function") {
-      prototype.deleteRule = function(this: CSSKeyframesRule, select: string) {
-        deleteRule.call(this, select)
-        notifyThemeChange()
-      }
-    }
-  }
-
-  function patchNotifyingAccessor(input: object | undefined, property: string) {
-    if (!input) return
-    let prototype: object | null = input
-    let descriptor = Object.getOwnPropertyDescriptor(prototype, property)
-    while (!descriptor && (prototype = Object.getPrototypeOf(prototype))) {
-      descriptor = Object.getOwnPropertyDescriptor(prototype, property)
-    }
-    if (!descriptor?.get || !descriptor.set) return
-    if (!prototype) return
-    let properties = patchedAccessors.get(prototype)
-    if (properties?.has(property)) return
-    if (!properties) {
-      properties = new Set()
-      patchedAccessors.set(prototype, properties)
-    }
-    properties.add(property)
-    Object.defineProperty(prototype, property, {
-      ...descriptor,
-      set(value: unknown) {
-        descriptor.set?.call(this, value)
-        notifyThemeChange()
-      }
-    })
-  }
-
-  function patchNotifyingMethod(input: object | undefined, property: string) {
-    if (!input) return
-    const prototype = input as Record<string, unknown>
-    const method = prototype[property]
-    if (typeof method !== "function") return
-    let properties = patchedMethods.get(input)
-    if (properties?.has(property)) return
-    if (!properties) {
-      properties = new Set()
-      patchedMethods.set(input, properties)
-    }
-    properties.add(property)
-    prototype[property] = function(this: unknown, ...args: unknown[]) {
-      const result = method.apply(this, args)
-      notifyThemeChange()
-      return result
     }
   }
 
@@ -281,7 +210,6 @@ function installLegacyThemeCompatibilityWithMigrations(
           value: function(this: CSSStyleSheet[], ...args: unknown[]) {
             const result = (method as (...values: unknown[]) => unknown).apply(this, args)
             for (const sheet of Array.from(this)) syncLegacyStyleSheet(sheet)
-            notifyThemeChange()
             return result
           }
         })
@@ -302,7 +230,6 @@ function installLegacyThemeCompatibilityWithMigrations(
         const list = descriptor.get?.call(this) ?? []
         observeAdoptedStyleSheetList(list)
         for (const sheet of list) syncLegacyStyleSheet(sheet)
-        notifyThemeChange()
       }
     })
   }
@@ -315,7 +242,6 @@ function installLegacyThemeCompatibilityWithMigrations(
       if (legacySources.includes(propertyName) || (migratedTargets.has(propertyName) && (ownedDeclarations.has(this) || hasLegacyDeclaration(this)))) {
         syncLegacyDeclaration(this)
       }
-      if (this.parentRule && propertyName.startsWith("--")) notifyThemeChange()
     }
     stylePrototype.removeProperty = function(name: string) {
       const value = nativeRemoveProperty.call(this, name)
@@ -323,7 +249,6 @@ function installLegacyThemeCompatibilityWithMigrations(
       if (legacySources.includes(propertyName) || (migratedTargets.has(propertyName) && (ownedDeclarations.has(this) || hasLegacyDeclaration(this)))) {
         syncLegacyDeclaration(this)
       }
-      if (this.parentRule && propertyName.startsWith("--")) notifyThemeChange()
       return value
     }
     if (cssText?.get && cssText.set) {
@@ -331,11 +256,9 @@ function installLegacyThemeCompatibilityWithMigrations(
         ...cssText,
         set(value: string | null) {
           const wasOwned = ownedDeclarations.has(this)
-          const previous = cssText.get?.call(this) ?? ""
           cssText.set?.call(this, value)
           const current = cssText.get?.call(this) ?? ""
           if (wasOwned || current.includes("--avs-")) syncLegacyDeclaration(this, current.includes("--avs-"))
-          if (this.parentRule && (previous.includes("--") || current.includes("--"))) notifyThemeChange()
         }
       })
     }
@@ -345,19 +268,11 @@ function installLegacyThemeCompatibilityWithMigrations(
   patchRuleContainer(sheetPrototype)
   patchRuleContainer(globalThis.CSSGroupingRule?.prototype)
   patchKeyframesRule(globalThis.CSSKeyframesRule?.prototype)
-  patchNotifyingAccessor(sheetPrototype, "disabled")
-  patchNotifyingAccessor(globalThis.StyleSheet?.prototype, "disabled")
-  patchNotifyingAccessor(globalThis.CSSStyleRule?.prototype, "selectorText")
-  patchNotifyingAccessor(globalThis.CSSKeyframeRule?.prototype, "keyText")
-  patchNotifyingAccessor(globalThis.MediaList?.prototype, "mediaText")
-  patchNotifyingMethod(globalThis.MediaList?.prototype, "appendMedium")
-  patchNotifyingMethod(globalThis.MediaList?.prototype, "deleteMedium")
   if (sheetPrototype?.replaceSync) {
     const replaceSync = sheetPrototype.replaceSync
     sheetPrototype.replaceSync = function(text: string) {
       replaceSync.call(this, text)
       syncLegacyStyleSheet(this)
-      notifyThemeChange()
     }
   }
   if (sheetPrototype?.replace) {
@@ -365,7 +280,6 @@ function installLegacyThemeCompatibilityWithMigrations(
     sheetPrototype.replace = async function(text: string) {
       const result = await replace.call(this, text)
       syncLegacyStyleSheet(this)
-      notifyThemeChange()
       return result
     }
   }
