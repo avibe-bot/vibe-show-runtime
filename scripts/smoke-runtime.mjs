@@ -115,7 +115,8 @@ const themeCompatScriptTag = Array.isArray(themeCompatIndexHtml)
 if (
   typeof themeCompatClientCode !== "string" ||
   !themeCompatClientCode.includes("ownedDeclarations") ||
-  !themeCompatClientCode.includes("style.setProperty(target, value, sourcePriority)") ||
+  !themeCompatClientCode.includes("syncLegacyRuleList") ||
+  !themeCompatClientCode.includes("sheetPrototype.insertRule") ||
   !themeCompatScriptTag?.attrs?.src?.includes("virtual:avibe-show-theme-compat-client")
 ) {
   throw new Error("Expected the runtime to install the one-way dynamic legacy theme migration")

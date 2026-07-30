@@ -29,7 +29,8 @@ describe("ThemeProvider", () => {
         primary: "var(--brand-hsl)",
         accent: "221deg calc(83%) var(--lightness) / calc(var(--alpha))",
         ring: "199 89% 48%",
-        warning: "32, 95%, 44%"
+        warning: "32, 95%, 44%",
+        success: "158 /* hue */ 64% 24%"
       } }}>content</ThemeProvider>
     )
     expect(markup).toContain("--foreground:var(--brand-color)")
@@ -41,6 +42,8 @@ describe("ThemeProvider", () => {
     expect(markup).toContain("--avs-ring:199 89% 48%")
     expect(markup).toContain("--warning:hsl(32, 95%, 44%)")
     expect(markup).toContain("--avs-warning:32, 95%, 44%")
+    expect(markup).toContain("--success:hsl(158 /* hue */ 64% 24%)")
+    expect(markup).toContain("--avs-success:158 /* hue */ 64% 24%")
   })
 
   it("delegates presets to dark-aware CSS instead of inline light colors", () => {

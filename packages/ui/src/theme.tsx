@@ -141,11 +141,12 @@ function splitSpaceChannels(value: string): string[] {
 }
 
 function usesLegacyHslChannels(value: string): boolean {
-  const commaChannels = splitTopLevel(value, ",")
+  const tokenizable = value.replace(/\/\*[\s\S]*?\*\//g, " ")
+  const commaChannels = splitTopLevel(tokenizable, ",")
   if (commaChannels.length === 3 || commaChannels.length === 4) return commaChannels.every(Boolean)
-  const spaceChannels = splitSpaceChannels(value)
+  const spaceChannels = splitSpaceChannels(tokenizable)
   if (spaceChannels.length === 3 || (spaceChannels.length === 5 && spaceChannels[3] === "/")) return true
-  const variable = value.match(/^\s*var\(\s*(--[^,\s)]+)/i)?.[1]
+  const variable = tokenizable.match(/^\s*var\(\s*(--[^,\s)]+)/i)?.[1]
   return Boolean(variable && /(?:^--avs-|(?:^|[-_])hsl(?:[-_]|$)|(?:^|[-_])channels?(?:[-_]|$))/i.test(variable))
 }
 
