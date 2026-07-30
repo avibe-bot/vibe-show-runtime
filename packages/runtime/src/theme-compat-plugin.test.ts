@@ -135,6 +135,10 @@ describe("dynamic legacy theme compatibility", () => {
     generatedRule.setProperty("--avs-primary", "221 83% 53%")
     generatedRule.setProperty("--primary", "hsl(var(--avs-primary))")
     generatedRule.setProperty("--avibe-show-theme-owner-primary", "--avs-primary")
+    const relinquishedRule = new TestStyle()
+    relinquishedRule.setProperty("--avs-primary", "221 83% 53%")
+    relinquishedRule.setProperty("--primary", "hsl(var(--avs-primary))")
+    relinquishedRule.setProperty("--avibe-show-theme-owner-primary", "--avs-primary")
     const unrelatedInitialRule = new TestStyle()
     unrelatedInitialRule.setProperty("color", "red")
     unrelatedInitialRule.reads = 0
@@ -148,6 +152,7 @@ describe("dynamic legacy theme compatibility", () => {
       { style: emptyLegacyRule },
       { style: emptyStandardRule },
       { style: generatedRule },
+      { style: relinquishedRule },
       { style: unrelatedInitialRule },
       { cssRules: [{ style: nestedRule }] },
       { styleSheet: { cssRules: [{ style: importedRule }] } }
@@ -203,6 +208,11 @@ describe("dynamic legacy theme compatibility", () => {
     expect(generatedRule.getPropertyPriority("--primary")).toBe("important")
     generatedRule.removeProperty("--avs-primary")
     expect(generatedRule.getPropertyValue("--primary")).toBe("")
+    expect(generatedRule.getPropertyValue("--avibe-show-theme-owner-primary")).toBe("")
+    relinquishedRule.setProperty("--primary", "oklch(0.62 0.19 255)")
+    expect(relinquishedRule.getPropertyValue("--avibe-show-theme-owner-primary")).toBe("")
+    relinquishedRule.setProperty("--primary", "hsl(var(--avs-primary))", "important")
+    expect(relinquishedRule.getPropertyPriority("--primary")).toBe("important")
     expect(nestedRule.getPropertyValue("--radius")).toBe("var(--avs-radius)")
     expect(importedRule.getPropertyValue("--input")).toBe("hsl(var(--avs-border))")
 
@@ -251,5 +261,81 @@ describe("dynamic legacy theme compatibility", () => {
     grouping.nextStyle = groupedRule
     grouping.insertRule(".nested {}")
     expect(groupedRule.getPropertyValue("--border")).toBe("hsl(var(--avs-border))")
+  })
+
+  it("bridges opaque stylesheet legacy overrides without replacing authored standard tokens", () => {
+    class TestElement {
+      style = new TestStyle()
+      isConnected = true
+      parentElement = null
+      shadowRoot = null
+      descendants: TestElement[] = []
+      constructor(readonly standard = false) {}
+      getAttribute() { return null }
+      matches() { return false }
+      querySelectorAll(selector: string) { return selector === "*" ? this.descendants : [] }
+      attachShadow() { throw new Error("unused") }
+    }
+    class TestShadowRoot {
+      adoptedStyleSheets = []
+      addEventListener() {}
+      querySelectorAll() { return [] }
+    }
+    class OpaqueStyleSheet {
+      disabled = false
+      get cssRules(): never {
+        throw Object.assign(new Error("opaque"), { name: "SecurityError" })
+      }
+    }
+    class TestMutationObserver {
+      observe() {}
+    }
+
+    const standard = new TestElement(true)
+    const root = new TestElement()
+    root.descendants.push(standard)
+    const opaque = new OpaqueStyleSheet()
+    const frames: FrameRequestCallback[] = []
+    const context = {
+      CSSStyleDeclaration: TestStyle,
+      CSSStyleSheet: OpaqueStyleSheet,
+      Element: TestElement,
+      HTMLLinkElement: class {},
+      MutationObserver: TestMutationObserver,
+      ShadowRoot: TestShadowRoot,
+      addEventListener() {},
+      getComputedStyle(element: TestElement) {
+        return {
+          getPropertyValue(name: string) {
+            if (name === "--avs-primary") return opaque.disabled ? "222 47% 11%" : "221 83% 53%"
+            if (name === "--primary") {
+              if (!opaque.disabled && element.standard) return "oklch(0.62 0.19 255)"
+              return "hsl(222 47% 11%)"
+            }
+            return ""
+          }
+        }
+      },
+      requestAnimationFrame(callback: FrameRequestCallback) {
+        frames.push(callback)
+        return frames.length
+      },
+      document: {
+        adoptedStyleSheets: [],
+        addEventListener() {},
+        documentElement: root,
+        querySelectorAll() { return [standard] },
+        styleSheets: [opaque]
+      }
+    }
+
+    runInNewContext(loadClientCode(), context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0)
+
+    expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    expect(root.style.getPropertyPriority("--primary")).toBe("important")
+    expect(standard.style.getPropertyValue("--primary")).toBe("")
+    expect(opaque.disabled).toBe(false)
   })
 })

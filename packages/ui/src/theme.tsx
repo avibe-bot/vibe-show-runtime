@@ -109,6 +109,7 @@ const legacyColorFanOut: Partial<Record<ThemeColor, readonly ThemeColor[]>> = {
 
 function composedParentNode(node: Node): Node | null {
   if (node instanceof Element) {
+    if (node.assignedSlot) return node.assignedSlot
     if (node.parentElement) return node.parentElement
     const root = node.getRootNode()
     if (typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot) return root
@@ -123,17 +124,25 @@ function useComposedDark(elementRef: React.RefObject<HTMLElement | null>): boole
     if (!current) return
     const element: HTMLElement = current
     const observer = new MutationObserver(update)
+    let observedSlots: HTMLSlotElement[] = []
     function update() {
       observer.disconnect()
+      for (const slot of observedSlots) slot.removeEventListener("slotchange", update)
+      observedSlots = []
       let nextDark = false
+      observer.observe(element, { attributes: true, attributeFilter: ["slot"] })
       for (let node = composedParentNode(element); node; node = composedParentNode(node)) {
         if (node instanceof Element) {
           if (node.classList.contains("dark") || node.getAttribute("data-theme") === "dark") nextDark = true
           observer.observe(node, {
             attributes: true,
-            attributeFilter: ["class", "data-theme"],
+            attributeFilter: ["class", "data-theme", "name", "slot"],
             childList: true
           })
+          if (typeof HTMLSlotElement !== "undefined" && node instanceof HTMLSlotElement) {
+            node.addEventListener("slotchange", update)
+            observedSlots.push(node)
+          }
         } else {
           observer.observe(node, { childList: true })
         }
@@ -141,7 +150,10 @@ function useComposedDark(elementRef: React.RefObject<HTMLElement | null>): boole
       setDark(nextDark)
     }
     update()
-    return () => observer.disconnect()
+    return () => {
+      observer.disconnect()
+      for (const slot of observedSlots) slot.removeEventListener("slotchange", update)
+    }
   }, [elementRef])
   return dark
 }

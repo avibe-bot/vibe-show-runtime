@@ -85,6 +85,12 @@ describe("ThemeProvider", () => {
     expect(markup).toContain('data-theme-preset="zinc"')
     expect(markup).not.toContain("--primary")
   })
+
+  it("follows the flattened slot tree when resolving dark preset context", () => {
+    const source = readFileSync(new URL("./theme.tsx", import.meta.url), "utf8")
+    expect(source.indexOf("node.assignedSlot")).toBeLessThan(source.indexOf("node.parentElement"))
+    expect(source).toContain('node.addEventListener("slotchange", update)')
+  })
 })
 
 describe("theme.css", () => {

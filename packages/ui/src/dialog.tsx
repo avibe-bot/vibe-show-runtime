@@ -24,7 +24,7 @@ const PORTAL_THEME_TOKENS = [
 type PortalThemeSnapshot = {
   dark: boolean
   signature: string
-  style: React.CSSProperties & Record<string, string>
+  properties: Record<string, string>
 }
 
 type PortalThemeSource = {
@@ -35,21 +35,21 @@ type PortalThemeSource = {
 function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
   const computed = getComputedStyle(source.tokens)
   const context = source.context === source.tokens ? computed : getComputedStyle(source.context)
-  const style = {} as React.CSSProperties & Record<string, string>
+  const properties: Record<string, string> = {}
   const values = PORTAL_THEME_TOKENS.map((token) => {
     const value = computed.getPropertyValue(token)
-    if (value) style[token] = value
+    properties[token] = value || " "
     return value
   })
-  if (context.colorScheme) style.colorScheme = context.colorScheme
-  if (context.color) style.color = context.color
-  if (context.fontFamily) style.fontFamily = context.fontFamily
-  if (context.fontSize) style.fontSize = context.fontSize
-  if (context.fontStretch) style.fontStretch = context.fontStretch
-  if (context.fontStyle) style.fontStyle = context.fontStyle
-  if (context.fontVariant) style.fontVariant = context.fontVariant
-  if (context.fontWeight) style.fontWeight = context.fontWeight
-  if (context.lineHeight) style.lineHeight = context.lineHeight
+  for (const [property, value] of [
+    ["color-scheme", context.colorScheme], ["color", context.color],
+    ["font-family", context.fontFamily], ["font-size", context.fontSize],
+    ["font-stretch", context.fontStretch], ["font-style", context.fontStyle],
+    ["font-variant", context.fontVariant], ["font-weight", context.fontWeight],
+    ["line-height", context.lineHeight]
+  ]) {
+    if (value) properties[property] = value
+  }
   const dark = hasComposedDarkTheme(source.tokens)
   return {
     dark,
@@ -58,12 +58,13 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
       context.fontStretch, context.fontStyle, context.fontVariant, context.fontWeight,
       context.lineHeight, ...values
     ]),
-    style
+    properties
   }
 }
 
 function composedParentNode(node: Node): Node | null {
   if (node instanceof Element) {
+    if (node.assignedSlot) return node.assignedSlot
     if (node.parentElement) return node.parentElement
     const root = node.getRootNode()
     if (typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot) return root
@@ -96,6 +97,8 @@ function PortalThemeBridge({
   children: React.ReactNode
 }) {
   const [theme, setTheme] = React.useState<PortalThemeSnapshot>()
+  const bridgeRef = React.useRef<HTMLDivElement>(null)
+  const copiedProperties = React.useRef<string[]>([])
 
   React.useLayoutEffect(() => {
     let frame = 0
@@ -112,10 +115,23 @@ function PortalThemeBridge({
     return () => window.cancelAnimationFrame(frame)
   }, [getSource])
 
+  React.useLayoutEffect(() => {
+    const bridge = bridgeRef.current
+    if (!bridge) return
+    for (const property of copiedProperties.current) bridge.style.removeProperty(property)
+    copiedProperties.current = []
+    if (!theme) return
+    for (const [property, value] of Object.entries(theme.properties)) {
+      bridge.style.setProperty(property, value, "important")
+      copiedProperties.current.push(property)
+    }
+  }, [theme])
+
   return (
     <div
+      ref={bridgeRef}
       data-theme={theme?.dark ? "dark" : undefined}
-      style={{ display: "contents", visibility: theme ? undefined : "hidden", ...theme?.style }}
+      style={{ display: "contents", visibility: theme ? undefined : "hidden" }}
     >
       {children}
     </div>
