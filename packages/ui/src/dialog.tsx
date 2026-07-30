@@ -5,6 +5,8 @@ import { X } from "lucide-react"
 import { ThemeScopeContext } from "./theme-context"
 import { cn } from "./utils"
 
+const THEME_CHANGE_EVENT = "avibe:show-theme-change"
+
 // Radix portals escape scoped inheritance; copy the source theme onto a contents-only bridge.
 const PORTAL_THEME_TOKENS = [
   "--radius", "--background", "--foreground", "--card", "--card-foreground",
@@ -62,11 +64,29 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
   }
 }
 
-function collectMediaQueries(rules: CSSRuleList, queries: Set<string>) {
+function collectMediaQueries(rules: CSSRuleList, queries: Set<string>, visited: Set<CSSStyleSheet>) {
   for (const rule of Array.from(rules)) {
     if (rule.type === CSSRule.MEDIA_RULE) queries.add((rule as CSSMediaRule).conditionText)
     const nested = (rule as CSSRule & { cssRules?: CSSRuleList }).cssRules
-    if (nested) collectMediaQueries(nested, queries)
+    if (nested) collectMediaQueries(nested, queries, visited)
+    const imported = (rule as CSSImportRule).styleSheet
+    if (rule.type === CSSRule.IMPORT_RULE && (rule as CSSImportRule).media.mediaText) {
+      queries.add((rule as CSSImportRule).media.mediaText)
+    }
+    if (imported) collectStyleSheetMediaQueries(imported, queries, visited)
+  }
+}
+
+function collectStyleSheetMediaQueries(sheet: CSSStyleSheet, queries: Set<string>, visited: Set<CSSStyleSheet>) {
+  if (visited.has(sheet)) return
+  visited.add(sheet)
+  const ownerMedia = (sheet.ownerNode as HTMLStyleElement | HTMLLinkElement | null)?.media
+  if (ownerMedia) queries.add(ownerMedia)
+  try {
+    collectMediaQueries(sheet.cssRules, queries, visited)
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "SecurityError") return
+    throw error
   }
 }
 
@@ -77,12 +97,9 @@ function subscribeToMediaChanges(update: () => void): () => void {
     "(prefers-contrast: more)",
     "(forced-colors: active)"
   ])
+  const visited = new Set<CSSStyleSheet>()
   for (const sheet of Array.from(document.styleSheets)) {
-    try {
-      collectMediaQueries(sheet.cssRules, queries)
-    } catch {
-      // Cross-origin stylesheets are opaque; their media attribute is observed separately.
-    }
+    collectStyleSheetMediaQueries(sheet, queries, visited)
   }
   const media = Array.from(queries, (query) => window.matchMedia(query))
   for (const item of media) item.addEventListener("change", update)
@@ -145,6 +162,7 @@ function PortalThemeBridge({
       if (target instanceof HTMLLinkElement && target.relList.contains("stylesheet")) refreshStylesheets()
     }
     document.addEventListener("load", handleLoad, true)
+    document.addEventListener(THEME_CHANGE_EVENT, refreshStylesheets)
     const stateChangeEvents = [
       "pointerover", "pointerout", "pointerdown", "pointerup", "focusin", "focusout",
       "input", "change", "toggle", "animationstart", "animationiteration", "animationend",
@@ -159,6 +177,7 @@ function PortalThemeBridge({
       stylesheetObserver.disconnect()
       stopMediaChanges()
       document.removeEventListener("load", handleLoad, true)
+      document.removeEventListener(THEME_CHANGE_EVENT, refreshStylesheets)
       for (const event of stateChangeEvents) document.removeEventListener(event, update, true)
       window.removeEventListener("hashchange", update)
       window.removeEventListener("resize", update)

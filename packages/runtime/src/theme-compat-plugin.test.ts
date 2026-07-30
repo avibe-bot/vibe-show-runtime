@@ -123,15 +123,20 @@ describe("dynamic legacy theme compatibility", () => {
     const root = new TestElement()
     const rule = new TestStyle()
     rule.setProperty("--avs-ring", "199 89% 48%")
+    const events: string[] = []
     const context = {
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: TestStyleSheet,
       Element: TestElement,
+      Event: class {
+        constructor(public type: string) {}
+      },
       HTMLLinkElement: class {},
       MutationObserver: TestMutationObserver,
       document: {
         adoptedStyleSheets: [],
         addEventListener() {},
+        dispatchEvent(event: { type: string }) { events.push(event.type) },
         documentElement: root,
         styleSheets: []
       }
@@ -156,5 +161,6 @@ describe("dynamic legacy theme compatibility", () => {
     sheet.insertRule(".brand {}")
     expect(rule.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
     expect(unrelatedRule.reads).toBe(0)
+    expect(events).toContain("avibe:show-theme-change")
   })
 })

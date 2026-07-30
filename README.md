@@ -142,6 +142,10 @@ export default function App() {
 }
 ```
 
+For backward compatibility, omitting `preset` selects `zinc`. Pass
+`preset={null}` when the subtree should inherit the standard root palette
+without a preset override.
+
 A `var(--brand-color)` theme value is treated as a complete color. Legacy HSL
 channel references remain supported when the custom property name ends in
 `-hsl` or `-channels`.

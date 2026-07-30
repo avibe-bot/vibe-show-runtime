@@ -5,10 +5,12 @@ import { describe, expect, it } from "vitest"
 import { ThemeProvider } from "./theme"
 
 describe("ThemeProvider", () => {
-  it("does not shadow the standard root tokens unless a preset is requested", () => {
-    const markup = renderToStaticMarkup(<ThemeProvider><span>content</span></ThemeProvider>)
-    expect(markup).not.toContain("--primary")
-    expect(markup).not.toContain("--avs-primary")
+  it("preserves the zinc default and allows the standard root palette explicitly", () => {
+    const defaultMarkup = renderToStaticMarkup(<ThemeProvider><span>content</span></ThemeProvider>)
+    expect(defaultMarkup).toContain('data-theme-preset="zinc"')
+    expect(defaultMarkup).not.toContain("--primary")
+    const rootMarkup = renderToStaticMarkup(<ThemeProvider preset={null}><span>content</span></ThemeProvider>)
+    expect(rootMarkup).not.toContain("data-theme-preset")
   })
 
   it("writes complete CSS colors to the standard shadcn variables", () => {
@@ -53,7 +55,8 @@ describe("ThemeProvider", () => {
         foreground: "210 40% 98%",
         muted: "217 33% 18%",
         border: "217 33% 22%",
-        card: "oklch(0.3 0.02 250)"
+        card: "oklch(0.3 0.02 250)",
+        popover: undefined
       } }}>content</ThemeProvider>
     )
     expect(markup).toContain("--background:hsl(222 47% 11%)")

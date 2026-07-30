@@ -165,8 +165,9 @@ function toStyle(theme?: ShowTheme): React.CSSProperties {
     style["--avs-radius"] = theme.radius
   }
   const colors = theme.colors ?? {}
-  const explicitColors = new Set(Object.keys(colors) as ThemeColor[])
-  for (const [key, value] of Object.entries(colors) as [ThemeColor, string][]) {
+  const colorEntries = Object.entries(colors) as [ThemeColor, string | undefined][]
+  const explicitColors = new Set(colorEntries.filter(([, value]) => Boolean(value)).map(([key]) => key))
+  for (const [key, value] of colorEntries) {
     if (!value) continue
     const legacyChannels = usesLegacyHslChannels(value)
     const standardValue = legacyChannels ? `hsl(${value})` : value
@@ -182,11 +183,11 @@ function toStyle(theme?: ShowTheme): React.CSSProperties {
 }
 
 export function ThemeProvider({
-  preset,
+  preset = "zinc",
   theme,
   children
 }: {
-  preset?: ThemePreset
+  preset?: ThemePreset | null
   theme?: ShowTheme
   children: React.ReactNode
 }) {

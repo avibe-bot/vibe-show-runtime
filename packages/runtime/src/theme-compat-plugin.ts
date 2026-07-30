@@ -53,11 +53,16 @@ const migrations = ${JSON.stringify(LEGACY_THEME_MIGRATIONS)};
 const legacySources = Object.keys(migrations);
 const migratedTargets = new Set(Object.values(migrations).flat());
 const ownedDeclarations = new WeakMap();
+const themeChangeEvent = "avibe:show-theme-change";
 const nativeSetProperty = globalThis.CSSStyleDeclaration?.prototype.setProperty;
 const nativeRemoveProperty = globalThis.CSSStyleDeclaration?.prototype.removeProperty;
 
 function migratedValue(source, target) {
   return target === "--radius" ? "var(" + source + ")" : "hsl(var(" + source + "))";
+}
+
+function notifyThemeChange() {
+  document.dispatchEvent(new Event(themeChangeEvent));
 }
 
 function hasLegacyDeclaration(style) {
@@ -150,12 +155,14 @@ if (typeof document !== "undefined" && !globalThis.__avibeShowThemeCompatInstall
       if (legacySources.includes(name) || (migratedTargets.has(name) && (ownedDeclarations.has(this) || hasLegacyDeclaration(this)))) {
         syncLegacyDeclaration(this);
       }
+      if (this.parentRule && name.startsWith("--")) notifyThemeChange();
     };
     stylePrototype.removeProperty = function(name) {
       const value = nativeRemoveProperty.call(this, name);
       if (legacySources.includes(name) || (migratedTargets.has(name) && (ownedDeclarations.has(this) || hasLegacyDeclaration(this)))) {
         syncLegacyDeclaration(this);
       }
+      if (this.parentRule && name.startsWith("--")) notifyThemeChange();
       return value;
     };
     if (cssText?.get && cssText.set) {
@@ -163,8 +170,11 @@ if (typeof document !== "undefined" && !globalThis.__avibeShowThemeCompatInstall
         ...cssText,
         set(value) {
           const wasOwned = ownedDeclarations.has(this);
+          const previous = cssText.get.call(this);
           cssText.set.call(this, value);
-          if (wasOwned || cssText.get.call(this).includes("--avs-")) syncLegacyDeclaration(this);
+          const current = cssText.get.call(this);
+          if (wasOwned || current.includes("--avs-")) syncLegacyDeclaration(this);
+          if (this.parentRule && (previous.includes("--") || current.includes("--"))) notifyThemeChange();
         }
       });
     }
@@ -177,6 +187,7 @@ if (typeof document !== "undefined" && !globalThis.__avibeShowThemeCompatInstall
       const index = insertRule.apply(this, args);
       const rule = this.cssRules[index];
       if (rule) syncLegacyRuleList([rule]);
+      notifyThemeChange();
       return index;
     };
     if (sheetPrototype.replaceSync) {
@@ -184,6 +195,7 @@ if (typeof document !== "undefined" && !globalThis.__avibeShowThemeCompatInstall
       sheetPrototype.replaceSync = function(...args) {
         const result = replaceSync.apply(this, args);
         syncLegacyStyleSheet(this);
+        notifyThemeChange();
         return result;
       };
     }
@@ -192,6 +204,7 @@ if (typeof document !== "undefined" && !globalThis.__avibeShowThemeCompatInstall
       sheetPrototype.replace = async function(...args) {
         const result = await replace.apply(this, args);
         syncLegacyStyleSheet(this);
+        notifyThemeChange();
         return result;
       };
     }
