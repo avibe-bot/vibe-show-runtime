@@ -44,7 +44,25 @@ describe("legacy theme migration", () => {
 
     await writeFile(
       join(workspace, "src", "styles.css"),
-      migrated.replace("--avs-primary: 221, 83%, 53%;", "")
+      migrated.replace("--avs-primary: 221, 83%, 53%;", "--avs-primary: 221, 83%, 53% !important;")
+    )
+    await ensureSessionTemplate(workspace)
+    const prioritized = await readFile(join(workspace, "src", "styles.css"), "utf8")
+    const prioritizedBrand = prioritized.match(/\.brand\s*\{([^}]*)\}/)?.[1] ?? ""
+    expect(prioritizedBrand).toMatch(/--primary:\s*hsl\(var\(--avs-primary\)\)\s*!important/)
+
+    await writeFile(
+      join(workspace, "src", "styles.css"),
+      prioritized.replace("--avs-primary: 221, 83%, 53% !important;", "--avs-primary: 221, 83%, 53%;")
+    )
+    await ensureSessionTemplate(workspace)
+    const reprioritized = await readFile(join(workspace, "src", "styles.css"), "utf8")
+    const reprioritizedBrand = reprioritized.match(/\.brand\s*\{([^}]*)\}/)?.[1] ?? ""
+    expect(reprioritizedBrand).toMatch(/--primary:\s*hsl\(var\(--avs-primary\)\)(?!\s*!important)/)
+
+    await writeFile(
+      join(workspace, "src", "styles.css"),
+      reprioritized.replace("--avs-primary: 221, 83%, 53%;", "")
     )
     await ensureSessionTemplate(workspace)
     const cleaned = await readFile(join(workspace, "src", "styles.css"), "utf8")

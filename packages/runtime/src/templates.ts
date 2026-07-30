@@ -131,11 +131,14 @@ function migrateLegacyThemeDeclarations(contents: string): string {
 
   let changed = false
   root.walkRules((rule) => {
-    const legacyProps = new Set(
-      rule.nodes
-        .filter((node): node is postcss.Declaration => node.type === "decl" && Boolean(LEGACY_THEME_MIGRATIONS[node.prop]))
-        .map((declaration) => declaration.prop)
-    )
+    const legacyDeclarations = new Map<string, postcss.Declaration>()
+    for (const node of rule.nodes) {
+      if (node.type !== "decl" || !LEGACY_THEME_MIGRATIONS[node.prop]) continue
+      const current = legacyDeclarations.get(node.prop)
+      if (!current || (node.important && !current.important) || node.important === current.important) {
+        legacyDeclarations.set(node.prop, node)
+      }
+    }
     for (const node of [...rule.nodes]) {
       if (node.type !== "comment") continue
       const marker = THEME_MIGRATION_MARKER.exec(node.text.trim())
@@ -153,19 +156,21 @@ function migrateLegacyThemeDeclarations(contents: string): string {
         changed = true
         continue
       }
-      if (!legacyProps.has(source)) {
+      const sourceDeclaration = legacyDeclarations.get(source)
+      if (!sourceDeclaration) {
         declaration.remove()
         node.remove()
+        changed = true
+      } else if (declaration.important !== sourceDeclaration.important) {
+        declaration.important = sourceDeclaration.important
         changed = true
       }
     }
     const existing = new Set(
       rule.nodes.filter((node): node is postcss.Declaration => node.type === "decl").map((declaration) => declaration.prop)
     )
-    for (const node of [...rule.nodes]) {
-      if (node.type !== "decl") continue
+    for (const node of legacyDeclarations.values()) {
       const targets = LEGACY_THEME_MIGRATIONS[node.prop]
-      if (!targets) continue
       let anchor: postcss.ChildNode = node
       for (const target of targets) {
         if (existing.has(target)) continue
