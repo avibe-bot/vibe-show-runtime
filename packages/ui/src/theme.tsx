@@ -1,4 +1,5 @@
 import * as React from "react"
+import { ThemeScopeContext } from "./theme-context"
 
 export type ThemePreset = "zinc" | "slate" | "green" | "blue"
 
@@ -174,5 +175,10 @@ export function ThemeProvider({
   theme?: ShowTheme
   children: React.ReactNode
 }) {
-  return <div className="avs-theme" data-theme-preset={preset} style={toStyle(theme)}>{children}</div>
+  const scopeRef = React.useRef<HTMLDivElement>(null)
+  return (
+    <ThemeScopeContext.Provider value={scopeRef}>
+      <div ref={scopeRef} className="avs-theme" data-theme-preset={preset} style={toStyle(theme)}>{children}</div>
+    </ThemeScopeContext.Provider>
+  )
 }
