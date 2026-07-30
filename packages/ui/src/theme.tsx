@@ -99,10 +99,11 @@ const legacyColorVars: Partial<Record<ThemeColor, string>> = {
 }
 
 const LEGACY_HSL_CHANNELS = /^\s*-?(?:\d+(?:\.\d+)?|\.\d+)(?:deg|grad|rad|turn)?\s+-?(?:\d+(?:\.\d+)?|\.\d+)%\s+-?(?:\d+(?:\.\d+)?|\.\d+)%(?:\s*\/\s*(?:\d+(?:\.\d+)?|\.\d+)%?)?\s*$/
+const LEGACY_HSL_COMMA_CHANNELS = /^\s*-?(?:\d+(?:\.\d+)?|\.\d+)(?:deg|grad|rad|turn)?\s*,\s*-?(?:\d+(?:\.\d+)?|\.\d+)%\s*,\s*-?(?:\d+(?:\.\d+)?|\.\d+)%(?:\s*,\s*(?:\d+(?:\.\d+)?|\.\d+)%?)?\s*$/
 const LEGACY_HSL_EXPRESSION = /^\s*(?:var\([^)]*\)\s+\S|calc\()/i
 
 function usesLegacyHslChannels(value: string): boolean {
-  if (LEGACY_HSL_CHANNELS.test(value) || LEGACY_HSL_EXPRESSION.test(value)) return true
+  if (LEGACY_HSL_CHANNELS.test(value) || LEGACY_HSL_COMMA_CHANNELS.test(value) || LEGACY_HSL_EXPRESSION.test(value)) return true
   const variable = value.match(/^\s*var\(\s*(--[^,\s)]+)/i)?.[1]
   return Boolean(variable && /(?:^--avs-|(?:^|[-_])hsl(?:[-_]|$)|(?:^|[-_])channels?(?:[-_]|$))/i.test(variable))
 }

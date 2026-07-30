@@ -1,5 +1,6 @@
 import { access, mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
+import postcss from "postcss"
 
 const DEFAULT_UI_PACKAGE = "@avibe/show-ui"
 const TAILWIND_IMPORT = `@import "tailwindcss";`
@@ -24,6 +25,21 @@ function escapeRegExp(value: string): string {
 const LEADING_CHARSET_PATTERN = /^@charset\s+["'][^"']*["'];[ \t]*\r?\n?/i
 // UTF-8 byte order mark, preserved at position 0 when re-emitting an existing file.
 const BOM = "\ufeff"
+// Preserve each old declaration's selector by adding its standard equivalent in the same rule.
+const LEGACY_THEME_MIGRATIONS: Record<string, readonly string[]> = {
+  "--avs-background": ["--background", "--card", "--popover"],
+  "--avs-foreground": ["--foreground", "--card-foreground", "--popover-foreground", "--secondary-foreground", "--accent-foreground"],
+  "--avs-muted": ["--secondary", "--muted", "--accent"],
+  "--avs-muted-foreground": ["--muted-foreground"],
+  "--avs-border": ["--border", "--input"],
+  "--avs-primary": ["--primary"],
+  "--avs-primary-foreground": ["--primary-foreground"],
+  "--avs-ring": ["--ring"],
+  "--avs-success": ["--success"],
+  "--avs-warning": ["--warning"],
+  "--avs-destructive": ["--destructive"],
+  "--avs-radius": ["--radius"]
+}
 
 export async function ensureSessionTemplate(workspace: string, uiPackageName: string = DEFAULT_UI_PACKAGE) {
   await mkdir(join(workspace, "src"), { recursive: true })
@@ -75,11 +91,16 @@ async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return
     throw error
   }
+  const original = contents
+  contents = migrateLegacyThemeDeclarations(contents)
   const theme = themeImport(uiPackageName)
   const scanned = maskCssComments(contents)
   const hasTailwind = TAILWIND_IMPORT_PATTERN.test(scanned)
   const hasTheme = themeImportPattern(uiPackageName).test(scanned)
-  if (hasTailwind && hasTheme) return
+  if (hasTailwind && hasTheme) {
+    if (contents !== original) await writeFile(path, contents, "utf8")
+    return
+  }
   if (!hasTailwind) {
     // No Tailwind entry yet: prepend it (plus the theme, unless the theme is already there)
     // as the leading statement(s), after any `@charset`/BOM.
@@ -90,6 +111,39 @@ async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_
     contents = insertThemeAfterTailwind(contents, theme)
   }
   await writeFile(path, contents, "utf8")
+}
+
+function migrateLegacyThemeDeclarations(contents: string): string {
+  let root: postcss.Root
+  try {
+    root = postcss.parse(contents)
+  } catch {
+    // Leave invalid CSS untouched so Vite reports the original syntax error.
+    return contents
+  }
+
+  let changed = false
+  root.walkRules((rule) => {
+    const existing = new Set(
+      rule.nodes.filter((node): node is postcss.Declaration => node.type === "decl").map((declaration) => declaration.prop)
+    )
+    for (const node of [...rule.nodes]) {
+      if (node.type !== "decl") continue
+      const targets = LEGACY_THEME_MIGRATIONS[node.prop]
+      if (!targets) continue
+      let anchor: postcss.ChildNode = node
+      for (const target of targets) {
+        if (existing.has(target)) continue
+        const value = target === "--radius" ? `var(${node.prop})` : `hsl(var(${node.prop}))`
+        const migrated = node.clone({ prop: target, value })
+        rule.insertAfter(anchor, migrated)
+        anchor = migrated
+        existing.add(target)
+        changed = true
+      }
+    }
+  })
+  return changed ? root.toString() : contents
 }
 
 /**

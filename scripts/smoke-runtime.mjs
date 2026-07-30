@@ -1142,12 +1142,16 @@ export default function App() {
   // direct var() usage, dark-mode selectors, and the agent's own utility override.
   await mkdir(join(root, "shadcn", "src"), { recursive: true })
   await writeFile(join(root, "shadcn", "src", "App.tsx"), `import { Button } from "@/components/ui/button"
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog"
 import { ThemeProvider } from "@/components/ui/theme"
 export default function App() {
   return (
     <main data-theme="dark" className="dark:bg-primary">
       <ThemeProvider preset="blue" theme={{ colors: { ring: "oklch(0.62 0.19 255)" } }}>
         <Button className="bg-red-500 text-foreground" style={{ borderColor: "var(--border)" }}>Ship</Button>
+        <Dialog defaultOpen>
+          <DialogContent><DialogTitle>Scoped theme</DialogTitle><DialogDescription>Portal smoke</DialogDescription></DialogContent>
+        </Dialog>
       </ThemeProvider>
     </main>
   )
@@ -1171,9 +1175,6 @@ export default function App() {
   if (!shadcnCss.includes("--background:") || !shadcnCss.includes("--card:") || !shadcnCss.includes("--chart-5:") || !shadcnCss.includes("--sidebar-ring:")) {
     throw new Error("Expected the complete standard shadcn token contract in served runtime CSS")
   }
-  if (!/--primary:\s*hsl\(var\(--avs-primary\)\)/.test(shadcnCss)) {
-    throw new Error("Expected legacy token overrides to remain bridged into standard semantic utilities")
-  }
   if (!shadcnCss.includes(".dark\\:bg-primary") || !shadcnCss.includes('[data-theme="dark"]')) {
     throw new Error("Expected class/data-theme dark-mode selectors in served runtime CSS")
   }
@@ -1188,7 +1189,10 @@ export default function App() {
   // (10) Legacy workspace (predates the theme import): a styles.css with only the Tailwind
   // entry must gain the show-ui theme import on warm so component tokens/utilities work.
   await mkdir(join(root, "shadcn-legacy", "src"), { recursive: true })
-  await writeFile(join(root, "shadcn-legacy", "src", "styles.css"), "@import \"tailwindcss\";\nbody { margin: 0; }\n")
+  await writeFile(join(root, "shadcn-legacy", "src", "styles.css"), `@import "tailwindcss";
+.brand { --avs-primary: 221, 83%, 53%; --avs-border: 214 32% 91%; }
+body { margin: 0; }
+`)
   await writeFile(join(root, "shadcn-legacy", "src", "App.tsx"), `export default function App() {
   return <main className="p-4">legacy</main>
 }
@@ -1200,6 +1204,9 @@ export default function App() {
   const shadcnLegacyStyles = await readFile(join(root, "shadcn-legacy", "src", "styles.css"), "utf8")
   if (!/@import\s+["']@avibe\/show-ui\/theme\.css["']/.test(shadcnLegacyStyles) || !shadcnLegacyStyles.includes("margin: 0")) {
     throw new Error(`Expected the legacy entry to gain the show-ui theme import while preserving prior rules, got ${JSON.stringify(shadcnLegacyStyles.slice(0, 90))}`)
+  }
+  if (!shadcnLegacyStyles.includes("--primary: hsl(var(--avs-primary))") || !shadcnLegacyStyles.includes("--input: hsl(var(--avs-border))")) {
+    throw new Error("Expected scoped legacy theme declarations to migrate to standard tokens in the same rule")
   }
   const shadcnLegacyCss = await fetch(`${runtime.url}/sessions/shadcn-legacy/app/src/styles.css?direct`).then((res) => res.text())
   if (!shadcnLegacyCss.includes(".bg-primary")) {
