@@ -129,6 +129,7 @@ function hasStylesheetMutation(records: MutationRecord[]): boolean {
   return records.some((record) => {
     if (record.type === "attributes") return containsStylesheet(record.target)
     if (record.type === "characterData") return Boolean(record.target.parentElement?.closest("style"))
+    if (record.target instanceof HTMLStyleElement) return true
     return [...record.addedNodes, ...record.removedNodes].some(containsStylesheet)
   })
 }
