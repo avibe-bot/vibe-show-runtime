@@ -142,6 +142,10 @@ export default function App() {
 }
 ```
 
+A `var(--brand-color)` theme value is treated as a complete color. Legacy HSL
+channel references remain supported when the custom property name ends in
+`-hsl` or `-channels`.
+
 ## Examples
 
 ```bash

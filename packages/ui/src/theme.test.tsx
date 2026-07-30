@@ -24,8 +24,10 @@ describe("ThemeProvider", () => {
 
   it("normalizes literal and variable-backed HSL channels for old workspaces", () => {
     const markup = renderToStaticMarkup(
-      <ThemeProvider theme={{ colors: { primary: "var(--brand-hsl)", ring: "199 89% 48%" } }}>content</ThemeProvider>
+      <ThemeProvider theme={{ colors: { foreground: "var(--brand-color)", primary: "var(--brand-hsl)", ring: "199 89% 48%" } }}>content</ThemeProvider>
     )
+    expect(markup).toContain("--foreground:var(--brand-color)")
+    expect(markup).not.toContain("--avs-foreground:var(--brand-color)")
     expect(markup).toContain("--primary:hsl(var(--brand-hsl))")
     expect(markup).toContain("--avs-primary:var(--brand-hsl)")
     expect(markup).toContain("--ring:hsl(199 89% 48%)")
@@ -63,5 +65,14 @@ describe("theme.css", () => {
     expect(css).toContain('@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *))')
     expect(css).toContain('.dark .avs-theme[data-theme-preset="zinc"],')
     expect(css).toContain('[data-theme="dark"] .avs-theme[data-theme-preset="blue"]')
+  })
+
+  it("bridges legacy CSS overrides into the standard semantic tokens", () => {
+    expect(css).toContain("--primary: hsl(var(--avs-primary));")
+    expect(css).toContain("--background: hsl(var(--avs-background));")
+    expect(css).toContain("--card: hsl(var(--avs-background));")
+    expect(css).toContain("--input: hsl(var(--avs-border));")
+    expect(css).toContain("--radius: var(--avs-radius);")
+    expect(css).not.toMatch(/--color-[^:]+:\s*[^;]*--avs-/)
   })
 })

@@ -1171,6 +1171,9 @@ export default function App() {
   if (!shadcnCss.includes("--background:") || !shadcnCss.includes("--card:") || !shadcnCss.includes("--chart-5:") || !shadcnCss.includes("--sidebar-ring:")) {
     throw new Error("Expected the complete standard shadcn token contract in served runtime CSS")
   }
+  if (!/--primary:\s*hsl\(var\(--avs-primary\)\)/.test(shadcnCss)) {
+    throw new Error("Expected legacy token overrides to remain bridged into standard semantic utilities")
+  }
   if (!shadcnCss.includes(".dark\\:bg-primary") || !shadcnCss.includes('[data-theme="dark"]')) {
     throw new Error("Expected class/data-theme dark-mode selectors in served runtime CSS")
   }
