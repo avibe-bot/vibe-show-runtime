@@ -39,7 +39,7 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
   const context = source.context === source.tokens ? computed : getComputedStyle(source.context)
   const style = {} as React.CSSProperties & Record<string, string>
   const values = PORTAL_THEME_TOKENS.map((token) => {
-    const value = computed.getPropertyValue(token).trim()
+    const value = computed.getPropertyValue(token)
     if (value) style[token] = value
     return value
   })
@@ -93,8 +93,9 @@ function sourceShadowRoots(source: PortalThemeSource): ShadowRoot[] {
   if (typeof ShadowRoot === "undefined") return []
   const roots = new Set<ShadowRoot>()
   for (const element of [source.tokens, source.context]) {
-    const root = element.getRootNode()
-    if (root instanceof ShadowRoot) roots.add(root)
+    for (let node: Node | null = element; node; node = composedParentNode(node)) {
+      if (node instanceof ShadowRoot) roots.add(node)
+    }
   }
   return Array.from(roots)
 }
