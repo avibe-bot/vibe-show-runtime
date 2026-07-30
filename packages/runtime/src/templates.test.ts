@@ -22,6 +22,7 @@ describe("legacy theme migration", () => {
 .modern { --avs-primary: 221 83% 53%; --primary: oklch(0.62 0.19 255); }
 .authored { --primary: hsl(var(--avs-primary)); }
 .prior { --avs-ring: 199 89% 48%; /* avibe-generated-theme --avs-ring --ring */ --ring: hsl(var(--avs-ring)); }
+.duplicate { --avs-primary: 221 83% 53%; --primary: oklch(0.62 0.19 255); /* avibe-generated-theme --avs-primary --primary */ --primary: hsl(var(--avs-primary)); --avibe-show-theme-owner-primary: --avs-primary; }
 `)
     await mkdir(join(workspace, "src", "features"), { recursive: true })
     await writeFile(join(workspace, "src", "theme.css"), `.tenant { --avs-ring: 199 89% 48%; }\n`)
@@ -35,6 +36,11 @@ describe("legacy theme migration", () => {
     expect(migrated).toMatch(/\.modern\s*\{[^}]*--primary:\s*oklch\(0\.62 0\.19 255\)/)
     expect(migrated).toMatch(/\.authored\s*\{[^}]*--primary:\s*hsl\(var\(--avs-primary\)\)/)
     expect(migrated).toMatch(/\.prior\s*\{[^}]*--avibe-show-theme-owner-ring:\s*--avs-ring/)
+    const duplicate = migrated.match(/\.duplicate\s*\{([^}]*)\}/)?.[1] ?? ""
+    expect(duplicate.match(/--primary:/g)).toHaveLength(1)
+    expect(duplicate).toContain("--primary: oklch(0.62 0.19 255)")
+    expect(duplicate).not.toContain("avibe-generated-theme")
+    expect(duplicate).not.toContain("--avibe-show-theme-owner-primary")
     const theme = await readFile(join(workspace, "src", "theme.css"), "utf8")
     const module = await readFile(join(workspace, "src", "features", "panel.module.css"), "utf8")
     expect(theme).toMatch(/\.tenant\s*\{[^}]*--ring:\s*hsl\(var\(--avs-ring\)\)/)

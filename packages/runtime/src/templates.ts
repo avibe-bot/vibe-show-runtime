@@ -159,8 +159,12 @@ function migrateLegacyThemeDeclarations(contents: string): string {
         && declaration.prop === target
         && declaration.value.trim() === generatedValue
         && targets?.includes(target)
-      if (!ownsDeclaration) {
+      const hasOtherTarget = rule.nodes.some((candidate) => candidate.type === "decl"
+        && candidate.prop === target
+        && candidate !== declaration)
+      if (!ownsDeclaration || hasOtherTarget) {
         if (ownsMarker) ownership.remove()
+        if (ownsDeclaration && hasOtherTarget) declaration.remove()
         node.remove()
         changed = true
         continue

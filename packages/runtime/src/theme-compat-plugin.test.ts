@@ -267,11 +267,12 @@ describe("dynamic legacy theme compatibility", () => {
     class TestElement {
       style = new TestStyle()
       isConnected = true
-      parentElement = null
+      parentElement: TestElement | null = null
       shadowRoot = null
       descendants: TestElement[] = []
       constructor(readonly standard = false) {}
       getAttribute() { return null }
+      getRootNode() { return null }
       matches() { return false }
       querySelectorAll(selector: string) { return selector === "*" ? this.descendants : [] }
       attachShadow() { throw new Error("unused") }
@@ -292,10 +293,18 @@ describe("dynamic legacy theme compatibility", () => {
     }
 
     const standard = new TestElement(true)
+    const inlineStandard = new TestElement()
+    const inherited = new TestElement()
+    inlineStandard.style.setProperty("--primary", "oklch(0.7 0.15 255)")
     const root = new TestElement()
-    root.descendants.push(standard)
+    standard.parentElement = root
+    inlineStandard.parentElement = root
+    inherited.parentElement = root
+    root.descendants.push(standard, inlineStandard, inherited)
     const opaque = new OpaqueStyleSheet()
     const frames: FrameRequestCallback[] = []
+    const listeners = new Map<string, EventListener>()
+    let legacyActive = false
     const context = {
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: OpaqueStyleSheet,
@@ -303,13 +312,15 @@ describe("dynamic legacy theme compatibility", () => {
       HTMLLinkElement: class {},
       MutationObserver: TestMutationObserver,
       ShadowRoot: TestShadowRoot,
-      addEventListener() {},
+      addEventListener(name: string, listener: EventListener) { listeners.set(name, listener) },
       getComputedStyle(element: TestElement) {
         return {
           getPropertyValue(name: string) {
-            if (name === "--avs-primary") return opaque.disabled ? "222 47% 11%" : "221 83% 53%"
+            if (name === "--avs-primary") return opaque.disabled || !legacyActive ? "222 47% 11%" : "221 83% 53%"
             if (name === "--primary") {
-              if (!opaque.disabled && element.standard) return "oklch(0.62 0.19 255)"
+              const inline = element.style.getPropertyValue(name)
+              if (inline) return inline
+              if (!opaque.disabled && legacyActive && element.standard) return "oklch(0.62 0.19 255)"
               return "hsl(222 47% 11%)"
             }
             return ""
@@ -324,7 +335,7 @@ describe("dynamic legacy theme compatibility", () => {
         adoptedStyleSheets: [],
         addEventListener() {},
         documentElement: root,
-        querySelectorAll() { return [standard] },
+        querySelectorAll() { return [standard, inlineStandard, inherited] },
         styleSheets: [opaque]
       }
     }
@@ -332,10 +343,18 @@ describe("dynamic legacy theme compatibility", () => {
     runInNewContext(loadClientCode(), context)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0)
+    expect(root.style.getPropertyValue("--primary")).toBe("")
+
+    legacyActive = true
+    listeners.get("resize")?.({} as Event)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(1)
 
     expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(root.style.getPropertyPriority("--primary")).toBe("important")
     expect(standard.style.getPropertyValue("--primary")).toBe("")
+    expect(inlineStandard.style.getPropertyValue("--primary")).toBe("oklch(0.7 0.15 255)")
+    expect(inherited.style.getPropertyValue("--primary")).toBe("")
     expect(opaque.disabled).toBe(false)
   })
 })

@@ -227,6 +227,13 @@ function installLegacyThemeCompatibilityWithMigrations(
     return samples
   }
 
+  function composedParentElement(element: Element): Element | null {
+    if (element.assignedSlot) return element.assignedSlot
+    if (element.parentElement) return element.parentElement
+    const root = element.getRootNode()
+    return typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot ? root.host : null
+  }
+
   // Cross-origin rules are opaque to CSSOM. Compare their computed effect with the
   // sheets disabled, then bridge only legacy deltas that did not also set a standard token.
   function syncOpaqueLegacyThemes() {
@@ -253,19 +260,24 @@ function installLegacyThemeCompatibilityWithMigrations(
       for (const { sheet, disabled } of activeSheets) sheet.disabled = disabled
     }
     const actual = sampleThemeValues(elements)
-    let legacyChanged = false
-
     mutatingOpaqueBridge = true
     try {
       for (const element of elements) {
         const before = baseline.get(element)
         const after = actual.get(element)
         if (!before || !after) continue
+        const parent = composedParentElement(element)
+        const parentBefore = parent ? baseline.get(parent) : undefined
+        const parentAfter = parent ? actual.get(parent) : undefined
         const owned = new Map<string, OwnedDeclaration>()
+        const inlineDeclarations = declaredProperties(element.style)
         for (const [source, targets] of Object.entries(migrations)) {
           if (before.get(source) === after.get(source)) continue
-          legacyChanged = true
+          if (parentBefore?.get(source) === before.get(source)
+            && parentAfter?.get(source) === after.get(source)) continue
           for (const target of targets) {
+            if (inlineDeclarations.has(target)) continue
+            if (parentBefore && parentBefore.get(target) !== before.get(target)) continue
             if (before.get(target) !== after.get(target)) continue
             const value = migratedValue(source, target)
             if (nativeSetProperty) nativeSetProperty.call(element.style, target, value, "important")
@@ -280,9 +292,6 @@ function installLegacyThemeCompatibilityWithMigrations(
       }
     } finally {
       mutatingOpaqueBridge = false
-    }
-    if (!legacyChanged) {
-      for (const { sheet } of activeSheets) opaqueStyleSheets.delete(sheet)
     }
   }
 
