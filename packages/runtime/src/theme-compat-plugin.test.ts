@@ -138,8 +138,13 @@ describe("dynamic legacy theme compatibility", () => {
     expect(dynamic.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
 
     const sheet = new TestStyleSheet()
+    const unrelatedRule = new TestStyle()
+    unrelatedRule.setProperty("opacity", "0.7")
+    unrelatedRule.reads = 0
+    sheet.cssRules.push({ style: unrelatedRule })
     sheet.nextStyle = rule
     sheet.insertRule(".brand {}")
     expect(rule.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
+    expect(unrelatedRule.reads).toBe(0)
   })
 })

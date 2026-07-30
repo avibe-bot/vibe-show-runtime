@@ -27,18 +27,29 @@ type PortalThemeSnapshot = {
   style: React.CSSProperties & Record<string, string>
 }
 
-function readPortalTheme(source: HTMLElement): PortalThemeSnapshot {
-  const computed = getComputedStyle(source)
+type PortalThemeSource = {
+  context: HTMLElement
+  tokens: HTMLElement
+}
+
+function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
+  const computed = getComputedStyle(source.tokens)
+  const context = source.context === source.tokens ? computed : getComputedStyle(source.context)
   const style = {} as React.CSSProperties & Record<string, string>
   const values = PORTAL_THEME_TOKENS.map((token) => {
     const value = computed.getPropertyValue(token).trim()
     if (value) style[token] = value
     return value
   })
-  if (computed.colorScheme) style.colorScheme = computed.colorScheme
-  if (computed.color) style.color = computed.color
-  const dark = Boolean(source.closest('.dark, [data-theme="dark"]'))
-  return { dark, signature: `${dark}|${computed.colorScheme}|${computed.color}|${values.join("|")}`, style }
+  if (context.colorScheme) style.colorScheme = context.colorScheme
+  if (context.color) style.color = context.color
+  if (context.fontSize) style.fontSize = context.fontSize
+  const dark = Boolean(source.tokens.closest('.dark, [data-theme="dark"]'))
+  return {
+    dark,
+    signature: `${dark}|${context.colorScheme}|${context.color}|${context.fontSize}|${values.join("|")}`,
+    style
+  }
 }
 
 function collectMediaQueries(rules: CSSRuleList, queries: Set<string>) {
@@ -74,23 +85,36 @@ function PortalThemeBridge({
   getSource,
   children
 }: {
-  getSource: () => HTMLElement
+  getSource: () => PortalThemeSource
   children: React.ReactNode
 }) {
   const [theme, setTheme] = React.useState<PortalThemeSnapshot>()
 
   React.useLayoutEffect(() => {
-    const source = getSource()
+    let source = getSource()
+    const ancestorObserver = new MutationObserver(() => update())
+    const observeSource = () => {
+      ancestorObserver.disconnect()
+      const observed = new Set<HTMLElement>()
+      for (const origin of [source.tokens, source.context]) {
+        for (let element: HTMLElement | null = origin; element; element = element.parentElement) {
+          if (observed.has(element)) continue
+          observed.add(element)
+          ancestorObserver.observe(element, { attributes: true, childList: true })
+        }
+      }
+    }
     const update = () => {
+      const nextSource = getSource()
+      if (nextSource.tokens !== source.tokens || nextSource.context !== source.context) {
+        source = nextSource
+        observeSource()
+      }
       const next = readPortalTheme(source)
       setTheme((current) => current?.signature === next.signature ? current : next)
     }
+    observeSource()
     update()
-
-    const ancestorObserver = new MutationObserver(update)
-    for (let element: HTMLElement | null = source; element; element = element.parentElement) {
-      ancestorObserver.observe(element, { attributes: true })
-    }
 
     let stopMediaChanges = subscribeToMediaChanges(update)
     const refreshStylesheets = () => {
@@ -163,7 +187,13 @@ export const DialogContent = React.forwardRef<
   const themeScope = React.useContext(ThemeScopeContext)
   const triggerScope = React.useContext(DialogScopeContext)
   const getSource = React.useCallback(
-    () => triggerScope?.current ?? themeScope?.current ?? document.documentElement,
+    (): PortalThemeSource => {
+      const fallback = themeScope?.current ?? document.documentElement
+      const trigger = triggerScope?.current
+      return trigger
+        ? { tokens: trigger, context: trigger.parentElement ?? fallback }
+        : { tokens: fallback, context: fallback }
+    },
     [themeScope, triggerScope]
   )
 
@@ -174,7 +204,7 @@ export const DialogContent = React.forwardRef<
         <DialogPrimitive.Content
           ref={ref}
           className={cn(
-            "fixed left-1/2 top-1/2 z-[41] w-[min(32.5rem,calc(100%-1.75rem))] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border bg-background p-[1.125rem] shadow-[0_24px_80px_rgb(17_24_39/22%)] outline-none animate-[avs-dialog-in_0.2s_cubic-bezier(0.2,0.8,0.2,1)_both] motion-reduce:animate-none max-[540px]:inset-x-0 max-[540px]:bottom-0 max-[540px]:top-auto max-[540px]:w-full max-[540px]:translate-x-0 max-[540px]:translate-y-0 max-[540px]:rounded-b-none max-[540px]:rounded-t-[1.125rem] max-[540px]:animate-[avs-dialog-in-sheet_0.24s_ease_both]",
+            "fixed left-1/2 top-1/2 z-[41] w-[min(32.5rem,calc(100%-1.75rem))] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border bg-background p-[1.125rem] text-foreground shadow-[0_24px_80px_rgb(17_24_39/22%)] outline-none animate-[avs-dialog-in_0.2s_cubic-bezier(0.2,0.8,0.2,1)_both] motion-reduce:animate-none max-[540px]:inset-x-0 max-[540px]:bottom-0 max-[540px]:top-auto max-[540px]:w-full max-[540px]:translate-x-0 max-[540px]:translate-y-0 max-[540px]:rounded-b-none max-[540px]:rounded-t-[1.125rem] max-[540px]:animate-[avs-dialog-in-sheet_0.24s_ease_both]",
             className
           )}
           {...props}

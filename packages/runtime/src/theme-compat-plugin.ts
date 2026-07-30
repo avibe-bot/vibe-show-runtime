@@ -175,7 +175,8 @@ if (typeof document !== "undefined" && !globalThis.__avibeShowThemeCompatInstall
     const insertRule = sheetPrototype.insertRule;
     sheetPrototype.insertRule = function(...args) {
       const index = insertRule.apply(this, args);
-      syncLegacyStyleSheet(this);
+      const rule = this.cssRules[index];
+      if (rule) syncLegacyRuleList([rule]);
       return index;
     };
     if (sheetPrototype.replaceSync) {

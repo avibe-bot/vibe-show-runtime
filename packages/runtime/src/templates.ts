@@ -129,6 +129,22 @@ function migrateLegacyThemeDeclarations(contents: string): string {
 
   let changed = false
   root.walkRules((rule) => {
+    const legacyProps = new Set(
+      rule.nodes
+        .filter((node): node is postcss.Declaration => node.type === "decl" && Boolean(LEGACY_THEME_MIGRATIONS[node.prop]))
+        .map((declaration) => declaration.prop)
+    )
+    for (const node of [...rule.nodes]) {
+      if (node.type !== "decl") continue
+      for (const [source, targets] of Object.entries(LEGACY_THEME_MIGRATIONS)) {
+        if (legacyProps.has(source) || !targets.includes(node.prop)) continue
+        const generatedValue = node.prop === "--radius" ? `var(${source})` : `hsl(var(${source}))`
+        if (node.value.trim() !== generatedValue) continue
+        node.remove()
+        changed = true
+        break
+      }
+    }
     const existing = new Set(
       rule.nodes.filter((node): node is postcss.Declaration => node.type === "decl").map((declaration) => declaration.prop)
     )

@@ -39,5 +39,15 @@ describe("legacy theme migration", () => {
     expect(await readFile(join(workspace, "src", "styles.css"), "utf8")).toBe(migrated)
     expect(await readFile(join(workspace, "src", "theme.css"), "utf8")).toBe(theme)
     expect(await readFile(join(workspace, "src", "features", "panel.module.css"), "utf8")).toBe(module)
+
+    await writeFile(
+      join(workspace, "src", "styles.css"),
+      migrated.replace("--avs-primary: 221, 83%, 53%;", "")
+    )
+    await ensureSessionTemplate(workspace)
+    const cleaned = await readFile(join(workspace, "src", "styles.css"), "utf8")
+    const brand = cleaned.match(/\.brand\s*\{([^}]*)\}/)?.[1] ?? ""
+    expect(brand).not.toContain("--primary:")
+    expect(brand).toContain("--input: hsl(var(--avs-border))")
   })
 })
