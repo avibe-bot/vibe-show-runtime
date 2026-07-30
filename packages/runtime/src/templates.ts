@@ -218,16 +218,13 @@ globalThis.__AVIBE_SHOW__ = {
 }
 
 function appTsx() {
-  return `import { ThemeProvider } from "@avibe/show-ui/theme"
-import { RouterView } from "./router"
+  return `import { RouterView } from "./router"
 
 export default function App() {
   return (
-    <ThemeProvider preset="zinc">
-      <main className="page">
-        <RouterView />
-      </main>
-    </ThemeProvider>
+    <main className="page bg-background text-foreground">
+      <RouterView />
+    </main>
   )
 }
 `
@@ -451,8 +448,8 @@ ${themeImport(uiPackageName)}
 body {
   margin: 0;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #f6f7f9;
-  color: hsl(var(--avs-foreground));
+  background: var(--background);
+  color: var(--foreground);
 }
 
 .page {

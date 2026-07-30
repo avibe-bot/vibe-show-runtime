@@ -70,7 +70,8 @@
   ],
   "scripts": {
     "build": "vite build && tsc -p tsconfig.json --emitDeclarationOnly && node -e \"require('fs').copyFileSync('src/theme.css','dist/theme.css')\"",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run src/theme.test.tsx"
   },
   "peerDependencies": {
     "react": ">=18",
