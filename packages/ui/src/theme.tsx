@@ -107,6 +107,45 @@ const legacyColorFanOut: Partial<Record<ThemeColor, readonly ThemeColor[]>> = {
   border: ["input"]
 }
 
+function composedParentNode(node: Node): Node | null {
+  if (node instanceof Element) {
+    if (node.parentElement) return node.parentElement
+    const root = node.getRootNode()
+    if (typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot) return root
+  }
+  return typeof ShadowRoot !== "undefined" && node instanceof ShadowRoot ? node.host : null
+}
+
+function useComposedDark(elementRef: React.RefObject<HTMLElement | null>): boolean {
+  const [dark, setDark] = React.useState(false)
+  React.useLayoutEffect(() => {
+    const current = elementRef.current
+    if (!current) return
+    const element: HTMLElement = current
+    const observer = new MutationObserver(update)
+    function update() {
+      observer.disconnect()
+      let nextDark = false
+      for (let node = composedParentNode(element); node; node = composedParentNode(node)) {
+        if (node instanceof Element) {
+          if (node.classList.contains("dark") || node.getAttribute("data-theme") === "dark") nextDark = true
+          observer.observe(node, {
+            attributes: true,
+            attributeFilter: ["class", "data-theme"],
+            childList: true
+          })
+        } else {
+          observer.observe(node, { childList: true })
+        }
+      }
+      setDark(nextDark)
+    }
+    update()
+    return () => observer.disconnect()
+  }, [elementRef])
+  return dark
+}
+
 function splitTopLevel(value: string, delimiter: string): string[] {
   const parts: string[] = []
   let depth = 0
@@ -193,9 +232,10 @@ export function ThemeProvider({
   children: React.ReactNode
 }) {
   const scopeRef = React.useRef<HTMLDivElement>(null)
+  const composedDark = useComposedDark(scopeRef)
   return (
     <ThemeScopeContext.Provider value={scopeRef}>
-      <div ref={scopeRef} className="avs-theme" data-theme-preset={preset} style={toStyle(theme)}>{children}</div>
+      <div ref={scopeRef} className={composedDark ? "avs-theme dark" : "avs-theme"} data-theme-preset={preset} style={toStyle(theme)}>{children}</div>
     </ThemeScopeContext.Provider>
   )
 }

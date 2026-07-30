@@ -110,6 +110,7 @@ describe("theme.css", () => {
   it("supports dark utilities on theme roots and dark-aware presets", () => {
     expect(css).toContain('@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *))')
     expect(css).toContain('.dark .avs-theme[data-theme-preset="zinc"],')
+    expect(css).toContain('.avs-theme.dark[data-theme-preset="zinc"],')
     expect(css).toContain('[data-theme="dark"] .avs-theme[data-theme-preset="blue"]')
   })
 

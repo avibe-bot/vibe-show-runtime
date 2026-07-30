@@ -30,7 +30,7 @@ type PortalThemeSnapshot = {
 }
 
 type PortalThemeSource = {
-  context: HTMLElement
+  context: Element
   tokens: HTMLElement
 }
 
@@ -107,6 +107,13 @@ function composedParentNode(node: Node): Node | null {
     if (typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot) return root
   }
   return typeof ShadowRoot !== "undefined" && node instanceof ShadowRoot ? node.host : null
+}
+
+function composedParentElement(node: Node): Element | null {
+  for (let parent = composedParentNode(node); parent; parent = composedParentNode(parent)) {
+    if (parent instanceof Element) return parent
+  }
+  return null
 }
 
 function hasComposedDarkTheme(element: Element): boolean {
@@ -207,7 +214,7 @@ function PortalThemeBridge({
     })
     observeStylesheetRoots = () => {
       stylesheetObserver.disconnect()
-      stylesheetObserver.observe(document.head, {
+      stylesheetObserver.observe(document.documentElement, {
         attributes: true,
         attributeFilter: ["href", "media", "disabled"],
         characterData: true,
@@ -339,7 +346,7 @@ export const DialogContent = React.forwardRef<
       const fallback = themeScope?.current ?? document.documentElement
       const trigger = activeDialogTrigger(triggerScope)
       return trigger
-        ? { tokens: trigger, context: trigger.parentElement ?? fallback }
+        ? { tokens: trigger, context: composedParentElement(trigger) ?? fallback }
         : { tokens: fallback, context: fallback }
     },
     [themeScope, triggerScope]

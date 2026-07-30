@@ -43,7 +43,8 @@ function installLegacyThemeCompatibilityWithMigrations(
   const migratedTargets = new Set(Object.values(migrations).flat())
   const ownedDeclarations = new WeakMap<CSSStyleDeclaration, Map<string, OwnedDeclaration>>()
   const observedAdoptedLists = new WeakSet<object>()
-  const patchedDisabledPrototypes = new WeakSet<object>()
+  const patchedAccessors = new WeakMap<object, Set<string>>()
+  const patchedMethods = new WeakMap<object, Set<string>>()
   const themeChangeEvent = "avibe:show-theme-change"
   const stylePrototype = globalThis.CSSStyleDeclaration?.prototype
   const nativeSetProperty = stylePrototype?.setProperty
@@ -222,23 +223,48 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
-  function patchStylesheetDisabled(input: object | undefined) {
+  function patchNotifyingAccessor(input: object | undefined, property: string) {
     if (!input) return
     let prototype: object | null = input
-    let descriptor = Object.getOwnPropertyDescriptor(prototype, "disabled")
+    let descriptor = Object.getOwnPropertyDescriptor(prototype, property)
     while (!descriptor && (prototype = Object.getPrototypeOf(prototype))) {
-      descriptor = Object.getOwnPropertyDescriptor(prototype, "disabled")
+      descriptor = Object.getOwnPropertyDescriptor(prototype, property)
     }
     if (!descriptor?.get || !descriptor.set) return
-    if (!prototype || patchedDisabledPrototypes.has(prototype)) return
-    patchedDisabledPrototypes.add(prototype)
-    Object.defineProperty(prototype, "disabled", {
+    if (!prototype) return
+    let properties = patchedAccessors.get(prototype)
+    if (properties?.has(property)) return
+    if (!properties) {
+      properties = new Set()
+      patchedAccessors.set(prototype, properties)
+    }
+    properties.add(property)
+    Object.defineProperty(prototype, property, {
       ...descriptor,
-      set(value: boolean) {
+      set(value: unknown) {
         descriptor.set?.call(this, value)
         notifyThemeChange()
       }
     })
+  }
+
+  function patchNotifyingMethod(input: object | undefined, property: string) {
+    if (!input) return
+    const prototype = input as Record<string, unknown>
+    const method = prototype[property]
+    if (typeof method !== "function") return
+    let properties = patchedMethods.get(input)
+    if (properties?.has(property)) return
+    if (!properties) {
+      properties = new Set()
+      patchedMethods.set(input, properties)
+    }
+    properties.add(property)
+    prototype[property] = function(this: unknown, ...args: unknown[]) {
+      const result = method.apply(this, args)
+      notifyThemeChange()
+      return result
+    }
   }
 
   function observeAdoptedStyleSheetList(list: CSSStyleSheet[]) {
@@ -319,8 +345,13 @@ function installLegacyThemeCompatibilityWithMigrations(
   patchRuleContainer(sheetPrototype)
   patchRuleContainer(globalThis.CSSGroupingRule?.prototype)
   patchKeyframesRule(globalThis.CSSKeyframesRule?.prototype)
-  patchStylesheetDisabled(sheetPrototype)
-  patchStylesheetDisabled(globalThis.StyleSheet?.prototype)
+  patchNotifyingAccessor(sheetPrototype, "disabled")
+  patchNotifyingAccessor(globalThis.StyleSheet?.prototype, "disabled")
+  patchNotifyingAccessor(globalThis.CSSStyleRule?.prototype, "selectorText")
+  patchNotifyingAccessor(globalThis.CSSKeyframeRule?.prototype, "keyText")
+  patchNotifyingAccessor(globalThis.MediaList?.prototype, "mediaText")
+  patchNotifyingMethod(globalThis.MediaList?.prototype, "appendMedium")
+  patchNotifyingMethod(globalThis.MediaList?.prototype, "deleteMedium")
   if (sheetPrototype?.replaceSync) {
     const replaceSync = sheetPrototype.replaceSync
     sheetPrototype.replaceSync = function(text: string) {

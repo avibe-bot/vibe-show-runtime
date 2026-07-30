@@ -113,6 +113,26 @@ describe("dynamic legacy theme compatibility", () => {
         this.cssRules.pop()
       }
     }
+    class TestStyleRule {
+      private selector = ".theme"
+
+      get selectorText() { return this.selector }
+      set selectorText(value: string) { this.selector = value }
+    }
+    class TestKeyframeRule {
+      private key = "to"
+
+      get keyText() { return this.key }
+      set keyText(value: string) { this.key = value }
+    }
+    class TestMediaList {
+      private text = "screen"
+
+      get mediaText() { return this.text }
+      set mediaText(value: string) { this.text = value }
+      appendMedium(value: string) { this.text += `, ${value}` }
+      deleteMedium(value: string) { this.text = this.text.replace(value, "") }
+    }
     class TestGroupingRule {
       cssRules: Array<Record<string, unknown>> = []
       nextStyle?: TestStyle
@@ -177,7 +197,9 @@ describe("dynamic legacy theme compatibility", () => {
     lateAdoptedSheet.cssRules.push({ style: lateAdoptedRule })
     const context = {
       CSSGroupingRule: TestGroupingRule,
+      CSSKeyframeRule: TestKeyframeRule,
       CSSKeyframesRule: TestKeyframesRule,
+      CSSStyleRule: TestStyleRule,
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: TestStyleSheet,
       Element: TestElement,
@@ -186,6 +208,7 @@ describe("dynamic legacy theme compatibility", () => {
       },
       HTMLLinkElement: class {},
       MutationObserver: TestMutationObserver,
+      MediaList: TestMediaList,
       ShadowRoot: TestShadowRoot,
       StyleSheet: TestStyleSheet,
       document: {
@@ -274,6 +297,21 @@ describe("dynamic legacy theme compatibility", () => {
     const beforeDisabled = events.length
     sheet.disabled = true
     expect(events.length).toBe(beforeDisabled + 1)
+
+    const styleRule = new TestStyleRule()
+    const beforeSelector = events.length
+    styleRule.selectorText = ".active-theme"
+    expect(events.length).toBe(beforeSelector + 1)
+
+    const keyframe = new TestKeyframeRule()
+    keyframe.keyText = "50%"
+    expect(events.length).toBe(beforeSelector + 2)
+
+    const media = new TestMediaList()
+    media.mediaText = "(prefers-color-scheme: dark)"
+    media.appendMedium("print")
+    media.deleteMedium("print")
+    expect(events.length).toBe(beforeSelector + 5)
 
     const grouping = new TestGroupingRule()
     const groupedRule = new TestStyle()
