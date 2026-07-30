@@ -58,7 +58,7 @@ function PortalThemeBridge({
 
     const ancestorObserver = new MutationObserver(update)
     for (let element = marker.parentElement; element; element = element.parentElement) {
-      ancestorObserver.observe(element, { attributes: true, attributeFilter: ["class", "data-theme", "style"] })
+      ancestorObserver.observe(element, { attributes: true })
     }
 
     const stylesheetObserver = new MutationObserver(update)

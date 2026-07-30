@@ -22,14 +22,21 @@ describe("ThemeProvider", () => {
     expect(markup).toContain("--card-foreground:#102030")
   })
 
-  it("normalizes literal and variable-backed HSL channels for old workspaces", () => {
+  it("normalizes literal, expression, and variable-backed HSL channels for old workspaces", () => {
     const markup = renderToStaticMarkup(
-      <ThemeProvider theme={{ colors: { foreground: "var(--brand-color)", primary: "var(--brand-hsl)", ring: "199 89% 48%", warning: "32, 95%, 44%" } }}>content</ThemeProvider>
+      <ThemeProvider theme={{ colors: {
+        foreground: "var(--brand-color)",
+        primary: "var(--brand-hsl)",
+        accent: "221deg calc(83%) var(--lightness) / calc(var(--alpha))",
+        ring: "199 89% 48%",
+        warning: "32, 95%, 44%"
+      } }}>content</ThemeProvider>
     )
     expect(markup).toContain("--foreground:var(--brand-color)")
     expect(markup).not.toContain("--avs-foreground:var(--brand-color)")
     expect(markup).toContain("--primary:hsl(var(--brand-hsl))")
     expect(markup).toContain("--avs-primary:var(--brand-hsl)")
+    expect(markup).toContain("--accent:hsl(221deg calc(83%) var(--lightness) / calc(var(--alpha)))")
     expect(markup).toContain("--ring:hsl(199 89% 48%)")
     expect(markup).toContain("--avs-ring:199 89% 48%")
     expect(markup).toContain("--warning:hsl(32, 95%, 44%)")
