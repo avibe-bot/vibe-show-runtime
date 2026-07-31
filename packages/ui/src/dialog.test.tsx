@@ -28,5 +28,7 @@ describe("Dialog", () => {
     expect(source).toContain("if (controlledOpen.current === false) clearOpeningTheme()")
     expect(source).toContain('["color-scheme", computed.colorScheme]')
     expect(source).toContain('node.classList.contains("avs-dark")')
+    expect(source).toContain("window.addEventListener(SHOW_THEME_CHANGE_EVENT, schedule)")
+    expect(source.match(/requestAnimationFrame\(update\)/g)).toHaveLength(1)
   })
 })

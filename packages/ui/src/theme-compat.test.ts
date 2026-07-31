@@ -10,6 +10,7 @@ describe("legacy theme compatibility", () => {
     expect(LEGACY_THEME_MIGRATIONS["--avs-primary"]).toEqual(["--primary"])
     expect(LEGACY_THEME_MIGRATIONS["--avs-background"]).toEqual(["--background", "--card", "--popover"])
     expect(themeCompatibilityClientScript()).toContain("__avibeShowThemeCompatInstalled")
+    expect(themeCompatibilityClientScript()).toContain("avibe-show-theme-change")
   })
 
   it("installs for direct component and ThemeProvider consumers", () => {

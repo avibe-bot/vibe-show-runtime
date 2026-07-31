@@ -14,6 +14,7 @@ export const LEGACY_THEME_MIGRATIONS: Record<string, readonly string[]> = {
 }
 
 export const LEGACY_THEME_OWNERSHIP_PREFIX = "--avibe-show-theme-owner-"
+export const SHOW_THEME_CHANGE_EVENT = "avibe-show-theme-change"
 
 export function legacyThemeOwnershipMarker(target: string): string {
   return `${LEGACY_THEME_OWNERSHIP_PREFIX}${target.slice(2)}`
@@ -42,7 +43,8 @@ type RuleContainer = {
 
 function installLegacyThemeCompatibilityWithMigrations(
   migrations: Record<string, readonly string[]>,
-  ownershipPrefix: string
+  ownershipPrefix: string,
+  themeChangeEvent: string
 ) {
   if (typeof document === "undefined") return
 
@@ -74,6 +76,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   let opaqueRelationalScanFrame = 0
   let opaqueFullScanPending = false
   let opaqueMutationCleanupPending = false
+  let themeChangePending = false
   let adoptedListPollTimer = 0
   let mutatingOpaqueSheetState = false
   const opaqueScanRoots = new Set<Node>()
@@ -198,7 +201,19 @@ function installLegacyThemeCompatibilityWithMigrations(
     return requestFrame(callback)
   }
 
+  function notifyThemeChange() {
+    if (themeChangePending) return
+    themeChangePending = true
+    const enqueue = globalThis.queueMicrotask
+      ?? ((callback: VoidFunction) => void Promise.resolve().then(callback))
+    enqueue(() => {
+      themeChangePending = false
+      if (typeof Event !== "undefined") globalThis.dispatchEvent?.(new Event(themeChangeEvent))
+    })
+  }
+
   function scheduleOpaqueLegacyScan(root?: Node) {
+    notifyThemeChange()
     if (!opaqueStyleSheets.size) return
     if (root && root !== document) {
       opaqueScanRoots.add(root)
@@ -1022,8 +1037,14 @@ function installLegacyThemeCompatibilityWithMigrations(
         set(value: string | null) {
           const wasOwned = ownedDeclarations.has(this)
           const before = cssText.get?.call(this) ?? ""
+          const carriesOpaqueBridge = typeof value === "string"
+            && value.length > before.length
+            && value.startsWith(before)
           cssText.set?.call(this, value)
-          if (!mutatingOpaqueBridge) removeOpaqueOwnedFromStyle(this)
+          if (!mutatingOpaqueBridge) {
+            if (carriesOpaqueBridge) removeOpaqueOwnedFromStyle(this)
+            else relinquishOpaqueOwnership(this)
+          }
           const current = cssText.get?.call(this) ?? ""
           if (wasOwned || current.includes("--avs-")) syncLegacyDeclaration(this, current.includes("--avs-"))
           if (!mutatingOpaqueBridge && before !== current) scheduleAllOpaqueLegacyScans()
@@ -1089,6 +1110,7 @@ function installLegacyThemeCompatibilityWithMigrations(
           ? ownerRoot as Document | ShadowRoot
           : undefined
       )
+      scheduleAllOpaqueLegacyScans()
     }
   }
   const observer = new MutationObserver((records) => {
@@ -1241,11 +1263,15 @@ function installLegacyThemeCompatibilityWithMigrations(
 }
 
 export function installLegacyThemeCompatibility() {
-  installLegacyThemeCompatibilityWithMigrations(LEGACY_THEME_MIGRATIONS, LEGACY_THEME_OWNERSHIP_PREFIX)
+  installLegacyThemeCompatibilityWithMigrations(
+    LEGACY_THEME_MIGRATIONS,
+    LEGACY_THEME_OWNERSHIP_PREFIX,
+    SHOW_THEME_CHANGE_EVENT
+  )
 }
 
 export function themeCompatibilityClientScript(): string {
-  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)},${JSON.stringify(LEGACY_THEME_OWNERSHIP_PREFIX)});`
+  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)},${JSON.stringify(LEGACY_THEME_OWNERSHIP_PREFIX)},${JSON.stringify(SHOW_THEME_CHANGE_EVENT)});`
 }
 
 installLegacyThemeCompatibility()

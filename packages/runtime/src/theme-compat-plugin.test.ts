@@ -399,6 +399,7 @@ describe("dynamic legacy theme compatibility", () => {
     const eventCard = new TestElement()
     const eventTarget = new TestElement()
     const eventPanel = new TestElement()
+    const authoredPanel = new TestElement()
     const unrelatedEventSibling = new TestElement()
     const closedHost = new TestElement()
     const closedElement = new TestElement()
@@ -421,7 +422,8 @@ describe("dynamic legacy theme compatibility", () => {
     eventCard.parentElement = root
     eventTarget.parentElement = eventCard
     eventPanel.parentElement = eventCard
-    eventCard.descendants.push(eventTarget, eventPanel)
+    authoredPanel.parentElement = eventCard
+    eventCard.descendants.push(eventTarget, eventPanel, authoredPanel)
     unrelatedEventSibling.parentElement = root
     closedHost.parentElement = root
     closedHost.nextShadowRoot = closedRoot
@@ -458,7 +460,9 @@ describe("dynamic legacy theme compatibility", () => {
       const inClosedRoot = element.rootNode === closedRoot
       const inInsertedClosedRoot = element.rootNode === insertedClosedRoot
       if (name === "--avs-primary") {
-        if (element === eventPanel && eventPanelActive && !opaque.disabled) return "262 83% 58%"
+        if ((element === eventPanel || element === authoredPanel) && eventPanelActive && !opaque.disabled) {
+          return "262 83% 58%"
+        }
         return inClosedRoot || opaque.disabled || !legacyActive ? "222 47% 11%" : "221 83% 53%"
       }
       if (name === "--avs-warning") {
@@ -587,17 +591,20 @@ describe("dynamic legacy theme compatibility", () => {
     expect(frames).toHaveLength(2)
     frames.shift()?.(0.125)
     expect(eventPanel.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    expect(authoredPanel.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(computedReads.get(unrelatedEventSibling)).toBeUndefined()
     frames.shift()?.(0.15)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.175)
     expect(computedReads.get(unrelatedEventSibling)).toBeGreaterThan(0)
 
+    authoredPanel.style.cssText = authoredPanel.style.cssText
     eventPanelActive = false
     listeners.get("reset")?.({ target: eventCard } as unknown as Event)
     expect(frames).toHaveLength(2)
     frames.shift()?.(0.18)
     expect(eventPanel.style.getPropertyValue("--primary")).toBe("")
+    expect(authoredPanel.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     frames.shift()?.(0.185)
     frames.shift()?.(0.19)
 

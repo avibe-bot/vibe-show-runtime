@@ -3,6 +3,7 @@ import * as DialogPrimitive from "@radix-ui/react-dialog"
 import { useComposedRefs } from "@radix-ui/react-compose-refs"
 import { X } from "lucide-react"
 import { ThemeScopeContext } from "./theme-context"
+import { SHOW_THEME_CHANGE_EVENT } from "./theme-compat"
 import { cn } from "./utils"
 
 // Radix portals escape scoped inheritance; copy the source theme onto a contents-only bridge.
@@ -106,15 +107,22 @@ function PortalThemeBridge({
     let frame = 0
     let signature = ""
     const update = () => {
+      frame = 0
       const next = getTheme()
       if (next.signature !== signature) {
         signature = next.signature
         setTheme(next)
       }
-      frame = window.requestAnimationFrame(update)
+    }
+    const schedule = () => {
+      if (!frame) frame = window.requestAnimationFrame(update)
     }
     update()
-    return () => window.cancelAnimationFrame(frame)
+    window.addEventListener(SHOW_THEME_CHANGE_EVENT, schedule)
+    return () => {
+      window.removeEventListener(SHOW_THEME_CHANGE_EVENT, schedule)
+      if (frame) window.cancelAnimationFrame(frame)
+    }
   }, [getTheme])
 
   React.useLayoutEffect(() => {
