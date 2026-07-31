@@ -90,10 +90,10 @@ function hasComposedDarkTheme(element: Element): boolean {
 }
 
 function PortalThemeBridge({
-  getSource,
+  getTheme,
   children
 }: {
-  getSource: () => PortalThemeSource
+  getTheme: () => PortalThemeSnapshot
   children: React.ReactNode
 }) {
   const [theme, setTheme] = React.useState<PortalThemeSnapshot>()
@@ -104,7 +104,7 @@ function PortalThemeBridge({
     let frame = 0
     let signature = ""
     const update = () => {
-      const next = readPortalTheme(getSource())
+      const next = getTheme()
       if (next.signature !== signature) {
         signature = next.signature
         setTheme(next)
@@ -113,7 +113,7 @@ function PortalThemeBridge({
     }
     update()
     return () => window.cancelAnimationFrame(frame)
-  }, [getSource])
+  }, [getTheme])
 
   React.useLayoutEffect(() => {
     const bridge = bridgeRef.current
@@ -140,6 +140,7 @@ function PortalThemeBridge({
 
 type DialogScope = {
   activeTrigger: React.RefObject<HTMLElement | null>
+  openingTheme: React.RefObject<PortalThemeSnapshot | null>
   triggers: Set<HTMLElement>
 }
 
@@ -157,13 +158,29 @@ function activeDialogTrigger(scope: DialogScope | null): HTMLElement | null {
   return only
 }
 
-export function Dialog(props: React.ComponentPropsWithoutRef<typeof DialogPrimitive.Root>) {
+export function Dialog({
+  onOpenChange,
+  open,
+  ...props
+}: React.ComponentPropsWithoutRef<typeof DialogPrimitive.Root>) {
   const activeTrigger = React.useRef<HTMLElement>(null)
+  const openingTheme = React.useRef<PortalThemeSnapshot>(null)
   const triggers = React.useRef(new Set<HTMLElement>()).current
-  const scope = React.useMemo(() => ({ activeTrigger, triggers }), [triggers])
+  const scope = React.useMemo(() => ({ activeTrigger, openingTheme, triggers }), [triggers])
+  const clearOpeningTheme = React.useCallback(() => {
+    activeTrigger.current = null
+    openingTheme.current = null
+  }, [])
+  React.useEffect(() => {
+    if (open === false) clearOpeningTheme()
+  }, [clearOpeningTheme, open])
+  const handleOpenChange = React.useCallback((nextOpen: boolean) => {
+    if (!nextOpen) clearOpeningTheme()
+    onOpenChange?.(nextOpen)
+  }, [clearOpeningTheme, onOpenChange])
   return (
     <DialogScopeContext.Provider value={scope}>
-      <DialogPrimitive.Root {...props} />
+      <DialogPrimitive.Root open={open} onOpenChange={handleOpenChange} {...props} />
     </DialogScopeContext.Provider>
   )
 }
@@ -185,7 +202,15 @@ export const DialogTrigger = React.forwardRef<
   const ref = useComposedRefs(forwardedRef, setLocalRef)
   const handleClick: NonNullable<React.ComponentPropsWithoutRef<typeof DialogPrimitive.Trigger>["onClick"]> = (event) => {
     onClick?.(event)
-    if (!event.defaultPrevented && localRef.current && scope) scope.activeTrigger.current = localRef.current
+    if (!event.defaultPrevented && localRef.current && scope) {
+      const trigger = localRef.current
+      const fallback = document.documentElement
+      scope.activeTrigger.current = trigger
+      scope.openingTheme.current = readPortalTheme({
+        tokens: trigger,
+        context: composedParentElement(trigger) ?? fallback
+      })
+    }
   }
   return <DialogPrimitive.Trigger ref={ref} onClick={handleClick} {...props} />
 })
@@ -200,20 +225,26 @@ export const DialogContent = React.forwardRef<
 >(({ className, children, ...props }, ref) => {
   const themeScope = React.useContext(ThemeScopeContext)
   const triggerScope = React.useContext(DialogScopeContext)
-  const getSource = React.useCallback(
-    (): PortalThemeSource => {
+  const getTheme = React.useCallback(
+    (): PortalThemeSnapshot => {
       const fallback = themeScope?.current ?? document.documentElement
+      const active = triggerScope?.activeTrigger.current
+      const opening = triggerScope?.openingTheme.current
+      if (!active?.isConnected && opening) return opening
       const trigger = activeDialogTrigger(triggerScope)
-      return trigger
+      const source = trigger
         ? { tokens: trigger, context: composedParentElement(trigger) ?? fallback }
         : { tokens: fallback, context: fallback }
+      const theme = readPortalTheme(source)
+      if (trigger && triggerScope) triggerScope.openingTheme.current = theme
+      return theme
     },
     [themeScope, triggerScope]
   )
 
   return (
     <DialogPortal>
-      <PortalThemeBridge getSource={getSource}>
+      <PortalThemeBridge getTheme={getTheme}>
         <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-[rgb(17_24_39/45%)] animate-[avs-fade-in_0.16s_ease_both] motion-reduce:animate-none" />
         <DialogPrimitive.Content
           ref={ref}

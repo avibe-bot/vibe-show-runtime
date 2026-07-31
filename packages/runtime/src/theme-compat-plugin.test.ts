@@ -34,6 +34,7 @@ class TestStyle {
   }
 
   setProperty(name: string, value: string, priority = "") {
+    if (priority && priority.toLowerCase() !== "important") return
     this.declarations.set(name, { value, priority })
   }
 
@@ -274,27 +275,43 @@ describe("dynamic legacy theme compatibility", () => {
   })
 
   it("bridges opaque stylesheet legacy overrides without replacing authored standard tokens", async () => {
-    class TestElement {
+    class TestNode {
+      parentElement: TestElement | null = null
+      get parentNode() { return this.parentElement }
+    }
+    class TestElement extends TestNode {
       style = new TestStyle()
       isConnected = true
-      parentElement: TestElement | null = null
-      shadowRoot = null
+      shadowRoot: TestShadowRoot | null = null
+      nextShadowRoot: TestShadowRoot | null = null
+      rootNode: TestShadowRoot | null = null
       descendants: TestElement[] = []
-      constructor(readonly standard = false) {}
-      get parentNode() { return this.parentElement }
+      constructor(readonly standard = false) { super() }
       getAttribute() { return null }
-      getRootNode() { return null }
+      getRootNode() { return this.rootNode }
       matches() { return false }
-      querySelectorAll(selector: string) { return selector === "*" ? this.descendants : [] }
-      attachShadow() { throw new Error("unused") }
+      querySelectorAll(selector: string): TestElement[] {
+        if (selector !== "*") return []
+        return this.descendants.flatMap((element) => [element, ...element.querySelectorAll("*")])
+      }
+      attachShadow(init: ShadowRootInit) {
+        const root = this.nextShadowRoot ?? new TestShadowRoot()
+        root.host = this
+        if (init.mode === "open") this.shadowRoot = root
+        return root
+      }
     }
-    class TestShadowRoot {
-      adoptedStyleSheets = []
+    class TestShadowRoot extends TestNode {
+      adoptedStyleSheets: OpaqueStyleSheet[] = []
+      host!: TestElement
+      descendants: TestElement[] = []
       addEventListener() {}
-      querySelectorAll() { return [] }
+      querySelectorAll() { return this.descendants }
     }
     class OpaqueStyleSheet {
-      disabled = false
+      private disabledValue = false
+      get disabled() { return this.disabledValue }
+      set disabled(value: boolean) { this.disabledValue = value }
       get cssRules(): never {
         throw Object.assign(new Error("opaque"), { name: "SecurityError" })
       }
@@ -309,17 +326,36 @@ describe("dynamic legacy theme compatibility", () => {
     const inlineStandard = new TestElement()
     const inherited = new TestElement()
     const external = new TestElement()
+    const ancestor = new TestElement()
+    const ancestorMiddle = new TestElement()
+    const ancestorChild = new TestElement()
+    const closedHost = new TestElement()
+    const closedElement = new TestElement()
+    const closedRoot = new TestShadowRoot()
+    const closedOpaque = new OpaqueStyleSheet()
     inlineStandard.style.setProperty("--primary", "oklch(0.7 0.15 255)")
     const root = new TestElement()
     standard.parentElement = root
     inlineStandard.parentElement = root
     inherited.parentElement = root
-    root.descendants.push(standard, inlineStandard, inherited)
+    ancestor.parentElement = root
+    ancestorMiddle.parentElement = ancestor
+    ancestorChild.parentElement = ancestorMiddle
+    ancestor.descendants.push(ancestorMiddle)
+    ancestorMiddle.descendants.push(ancestorChild)
+    closedHost.parentElement = root
+    closedHost.nextShadowRoot = closedRoot
+    closedRoot.host = closedHost
+    closedRoot.adoptedStyleSheets.push(closedOpaque)
+    closedRoot.descendants.push(closedElement)
+    closedElement.rootNode = closedRoot
+    root.descendants.push(standard, inlineStandard, inherited, ancestor, closedHost)
     const opaque = new OpaqueStyleSheet()
     const frames: FrameRequestCallback[] = []
     const listeners = new Map<string, EventListener>()
     const mediaListeners = new Map<string, EventListener>()
     let legacyActive = false
+    let ancestorActive = false
     const context = {
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: OpaqueStyleSheet,
@@ -327,15 +363,24 @@ describe("dynamic legacy theme compatibility", () => {
       HTMLLinkElement: class {},
       HTMLStyleElement: class {},
       MutationObserver: TestMutationObserver,
-      Node: TestElement,
+      Node: TestNode,
       ShadowRoot: TestShadowRoot,
       addEventListener(name: string, listener: EventListener) { listeners.set(name, listener) },
       getComputedStyle(element: TestElement) {
         return {
           getPropertyValue(name: string) {
-            if (name === "--avs-primary") return opaque.disabled || !legacyActive ? "222 47% 11%" : "221 83% 53%"
+            const inClosedRoot = element.rootNode === closedRoot
+            if (name === "--avs-primary") {
+              return inClosedRoot || opaque.disabled || !legacyActive ? "222 47% 11%" : "221 83% 53%"
+            }
             if (name === "--avs-warning") {
-              return !opaque.disabled && legacyActive && element.style.cssText ? "32 95% 44%" : ""
+              return !inClosedRoot && !opaque.disabled && legacyActive && element.style.cssText ? "32 95% 44%" : ""
+            }
+            if (name === "--avs-ring") {
+              return !opaque.disabled && ancestorActive && element === ancestor ? "199 89% 48%" : ""
+            }
+            if (name === "--avs-success") {
+              return inClosedRoot && !closedOpaque.disabled ? "142 71% 45%" : ""
             }
             if (name === "--primary") {
               const inline = element.style.getPropertyValue(name)
@@ -347,6 +392,12 @@ describe("dynamic legacy theme compatibility", () => {
               return "hsl(222 47% 11%)"
             }
             if (name === "--warning") return element.style.getPropertyValue(name)
+            if (name === "--ring" || name === "--success") {
+              const inline = element.style.getPropertyValue(name)
+              if (!inline) return ""
+              const sourceDisabled = name === "--success" ? closedOpaque.disabled : opaque.disabled
+              return sourceDisabled ? "" : inline.replace(`var(--avs-${name.slice(2)})`, name === "--ring" ? "199 89% 48%" : "142 71% 45%")
+            }
             return ""
           }
         }
@@ -366,15 +417,20 @@ describe("dynamic legacy theme compatibility", () => {
         adoptedStyleSheets: [],
         addEventListener() {},
         documentElement: root,
-        querySelectorAll() { return [standard, inlineStandard, inherited] },
+        querySelectorAll() { return root.querySelectorAll("*") },
         styleSheets: [opaque]
       }
     }
 
     runInNewContext(loadClientCode(), context)
     expect(frames).toHaveLength(1)
+    const returnedClosedRoot = closedHost.attachShadow({ mode: "closed" })
+    expect(returnedClosedRoot).toBe(closedRoot)
+    expect(closedHost.shadowRoot).toBe(null)
+    expect(frames).toHaveLength(1)
     frames.shift()?.(0)
     expect(root.style.getPropertyValue("--primary")).toBe("")
+    expect(closedElement.style.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
 
     legacyActive = true
     expect(mediaListeners.has("(prefers-reduced-motion: reduce)")).toBe(true)
@@ -398,9 +454,16 @@ describe("dynamic legacy theme compatibility", () => {
     frames.shift()?.(2)
     expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
 
+    await Promise.resolve()
+    ancestorActive = true
+    mutationCallbacks[1]?.([{ type: "attributes", attributeName: "class", target: ancestorChild }] as unknown as MutationRecord[], {} as MutationObserver)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(3)
+    expect(ancestor.style.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
+
     root.isConnected = false
     listeners.get("focus")?.({ target: external } as unknown as Event)
-    frames.shift()?.(3)
+    frames.shift()?.(4)
     expect(root.style.getPropertyValue("--primary")).toBe("")
     root.isConnected = true
 
@@ -408,13 +471,15 @@ describe("dynamic legacy theme compatibility", () => {
     expect(root.style.getPropertyValue("--primary")).toBe("")
     expect(root.style.getPropertyValue("color")).toBe("red")
     listeners.get("resize")?.({} as Event)
-    frames.shift()?.(4)
+    frames.shift()?.(5)
     expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(root.style.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
 
+    root.style.setProperty("--primary", "oklch(0.62 0.19 255)", "invalid")
+    expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     opaque.disabled = true
-    listeners.get("resize")?.({} as Event)
-    frames.shift()?.(5)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(6)
     expect(root.style.getPropertyValue("--primary")).toBe("")
     expect(opaque.disabled).toBe(true)
   })

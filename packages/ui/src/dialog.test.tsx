@@ -22,5 +22,7 @@ describe("Dialog", () => {
     const source = readFileSync(new URL("./dialog.tsx", import.meta.url), "utf8")
     expect(source.indexOf("node.assignedSlot")).toBeLessThan(source.indexOf("node.parentElement"))
     expect(source).toContain('bridge.style.setProperty(property, value, "important")')
+    expect(source).toContain("scope.openingTheme.current = readPortalTheme")
+    expect(source).toContain("if (!active?.isConnected && opening) return opening")
   })
 })
