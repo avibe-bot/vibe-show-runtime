@@ -69,6 +69,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   const opaqueStyleSheets = new Set<CSSStyleSheet>()
   const opaqueStyleSheetScopes = new Map<CSSStyleSheet, Document | ShadowRoot | undefined>()
   const styleSheetScopes = new WeakMap<CSSStyleSheet, Document | ShadowRoot | undefined>()
+  const ruleStyleDeclarations = new WeakSet<CSSStyleDeclaration>()
   const stylePropertyMapOwners = new WeakMap<object, CSSStyleDeclaration>()
   const adoptedListProxies = new WeakMap<object, CSSStyleSheet[]>()
   const observedAdoptedLists = new Map<CSSStyleSheet[], {
@@ -193,6 +194,7 @@ function installLegacyThemeCompatibilityWithMigrations(
         cssRules?: CSSRuleList
         styleSheet?: CSSStyleSheet | null
       }
+      if (candidate.style) ruleStyleDeclarations.add(candidate.style)
       if (candidate.style && candidate.styleMap) stylePropertyMapOwners.set(candidate.styleMap, candidate.style)
       if (candidate.style && (ownedDeclarations.has(candidate.style) || candidate.style.cssText.includes("--avs-"))) {
         syncLegacyDeclaration(candidate.style, true)
@@ -1047,6 +1049,25 @@ function installLegacyThemeCompatibilityWithMigrations(
     })
   }
 
+  function patchSelectValue(input: object | undefined) {
+    if (!input) return
+    const descriptor = Object.getOwnPropertyDescriptor(input, "value")
+    if (!descriptor?.get || !descriptor.set) return
+    Object.defineProperty(input, "value", {
+      ...descriptor,
+      set(value: string) {
+        const select = this as HTMLSelectElement
+        const beforeValue = descriptor.get?.call(select)
+        const beforeIndex = select.selectedIndex
+        descriptor.set?.call(select, value)
+        if (!Object.is(beforeValue, descriptor.get?.call(select))
+          || beforeIndex !== select.selectedIndex) {
+          scheduleAllOpaqueLegacyScans()
+        }
+      }
+    })
+  }
+
   function patchValidityMethod(input: object | undefined) {
     if (!input) return
     const prototype = input as { setCustomValidity?: (message: string) => void }
@@ -1189,10 +1210,17 @@ function installLegacyThemeCompatibilityWithMigrations(
 
   function observeAdoptedStyleSheetList(list: CSSStyleSheet[], scope?: Document | ShadowRoot) {
     const existing = adoptedListProxies.get(list)
-    if (existing) return existing
+    if (existing) {
+      if (!observedAdoptedLists.has(list)) {
+        observedAdoptedLists.set(list, { scope, snapshot: Array.from(list) })
+        scheduleAdoptedListPoll()
+      }
+      return existing
+    }
     observedAdoptedLists.set(list, { scope, snapshot: Array.from(list) })
     scheduleAdoptedListPoll()
     const syncList = () => {
+      if (!observedAdoptedLists.has(list)) return
       syncObservedAdoptedList(list, scope)
     }
     const methods = ["copyWithin", "fill", "pop", "push", "reverse", "shift", "sort", "splice", "unshift"] as const
@@ -1250,9 +1278,11 @@ function installLegacyThemeCompatibilityWithMigrations(
         return observeAdoptedStyleSheetList(list, scope)
       },
       set(value: CSSStyleSheet[]) {
+        const previousList = descriptor.get?.call(this)
         descriptor.set?.call(this, value)
         const list = descriptor.get?.call(this) ?? []
         const scope = this instanceof Document || this instanceof ShadowRoot ? this : undefined
+        if (previousList && previousList !== list) observedAdoptedLists.delete(previousList)
         observeAdoptedStyleSheetList(list, scope)
         syncObservedAdoptedList(list, scope)
       }
@@ -1323,7 +1353,10 @@ function installLegacyThemeCompatibilityWithMigrations(
       const propertyName = String(name)
       const tracksOpaqueTarget = !mutatingOpaqueBridge && migratedTargets.has(propertyName)
       const tracksPortalTheme = !mutatingOpaqueBridge && portalThemePropertySet.has(propertyName)
-      const tracksChange = tracksOpaqueTarget || tracksPortalTheme
+      const tracksRuleStyle = !mutatingOpaqueBridge
+        && opaqueStyleSheets.size > 0
+        && ruleStyleDeclarations.has(this)
+      const tracksChange = tracksOpaqueTarget || tracksPortalTheme || tracksRuleStyle
       const ownedOpaqueTarget = tracksOpaqueTarget
         && Boolean(opaqueOwnedDeclarations.get(this)?.declarations.has(propertyName))
       const declaredBefore = tracksChange ? declaredProperties(this).has(propertyName) : false
@@ -1342,6 +1375,8 @@ function installLegacyThemeCompatibilityWithMigrations(
       if (tracksOpaqueTarget && acceptedPriority && (changed || ownedOpaqueTarget)) {
         relinquishOpaqueOwnership(this, propertyName)
         scheduleAllOpaqueLegacyScans()
+      } else if (changed && tracksRuleStyle) {
+        scheduleAllOpaqueLegacyScans()
       } else if (changed) {
         notifyThemeChange()
       }
@@ -1353,7 +1388,10 @@ function installLegacyThemeCompatibilityWithMigrations(
       const propertyName = String(name)
       const tracksOpaqueTarget = !mutatingOpaqueBridge && migratedTargets.has(propertyName)
       const tracksPortalTheme = !mutatingOpaqueBridge && portalThemePropertySet.has(propertyName)
-      const tracksChange = tracksOpaqueTarget || tracksPortalTheme
+      const tracksRuleStyle = !mutatingOpaqueBridge
+        && opaqueStyleSheets.size > 0
+        && ruleStyleDeclarations.has(this)
+      const tracksChange = tracksOpaqueTarget || tracksPortalTheme || tracksRuleStyle
       const declaredBefore = tracksChange ? declaredProperties(this).has(propertyName) : false
       const valueBefore = tracksChange ? this.getPropertyValue(propertyName) : ""
       const priorityBefore = tracksChange ? this.getPropertyPriority(propertyName) : ""
@@ -1364,6 +1402,8 @@ function installLegacyThemeCompatibilityWithMigrations(
           || priorityBefore !== this.getPropertyPriority(propertyName))
       if (changed && tracksOpaqueTarget) {
         relinquishOpaqueOwnership(this, propertyName)
+        scheduleAllOpaqueLegacyScans()
+      } else if (changed && tracksRuleStyle) {
         scheduleAllOpaqueLegacyScans()
       } else if (changed) {
         notifyThemeChange()
@@ -1418,11 +1458,12 @@ function installLegacyThemeCompatibilityWithMigrations(
   for (const [prototype, properties] of [
     [globalThis.HTMLInputElement?.prototype, ["checked", "indeterminate", "value", "valueAsDate", "valueAsNumber"]],
     [globalThis.HTMLTextAreaElement?.prototype, ["value"]],
-    [globalThis.HTMLSelectElement?.prototype, ["value", "selectedIndex"]],
+    [globalThis.HTMLSelectElement?.prototype, ["selectedIndex"]],
     [globalThis.HTMLOptionElement?.prototype, ["selected"]]
   ] as const) {
     for (const property of properties) patchStateProperty(prototype, property)
   }
+  patchSelectValue(globalThis.HTMLSelectElement?.prototype)
   for (const prototype of [
     globalThis.HTMLButtonElement?.prototype,
     globalThis.HTMLFieldSetElement?.prototype,

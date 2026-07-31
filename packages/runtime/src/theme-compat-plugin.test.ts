@@ -353,9 +353,11 @@ describe("dynamic legacy theme compatibility", () => {
       }
     }
     class TestShadowRoot extends TestNode {
-      adoptedStyleSheets: OpaqueStyleSheet[] = []
+      private adoptedSheets: OpaqueStyleSheet[] = []
       host!: TestElement
       descendants: TestElement[] = []
+      get adoptedStyleSheets() { return this.adoptedSheets }
+      set adoptedStyleSheets(value: OpaqueStyleSheet[]) { this.adoptedSheets = Array.from(value) }
       addEventListener() {}
       querySelectorAll() { return this.descendants }
     }
@@ -426,6 +428,14 @@ describe("dynamic legacy theme compatibility", () => {
       }
     }
     class TestTextAreaElement extends TestInputElement {}
+    class TestSelectElement {
+      private selectedIndexValue = 1
+      private readonly values = ["duplicate", "duplicate", "other"]
+      get selectedIndex() { return this.selectedIndexValue }
+      set selectedIndex(value: number) { this.selectedIndexValue = value }
+      get value() { return this.values[this.selectedIndexValue] ?? "" }
+      set value(value: string) { this.selectedIndexValue = this.values.indexOf(value) }
+    }
     class TestHistory {
       pushState() {}
       replaceState() {}
@@ -629,8 +639,10 @@ describe("dynamic legacy theme compatibility", () => {
       CustomElementRegistry: TestCustomElementRegistry,
       Element: TestElement,
       Event: class { constructor(readonly type: string) {} },
+      Document: class {},
       HTMLLinkElement: class {},
       HTMLInputElement: TestInputElement,
+      HTMLSelectElement: TestSelectElement,
       HTMLTextAreaElement: TestTextAreaElement,
       HTMLStyleElement: class {},
       MutationObserver: TestMutationObserver,
@@ -803,6 +815,9 @@ describe("dynamic legacy theme compatibility", () => {
     runInNewContext("const rangeTextArea = new HTMLTextAreaElement(); rangeTextArea.setRangeText('changed')", context)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.45775)
+    runInNewContext("const select = new HTMLSelectElement(); select.value = 'duplicate'", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.457875)
     runInNewContext("history.pushState({}, '', '#theme-panel')", context)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.458)
@@ -831,6 +846,20 @@ describe("dynamic legacy theme compatibility", () => {
     await Promise.resolve()
     expect(dispatchedEvents).toContain("avibe-show-theme-change")
     while (frames.length) frames.shift()?.(0.465)
+
+    typedRule.setProperty("width", "400px")
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.466)
+    typedRule.removeProperty("width")
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.467)
+
+    const staleAdoptedSheets = closedRoot.adoptedStyleSheets
+    closedRoot.adoptedStyleSheets = [closedOpaque]
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.468)
+    staleAdoptedSheets.push(new OpaqueStyleSheet())
+    expect(frames).toHaveLength(0)
 
     dispatchedEvents.length = 0
     const namedStyle = insertedStandardRule as TestStyle & { fontSize: string }
