@@ -366,8 +366,17 @@ describe("dynamic legacy theme compatibility", () => {
         if (this.nextStyle) this.cssRules.push({ style: this.nextStyle })
         else if (this.nextStyleSheet) {
           this.cssRules.push({ styleSheet: this.deferStyleSheet ? undefined : this.nextStyleSheet })
+          if (!this.deferStyleSheet && this.nextStyleSheet.ownerRule) {
+            this.nextStyleSheet.ownerRule.parentStyleSheet = this.parentStyleSheet ?? null
+          }
         }
         return this.cssRules.length - 1
+      }
+
+      deleteRule(index: number) {
+        const removed = this.cssRules[index]
+        if (removed?.styleSheet?.ownerRule) removed.styleSheet.ownerRule.parentStyleSheet = null
+        this.cssRules.splice(index, 1)
       }
     }
     class TestMediaList {
@@ -376,12 +385,23 @@ describe("dynamic legacy theme compatibility", () => {
       deleteMedium() { this.mediaText = "" }
     }
     class TestImportRule {
+      parentStyleSheet: CSSStyleSheet | null = null
       constructor(readonly media: TestMediaList) {}
     }
     class TestInputElement {
       private checkedValue = false
+      private customValidity = ""
       get checked() { return this.checkedValue }
       set checked(value: boolean) { this.checkedValue = value }
+      get validity() { return { valid: !this.customValidity } }
+      setCustomValidity(message: string) { this.customValidity = message }
+    }
+    class TestCustomElementRegistry {
+      private definitions = new Set<string>()
+      define(name: string) {
+        if (this.definitions.has(name)) throw new Error("already defined")
+        this.definitions.add(name)
+      }
     }
     const mutationCallbacks: MutationCallback[] = []
     class TestMutationObserver {
@@ -451,6 +471,7 @@ describe("dynamic legacy theme compatibility", () => {
     const timers: Array<() => void> = []
     const listeners = new Map<string, EventListener>()
     const mediaListeners = new Map<string, EventListener>()
+    const dispatchedEvents: string[] = []
     let legacyActive = false
     let ancestorActive = false
     let eventPanelActive = false
@@ -521,7 +542,9 @@ describe("dynamic legacy theme compatibility", () => {
       CSSStyleSheet: OpaqueStyleSheet,
       CSSImportRule: TestImportRule,
       CSSGroupingRule: TestGroupingRule,
+      CustomElementRegistry: TestCustomElementRegistry,
       Element: TestElement,
+      Event: class { constructor(readonly type: string) {} },
       HTMLLinkElement: class {},
       HTMLInputElement: TestInputElement,
       HTMLStyleElement: class {},
@@ -530,6 +553,11 @@ describe("dynamic legacy theme compatibility", () => {
       Node: TestNode,
       ShadowRoot: TestShadowRoot,
       addEventListener(name: string, listener: EventListener) { listeners.set(name, listener) },
+      customElements: new TestCustomElementRegistry(),
+      dispatchEvent(event: { type: string }) {
+        dispatchedEvents.push(event.type)
+        return true
+      },
       getComputedStyle(element: TestElement) {
         computedReads.set(element, (computedReads.get(element) ?? 0) + 1)
         return {
@@ -570,6 +598,8 @@ describe("dynamic legacy theme compatibility", () => {
     expect(insertedClosedHost.shadowRoot).toBe(null)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0)
+    await Promise.resolve()
+    dispatchedEvents.length = 0
     expect(root.style.getPropertyValue("--primary")).toBe("")
     expect(root.style.getPropertyValue("--border")).toBe("")
     expect(closedElement.style.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
@@ -618,6 +648,7 @@ describe("dynamic legacy theme compatibility", () => {
     insertedClosedOpaque.ownerRule = new TestImportRule(new TestMediaList())
     const closedGroupingRule = new TestGroupingRule()
     closedGroupingRule.parentStyleSheet = insertedClosedParentSheet as unknown as CSSStyleSheet
+    insertedClosedOpaque.ownerRule.parentStyleSheet = closedGroupingRule.parentStyleSheet
     closedGroupingRule.nextStyleSheet = insertedClosedOpaque
     closedGroupingRule.deferStyleSheet = true
     closedGroupingRule.insertRule()
@@ -630,6 +661,17 @@ describe("dynamic legacy theme compatibility", () => {
     frames.shift()?.(0.21)
     expect(insertedClosedElement.style.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
 
+    closedGroupingRule.deleteRule(0)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.225)
+    expect(insertedClosedElement.style.getPropertyValue("--warning")).toBe("")
+    computedReads.delete(insertedClosedElement)
+    listeners.get("pointerdown")?.({ target: eventTarget } as unknown as Event)
+    frames.shift()?.(0.23)
+    frames.shift()?.(0.235)
+    frames.shift()?.(0.24)
+    expect(computedReads.get(insertedClosedElement)).toBeUndefined()
+
     groupingRule.insertRule()
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.25)
@@ -640,6 +682,16 @@ describe("dynamic legacy theme compatibility", () => {
     runInNewContext("const input = new HTMLInputElement(); input.checked = true", context)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.4375)
+    runInNewContext("const validityInput = new HTMLInputElement(); validityInput.setCustomValidity('invalid')", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.45)
+    runInNewContext("customElements.define('theme-swatch', class {})", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.46)
+
+    insertedStandardRule.setProperty("--chart-1", "oklch(0.7 0.15 255)")
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
 
     mutationCallbacks[1]?.([{ type: "attributes", attributeName: "class", target: closedHost }] as unknown as MutationRecord[], {} as MutationObserver)
     expect(frames).toHaveLength(1)

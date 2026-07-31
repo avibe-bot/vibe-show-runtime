@@ -4,23 +4,11 @@ import { useComposedRefs } from "@radix-ui/react-compose-refs"
 import { X } from "lucide-react"
 import { ThemeScopeContext } from "./theme-context"
 import { SHOW_THEME_CHANGE_EVENT } from "./theme-compat"
+import { SHOW_PORTAL_THEME_PROPERTIES } from "./theme-properties"
 import { cn } from "./utils"
 
 // Radix portals escape scoped inheritance; copy the source theme onto a contents-only bridge.
-const PORTAL_THEME_TOKENS = [
-  "--radius", "--background", "--foreground", "--card", "--card-foreground",
-  "--popover", "--popover-foreground", "--primary", "--primary-foreground",
-  "--secondary", "--secondary-foreground", "--muted", "--muted-foreground",
-  "--accent", "--accent-foreground", "--destructive", "--destructive-foreground",
-  "--border", "--input", "--ring", "--chart-1", "--chart-2", "--chart-3",
-  "--chart-4", "--chart-5", "--sidebar", "--sidebar-foreground",
-  "--sidebar-primary", "--sidebar-primary-foreground", "--sidebar-accent",
-  "--sidebar-accent-foreground", "--sidebar-border", "--sidebar-ring", "--success",
-  "--success-foreground", "--warning", "--warning-foreground", "--avs-radius",
-  "--avs-background", "--avs-foreground", "--avs-muted", "--avs-muted-foreground",
-  "--avs-border", "--avs-primary", "--avs-primary-foreground", "--avs-ring",
-  "--avs-success", "--avs-warning", "--avs-destructive"
-] as const
+const PORTAL_THEME_TOKENS = SHOW_PORTAL_THEME_PROPERTIES.filter((property) => property.startsWith("--"))
 
 type PortalThemeSnapshot = {
   dark: boolean
@@ -92,11 +80,28 @@ function hasComposedDarkTheme(element: Element): boolean {
   return false
 }
 
+function hasActivePortalThemeMotion(source: PortalThemeSource | null): boolean {
+  if (!source) return false
+  const seen = new Set<Element>()
+  for (const start of [source.tokens, source.context]) {
+    for (let node: Node | null = start; node; node = composedParentNode(node)) {
+      if (!(node instanceof Element) || seen.has(node)) continue
+      seen.add(node)
+      if (node.getAnimations().some((animation) => animation.playState === "running" || animation.pending)) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
 function PortalThemeBridge({
   getTheme,
+  getThemeSource,
   children
 }: {
   getTheme: () => PortalThemeSnapshot
+  getThemeSource: () => PortalThemeSource | null
   children: React.ReactNode
 }) {
   const [theme, setTheme] = React.useState<PortalThemeSnapshot>()
@@ -113,17 +118,22 @@ function PortalThemeBridge({
         signature = next.signature
         setTheme(next)
       }
+      if (hasActivePortalThemeMotion(getThemeSource())) schedule()
     }
     const schedule = () => {
       if (!frame) frame = window.requestAnimationFrame(update)
     }
     update()
     window.addEventListener(SHOW_THEME_CHANGE_EVENT, schedule)
+    window.addEventListener("animationstart", schedule, true)
+    window.addEventListener("transitionrun", schedule, true)
     return () => {
       window.removeEventListener(SHOW_THEME_CHANGE_EVENT, schedule)
+      window.removeEventListener("animationstart", schedule, true)
+      window.removeEventListener("transitionrun", schedule, true)
       if (frame) window.cancelAnimationFrame(frame)
     }
-  }, [getTheme])
+  }, [getTheme, getThemeSource])
 
   React.useLayoutEffect(() => {
     const bridge = bridgeRef.current
@@ -242,26 +252,36 @@ export const DialogContent = React.forwardRef<
 >(({ className, children, ...props }, ref) => {
   const themeScope = React.useContext(ThemeScopeContext)
   const triggerScope = React.useContext(DialogScopeContext)
-  const getTheme = React.useCallback(
-    (): PortalThemeSnapshot => {
+  const getThemeSource = React.useCallback(
+    (): PortalThemeSource | null => {
       const fallback = themeScope?.current ?? document.documentElement
       const active = triggerScope?.activeTrigger.current
-      const opening = triggerScope?.openingTheme.current
-      if (!active?.isConnected && opening) return opening
+      if (!active?.isConnected && triggerScope?.openingTheme.current) return null
       const trigger = activeDialogTrigger(triggerScope)
-      const source = trigger
+      return trigger
         ? { tokens: trigger, context: composedParentElement(trigger) ?? fallback }
         : { tokens: fallback, context: fallback }
-      const theme = readPortalTheme(source)
-      if (trigger && triggerScope) triggerScope.openingTheme.current = theme
-      return theme
     },
     [themeScope, triggerScope]
+  )
+  const getTheme = React.useCallback(
+    (): PortalThemeSnapshot => {
+      const opening = triggerScope?.openingTheme.current
+      const source = getThemeSource()
+      if (!source && opening) return opening
+      if (!source) return readPortalTheme({ tokens: document.documentElement, context: document.documentElement })
+      const theme = readPortalTheme(source)
+      if (source.tokens !== (themeScope?.current ?? document.documentElement) && triggerScope) {
+        triggerScope.openingTheme.current = theme
+      }
+      return theme
+    },
+    [getThemeSource, themeScope, triggerScope]
   )
 
   return (
     <DialogPortal>
-      <PortalThemeBridge getTheme={getTheme}>
+      <PortalThemeBridge getTheme={getTheme} getThemeSource={getThemeSource}>
         <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-[rgb(17_24_39/45%)] animate-[avs-fade-in_0.16s_ease_both] motion-reduce:animate-none" />
         <DialogPrimitive.Content
           ref={ref}

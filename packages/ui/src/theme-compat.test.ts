@@ -4,6 +4,7 @@ import {
   LEGACY_THEME_MIGRATIONS,
   themeCompatibilityClientScript
 } from "./theme-compat"
+import { SHOW_PORTAL_THEME_PROPERTIES } from "./theme-properties"
 
 describe("legacy theme compatibility", () => {
   it("keeps the compatibility contract owned by Show UI", () => {
@@ -11,6 +12,8 @@ describe("legacy theme compatibility", () => {
     expect(LEGACY_THEME_MIGRATIONS["--avs-background"]).toEqual(["--background", "--card", "--popover"])
     expect(themeCompatibilityClientScript()).toContain("__avibeShowThemeCompatInstalled")
     expect(themeCompatibilityClientScript()).toContain("avibe-show-theme-change")
+    expect(SHOW_PORTAL_THEME_PROPERTIES).toContain("--chart-1")
+    expect(SHOW_PORTAL_THEME_PROPERTIES).toContain("--sidebar")
   })
 
   it("installs for direct component and ThemeProvider consumers", () => {
@@ -18,6 +21,8 @@ describe("legacy theme compatibility", () => {
       const contents = readFileSync(new URL(source, import.meta.url), "utf8")
       expect(contents).toContain('import "./theme-compat"')
     }
+    const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
+    expect(packageJson.sideEffects).toContain("./dist/theme-compat*.js")
   })
 
   it("serializes the opaque stylesheet state observers", () => {
@@ -51,5 +56,8 @@ describe("legacy theme compatibility", () => {
     expect(script).toContain('"reset"')
     expect(script).toContain('"hashchange"')
     expect(script).toContain('"popstate"')
+    expect(script).toContain("setCustomValidity")
+    expect(script).toContain("CustomElementRegistry")
+    expect(script).toContain("parentStyleSheet")
   })
 })

@@ -1,3 +1,5 @@
+import { SHOW_PORTAL_THEME_PROPERTIES } from "./theme-properties"
+
 export const LEGACY_THEME_MIGRATIONS: Record<string, readonly string[]> = {
   "--avs-background": ["--background", "--card", "--popover"],
   "--avs-foreground": ["--foreground", "--card-foreground", "--popover-foreground", "--secondary-foreground", "--accent-foreground"],
@@ -44,7 +46,8 @@ type RuleContainer = {
 function installLegacyThemeCompatibilityWithMigrations(
   migrations: Record<string, readonly string[]>,
   ownershipPrefix: string,
-  themeChangeEvent: string
+  themeChangeEvent: string,
+  portalThemeProperties: readonly string[]
 ) {
   if (typeof document === "undefined") return
 
@@ -57,6 +60,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   const legacySources = Object.keys(migrations)
   const legacySourceSet = new Set(legacySources)
   const migratedTargets = new Set(Object.values(migrations).flat())
+  const portalThemePropertySet = new Set(portalThemeProperties)
   const ownedDeclarations = new WeakMap<CSSStyleDeclaration, Map<string, OwnedDeclaration>>()
   const opaqueOwnedDeclarations = new Map<CSSStyleDeclaration, OpaqueOwnedDeclarations>()
   const opaqueBridgeSignatures = new WeakMap<CSSStyleDeclaration, string>()
@@ -547,6 +551,7 @@ function installLegacyThemeCompatibilityWithMigrations(
           ? ownerRule.media
           : undefined
         if ((sheet.ownerNode && !sheet.ownerNode.isConnected)
+          || (importMedia && !ownerRule?.parentStyleSheet)
           || (typeof ShadowRoot !== "undefined" && scope instanceof ShadowRoot && !scope.host.isConnected)) {
           opaqueStyleSheets.delete(sheet)
           opaqueStyleSheetScopes.delete(sheet)
@@ -861,6 +866,33 @@ function installLegacyThemeCompatibilityWithMigrations(
     })
   }
 
+  function patchValidityMethod(input: object | undefined) {
+    if (!input) return
+    const prototype = input as { setCustomValidity?: (message: string) => void }
+    const setCustomValidity = prototype.setCustomValidity
+    if (typeof setCustomValidity !== "function") return
+    prototype.setCustomValidity = function(this: Element & { validity?: ValidityState }, message: string) {
+      const before = this.validity?.valid
+      setCustomValidity.call(this, message)
+      if (before !== this.validity?.valid) scheduleAllOpaqueLegacyScans()
+    }
+  }
+
+  function patchCustomElementRegistry(input: object | undefined) {
+    if (!input) return
+    const prototype = input as CustomElementRegistry
+    const define = prototype.define
+    if (typeof define !== "function") return
+    prototype.define = function(
+      name: string,
+      constructor: CustomElementConstructor,
+      options?: ElementDefinitionOptions
+    ) {
+      define.call(this, name, constructor, options)
+      scheduleAllOpaqueLegacyScans()
+    }
+  }
+
   function syncObservedAdoptedList(list: CSSStyleSheet[], scope?: Document | ShadowRoot) {
     const sheets = Array.from(list)
     const record = observedAdoptedLists.get(list)
@@ -995,17 +1027,21 @@ function installLegacyThemeCompatibilityWithMigrations(
     stylePrototype.setProperty = function(name: string, value: string | null, priority?: string) {
       const propertyName = String(name)
       const tracksOpaqueTarget = !mutatingOpaqueBridge && migratedTargets.has(propertyName)
-      const declaredBefore = tracksOpaqueTarget ? declaredProperties(this).has(propertyName) : false
-      const valueBefore = tracksOpaqueTarget ? this.getPropertyValue(propertyName) : ""
-      const priorityBefore = tracksOpaqueTarget ? this.getPropertyPriority(propertyName) : ""
+      const tracksPortalTheme = !mutatingOpaqueBridge && portalThemePropertySet.has(propertyName)
+      const tracksChange = tracksOpaqueTarget || tracksPortalTheme
+      const declaredBefore = tracksChange ? declaredProperties(this).has(propertyName) : false
+      const valueBefore = tracksChange ? this.getPropertyValue(propertyName) : ""
+      const priorityBefore = tracksChange ? this.getPropertyPriority(propertyName) : ""
       nativeSetProperty.call(this, name, value, priority)
-      const changed = tracksOpaqueTarget
+      const changed = tracksChange
         && (declaredBefore !== declaredProperties(this).has(propertyName)
           || valueBefore !== this.getPropertyValue(propertyName)
           || priorityBefore !== this.getPropertyPriority(propertyName))
-      if (changed) {
+      if (changed && tracksOpaqueTarget) {
         relinquishOpaqueOwnership(this, propertyName)
         scheduleAllOpaqueLegacyScans()
+      } else if (changed) {
+        notifyThemeChange()
       }
       if (legacySources.includes(propertyName) || (migratedTargets.has(propertyName) && (ownedDeclarations.has(this) || hasLegacyDeclaration(this)))) {
         syncLegacyDeclaration(this)
@@ -1014,17 +1050,21 @@ function installLegacyThemeCompatibilityWithMigrations(
     stylePrototype.removeProperty = function(name: string) {
       const propertyName = String(name)
       const tracksOpaqueTarget = !mutatingOpaqueBridge && migratedTargets.has(propertyName)
-      const declaredBefore = tracksOpaqueTarget ? declaredProperties(this).has(propertyName) : false
-      const valueBefore = tracksOpaqueTarget ? this.getPropertyValue(propertyName) : ""
-      const priorityBefore = tracksOpaqueTarget ? this.getPropertyPriority(propertyName) : ""
+      const tracksPortalTheme = !mutatingOpaqueBridge && portalThemePropertySet.has(propertyName)
+      const tracksChange = tracksOpaqueTarget || tracksPortalTheme
+      const declaredBefore = tracksChange ? declaredProperties(this).has(propertyName) : false
+      const valueBefore = tracksChange ? this.getPropertyValue(propertyName) : ""
+      const priorityBefore = tracksChange ? this.getPropertyPriority(propertyName) : ""
       const value = nativeRemoveProperty.call(this, name)
-      const changed = tracksOpaqueTarget
+      const changed = tracksChange
         && (declaredBefore !== declaredProperties(this).has(propertyName)
           || valueBefore !== this.getPropertyValue(propertyName)
           || priorityBefore !== this.getPropertyPriority(propertyName))
-      if (changed) {
+      if (changed && tracksOpaqueTarget) {
         relinquishOpaqueOwnership(this, propertyName)
         scheduleAllOpaqueLegacyScans()
+      } else if (changed) {
+        notifyThemeChange()
       }
       if (legacySources.includes(propertyName) || (migratedTargets.has(propertyName) && (ownedDeclarations.has(this) || hasLegacyDeclaration(this)))) {
         syncLegacyDeclaration(this)
@@ -1067,6 +1107,18 @@ function installLegacyThemeCompatibilityWithMigrations(
   ] as const) {
     for (const property of properties) patchStateProperty(prototype, property)
   }
+  for (const prototype of [
+    globalThis.HTMLButtonElement?.prototype,
+    globalThis.HTMLFieldSetElement?.prototype,
+    globalThis.HTMLInputElement?.prototype,
+    globalThis.HTMLObjectElement?.prototype,
+    globalThis.HTMLOutputElement?.prototype,
+    globalThis.HTMLSelectElement?.prototype,
+    globalThis.HTMLTextAreaElement?.prototype
+  ]) {
+    patchValidityMethod(prototype)
+  }
+  patchCustomElementRegistry(globalThis.CustomElementRegistry?.prototype)
   const styleRulePrototype = globalThis.CSSStyleRule?.prototype
   const selectorText = styleRulePrototype && Object.getOwnPropertyDescriptor(styleRulePrototype, "selectorText")
   if (styleRulePrototype && selectorText?.get && selectorText.set) {
@@ -1266,12 +1318,13 @@ export function installLegacyThemeCompatibility() {
   installLegacyThemeCompatibilityWithMigrations(
     LEGACY_THEME_MIGRATIONS,
     LEGACY_THEME_OWNERSHIP_PREFIX,
-    SHOW_THEME_CHANGE_EVENT
+    SHOW_THEME_CHANGE_EVENT,
+    SHOW_PORTAL_THEME_PROPERTIES
   )
 }
 
 export function themeCompatibilityClientScript(): string {
-  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)},${JSON.stringify(LEGACY_THEME_OWNERSHIP_PREFIX)},${JSON.stringify(SHOW_THEME_CHANGE_EVENT)});`
+  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)},${JSON.stringify(LEGACY_THEME_OWNERSHIP_PREFIX)},${JSON.stringify(SHOW_THEME_CHANGE_EVENT)},${JSON.stringify(SHOW_PORTAL_THEME_PROPERTIES)});`
 }
 
 installLegacyThemeCompatibility()

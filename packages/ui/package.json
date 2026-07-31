@@ -5,7 +5,7 @@
   "type": "module",
   "sideEffects": [
     "./dist/show-ui.css",
-    "./dist/theme-compat.js"
+    "./dist/theme-compat*.js"
   ],
   "main": "./dist/index.js",
   "module": "./dist/index.js",
