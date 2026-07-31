@@ -31,6 +31,7 @@ type OpaqueOwnedDeclarations = {
 type OpaqueStyleSheetState = {
   sheet: CSSStyleSheet
   disabled: boolean
+  scope?: Document | ShadowRoot
   importMedia?: MediaList
   importMediaText?: string
 }
@@ -79,6 +80,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   let opaqueScanFrame = 0
   let opaqueRelationalScanFrame = 0
   let opaqueFullScanPending = false
+  let opaqueContinuationPending = false
   let opaqueMutationCleanupPending = false
   let themeChangePending = false
   let adoptedListPollTimer = 0
@@ -471,12 +473,20 @@ function installLegacyThemeCompatibilityWithMigrations(
 
     if (rootCandidates.size) {
       const readableSheets: Array<{ sheet: CSSStyleSheet; disabled: boolean }> = []
+      const opaqueImportAncestors = new Set<CSSStyleSheet>()
+      for (const opaqueSheet of opaqueStyleSheets) {
+        let ownerSheet = opaqueSheet.ownerRule?.parentStyleSheet
+        while (ownerSheet && !opaqueImportAncestors.has(ownerSheet)) {
+          opaqueImportAncestors.add(ownerSheet)
+          ownerSheet = ownerSheet.ownerRule?.parentStyleSheet
+        }
+      }
       const candidates = new Set<CSSStyleSheet>([
         ...Array.from(document.styleSheets),
         ...Array.from(document.adoptedStyleSheets ?? [])
       ])
       for (const sheet of candidates) {
-        if (opaqueStyleSheets.has(sheet)) continue
+        if (opaqueStyleSheets.has(sheet) || opaqueImportAncestors.has(sheet)) continue
         try {
           void sheet.cssRules
           if (!sheet.disabled) readableSheets.push({ sheet, disabled: sheet.disabled })
@@ -526,9 +536,34 @@ function installLegacyThemeCompatibilityWithMigrations(
     else state.sheet.disabled = state.disabled
   }
 
+  function hasActiveCssMotion(scope?: Document | ShadowRoot) {
+    const root = scope ?? document
+    const animations: Animation[] = []
+    if ("getAnimations" in root && typeof root.getAnimations === "function") {
+      animations.push(...root.getAnimations())
+    } else {
+      const container = root === document ? document.documentElement : root
+      if (container) {
+        const elements = container instanceof Element
+          ? [container, ...container.querySelectorAll("*")]
+          : Array.from(container.querySelectorAll("*"))
+        for (const element of elements) animations.push(...element.getAnimations?.() ?? [])
+      }
+    }
+    return animations.some((animation) => {
+      const cssAnimation = (typeof CSSAnimation !== "undefined" && animation instanceof CSSAnimation)
+        || (typeof CSSTransition !== "undefined" && animation instanceof CSSTransition)
+        || animation.constructor?.name === "CSSAnimation"
+        || animation.constructor?.name === "CSSTransition"
+      return cssAnimation && (animation.playState === "running" || animation.pending)
+    })
+  }
+
   // Cross-origin rules are opaque to CSSOM. Compare their computed effect with the
   // sheets disabled, then bridge only legacy deltas that did not also set a standard token.
   function syncOpaqueLegacyThemes() {
+    const continuing = opaqueContinuationPending
+    opaqueContinuationPending = false
     const disconnectedStyles = new Set(
       Array.from(opaqueOwnedDeclarations)
         .filter(([, ownership]) => !ownership.element.isConnected)
@@ -540,7 +575,6 @@ function installLegacyThemeCompatibilityWithMigrations(
     opaqueFullScanPending = false
     opaqueScanRoots.clear()
     const { affected, elements } = compatibilityElements(roots)
-    clearOpaqueOwnedDeclarations(new Set(affected.map((element) => element.style)))
 
     const activeSheets: OpaqueStyleSheetState[] = []
     for (const sheet of opaqueStyleSheets) {
@@ -561,6 +595,7 @@ function installLegacyThemeCompatibilityWithMigrations(
         activeSheets.push({
           sheet,
           disabled: sheet.disabled,
+          scope,
           importMedia,
           importMediaText: importMedia?.mediaText
         })
@@ -570,8 +605,21 @@ function installLegacyThemeCompatibilityWithMigrations(
         opaqueStyleSheetScopes.delete(sheet)
       }
     }
-    if (!activeSheets.length) return
+    if (!activeSheets.length) {
+      clearOpaqueOwnedDeclarations(new Set(affected.map((element) => element.style)))
+      return
+    }
+    if (activeSheets.some((state) => hasActiveCssMotion(state.scope))) {
+      if (continuing) opaqueContinuationPending = true
+      for (const root of roots) {
+        if (root === document) opaqueFullScanPending = true
+        else opaqueScanRoots.add(root)
+      }
+      return
+    }
+    if (!continuing) clearOpaqueOwnedDeclarations(new Set(affected.map((element) => element.style)))
 
+    let needsContinuation = false
     for (let pass = 0; pass <= migratedTargets.size; pass += 1) {
       let baseline: Map<Element, Map<string, string>>
       mutatingOpaqueSheetState = true
@@ -651,6 +699,11 @@ function installLegacyThemeCompatibilityWithMigrations(
         scheduleOpaqueMutationCleanup()
       }
       if (!changed) break
+      if (pass === migratedTargets.size) needsContinuation = true
+    }
+    if (needsContinuation) {
+      opaqueContinuationPending = true
+      scheduleAllOpaqueLegacyScans()
     }
   }
 
@@ -875,6 +928,22 @@ function installLegacyThemeCompatibilityWithMigrations(
       const before = this.validity?.valid
       setCustomValidity.call(this, message)
       if (before !== this.validity?.valid) scheduleAllOpaqueLegacyScans()
+    }
+  }
+
+  function patchInputStepMethod(input: object | undefined, name: "stepUp" | "stepDown") {
+    if (!input) return
+    const prototype = input as HTMLInputElement
+    const step = prototype[name]
+    if (typeof step !== "function") return
+    prototype[name] = function(this: HTMLInputElement, amount?: number) {
+      const before = [this.value, this.valueAsNumber, this.validity.valid]
+      step.call(this, amount)
+      if (before[0] !== this.value
+        || !Object.is(before[1], this.valueAsNumber)
+        || before[2] !== this.validity.valid) {
+        scheduleAllOpaqueLegacyScans()
+      }
     }
   }
 
@@ -1118,6 +1187,8 @@ function installLegacyThemeCompatibilityWithMigrations(
   ]) {
     patchValidityMethod(prototype)
   }
+  patchInputStepMethod(globalThis.HTMLInputElement?.prototype, "stepUp")
+  patchInputStepMethod(globalThis.HTMLInputElement?.prototype, "stepDown")
   patchCustomElementRegistry(globalThis.CustomElementRegistry?.prototype)
   const styleRulePrototype = globalThis.CSSStyleRule?.prototype
   const selectorText = styleRulePrototype && Object.getOwnPropertyDescriptor(styleRulePrototype, "selectorText")
@@ -1284,7 +1355,8 @@ function installLegacyThemeCompatibilityWithMigrations(
     globalThis.addEventListener?.(event, scheduleOpaqueLegacyRelationalEventScan, true)
   }
   for (const event of [
-    "animationstart", "animationiteration", "animationend", "transitionrun", "transitionend"
+    "animationstart", "animationiteration", "animationend", "animationcancel",
+    "transitionrun", "transitionend", "transitioncancel"
   ]) {
     globalThis.addEventListener?.(event, scheduleOpaqueLegacyEventScan, true)
   }

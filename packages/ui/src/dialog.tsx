@@ -31,7 +31,7 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
     return value
   })
   for (const [property, value] of [
-    ["color-scheme", computed.colorScheme], ["color", context.color],
+    ["color-scheme", computed.colorScheme], ["color", context.color], ["direction", context.direction],
     ["font-family", context.fontFamily], ["font-size", context.fontSize],
     ["font-stretch", context.fontStretch], ["font-style", context.fontStyle],
     ["font-variant", context.fontVariant], ["font-weight", context.fontWeight],
@@ -43,7 +43,7 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
   return {
     dark,
     signature: JSON.stringify([
-      dark, computed.colorScheme, context.color, context.fontFamily, context.fontSize,
+      dark, computed.colorScheme, context.color, context.direction, context.fontFamily, context.fontSize,
       context.fontStretch, context.fontStyle, context.fontVariant, context.fontWeight,
       context.lineHeight, ...values
     ]),

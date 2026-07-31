@@ -10,7 +10,7 @@ export const SHOW_PORTAL_THEME_PROPERTIES = [
   "--success-foreground", "--warning", "--warning-foreground", "--avs-radius",
   "--avs-background", "--avs-foreground", "--avs-muted", "--avs-muted-foreground",
   "--avs-border", "--avs-primary", "--avs-primary-foreground", "--avs-ring",
-  "--avs-success", "--avs-warning", "--avs-destructive", "color-scheme", "color",
+  "--avs-success", "--avs-warning", "--avs-destructive", "color-scheme", "color", "direction",
   "font-family", "font-size", "font-stretch", "font-style", "font-variant",
   "font-weight", "line-height"
 ] as const

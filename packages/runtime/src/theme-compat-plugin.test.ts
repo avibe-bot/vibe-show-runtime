@@ -349,9 +349,13 @@ describe("dynamic legacy theme compatibility", () => {
     }
     class OpaqueStyleSheet {
       private disabledValue = false
+      disabledWrites = 0
       ownerRule: TestImportRule | null = null
       get disabled() { return this.disabledValue }
-      set disabled(value: boolean) { this.disabledValue = value }
+      set disabled(value: boolean) {
+        this.disabledWrites += 1
+        this.disabledValue = value
+      }
       get cssRules(): never {
         throw Object.assign(new Error("opaque"), { name: "SecurityError" })
       }
@@ -391,10 +395,20 @@ describe("dynamic legacy theme compatibility", () => {
     class TestInputElement {
       private checkedValue = false
       private customValidity = ""
+      value = "0"
+      valueAsNumber = 0
       get checked() { return this.checkedValue }
       set checked(value: boolean) { this.checkedValue = value }
       get validity() { return { valid: !this.customValidity } }
       setCustomValidity(message: string) { this.customValidity = message }
+      stepUp(amount = 1) {
+        this.valueAsNumber += amount
+        this.value = String(this.valueAsNumber)
+      }
+      stepDown(amount = 1) {
+        this.valueAsNumber -= amount
+        this.value = String(this.valueAsNumber)
+      }
     }
     class TestCustomElementRegistry {
       private definitions = new Set<string>()
@@ -429,6 +443,7 @@ describe("dynamic legacy theme compatibility", () => {
     const insertedClosedElement = new TestElement()
     const insertedClosedRoot = new TestShadowRoot()
     const insertedClosedParentSheet = { cssRules: [], disabled: false }
+    const chainElements = Array.from({ length: 32 }, () => new TestElement())
     inlineStandard.style.setProperty("--primary", "oklch(0.7 0.15 255)")
     const root = new TestElement()
     standard.parentElement = root
@@ -459,9 +474,24 @@ describe("dynamic legacy theme compatibility", () => {
     insertedClosedElement.rootNode = insertedClosedRoot
     root.descendants.push(
       standard, inlineStandard, inherited, ancestor, eventCard, unrelatedEventSibling,
-      closedHost, insertedClosedHost
+      closedHost, insertedClosedHost, ...chainElements
     )
+    for (const element of chainElements) element.parentElement = root
     const opaque = new OpaqueStyleSheet()
+    const importedOpaque = new OpaqueStyleSheet()
+    const importedMedia = new TestMediaList()
+    importedOpaque.ownerRule = new TestImportRule(importedMedia)
+    const readableImportParent = {
+      cssRules: [{ styleSheet: importedOpaque }],
+      disabledValue: false,
+      disabledWrites: 0,
+      get disabled() { return this.disabledValue },
+      set disabled(value: boolean) {
+        this.disabledWrites += 1
+        this.disabledValue = value
+      }
+    }
+    importedOpaque.ownerRule.parentStyleSheet = readableImportParent as unknown as CSSStyleSheet
     const readableThemeSheet = { cssRules: [], disabled: false }
     const insertedStandardRule = new TestStyle()
     insertedStandardRule.setProperty("--primary", "rgb(1 2 3)")
@@ -475,6 +505,8 @@ describe("dynamic legacy theme compatibility", () => {
     let legacyActive = false
     let ancestorActive = false
     let eventPanelActive = false
+    let chainActive = false
+    let activeCssMotion = false
     let insertedClosedOpaque: OpaqueStyleSheet | null = null
     const computedReads = new Map<TestElement, number>()
     const computedProperty = (element: TestElement, name: string): string => {
@@ -495,6 +527,13 @@ describe("dynamic legacy theme compatibility", () => {
         return !inClosedRoot && !opaque.disabled && legacyActive && element.style.cssText ? "32 95% 44%" : ""
       }
       if (name === "--avs-ring") {
+        const chainIndex = chainElements.indexOf(element)
+        if (chainIndex >= 0) {
+          const previous = chainElements[chainIndex - 1]
+          if (chainActive && !opaque.disabled
+            && (chainIndex === 0 || previous.style.getPropertyValue("--ring"))) return "280 65% 60%"
+          return computedProperty(root, name)
+        }
         return !opaque.disabled && ancestorActive && element === ancestor ? "199 89% 48%" : ""
       }
       if (name === "--avs-success") {
@@ -542,6 +581,8 @@ describe("dynamic legacy theme compatibility", () => {
       CSSStyleSheet: OpaqueStyleSheet,
       CSSImportRule: TestImportRule,
       CSSGroupingRule: TestGroupingRule,
+      CSSAnimation: class {},
+      CSSTransition: class {},
       CustomElementRegistry: TestCustomElementRegistry,
       Element: TestElement,
       Event: class { constructor(readonly type: string) {} },
@@ -583,8 +624,13 @@ describe("dynamic legacy theme compatibility", () => {
         adoptedStyleSheets: [],
         addEventListener() {},
         documentElement: root,
+        getAnimations() {
+          return activeCssMotion
+            ? [{ constructor: { name: "CSSAnimation" }, playState: "running", pending: false }]
+            : []
+        },
         querySelectorAll() { return root.querySelectorAll("*") },
-        styleSheets: [readableThemeSheet, opaque]
+        styleSheets: [readableThemeSheet, readableImportParent, opaque]
       }
     }
 
@@ -609,6 +655,8 @@ describe("dynamic legacy theme compatibility", () => {
     expect(listeners.has("beforetoggle")).toBe(true)
     expect(listeners.has("toggle")).toBe(true)
     expect(listeners.has("reset")).toBe(true)
+    expect(listeners.has("animationcancel")).toBe(true)
+    expect(listeners.has("transitioncancel")).toBe(true)
     expect(listeners.has("fullscreenchange")).toBe(true)
     expect(listeners.get("pointerdown")).not.toBe(listeners.get("resize"))
     expect(listeners.get("pointerdown")).not.toBe(listeners.get("animationstart"))
@@ -685,6 +733,9 @@ describe("dynamic legacy theme compatibility", () => {
     runInNewContext("const validityInput = new HTMLInputElement(); validityInput.setCustomValidity('invalid')", context)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.45)
+    runInNewContext("const stepInput = new HTMLInputElement(); stepInput.stepUp()", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.455)
     runInNewContext("customElements.define('theme-swatch', class {})", context)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.46)
@@ -692,6 +743,29 @@ describe("dynamic legacy theme compatibility", () => {
     insertedStandardRule.setProperty("--chart-1", "oklch(0.7 0.15 255)")
     await Promise.resolve()
     expect(dispatchedEvents).toContain("avibe-show-theme-change")
+
+    const opaqueWritesBeforeMotion = opaque.disabledWrites
+    activeCssMotion = true
+    listeners.get("pointerdown")?.({ target: eventTarget } as unknown as Event)
+    frames.shift()?.(0.47)
+    frames.shift()?.(0.475)
+    frames.shift()?.(0.48)
+    expect(opaque.disabledWrites).toBe(opaqueWritesBeforeMotion)
+    activeCssMotion = false
+    listeners.get("animationcancel")?.({ target: eventTarget } as unknown as Event)
+    frames.shift()?.(0.485)
+    expect(opaque.disabledWrites).toBeGreaterThan(opaqueWritesBeforeMotion)
+
+    chainActive = true
+    listeners.get("resize")?.({} as Event)
+    let continuationFrames = 0
+    while (frames.length && continuationFrames < 10) {
+      continuationFrames += 1
+      frames.shift()?.(0.49 + continuationFrames / 1000)
+    }
+    expect(continuationFrames).toBeGreaterThan(1)
+    expect(chainElements.at(-1)?.style.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
+    expect(readableImportParent.disabledWrites).toBe(0)
 
     mutationCallbacks[1]?.([{ type: "attributes", attributeName: "class", target: closedHost }] as unknown as MutationRecord[], {} as MutationObserver)
     expect(frames).toHaveLength(1)

@@ -31,7 +31,7 @@ describe("ThemeProvider", () => {
         foreground: "var(--brand-color)",
         primary: "var(--brand-hsl)",
         accent: "221deg calc(83%) var(--lightness) / calc(var(--alpha))",
-        ring: "199 89% 48%",
+        ring: "hsl(199 89% 48%)",
         warning: "32, 95%, 44%",
         success: "158 /* hue */ 64% 24%"
       } }}>content</ThemeProvider>

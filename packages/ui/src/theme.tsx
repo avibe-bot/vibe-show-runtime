@@ -211,6 +211,12 @@ function usesLegacyHslChannels(value: string): boolean {
   return Boolean(variable && /(?:^--avs-|[-_](?:hsl|channels?))$/i.test(variable))
 }
 
+function legacyHslChannels(value: string): string | null {
+  if (usesLegacyHslChannels(value)) return value
+  const functionMatch = value.trim().match(/^hsla?\(([\s\S]*)\)$/i)
+  return functionMatch && usesLegacyHslChannels(functionMatch[1]) ? functionMatch[1].trim() : null
+}
+
 function toStyle(theme?: ShowTheme): React.CSSProperties {
   const style = {} as React.CSSProperties & Record<string, string>
   if (!theme) return style
@@ -223,14 +229,17 @@ function toStyle(theme?: ShowTheme): React.CSSProperties {
   const explicitColors = new Set(colorEntries.filter(([, value]) => Boolean(value)).map(([key]) => key))
   for (const [key, value] of colorEntries) {
     if (!value) continue
-    const legacyChannels = usesLegacyHslChannels(value)
-    const standardValue = legacyChannels ? `hsl(${value})` : value
+    const channelInput = usesLegacyHslChannels(value)
+    const channels = legacyHslChannels(value)
+    const standardValue = channelInput ? `hsl(${value})` : value
     style[colorVars[key]] = standardValue
     const legacyVar = legacyColorVars[key]
-    if (!legacyChannels || !legacyVar) continue
-    style[legacyVar] = value
-    for (const companion of legacyColorFanOut[key] ?? []) {
-      if (!explicitColors.has(companion)) style[colorVars[companion]] = standardValue
+    if (!channels || !legacyVar) continue
+    style[legacyVar] = channels
+    if (channelInput) {
+      for (const companion of legacyColorFanOut[key] ?? []) {
+        if (!explicitColors.has(companion)) style[colorVars[companion]] = standardValue
+      }
     }
   }
   return style
