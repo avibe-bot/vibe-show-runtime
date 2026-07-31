@@ -46,6 +46,8 @@ describe("legacy theme compatibility", () => {
     }
     expect(script).toContain("opaqueStyleSheetScopes.values()")
     expect(script).toContain("addEventListener?.(event, scheduleOpaqueLegacyEventScan, true)")
+    expect(script).toContain("addEventListener?.(event, scheduleOpaqueLegacyRelationalEventScan, true)")
+    expect(script).toContain('"reset"')
     expect(script).toContain('"hashchange"')
     expect(script).toContain('"popstate"')
   })

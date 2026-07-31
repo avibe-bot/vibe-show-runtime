@@ -25,9 +25,16 @@ type OpaqueOwnedDeclarations = {
   element: ThemeElement
   declarations: Map<string, OwnedDeclaration>
 }
+type OpaqueStyleSheetState = {
+  sheet: CSSStyleSheet
+  disabled: boolean
+  importMedia?: MediaList
+  importMediaText?: string
+}
 type RuleContainer = {
   cssRules: CSSRuleList
   insertRule: (rule: string, index?: number) => number
+  parentStyleSheet?: CSSStyleSheet | null
   addRule?: (selector?: string, style?: string, index?: number) => number
   deleteRule?: (index: number) => void
   removeRule?: (index: number) => void
@@ -54,6 +61,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   const pendingOpaqueBridgeMutations = new Set<Element>()
   const opaqueStyleSheets = new Set<CSSStyleSheet>()
   const opaqueStyleSheetScopes = new Map<CSSStyleSheet, Document | ShadowRoot | undefined>()
+  const styleSheetScopes = new WeakMap<CSSStyleSheet, Document | ShadowRoot | undefined>()
   const adoptedListProxies = new WeakMap<object, CSSStyleSheet[]>()
   const observedAdoptedLists = new Map<CSSStyleSheet[], {
     scope?: Document | ShadowRoot
@@ -63,6 +71,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   const nativeSetProperty = stylePrototype?.setProperty
   const nativeRemoveProperty = stylePrototype?.removeProperty
   let opaqueScanFrame = 0
+  let opaqueRelationalScanFrame = 0
   let opaqueFullScanPending = false
   let opaqueMutationCleanupPending = false
   let adoptedListPollTimer = 0
@@ -181,6 +190,14 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
+  function requestCompatibilityFrame(callback: FrameRequestCallback) {
+    const requestFrame = globalThis.requestAnimationFrame
+      ?? ((callback: FrameRequestCallback) => globalThis.setTimeout(
+        () => callback(globalThis.performance?.now() ?? Date.now()), 0
+      ) as unknown as number)
+    return requestFrame(callback)
+  }
+
   function scheduleOpaqueLegacyScan(root?: Node) {
     if (!opaqueStyleSheets.size) return
     if (root && root !== document) {
@@ -189,11 +206,7 @@ function installLegacyThemeCompatibilityWithMigrations(
       opaqueFullScanPending = true
     }
     if (opaqueScanFrame) return
-    const requestFrame = globalThis.requestAnimationFrame
-      ?? ((callback: FrameRequestCallback) => globalThis.setTimeout(
-        () => callback(globalThis.performance?.now() ?? Date.now()), 0
-      ) as unknown as number)
-    opaqueScanFrame = requestFrame(() => {
+    opaqueScanFrame = requestCompatibilityFrame(() => {
       opaqueScanFrame = 0
       syncOpaqueLegacyThemes()
     })
@@ -243,6 +256,15 @@ function installLegacyThemeCompatibilityWithMigrations(
         scheduleOpaqueLegacyScan(scope)
       }
     }
+  }
+
+  function scheduleOpaqueLegacyRelationalEventScan(event: Event) {
+    scheduleOpaqueLegacyEventScan(event)
+    if (!opaqueStyleSheets.size || opaqueRelationalScanFrame) return
+    opaqueRelationalScanFrame = requestCompatibilityFrame(() => {
+      opaqueRelationalScanFrame = 0
+      scheduleAllOpaqueLegacyScans()
+    })
   }
 
   function markOpaqueBridgeMutation(element: Element) {
@@ -475,6 +497,16 @@ function installLegacyThemeCompatibilityWithMigrations(
     return typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot ? root.host : null
   }
 
+  function disableOpaqueStyleSheet(state: OpaqueStyleSheetState) {
+    if (state.importMedia) state.importMedia.mediaText = "not all"
+    else state.sheet.disabled = true
+  }
+
+  function restoreOpaqueStyleSheet(state: OpaqueStyleSheetState) {
+    if (state.importMedia) state.importMedia.mediaText = state.importMediaText ?? ""
+    else state.sheet.disabled = state.disabled
+  }
+
   // Cross-origin rules are opaque to CSSOM. Compare their computed effect with the
   // sheets disabled, then bridge only legacy deltas that did not also set a standard token.
   function syncOpaqueLegacyThemes() {
@@ -491,18 +523,27 @@ function installLegacyThemeCompatibilityWithMigrations(
     const { affected, elements } = compatibilityElements(roots)
     clearOpaqueOwnedDeclarations(new Set(affected.map((element) => element.style)))
 
-    const activeSheets: Array<{ sheet: CSSStyleSheet; disabled: boolean }> = []
+    const activeSheets: OpaqueStyleSheetState[] = []
     for (const sheet of opaqueStyleSheets) {
       try {
         const scope = opaqueStyleSheetScopes.get(sheet)
+        const ownerRule = sheet.ownerRule
+        const importMedia = typeof CSSImportRule !== "undefined" && ownerRule instanceof CSSImportRule
+          ? ownerRule.media
+          : undefined
         if ((sheet.ownerNode && !sheet.ownerNode.isConnected)
           || (typeof ShadowRoot !== "undefined" && scope instanceof ShadowRoot && !scope.host.isConnected)) {
           opaqueStyleSheets.delete(sheet)
           opaqueStyleSheetScopes.delete(sheet)
           continue
         }
-        if (sheet.disabled) continue
-        activeSheets.push({ sheet, disabled: sheet.disabled })
+        if (sheet.disabled && !importMedia) continue
+        activeSheets.push({
+          sheet,
+          disabled: sheet.disabled,
+          importMedia,
+          importMediaText: importMedia?.mediaText
+        })
       } catch {
         // A stylesheet that cannot be toggled cannot be compared without changing page semantics.
         opaqueStyleSheets.delete(sheet)
@@ -515,11 +556,11 @@ function installLegacyThemeCompatibilityWithMigrations(
       let baseline: Map<Element, Map<string, string>>
       mutatingOpaqueSheetState = true
       try {
-        for (const { sheet } of activeSheets) sheet.disabled = true
+        for (const state of activeSheets) disableOpaqueStyleSheet(state)
         baseline = sampleThemeValues(elements)
       } finally {
         try {
-          for (const { sheet, disabled } of activeSheets) sheet.disabled = disabled
+          for (const state of activeSheets) restoreOpaqueStyleSheet(state)
         } finally {
           mutatingOpaqueSheetState = false
         }
@@ -626,7 +667,24 @@ function installLegacyThemeCompatibilityWithMigrations(
     opaqueOwnedDeclarations.delete(style)
   }
 
+  function resolveStyleSheetScope(
+    sheet: CSSStyleSheet,
+    fallback?: Document | ShadowRoot
+  ): Document | ShadowRoot | undefined {
+    const ownerRoot = sheet.ownerNode?.getRootNode()
+    if (ownerRoot === document
+      || (typeof ShadowRoot !== "undefined" && ownerRoot instanceof ShadowRoot)) {
+      return ownerRoot as Document | ShadowRoot
+    }
+    return fallback ?? styleSheetScopes.get(sheet)
+  }
+
   function syncLegacyStyleSheet(sheet: CSSStyleSheet | null | undefined, scope?: Document | ShadowRoot) {
+    if (sheet) {
+      const knownScope = resolveStyleSheetScope(sheet, scope)
+      styleSheetScopes.set(sheet, knownScope)
+      scope = knownScope
+    }
     try {
       if (sheet?.cssRules) syncLegacyRuleList(sheet.cssRules, scope)
     } catch (error) {
@@ -663,6 +721,32 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
+  function syncInsertedRule(rule: CSSRule, scope?: Document | ShadowRoot) {
+    syncLegacyRuleList([rule], scope)
+    const candidate = rule as CSSRule & { styleSheet?: CSSStyleSheet | null }
+    if (!("styleSheet" in candidate) || !globalThis.setTimeout) return
+    // Dynamically inserted imports expose their child sheet only after loading.
+    let attempts = 0
+    const poll = () => {
+      if (candidate.parentStyleSheet) {
+        try {
+          if (!Array.from(candidate.parentStyleSheet.cssRules).includes(candidate)) return
+        } catch {
+          return
+        }
+      }
+      const sheet = candidate.styleSheet
+      if (sheet) {
+        syncLegacyStyleSheet(sheet, scope)
+        if (opaqueStyleSheets.has(sheet)) scheduleOpaqueLegacyScan(scope)
+        return
+      }
+      attempts += 1
+      if (attempts < 600) globalThis.setTimeout(poll, 50)
+    }
+    globalThis.setTimeout(poll, 0)
+  }
+
   function patchRuleContainer(input: object | undefined) {
     if (!input) return
     const prototype = input as RuleContainer
@@ -671,7 +755,8 @@ function installLegacyThemeCompatibilityWithMigrations(
       prototype.insertRule = function(this: RuleContainer, rule: string, index?: number) {
         const insertedIndex = insertRule.call(this, rule, index)
         const insertedRule = this.cssRules[insertedIndex]
-        if (insertedRule) syncLegacyRuleList([insertedRule])
+        const sheet = this instanceof CSSStyleSheet ? this : this.parentStyleSheet
+        if (insertedRule) syncInsertedRule(insertedRule, sheet ? resolveStyleSheetScope(sheet) : undefined)
         scheduleAllOpaqueLegacyScans()
         return insertedIndex
       }
@@ -680,7 +765,8 @@ function installLegacyThemeCompatibilityWithMigrations(
     if (typeof addRule === "function") {
       prototype.addRule = function(this: RuleContainer, selector?: string, style?: string, index?: number) {
         const result = addRule.call(this, selector, style, index)
-        syncLegacyRuleList(this.cssRules)
+        const sheet = this instanceof CSSStyleSheet ? this : this.parentStyleSheet
+        syncLegacyRuleList(this.cssRules, sheet ? resolveStyleSheetScope(sheet) : undefined)
         scheduleAllOpaqueLegacyScans()
         return result
       }
@@ -729,7 +815,9 @@ function installLegacyThemeCompatibilityWithMigrations(
         set(value: string) {
           const before = mediaText.get?.call(this)
           mediaText.set?.call(this, value)
-          if (before !== mediaText.get?.call(this)) scheduleAllOpaqueLegacyScans()
+          if (!mutatingOpaqueSheetState && before !== mediaText.get?.call(this)) {
+            scheduleAllOpaqueLegacyScans()
+          }
         }
       })
     }
@@ -739,7 +827,7 @@ function installLegacyThemeCompatibilityWithMigrations(
       prototype[name] = function(this: MediaList, medium: string) {
         const before = this.mediaText
         mutate.call(this, medium)
-        if (before !== this.mediaText) scheduleAllOpaqueLegacyScans()
+        if (!mutatingOpaqueSheetState && before !== this.mediaText) scheduleAllOpaqueLegacyScans()
       }
     }
   }
@@ -1117,7 +1205,11 @@ function installLegacyThemeCompatibilityWithMigrations(
   for (const event of [
     "focus", "pointerover", "pointerout", "pointerdown", "pointerup", "pointercancel",
     "mousedown", "mouseup", "touchstart", "touchend", "touchcancel", "keydown", "keyup",
-    "focusin", "focusout", "input", "change", "beforetoggle", "toggle",
+    "focusin", "focusout", "input", "change", "reset", "beforetoggle", "toggle"
+  ]) {
+    globalThis.addEventListener?.(event, scheduleOpaqueLegacyRelationalEventScan, true)
+  }
+  for (const event of [
     "animationstart", "animationiteration", "animationend", "transitionrun", "transitionend"
   ]) {
     globalThis.addEventListener?.(event, scheduleOpaqueLegacyEventScan, true)

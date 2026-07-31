@@ -349,6 +349,7 @@ describe("dynamic legacy theme compatibility", () => {
     }
     class OpaqueStyleSheet {
       private disabledValue = false
+      ownerRule: TestImportRule | null = null
       get disabled() { return this.disabledValue }
       set disabled(value: boolean) { this.disabledValue = value }
       get cssRules(): never {
@@ -356,10 +357,16 @@ describe("dynamic legacy theme compatibility", () => {
       }
     }
     class TestGroupingRule {
-      cssRules: Array<{ style: TestStyle }> = []
+      cssRules: Array<{ style?: TestStyle; styleSheet?: OpaqueStyleSheet }> = []
+      parentStyleSheet?: CSSStyleSheet
       nextStyle?: TestStyle
+      nextStyleSheet?: OpaqueStyleSheet
+      deferStyleSheet = false
       insertRule() {
         if (this.nextStyle) this.cssRules.push({ style: this.nextStyle })
+        else if (this.nextStyleSheet) {
+          this.cssRules.push({ styleSheet: this.deferStyleSheet ? undefined : this.nextStyleSheet })
+        }
         return this.cssRules.length - 1
       }
     }
@@ -367,6 +374,9 @@ describe("dynamic legacy theme compatibility", () => {
       mediaText = ""
       appendMedium(value: string) { this.mediaText = value }
       deleteMedium() { this.mediaText = "" }
+    }
+    class TestImportRule {
+      constructor(readonly media: TestMediaList) {}
     }
     class TestInputElement {
       private checkedValue = false
@@ -394,6 +404,10 @@ describe("dynamic legacy theme compatibility", () => {
     const closedElement = new TestElement()
     const closedRoot = new TestShadowRoot()
     const closedOpaque = new OpaqueStyleSheet()
+    const insertedClosedHost = new TestElement()
+    const insertedClosedElement = new TestElement()
+    const insertedClosedRoot = new TestShadowRoot()
+    const insertedClosedParentSheet = { cssRules: [], disabled: false }
     inlineStandard.style.setProperty("--primary", "oklch(0.7 0.15 255)")
     const root = new TestElement()
     standard.parentElement = root
@@ -415,8 +429,15 @@ describe("dynamic legacy theme compatibility", () => {
     closedRoot.adoptedStyleSheets.push(closedOpaque)
     closedRoot.descendants.push(closedElement)
     closedElement.rootNode = closedRoot
+    insertedClosedHost.parentElement = root
+    insertedClosedHost.nextShadowRoot = insertedClosedRoot
+    insertedClosedRoot.host = insertedClosedHost
+    insertedClosedRoot.adoptedStyleSheets.push(insertedClosedParentSheet as unknown as OpaqueStyleSheet)
+    insertedClosedRoot.descendants.push(insertedClosedElement)
+    insertedClosedElement.rootNode = insertedClosedRoot
     root.descendants.push(
-      standard, inlineStandard, inherited, ancestor, eventCard, unrelatedEventSibling, closedHost
+      standard, inlineStandard, inherited, ancestor, eventCard, unrelatedEventSibling,
+      closedHost, insertedClosedHost
     )
     const opaque = new OpaqueStyleSheet()
     const readableThemeSheet = { cssRules: [], disabled: false }
@@ -425,19 +446,27 @@ describe("dynamic legacy theme compatibility", () => {
     const groupingRule = new TestGroupingRule()
     groupingRule.nextStyle = insertedStandardRule
     const frames: FrameRequestCallback[] = []
+    const timers: Array<() => void> = []
     const listeners = new Map<string, EventListener>()
     const mediaListeners = new Map<string, EventListener>()
     let legacyActive = false
     let ancestorActive = false
     let eventPanelActive = false
+    let insertedClosedOpaque: OpaqueStyleSheet | null = null
     const computedReads = new Map<TestElement, number>()
     const computedProperty = (element: TestElement, name: string): string => {
       const inClosedRoot = element.rootNode === closedRoot
+      const inInsertedClosedRoot = element.rootNode === insertedClosedRoot
       if (name === "--avs-primary") {
         if (element === eventPanel && eventPanelActive && !opaque.disabled) return "262 83% 58%"
         return inClosedRoot || opaque.disabled || !legacyActive ? "222 47% 11%" : "221 83% 53%"
       }
       if (name === "--avs-warning") {
+        const insertedImportActive = insertedClosedOpaque
+          && insertedClosedOpaque.ownerRule?.media.mediaText !== "not all"
+        if (inInsertedClosedRoot && insertedImportActive) {
+          return "32 95% 44%"
+        }
         return !inClosedRoot && !opaque.disabled && legacyActive && element.style.cssText ? "32 95% 44%" : ""
       }
       if (name === "--avs-ring") {
@@ -467,7 +496,9 @@ describe("dynamic legacy theme compatibility", () => {
         if (element === root && !opaque.disabled) return "rgb(10 20 30)"
         return parent ? computedProperty(parent, name) : readableThemeSheet.disabled ? "" : "rgb(10 20 30)"
       }
-      if (name === "--warning") return element.style.getPropertyValue(name)
+      if (name === "--warning") {
+        return element.style.getPropertyValue(name) || (parent ? computedProperty(parent, name) : "")
+      }
       if (name === "--ring" || name === "--success") {
         const inline = element.style.getPropertyValue(name)
         if (!inline) return parent ? computedProperty(parent, name) : ""
@@ -484,6 +515,7 @@ describe("dynamic legacy theme compatibility", () => {
     const context = {
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: OpaqueStyleSheet,
+      CSSImportRule: TestImportRule,
       CSSGroupingRule: TestGroupingRule,
       Element: TestElement,
       HTMLLinkElement: class {},
@@ -511,6 +543,10 @@ describe("dynamic legacy theme compatibility", () => {
         frames.push(callback)
         return frames.length
       },
+      setTimeout(callback: () => void) {
+        timers.push(callback)
+        return timers.length
+      },
       document: {
         adoptedStyleSheets: [],
         addEventListener() {},
@@ -525,6 +561,9 @@ describe("dynamic legacy theme compatibility", () => {
     const returnedClosedRoot = closedHost.attachShadow({ mode: "closed" })
     expect(returnedClosedRoot).toBe(closedRoot)
     expect(closedHost.shadowRoot).toBe(null)
+    const returnedInsertedClosedRoot = insertedClosedHost.attachShadow({ mode: "closed" })
+    expect(returnedInsertedClosedRoot).toBe(insertedClosedRoot)
+    expect(insertedClosedHost.shadowRoot).toBe(null)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0)
     expect(root.style.getPropertyValue("--primary")).toBe("")
@@ -535,24 +574,54 @@ describe("dynamic legacy theme compatibility", () => {
     expect(listeners.has("keydown")).toBe(true)
     expect(listeners.has("beforetoggle")).toBe(true)
     expect(listeners.has("toggle")).toBe(true)
+    expect(listeners.has("reset")).toBe(true)
     expect(listeners.has("fullscreenchange")).toBe(true)
     expect(listeners.get("pointerdown")).not.toBe(listeners.get("resize"))
+    expect(listeners.get("pointerdown")).not.toBe(listeners.get("animationstart"))
     expect(mediaListeners.has("(any-pointer: coarse)")).toBe(true)
     expect(mediaListeners.has("(any-pointer: none)")).toBe(true)
 
     computedReads.clear()
     eventPanelActive = true
     listeners.get("pointerdown")?.({ target: eventTarget } as unknown as Event)
-    expect(frames).toHaveLength(1)
+    expect(frames).toHaveLength(2)
     frames.shift()?.(0.125)
     expect(eventPanel.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(computedReads.get(unrelatedEventSibling)).toBeUndefined()
+    frames.shift()?.(0.15)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.175)
+    expect(computedReads.get(unrelatedEventSibling)).toBeGreaterThan(0)
+
+    eventPanelActive = false
+    listeners.get("reset")?.({ target: eventCard } as unknown as Event)
+    expect(frames).toHaveLength(2)
+    frames.shift()?.(0.18)
+    expect(eventPanel.style.getPropertyValue("--primary")).toBe("")
+    frames.shift()?.(0.185)
+    frames.shift()?.(0.19)
 
     computedReads.clear()
     listeners.get("fullscreenchange")?.({} as Event)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.1875)
     expect(computedReads.get(unrelatedEventSibling)).toBeGreaterThan(0)
+
+    insertedClosedOpaque = new OpaqueStyleSheet()
+    insertedClosedOpaque.ownerRule = new TestImportRule(new TestMediaList())
+    const closedGroupingRule = new TestGroupingRule()
+    closedGroupingRule.parentStyleSheet = insertedClosedParentSheet as unknown as CSSStyleSheet
+    closedGroupingRule.nextStyleSheet = insertedClosedOpaque
+    closedGroupingRule.deferStyleSheet = true
+    closedGroupingRule.insertRule()
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.2)
+    expect(insertedClosedElement.style.getPropertyValue("--warning")).toBe("")
+    closedGroupingRule.cssRules[0].styleSheet = insertedClosedOpaque
+    timers.pop()?.()
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.21)
+    expect(insertedClosedElement.style.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
 
     groupingRule.insertRule()
     expect(frames).toHaveLength(1)
@@ -601,8 +670,11 @@ describe("dynamic legacy theme compatibility", () => {
 
     root.isConnected = false
     listeners.get("focus")?.({ target: external } as unknown as Event)
+    expect(frames).toHaveLength(2)
     frames.shift()?.(4)
     expect(root.style.getPropertyValue("--primary")).toBe("")
+    frames.shift()?.(4.25)
+    frames.shift()?.(4.5)
     root.isConnected = true
 
     root.style.cssText += "; color: red"
