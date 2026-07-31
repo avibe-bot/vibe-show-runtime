@@ -71,6 +71,7 @@ describe("legacy theme compatibility", () => {
     expect(script).toContain("syncAllOpaqueLegacyThemesNow")
     expect(script).toContain("patchRuleStyleOwner")
     expect(script).toContain("patchNamedRuleStyleProperties")
+    expect(script).toContain('[...portalThemeProperties, "all", "font"]')
     expect(script).toContain("patchCustomStateSet")
     expect(script).toContain('document.fonts?.addEventListener?.("loadingdone"')
     expect(script).toContain("scheduleOpaqueLegacyRelationalScan")

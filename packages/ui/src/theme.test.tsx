@@ -120,6 +120,7 @@ describe("theme.css", () => {
 
   it("provides cycle-free shadow defaults without reserving consumer-owned standard properties", () => {
     expect(css).toContain(":where(:host) > :where(*) {")
+    expect(css).toContain(':where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) {')
     for (const property of SHOW_PORTAL_THEME_PROPERTIES.filter(
       (property) => property.startsWith("--") && !property.startsWith("--avs-")
     )) {
@@ -127,10 +128,14 @@ describe("theme.css", () => {
       expect(css).not.toContain(`--avibe-show-host-${name}: var(${property},`)
       expect(css).toContain(`${property}: var(--avibe-show-host-${name},`)
     }
+    expect(css).toContain("--background: var(--avibe-show-host-background, hsl(222 47% 11%));")
+    expect(css).toContain("--foreground: var(--avibe-show-host-foreground, hsl(210 40% 98%));")
+    expect(css).toContain("--primary: var(--avibe-show-host-primary, hsl(210 40% 98%));")
   })
 
   it("supports dark utilities on theme roots and dark-aware presets", () => {
     expect(css).toContain(":host(.dark) *")
+    expect(css).toContain(":host(.avs-dark) *")
     expect(css).toContain(".avs-dark *")
     expect(css).toContain('.dark .avs-theme[data-theme-preset="zinc"],')
     expect(css).toContain('.avs-theme.dark[data-theme-preset="zinc"],')

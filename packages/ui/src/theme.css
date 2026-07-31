@@ -8,7 +8,7 @@
  * plain `var(...)` outside Tailwind.
  */
 
-@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *, .avs-dark, .avs-dark *, :host(.dark) *, :host([data-theme="dark"]) *));
+@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *, .avs-dark, .avs-dark *, :host(.dark) *, :host([data-theme="dark"]) *, :host(.avs-dark) *));
 
 @theme inline {
   --color-background: var(--background);
@@ -60,7 +60,7 @@
 /*
  * A shadow stylesheet cannot select the document root. The compatibility
  * runtime snapshots resolved host tokens into internal aliases; direct CSS-only
- * consumers fall back to the light contract without reserving public names.
+ * consumers fall back to the matching host palette without reserving public names.
  */
 :where(:host) > :where(*) {
   --radius: var(--avibe-show-host-radius, 0.5rem);
@@ -100,6 +100,46 @@
   --success-foreground: var(--avibe-show-host-success-foreground, hsl(0 0% 100%));
   --warning: var(--avibe-show-host-warning, hsl(32 95% 44%));
   --warning-foreground: var(--avibe-show-host-warning-foreground, hsl(0 0% 100%));
+}
+
+:where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) {
+  --radius: var(--avibe-show-host-radius, 0.5rem);
+  --background: var(--avibe-show-host-background, hsl(222 47% 11%));
+  --foreground: var(--avibe-show-host-foreground, hsl(210 40% 98%));
+  --card: var(--avibe-show-host-card, hsl(222 47% 14%));
+  --card-foreground: var(--avibe-show-host-card-foreground, hsl(210 40% 98%));
+  --popover: var(--avibe-show-host-popover, hsl(222 47% 14%));
+  --popover-foreground: var(--avibe-show-host-popover-foreground, hsl(210 40% 98%));
+  --primary: var(--avibe-show-host-primary, hsl(210 40% 98%));
+  --primary-foreground: var(--avibe-show-host-primary-foreground, hsl(222 47% 11%));
+  --secondary: var(--avibe-show-host-secondary, hsl(217 33% 18%));
+  --secondary-foreground: var(--avibe-show-host-secondary-foreground, hsl(210 40% 98%));
+  --muted: var(--avibe-show-host-muted, hsl(217 33% 18%));
+  --muted-foreground: var(--avibe-show-host-muted-foreground, hsl(215 20% 65%));
+  --accent: var(--avibe-show-host-accent, hsl(217 33% 18%));
+  --accent-foreground: var(--avibe-show-host-accent-foreground, hsl(210 40% 98%));
+  --destructive: var(--avibe-show-host-destructive, hsl(0 63% 31%));
+  --destructive-foreground: var(--avibe-show-host-destructive-foreground, hsl(210 40% 98%));
+  --border: var(--avibe-show-host-border, hsl(217 33% 22%));
+  --input: var(--avibe-show-host-input, hsl(217 33% 22%));
+  --ring: var(--avibe-show-host-ring, hsl(212 27% 84%));
+  --chart-1: var(--avibe-show-host-chart-1, hsl(220 70% 50%));
+  --chart-2: var(--avibe-show-host-chart-2, hsl(160 60% 45%));
+  --chart-3: var(--avibe-show-host-chart-3, hsl(30 80% 55%));
+  --chart-4: var(--avibe-show-host-chart-4, hsl(280 65% 60%));
+  --chart-5: var(--avibe-show-host-chart-5, hsl(340 75% 55%));
+  --sidebar: var(--avibe-show-host-sidebar, hsl(222 47% 14%));
+  --sidebar-foreground: var(--avibe-show-host-sidebar-foreground, hsl(210 40% 98%));
+  --sidebar-primary: var(--avibe-show-host-sidebar-primary, hsl(221 83% 53%));
+  --sidebar-primary-foreground: var(--avibe-show-host-sidebar-primary-foreground, hsl(210 40% 98%));
+  --sidebar-accent: var(--avibe-show-host-sidebar-accent, hsl(217 33% 18%));
+  --sidebar-accent-foreground: var(--avibe-show-host-sidebar-accent-foreground, hsl(210 40% 98%));
+  --sidebar-border: var(--avibe-show-host-sidebar-border, hsl(217 33% 22%));
+  --sidebar-ring: var(--avibe-show-host-sidebar-ring, hsl(212 27% 84%));
+  --success: var(--avibe-show-host-success, hsl(158 64% 52%));
+  --success-foreground: var(--avibe-show-host-success-foreground, hsl(222 47% 11%));
+  --warning: var(--avibe-show-host-warning, hsl(38 92% 50%));
+  --warning-foreground: var(--avibe-show-host-warning-foreground, hsl(222 47% 11%));
 }
 
 :root,
@@ -162,6 +202,7 @@
 [data-theme="dark"],
 :host(.dark),
 :host([data-theme="dark"]),
+:host(.avs-dark),
 .avs-theme.dark,
 .avs-theme.avs-dark,
 .dark .avs-theme,

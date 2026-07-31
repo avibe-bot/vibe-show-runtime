@@ -87,7 +87,7 @@ function loadClientCode() {
 }
 
 describe("dynamic legacy theme compatibility", () => {
-  it("installs CSSOM migration without scanning unrelated inline animations", () => {
+  it("installs CSSOM migration without scanning unrelated inline animations", async () => {
     class TestElement {
       style = new TestStyle()
       parentElement = null
@@ -224,6 +224,7 @@ describe("dynamic legacy theme compatibility", () => {
     const testDocument = new TestDocument()
     const retainedAdoptedSheets = testDocument.adoptedStyleSheets
     const timers: Array<() => void> = []
+    const dispatchedEvents: string[] = []
     const context = {
       CSSGroupingRule: TestGroupingRule,
       CSSKeyframesRule: TestKeyframesRule,
@@ -234,13 +235,28 @@ describe("dynamic legacy theme compatibility", () => {
       MutationObserver: TestMutationObserver,
       ShadowRoot: TestShadowRoot,
       Document: TestDocument,
+      Event: class { constructor(readonly type: string) {} },
       document: testDocument,
+      dispatchEvent(event: { type: string }) {
+        dispatchedEvents.push(event.type)
+        return true
+      },
       setTimeout(callback: () => void) {
         timers.push(callback)
         return timers.length
       }
     }
     runInNewContext(loadClientCode(), context)
+
+    await Promise.resolve()
+    dispatchedEvents.length = 0
+    directRule.setProperty("font", "italic 20px sans-serif")
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
+    dispatchedEvents.length = 0
+    directRule.removeProperty("font")
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
 
     expect(directRule.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(emptyLegacyRule.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")

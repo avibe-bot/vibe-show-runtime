@@ -61,7 +61,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   const legacySources = Object.keys(migrations)
   const legacySourceSet = new Set(legacySources)
   const migratedTargets = new Set(Object.values(migrations).flat())
-  const portalThemePropertySet = new Set(portalThemeProperties)
+  const portalThemeMutationPropertySet = new Set([...portalThemeProperties, "all", "font"])
   const ownedDeclarations = new WeakMap<CSSStyleDeclaration, Map<string, OwnedDeclaration>>()
   const opaqueOwnedDeclarations = new Map<CSSStyleDeclaration, OpaqueOwnedDeclarations>()
   const opaqueBridgeSignatures = new WeakMap<CSSStyleDeclaration, string>()
@@ -1476,7 +1476,7 @@ function installLegacyThemeCompatibilityWithMigrations(
     stylePrototype.setProperty = function(name: string, value: string | null, priority?: string) {
       const propertyName = String(name)
       const tracksOpaqueTarget = !mutatingOpaqueBridge && migratedTargets.has(propertyName)
-      const tracksPortalTheme = !mutatingOpaqueBridge && portalThemePropertySet.has(propertyName)
+      const tracksPortalTheme = !mutatingOpaqueBridge && portalThemeMutationPropertySet.has(propertyName)
       const tracksRuleStyle = !mutatingOpaqueBridge
         && opaqueStyleSheets.size > 0
         && ruleStyleDeclarations.has(this)
@@ -1511,7 +1511,7 @@ function installLegacyThemeCompatibilityWithMigrations(
     stylePrototype.removeProperty = function(name: string) {
       const propertyName = String(name)
       const tracksOpaqueTarget = !mutatingOpaqueBridge && migratedTargets.has(propertyName)
-      const tracksPortalTheme = !mutatingOpaqueBridge && portalThemePropertySet.has(propertyName)
+      const tracksPortalTheme = !mutatingOpaqueBridge && portalThemeMutationPropertySet.has(propertyName)
       const tracksRuleStyle = !mutatingOpaqueBridge
         && opaqueStyleSheets.size > 0
         && ruleStyleDeclarations.has(this)
