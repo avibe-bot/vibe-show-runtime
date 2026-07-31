@@ -183,7 +183,7 @@ function installLegacyThemeCompatibilityWithMigrations(
 
   function scheduleOpaqueLegacyScan(root?: Node) {
     if (!opaqueStyleSheets.size) return
-    if (typeof Node !== "undefined" && root instanceof Node && root !== document) {
+    if (root && root !== document) {
       opaqueScanRoots.add(root)
     } else {
       opaqueFullScanPending = true
@@ -214,6 +214,26 @@ function installLegacyThemeCompatibilityWithMigrations(
     scheduleOpaqueLegacyScan()
     for (const scope of opaqueStyleSheetScopes.values()) {
       if (typeof ShadowRoot !== "undefined" && scope instanceof ShadowRoot) {
+        scheduleOpaqueLegacyScan(scope)
+      }
+    }
+  }
+
+  function scheduleOpaqueLegacyEventScan(event: Event) {
+    const target = event.target
+    const element = target instanceof Element
+      ? target
+      : (typeof Node !== "undefined" && target instanceof Node ? target.parentElement : null)
+    if (!element) {
+      scheduleAllOpaqueLegacyScans()
+      return
+    }
+    scheduleOpaqueLegacyScan(element)
+    const targetRoot = element.getRootNode()
+    for (const scope of opaqueStyleSheetScopes.values()) {
+      if (typeof ShadowRoot === "undefined" || !(scope instanceof ShadowRoot)) continue
+      const host = scope.host
+      if (scope === targetRoot || element === host || element.contains(host) || host.contains(element)) {
         scheduleOpaqueLegacyScan(scope)
       }
     }
@@ -1093,7 +1113,7 @@ function installLegacyThemeCompatibilityWithMigrations(
     "focusin", "focusout", "input", "change", "beforetoggle", "toggle",
     "animationstart", "animationiteration", "animationend", "transitionrun", "transitionend"
   ]) {
-    globalThis.addEventListener?.(event, scheduleAllOpaqueLegacyScans, true)
+    globalThis.addEventListener?.(event, scheduleOpaqueLegacyEventScan, true)
   }
   for (const query of [
     "(prefers-color-scheme: dark)",

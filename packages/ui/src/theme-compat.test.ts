@@ -43,6 +43,7 @@ describe("legacy theme compatibility", () => {
       expect(script).toContain(`"${property}"`)
     }
     expect(script).toContain("opaqueStyleSheetScopes.values()")
+    expect(script).toContain("addEventListener?.(event, scheduleOpaqueLegacyEventScan, true)")
     expect(script).toContain('"hashchange"')
     expect(script).toContain('"popstate"')
   })

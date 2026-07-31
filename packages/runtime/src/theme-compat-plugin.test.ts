@@ -520,6 +520,7 @@ describe("dynamic legacy theme compatibility", () => {
     expect(listeners.has("keydown")).toBe(true)
     expect(listeners.has("beforetoggle")).toBe(true)
     expect(listeners.has("toggle")).toBe(true)
+    expect(listeners.get("pointerdown")).not.toBe(listeners.get("resize"))
     expect(mediaListeners.has("(any-pointer: coarse)")).toBe(true)
     expect(mediaListeners.has("(any-pointer: none)")).toBe(true)
 
