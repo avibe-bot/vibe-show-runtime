@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs"
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
 import { ThemeProvider } from "./theme"
+import { SHOW_PORTAL_THEME_PROPERTIES } from "./theme-properties"
 
 describe("ThemeProvider", () => {
   it("preserves the zinc default and allows the standard root palette explicitly", () => {
@@ -115,6 +116,17 @@ describe("theme.css", () => {
     expect(css).toContain("\n.dark,\n[data-theme=\"dark\"],\n:host(.dark),")
     expect(css).toContain("[data-theme=\"dark\"] .avs-theme {\n  color-scheme: dark;")
     expect(css).toContain("--background: hsl(")
+  })
+
+  it("provides shadow defaults without reserving consumer-owned standard properties", () => {
+    expect(css).toContain(":where(:host) > :where(*) {")
+    for (const property of SHOW_PORTAL_THEME_PROPERTIES.filter(
+      (property) => property.startsWith("--") && !property.startsWith("--avs-")
+    )) {
+      const name = property.slice(2)
+      expect(css).toContain(`--avibe-show-host-${name}: var(${property},`)
+      expect(css).toContain(`${property}: var(--avibe-show-host-${name});`)
+    }
   })
 
   it("supports dark utilities on theme roots and dark-aware presets", () => {

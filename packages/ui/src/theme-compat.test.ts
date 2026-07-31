@@ -2,7 +2,6 @@ import { readFileSync } from "node:fs"
 import { describe, expect, it } from "vitest"
 import {
   LEGACY_THEME_MIGRATIONS,
-  STANDARD_THEME_INITIAL_VALUES,
   themeCompatibilityClientScript
 } from "./theme-compat"
 import { SHOW_PORTAL_THEME_PROPERTIES } from "./theme-properties"
@@ -13,12 +12,9 @@ describe("legacy theme compatibility", () => {
     expect(LEGACY_THEME_MIGRATIONS["--avs-background"]).toEqual(["--background", "--card", "--popover"])
     expect(themeCompatibilityClientScript()).toContain("__avibeShowThemeCompatInstalled")
     expect(themeCompatibilityClientScript()).toContain("avibe-show-theme-change")
-    expect(themeCompatibilityClientScript()).toContain("registerProperty")
+    expect(themeCompatibilityClientScript()).not.toContain("registerProperty")
     expect(SHOW_PORTAL_THEME_PROPERTIES).toContain("--chart-1")
     expect(SHOW_PORTAL_THEME_PROPERTIES).toContain("--sidebar")
-    for (const property of SHOW_PORTAL_THEME_PROPERTIES.filter((property) => property.startsWith("--") && !property.startsWith("--avs-"))) {
-      expect(STANDARD_THEME_INITIAL_VALUES[property]).toBeTruthy()
-    }
   })
 
   it("installs for direct component and ThemeProvider consumers", () => {

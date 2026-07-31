@@ -18,46 +18,6 @@ export const LEGACY_THEME_MIGRATIONS: Record<string, readonly string[]> = {
 export const LEGACY_THEME_OWNERSHIP_PREFIX = "--avibe-show-theme-owner-"
 export const SHOW_THEME_CHANGE_EVENT = "avibe-show-theme-change"
 
-export const STANDARD_THEME_INITIAL_VALUES: Record<string, string> = {
-  "--radius": "0.5rem",
-  "--background": "hsl(0 0% 100%)",
-  "--foreground": "hsl(222 47% 11%)",
-  "--card": "hsl(0 0% 100%)",
-  "--card-foreground": "hsl(222 47% 11%)",
-  "--popover": "hsl(0 0% 100%)",
-  "--popover-foreground": "hsl(222 47% 11%)",
-  "--primary": "hsl(222 47% 11%)",
-  "--primary-foreground": "hsl(210 40% 98%)",
-  "--secondary": "hsl(210 40% 96%)",
-  "--secondary-foreground": "hsl(222 47% 11%)",
-  "--muted": "hsl(210 40% 96%)",
-  "--muted-foreground": "hsl(215 16% 47%)",
-  "--accent": "hsl(210 40% 96%)",
-  "--accent-foreground": "hsl(222 47% 11%)",
-  "--destructive": "hsl(0 84% 60%)",
-  "--destructive-foreground": "hsl(0 0% 100%)",
-  "--border": "hsl(214 32% 91%)",
-  "--input": "hsl(214 32% 91%)",
-  "--ring": "hsl(221 83% 53%)",
-  "--chart-1": "hsl(12 76% 61%)",
-  "--chart-2": "hsl(173 58% 39%)",
-  "--chart-3": "hsl(197 37% 24%)",
-  "--chart-4": "hsl(43 74% 66%)",
-  "--chart-5": "hsl(27 87% 67%)",
-  "--sidebar": "hsl(210 40% 98%)",
-  "--sidebar-foreground": "hsl(222 47% 11%)",
-  "--sidebar-primary": "hsl(222 47% 11%)",
-  "--sidebar-primary-foreground": "hsl(210 40% 98%)",
-  "--sidebar-accent": "hsl(210 40% 96%)",
-  "--sidebar-accent-foreground": "hsl(222 47% 11%)",
-  "--sidebar-border": "hsl(214 32% 91%)",
-  "--sidebar-ring": "hsl(221 83% 53%)",
-  "--success": "hsl(158 64% 24%)",
-  "--success-foreground": "hsl(0 0% 100%)",
-  "--warning": "hsl(32 95% 44%)",
-  "--warning-foreground": "hsl(0 0% 100%)"
-}
-
 export function legacyThemeOwnershipMarker(target: string): string {
   return `${LEGACY_THEME_OWNERSHIP_PREFIX}${target.slice(2)}`
 }
@@ -88,8 +48,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   migrations: Record<string, readonly string[]>,
   ownershipPrefix: string,
   themeChangeEvent: string,
-  portalThemeProperties: readonly string[],
-  standardThemeInitialValues: Record<string, string>
+  portalThemeProperties: readonly string[]
 ) {
   if (typeof document === "undefined") return
 
@@ -98,17 +57,6 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
   if (runtime.__avibeShowThemeCompatInstalled) return
   runtime.__avibeShowThemeCompatInstalled = true
-
-  const registerProperty = globalThis.CSS?.registerProperty?.bind(globalThis.CSS)
-  if (registerProperty) {
-    for (const [name, initialValue] of Object.entries(standardThemeInitialValues)) {
-      try {
-        registerProperty({ name, syntax: "*", inherits: true, initialValue })
-      } catch {
-        // Consumers may have registered a stricter definition before Show UI loads.
-      }
-    }
-  }
 
   const legacySources = Object.keys(migrations)
   const legacySourceSet = new Set(legacySources)
@@ -1706,13 +1654,12 @@ export function installLegacyThemeCompatibility() {
     LEGACY_THEME_MIGRATIONS,
     LEGACY_THEME_OWNERSHIP_PREFIX,
     SHOW_THEME_CHANGE_EVENT,
-    SHOW_PORTAL_THEME_PROPERTIES,
-    STANDARD_THEME_INITIAL_VALUES
+    SHOW_PORTAL_THEME_PROPERTIES
   )
 }
 
 export function themeCompatibilityClientScript(): string {
-  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)},${JSON.stringify(LEGACY_THEME_OWNERSHIP_PREFIX)},${JSON.stringify(SHOW_THEME_CHANGE_EVENT)},${JSON.stringify(SHOW_PORTAL_THEME_PROPERTIES)},${JSON.stringify(STANDARD_THEME_INITIAL_VALUES)});`
+  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)},${JSON.stringify(LEGACY_THEME_OWNERSHIP_PREFIX)},${JSON.stringify(SHOW_THEME_CHANGE_EVENT)},${JSON.stringify(SHOW_PORTAL_THEME_PROPERTIES)});`
 }
 
 installLegacyThemeCompatibility()

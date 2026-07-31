@@ -711,12 +711,7 @@ describe("dynamic legacy theme compatibility", () => {
     expect(listeners.get("pointerdown")).not.toBe(listeners.get("animationstart"))
     expect(mediaListeners.has("(any-pointer: coarse)")).toBe(true)
     expect(mediaListeners.has("(any-pointer: none)")).toBe(true)
-    expect(registeredProperties).toContainEqual({
-      name: "--background",
-      initialValue: "hsl(0 0% 100%)",
-      inherits: true,
-      syntax: "*"
-    })
+    expect(registeredProperties).toEqual([])
 
     legacyActive = true
     listeners.get("beforeprint")?.({} as Event)

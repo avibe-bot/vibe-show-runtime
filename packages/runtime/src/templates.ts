@@ -104,13 +104,17 @@ function orderThemeAfterTailwind(contents: string, uiPackageName: string): strin
   const tailwind = imports.find((statement) => statement.specifier === "tailwindcss")
   const theme = imports.find((statement) => statement.specifier === `${uiPackageName}/theme.css`)
   if (!tailwind || !theme || tailwind.start < theme.start) return contents
-  const statement = contents.slice(theme.start, theme.end)
-  const removedLength = theme.end - theme.start
-  const withoutTheme = `${contents.slice(0, theme.start)}${contents.slice(theme.end)}`
-  return insertAfterImport(withoutTheme, { ...tailwind, end: tailwind.end - removedLength }, statement)
+  const statement = contents.slice(theme.start, theme.endExclusive)
+  const removedLength = theme.endExclusive - theme.start
+  const withoutTheme = `${contents.slice(0, theme.start)}${contents.slice(theme.endExclusive)}`
+  return insertAfterImport(
+    withoutTheme,
+    { ...tailwind, endExclusive: tailwind.endExclusive - removedLength },
+    statement
+  )
 }
 
-type ImportStatement = { start: number; end: number; specifier: string }
+type ImportStatement = { start: number; endExclusive: number; specifier: string }
 
 function topLevelImports(contents: string): ImportStatement[] | null {
   let root: postcss.Root
@@ -126,7 +130,7 @@ function topLevelImports(contents: string): ImportStatement[] | null {
     const start = node.source?.start?.offset
     const end = node.source?.end?.offset
     if (specifier == null || start == null || end == null) continue
-    imports.push({ start, end, specifier })
+    imports.push({ start, endExclusive: end, specifier })
   }
   return imports
 }
@@ -249,7 +253,7 @@ function migrateLegacyThemeDeclarations(contents: string): string {
 
 function insertAfterImport(contents: string, target: ImportStatement, statement: string): string {
   const newline = contents.includes("\r\n") ? "\r\n" : "\n"
-  return `${contents.slice(0, target.end)}${newline}${statement}${contents.slice(target.end)}`
+  return `${contents.slice(0, target.endExclusive)}${newline}${statement}${contents.slice(target.endExclusive)}`
 }
 
 /**
