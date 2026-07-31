@@ -528,6 +528,14 @@ describe("dynamic legacy theme compatibility", () => {
       constructor(callback: MutationCallback) { mutationCallbacks.push(callback) }
       observe() {}
     }
+    let resizeCallback: ResizeObserverCallback | undefined
+    const resizeObserved = new Set<TestElement>()
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resizeCallback = callback }
+      observe(element: TestElement) { resizeObserved.add(element) }
+      unobserve(element: TestElement) { resizeObserved.delete(element) }
+      disconnect() { resizeObserved.clear() }
+    }
 
     const standard = new TestElement(true)
     const inlineStandard = new TestElement()
@@ -730,6 +738,7 @@ describe("dynamic legacy theme compatibility", () => {
       HTMLTextAreaElement: TestTextAreaElement,
       HTMLStyleElement: TestStyleElement,
       MutationObserver: TestMutationObserver,
+      ResizeObserver: TestResizeObserver,
       MediaList: TestMediaList,
       Node: TestNode,
       History: TestHistory,
@@ -773,7 +782,12 @@ describe("dynamic legacy theme compatibility", () => {
         },
         getAnimations() {
           return activeCssMotion
-            ? [{ constructor: { name: "CSSAnimation" }, playState: "running", pending: false }]
+            ? [{
+                constructor: { name: "CSSAnimation" },
+                effect: { getKeyframes: () => [{ width: "40rem" }] },
+                playState: "running",
+                pending: false
+              }]
             : []
         },
         querySelectorAll() { return root.querySelectorAll("*") },
@@ -823,6 +837,8 @@ describe("dynamic legacy theme compatibility", () => {
     expect(rootListeners.has("scroll")).toBe(true)
     expect(rootListeners.has("scrollend")).toBe(true)
     expect(registeredProperties).toEqual([])
+    expect(resizeObserved.has(closedHost)).toBe(true)
+    expect(resizeObserved.has(root)).toBe(true)
 
     mutationCallbacks[0]?.([{
       type: "characterData",
@@ -1019,6 +1035,7 @@ describe("dynamic legacy theme compatibility", () => {
     frames.shift()?.(0.4699)
     expect(opaque.disabledWrites).toBe(opaqueWritesBeforeStandardMotion)
     expect(root.style.getPropertyValue("--primary")).toBe("")
+    expect(frames.length).toBeGreaterThan(0)
 
     activeCssMotion = false
     legacyActive = false
@@ -1039,6 +1056,7 @@ describe("dynamic legacy theme compatibility", () => {
     expect(opaque.disabledWrites).toBe(opaqueWritesBeforeMotion)
     expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(eventPanel.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    expect(frames.length).toBeGreaterThan(0)
     activeCssMotion = false
     legacyActive = false
     eventPanelActive = false
@@ -1159,6 +1177,11 @@ describe("dynamic legacy theme compatibility", () => {
     for (const callback of finalMotionFrames) callback(5.5)
     expect(closedHost.style.getPropertyValue("--avibe-show-host-primary")).toBe("rgb(7 8 9)")
     while (frames.length) frames.shift()?.(5.75)
+    closedHost.animations = []
+    shadowHostPrimary = "rgb(10 11 12)"
+    resizeCallback?.([], {} as ResizeObserver)
+    frames.shift()?.(5.875)
+    expect(closedHost.style.getPropertyValue("--avibe-show-host-primary")).toBe("rgb(10 11 12)")
 
     root.style.setProperty("--primary", "oklch(0.62 0.19 255)", "invalid")
     expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")

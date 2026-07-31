@@ -89,6 +89,8 @@ function installLegacyThemeCompatibilityWithMigrations(
   const knownShadowRoots = new WeakMap<Element, ShadowRoot>()
   const activeShadowRoots = new Set<ShadowRoot>()
   const inactiveShadowRoots = new WeakSet<ShadowRoot>()
+  let shadowHostResizeObserver: ResizeObserver | null = null
+  let observedShadowThemeElements = new Set<Element>()
   const shadowHostThemeProperties = portalThemeProperties.filter(
     (property) => property.startsWith("--") && !property.startsWith("--avs-")
   )
@@ -288,14 +290,38 @@ function installLegacyThemeCompatibilityWithMigrations(
     return false
   }
 
+  function scheduleShadowHostThemeRefresh() {
+    if (shadowHostThemeFrame) return
+    shadowHostThemeFrame = requestCompatibilityFrame(() => {
+      shadowHostThemeFrame = 0
+      refreshShadowHostThemes()
+    })
+  }
+
+  function syncShadowHostResizeObserver() {
+    if (typeof ResizeObserver === "undefined") return
+    if (!shadowHostResizeObserver) {
+      shadowHostResizeObserver = new ResizeObserver(scheduleShadowHostThemeRefresh)
+    }
+    const nextElements = new Set<Element>()
+    for (const root of activeShadowRoots) {
+      for (let element: Element | null = root.host; element; element = composedParentElement(element)) {
+        nextElements.add(element)
+      }
+    }
+    for (const element of observedShadowThemeElements) {
+      if (!nextElements.has(element)) shadowHostResizeObserver.unobserve(element)
+    }
+    for (const element of nextElements) {
+      if (!observedShadowThemeElements.has(element)) shadowHostResizeObserver.observe(element)
+    }
+    observedShadowThemeElements = nextElements
+  }
+
   function refreshShadowHostThemes() {
     for (const root of activeShadowRoots) snapshotShadowHostTheme(root)
-    if (!shadowHostThemeFrame && hasActiveShadowHostThemeMotion()) {
-      shadowHostThemeFrame = requestCompatibilityFrame(() => {
-        shadowHostThemeFrame = 0
-        refreshShadowHostThemes()
-      })
-    }
+    syncShadowHostResizeObserver()
+    if (hasActiveShadowHostThemeMotion()) scheduleShadowHostThemeRefresh()
   }
 
   function notifyThemeChange() {
@@ -765,7 +791,7 @@ function installLegacyThemeCompatibilityWithMigrations(
     else state.sheet.disabled = state.disabled
   }
 
-  function hasActiveCssMotion(scope?: Document | ShadowRoot) {
+  function animationsInScope(scope?: Document | ShadowRoot) {
     const root = scope ?? document
     const animations: Animation[] = []
     if ("getAnimations" in root && typeof root.getAnimations === "function") {
@@ -779,13 +805,23 @@ function installLegacyThemeCompatibilityWithMigrations(
         for (const element of elements) animations.push(...element.getAnimations?.() ?? [])
       }
     }
-    return animations.some((animation) => {
+    return animations
+  }
+
+  function hasActiveCssMotion(scope?: Document | ShadowRoot) {
+    return animationsInScope(scope).some((animation) => {
       const cssAnimation = (typeof CSSAnimation !== "undefined" && animation instanceof CSSAnimation)
         || (typeof CSSTransition !== "undefined" && animation instanceof CSSTransition)
         || animation.constructor?.name === "CSSAnimation"
         || animation.constructor?.name === "CSSTransition"
       return cssAnimation && (animation.playState === "running" || animation.pending)
     })
+  }
+
+  function hasActiveThemeMotion(scope?: Document | ShadowRoot) {
+    return animationsInScope(scope).some((animation) =>
+      (animation.playState === "running" || animation.pending)
+      && animationAffectsThemeContext(animation))
   }
 
   function reconcileOpaqueBridgeDeclarations(
@@ -919,7 +955,8 @@ function installLegacyThemeCompatibilityWithMigrations(
       clearOpaqueOwnedDeclarations(new Set(affected.map((element) => element.style)))
       return
     }
-    if (activeSheets.some((state) => hasActiveCssMotion(state.scope))) {
+    const themeMotionActive = activeSheets.some((state) => hasActiveThemeMotion(state.scope))
+    if (themeMotionActive || activeSheets.some((state) => hasActiveCssMotion(state.scope))) {
       const actual = sampleThemeValues(elements)
       const localProperties = sampleLocalThemeProperties(elements, actual)
       const changed = reconcileOpaqueBridgeDeclarations(
@@ -934,7 +971,7 @@ function installLegacyThemeCompatibilityWithMigrations(
         if (root === document) opaqueFullScanPending = true
         else opaqueScanRoots.add(root)
       }
-      if (changed) {
+      if (changed || themeMotionActive) {
         opaqueContinuationPending = true
         scheduleAllOpaqueLegacyScans()
       }
