@@ -65,6 +65,8 @@ function installLegacyThemeCompatibilityWithMigrations(
   const ownedDeclarations = new WeakMap<CSSStyleDeclaration, Map<string, OwnedDeclaration>>()
   const opaqueOwnedDeclarations = new Map<CSSStyleDeclaration, OpaqueOwnedDeclarations>()
   const opaqueBridgeSignatures = new WeakMap<CSSStyleDeclaration, string>()
+  const knownOpaqueStandardTargets = new WeakMap<Element, Set<string>>()
+  const stableThemeValues = new WeakMap<Element, Map<string, string>>()
   const pendingOpaqueBridgeMutations = new Set<Element>()
   const opaqueStyleSheets = new Set<CSSStyleSheet>()
   const opaqueStyleSheetScopes = new Map<CSSStyleSheet, Document | ShadowRoot | undefined>()
@@ -452,8 +454,18 @@ function installLegacyThemeCompatibilityWithMigrations(
       const parentValues = parent ? samples.get(parent) : undefined
       if (!values) continue
       if (!parent || !parentValues || !("style" in parent)) {
+        const synthetic = opaqueOwnedDeclarations.get(element.style)?.declarations
         for (const source of legacySources) {
-          if (values.get(source)) markLocal(element, source)
+          if (!values.get(source)) continue
+          markLocal(element, source)
+          for (const target of migrations[source] ?? []) {
+            if (knownOpaqueStandardTargets.get(element)?.has(target)
+              || (!synthetic?.has(target)
+                && stableThemeValues.get(element)?.has(target)
+                && stableThemeValues.get(element)?.get(target) !== values.get(target))) {
+              markLocal(element, target)
+            }
+          }
         }
         continue
       }
@@ -668,6 +680,32 @@ function installLegacyThemeCompatibilityWithMigrations(
     return localTargets
   }
 
+  function rememberStableOpaqueThemeState(
+    elements: ThemeElement[],
+    baseline: Map<Element, Map<string, string>>,
+    actual: Map<Element, Map<string, string>>,
+    localTargets: Map<Element, Set<string>>
+  ) {
+    for (const element of elements) {
+      const before = baseline.get(element)
+      const after = actual.get(element)
+      if (!before || !after) {
+        knownOpaqueStandardTargets.delete(element)
+        stableThemeValues.delete(element)
+        continue
+      }
+      stableThemeValues.set(element, new Map(after))
+      const authoritative = new Set<string>()
+      for (const target of migratedTargets) {
+        if (before.get(target) !== after.get(target) || localTargets.get(element)?.has(target)) {
+          authoritative.add(target)
+        }
+      }
+      if (authoritative.size) knownOpaqueStandardTargets.set(element, authoritative)
+      else knownOpaqueStandardTargets.delete(element)
+    }
+  }
+
   function composedParentElement(element: Element): Element | null {
     if (element.assignedSlot) return element.assignedSlot
     if (element.parentElement) return element.parentElement
@@ -878,6 +916,9 @@ function installLegacyThemeCompatibilityWithMigrations(
       }
       const actual = sampleThemeValues(elements)
       const localTargets = sampleLocalThemeBoundaries(elements, baseline, actual)
+      if (pass === 0) {
+        rememberStableOpaqueThemeState(elements, baseline, actual, localTargets)
+      }
       const changed = reconcileOpaqueBridgeDeclarations(affected, baseline, actual, localTargets)
       if (!changed) break
       if (pass === migratedTargets.size) needsContinuation = true
@@ -1476,10 +1517,15 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
+  function canonicalCssPropertyName(name: unknown) {
+    const propertyName = String(name)
+    return propertyName.startsWith("--") ? propertyName : propertyName.toLowerCase()
+  }
+
   if (stylePrototype && nativeSetProperty && nativeRemoveProperty) {
     const cssText = Object.getOwnPropertyDescriptor(stylePrototype, "cssText")
     stylePrototype.setProperty = function(name: string, value: string | null, priority?: string) {
-      const propertyName = String(name)
+      const propertyName = canonicalCssPropertyName(name)
       const tracksOpaqueTarget = !mutatingOpaqueBridge && migratedTargets.has(propertyName)
       const tracksPortalTheme = !mutatingOpaqueBridge && portalThemeMutationPropertySet.has(propertyName)
       const tracksRuleStyle = !mutatingOpaqueBridge
@@ -1514,7 +1560,7 @@ function installLegacyThemeCompatibilityWithMigrations(
       }
     }
     stylePrototype.removeProperty = function(name: string) {
-      const propertyName = String(name)
+      const propertyName = canonicalCssPropertyName(name)
       const tracksOpaqueTarget = !mutatingOpaqueBridge && migratedTargets.has(propertyName)
       const tracksPortalTheme = !mutatingOpaqueBridge && portalThemeMutationPropertySet.has(propertyName)
       const tracksRuleStyle = !mutatingOpaqueBridge
@@ -1682,6 +1728,7 @@ function installLegacyThemeCompatibilityWithMigrations(
               ? ownerRoot as Document | ShadowRoot
               : undefined
           )
+          notifyThemeChange()
         }
         for (const node of record.addedNodes) {
           if (!(node instanceof Element)) continue

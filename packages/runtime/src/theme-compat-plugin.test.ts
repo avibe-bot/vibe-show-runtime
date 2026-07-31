@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest"
 import { runInNewContext } from "node:vm"
 import { showThemeCompatibilityPlugin } from "./theme-compat-plugin.js"
 
+function canonicalTestPropertyName(name: unknown) {
+  const propertyName = String(name)
+  return propertyName.startsWith("--") ? propertyName : propertyName.toLowerCase()
+}
+
 class TestStyle {
   private declarations = new Map<string, { value: string; priority: string }>()
   reads = 0
@@ -15,27 +20,27 @@ class TestStyle {
   }
 
   hasProperty(name: string) {
-    return this.declarations.has(name)
+    return this.declarations.has(canonicalTestPropertyName(name))
   }
 
   getPropertyPriority(name: string) {
-    return this.declarations.get(name)?.priority ?? ""
+    return this.declarations.get(canonicalTestPropertyName(name))?.priority ?? ""
   }
 
   getPropertyValue(name: string) {
     this.reads += 1
-    return this.declarations.get(name)?.value ?? ""
+    return this.declarations.get(canonicalTestPropertyName(name))?.value ?? ""
   }
 
   removeProperty(name: string) {
     const value = this.getPropertyValue(name)
-    this.declarations.delete(name)
+    this.declarations.delete(canonicalTestPropertyName(name))
     return value
   }
 
   setProperty(name: string, value: string, priority = "") {
     if (priority && priority.toLowerCase() !== "important") return
-    this.declarations.set(name, { value, priority })
+    this.declarations.set(canonicalTestPropertyName(name), { value, priority })
   }
 
   get width() {
@@ -47,11 +52,11 @@ class TestStyle {
   }
 
   assignProperty(name: string, value: string, priority = "") {
-    this.declarations.set(name, { value, priority })
+    this.declarations.set(canonicalTestPropertyName(name), { value, priority })
   }
 
   deleteProperty(name: string) {
-    this.declarations.delete(name)
+    this.declarations.delete(canonicalTestPropertyName(name))
   }
 
   clearProperties() {
@@ -73,7 +78,7 @@ class TestStyle {
       const raw = entry.slice(separator + 1).trim()
       const important = /\s*!important\s*$/i.test(raw)
       const propertyValue = important ? raw.replace(/\s*!important\s*$/i, "").trim() : raw
-      if (name) this.declarations.set(name, { value: propertyValue, priority: important ? "important" : "" })
+      if (name) this.declarations.set(canonicalTestPropertyName(name), { value: propertyValue, priority: important ? "important" : "" })
     }
   }
 }
@@ -257,6 +262,14 @@ describe("dynamic legacy theme compatibility", () => {
     directRule.removeProperty("font")
     await Promise.resolve()
     expect(dispatchedEvents).toContain("avibe-show-theme-change")
+    dispatchedEvents.length = 0
+    directRule.setProperty("COLOR", "red")
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
+    dispatchedEvents.length = 0
+    directRule.removeProperty("CoLoR")
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
 
     expect(directRule.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(emptyLegacyRule.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
@@ -365,6 +378,7 @@ describe("dynamic legacy theme compatibility", () => {
       getAttribute() { return null }
       getRootNode() { return this.rootNode }
       matches() { return false }
+      closest(selector: string) { return selector === "style" && this instanceof TestStyleElement ? this : null }
       contains(node: TestNode): boolean {
         return node === this || this.descendants.some((element) => element.contains(node))
       }
@@ -378,6 +392,9 @@ describe("dynamic legacy theme compatibility", () => {
         if (init.mode === "open") this.shadowRoot = root
         return root
       }
+    }
+    class TestStyleElement extends TestElement {
+      constructor(readonly sheet: { cssRules: Array<{ style?: TestStyle }>; disabled: boolean }) { super() }
     }
     class TestMediaElement extends TestElement {}
     class TestShadowRoot extends TestNode {
@@ -570,6 +587,9 @@ describe("dynamic legacy theme compatibility", () => {
     const typedStyleMap = new TestStylePropertyMap(typedRule)
     const typedCssRule = new TestCSSStyleRule(typedRule, typedStyleMap)
     const readableThemeSheet = { cssRules: [typedCssRule], disabled: false }
+    const styleElement = new TestStyleElement(readableThemeSheet)
+    const styleTextNode = new TestNode()
+    styleTextNode.parentElement = styleElement
     const insertedStandardRule = new TestStyle()
     insertedStandardRule.setProperty("--primary", "rgb(1 2 3)")
     const groupingRule = new TestGroupingRule()
@@ -592,6 +612,7 @@ describe("dynamic legacy theme compatibility", () => {
     let eventPanelActive = false
     let chainActive = false
     let activeCssMotion = false
+    let rootStandardActive = false
     let insertedClosedOpaque: OpaqueStyleSheet | null = null
     const computedReads = new Map<TestElement, number>()
     const computedProperty = (element: TestElement, name: string): string => {
@@ -636,6 +657,7 @@ describe("dynamic legacy theme compatibility", () => {
           return opaque.disabled ? "" : "hsl(221 83% 53%)"
         }
         if (inline) return inline
+        if (element === root && !opaque.disabled && rootStandardActive) return "oklch(0.72 0.18 255)"
         if (!opaque.disabled && legacyActive && element.standard) return "oklch(0.62 0.19 255)"
         return parent ? computedProperty(parent, name) : readableThemeSheet.disabled ? "" : "hsl(222 47% 11%)"
       }
@@ -685,7 +707,7 @@ describe("dynamic legacy theme compatibility", () => {
       HTMLInputElement: TestInputElement,
       HTMLSelectElement: TestSelectElement,
       HTMLTextAreaElement: TestTextAreaElement,
-      HTMLStyleElement: class {},
+      HTMLStyleElement: TestStyleElement,
       MutationObserver: TestMutationObserver,
       MediaList: TestMediaList,
       Node: TestNode,
@@ -777,6 +799,16 @@ describe("dynamic legacy theme compatibility", () => {
     expect(fontListeners.has("loadingdone")).toBe(true)
     expect(fontListeners.has("loadingerror")).toBe(true)
     expect(registeredProperties).toEqual([])
+
+    mutationCallbacks[0]?.([{
+      type: "characterData",
+      target: styleTextNode,
+      addedNodes: [],
+      removedNodes: []
+    }] as unknown as MutationRecord[], {} as MutationObserver)
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
+    dispatchedEvents.length = 0
 
     listeners.get("play")?.({ target: eventTarget } as unknown as Event)
     expect(frames).toHaveLength(0)
@@ -944,6 +976,29 @@ describe("dynamic legacy theme compatibility", () => {
     namedStyle.fontSize = "20px"
     await Promise.resolve()
     expect(dispatchedEvents).toContain("avibe-show-theme-change")
+
+    legacyActive = true
+    rootStandardActive = true
+    listeners.get("resize")?.({} as Event)
+    while (frames.length) frames.shift()?.(0.46975)
+    expect(root.style.getPropertyValue("--primary")).toBe("")
+
+    const opaqueWritesBeforeStandardMotion = opaque.disabledWrites
+    activeCssMotion = true
+    listeners.get("pointerdown")?.({ target: eventTarget } as unknown as Event)
+    frames.shift()?.(0.4698)
+    frames.shift()?.(0.46985)
+    frames.shift()?.(0.4699)
+    expect(opaque.disabledWrites).toBe(opaqueWritesBeforeStandardMotion)
+    expect(root.style.getPropertyValue("--primary")).toBe("")
+
+    activeCssMotion = false
+    legacyActive = false
+    rootStandardActive = false
+    listeners.get("animationcancel")?.({ target: eventTarget } as unknown as Event)
+    while (frames.length) frames.shift()?.(0.46995)
+    listeners.get("resize")?.({} as Event)
+    while (frames.length) frames.shift()?.(0.469975)
 
     const opaqueWritesBeforeMotion = opaque.disabledWrites
     activeCssMotion = true
