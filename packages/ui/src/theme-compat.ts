@@ -1620,8 +1620,8 @@ function installLegacyThemeCompatibilityWithMigrations(
       const tracksOpaqueTarget = !mutatingOpaqueBridge && migratedTargets.has(propertyName)
       const tracksPortalTheme = !mutatingOpaqueBridge && portalThemeMutationPropertySet.has(propertyName)
       const tracksRuleStyle = !mutatingOpaqueBridge
-        && opaqueStyleSheets.size > 0
         && ruleStyleDeclarations.has(this)
+        && (opaqueStyleSheets.size > 0 || propertyName.startsWith("--"))
       const tracksChange = tracksOpaqueTarget || tracksPortalTheme || tracksRuleStyle
       const ownedOpaqueTarget = tracksOpaqueTarget
         && Boolean(opaqueOwnedDeclarations.get(this)?.declarations.has(propertyName))
@@ -1655,8 +1655,8 @@ function installLegacyThemeCompatibilityWithMigrations(
       const tracksOpaqueTarget = !mutatingOpaqueBridge && migratedTargets.has(propertyName)
       const tracksPortalTheme = !mutatingOpaqueBridge && portalThemeMutationPropertySet.has(propertyName)
       const tracksRuleStyle = !mutatingOpaqueBridge
-        && opaqueStyleSheets.size > 0
         && ruleStyleDeclarations.has(this)
+        && (opaqueStyleSheets.size > 0 || propertyName.startsWith("--"))
       const tracksChange = tracksOpaqueTarget || tracksPortalTheme || tracksRuleStyle
       const declaredBefore = tracksChange ? declaredProperties(this).has(propertyName) : false
       const valueBefore = tracksChange ? this.getPropertyValue(propertyName) : ""

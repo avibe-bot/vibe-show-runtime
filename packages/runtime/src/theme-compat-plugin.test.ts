@@ -280,6 +280,14 @@ describe("dynamic legacy theme compatibility", () => {
     await Promise.resolve()
     expect(dispatchedEvents).toContain("avibe-show-theme-change")
     dispatchedEvents.length = 0
+    directRule.setProperty("--brand", "blue")
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
+    dispatchedEvents.length = 0
+    directRule.removeProperty("--brand")
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
+    dispatchedEvents.length = 0
     const webAnimation = root.animate()
     await Promise.resolve()
     expect(dispatchedEvents).toContain("avibe-show-theme-change")

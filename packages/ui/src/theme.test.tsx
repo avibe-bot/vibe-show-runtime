@@ -118,19 +118,18 @@ describe("theme.css", () => {
     expect(css).toContain("--background: hsl(")
   })
 
-  it("provides cycle-free shadow defaults without reserving consumer-owned standard properties", () => {
+  it("provides inheritance-preserving shadow defaults without reserving standard properties", () => {
     expect(css).toContain(":where(:host) > :where(*) {")
     expect(css).toContain(':where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) {')
     for (const property of SHOW_PORTAL_THEME_PROPERTIES.filter(
       (property) => property.startsWith("--") && !property.startsWith("--avs-")
     )) {
-      const name = property.slice(2)
-      expect(css).not.toContain(`--avibe-show-host-${name}: var(${property},`)
-      expect(css).toContain(`${property}: var(--avibe-show-host-${name},`)
+      expect(css).toContain(`@container not style(${property})`)
     }
-    expect(css).toContain("--background: var(--avibe-show-host-background, hsl(222 47% 11%));")
-    expect(css).toContain("--foreground: var(--avibe-show-host-foreground, hsl(210 40% 98%));")
-    expect(css).toContain("--primary: var(--avibe-show-host-primary, hsl(210 40% 98%));")
+    expect(css).not.toContain("--primary: var(--avibe-show-host-primary")
+    expect(css).toContain("--background: hsl(222 47% 11%);")
+    expect(css).toContain("--foreground: hsl(210 40% 98%);")
+    expect(css).toContain("--primary: hsl(210 40% 98%);")
   })
 
   it("supports dark utilities on theme roots and dark-aware presets", () => {
