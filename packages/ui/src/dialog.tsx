@@ -9,6 +9,9 @@ import { cn } from "./utils"
 
 // Radix portals escape scoped inheritance; copy the source theme onto a contents-only bridge.
 const PORTAL_THEME_TOKENS = SHOW_PORTAL_THEME_PROPERTIES.filter((property) => property.startsWith("--"))
+const PORTAL_CONTEXT_PROPERTIES = SHOW_PORTAL_THEME_PROPERTIES.filter(
+  (property) => !property.startsWith("--") && property !== "color-scheme"
+)
 
 type PortalThemeSnapshot = {
   dark: boolean
@@ -38,24 +41,19 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
     properties[token] = value || " "
     return value
   })
-  for (const [property, value] of [
-    ["color-scheme", computed.colorScheme], ["color", context.color], ["direction", context.direction],
-    ["font-family", context.fontFamily], ["font-size", context.fontSize],
-    ["font-stretch", context.fontStretch], ["font-style", context.fontStyle],
-    ["font-variant", context.fontVariant], ["font-weight", context.fontWeight],
-    ["line-height", context.lineHeight]
-  ]) {
+  const contextValues = PORTAL_CONTEXT_PROPERTIES.map((property) => {
+    const value = context.getPropertyValue(property)
     if (value) properties[property] = value
-  }
+    return value
+  })
+  if (computed.colorScheme) properties["color-scheme"] = computed.colorScheme
   const dark = hasComposedDarkTheme(source.tokens)
   const language = composedLanguage(source.tokens)
   return {
     dark,
     language,
     signature: JSON.stringify([
-      dark, language, computed.colorScheme, context.color, context.direction, context.fontFamily, context.fontSize,
-      context.fontStretch, context.fontStyle, context.fontVariant, context.fontWeight,
-      context.lineHeight, ...values
+      dark, language, computed.colorScheme, ...values, ...contextValues
     ]),
     properties
   }

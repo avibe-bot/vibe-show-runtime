@@ -38,6 +38,14 @@ class TestStyle {
     this.declarations.set(name, { value, priority })
   }
 
+  get width() {
+    return this.getPropertyValue("width")
+  }
+
+  set width(value: string) {
+    this.assignProperty("width", value)
+  }
+
   assignProperty(name: string, value: string, priority = "") {
     this.declarations.set(name, { value, priority })
   }
@@ -450,6 +458,10 @@ describe("dynamic legacy theme compatibility", () => {
       delete(name: string) { this.style.deleteProperty(name) }
       clear() { this.style.clearProperties() }
     }
+    class TestCSSStyleRule {
+      constructor(private readonly declaration: TestStyle, readonly styleMap?: TestStylePropertyMap) {}
+      get style() { return this.declaration }
+    }
     class TestCustomElementRegistry {
       private definitions = new Set<string>()
       define(name: string) {
@@ -457,6 +469,7 @@ describe("dynamic legacy theme compatibility", () => {
         this.definitions.add(name)
       }
     }
+    class TestCustomStateSet extends Set<string> {}
     const mutationCallbacks: MutationCallback[] = []
     class TestMutationObserver {
       constructor(callback: MutationCallback) { mutationCallbacks.push(callback) }
@@ -536,7 +549,8 @@ describe("dynamic legacy theme compatibility", () => {
     importedOpaque.ownerRule.parentStyleSheet = readableImportParent as unknown as CSSStyleSheet
     const typedRule = new TestStyle()
     const typedStyleMap = new TestStylePropertyMap(typedRule)
-    const readableThemeSheet = { cssRules: [{ style: typedRule, styleMap: typedStyleMap }], disabled: false }
+    const typedCssRule = new TestCSSStyleRule(typedRule, typedStyleMap)
+    const readableThemeSheet = { cssRules: [typedCssRule], disabled: false }
     const insertedStandardRule = new TestStyle()
     insertedStandardRule.setProperty("--primary", "rgb(1 2 3)")
     const groupingRule = new TestGroupingRule()
@@ -546,6 +560,7 @@ describe("dynamic legacy theme compatibility", () => {
     const listeners = new Map<string, EventListener>()
     const rootListeners = new Map<string, EventListener>()
     const mediaListeners = new Map<string, EventListener>()
+    const fontListeners = new Map<string, EventListener>()
     const dispatchedEvents: string[] = []
     const registeredProperties: Array<{
       name: string
@@ -638,9 +653,11 @@ describe("dynamic legacy theme compatibility", () => {
       },
       CSSImportRule: TestImportRule,
       CSSGroupingRule: TestGroupingRule,
+      CSSStyleRule: TestCSSStyleRule,
       CSSAnimation: class {},
       CSSTransition: class {},
       CustomElementRegistry: TestCustomElementRegistry,
+      CustomStateSet: TestCustomStateSet,
       Element: TestElement,
       Event: class { constructor(readonly type: string) {} },
       Document: class {},
@@ -687,6 +704,9 @@ describe("dynamic legacy theme compatibility", () => {
         adoptedStyleSheets: [],
         addEventListener(name: string, listener: EventListener) { rootListeners.set(name, listener) },
         documentElement: root,
+        fonts: {
+          addEventListener(name: string, listener: EventListener) { fontListeners.set(name, listener) }
+        },
         getAnimations() {
           return activeCssMotion
             ? [{ constructor: { name: "CSSAnimation" }, playState: "running", pending: false }]
@@ -728,6 +748,8 @@ describe("dynamic legacy theme compatibility", () => {
     expect(listeners.get("pointerdown")).not.toBe(listeners.get("animationstart"))
     expect(mediaListeners.has("(any-pointer: coarse)")).toBe(true)
     expect(mediaListeners.has("(any-pointer: none)")).toBe(true)
+    expect(fontListeners.has("loadingdone")).toBe(true)
+    expect(fontListeners.has("loadingerror")).toBe(true)
     expect(registeredProperties).toEqual([])
 
     legacyActive = true
@@ -835,6 +857,15 @@ describe("dynamic legacy theme compatibility", () => {
     runInNewContext("customElements.define('theme-swatch', class {})", context)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.46)
+    runInNewContext("globalThis.themeStates = new CustomStateSet(); themeStates.add('active')", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.461)
+    runInNewContext("themeStates.delete('active')", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.462)
+    runInNewContext("themeStates.add('active'); themeStates.clear()", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.463)
 
     insertedStandardRule.setProperty("--chart-1", "oklch(0.7 0.15 255)")
     await Promise.resolve()
@@ -858,6 +889,9 @@ describe("dynamic legacy theme compatibility", () => {
     typedRule.removeProperty("width")
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.467)
+    typedCssRule.style.width = "480px"
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.4675)
 
     const staleAdoptedSheets = closedRoot.adoptedStyleSheets
     closedRoot.adoptedStyleSheets = [closedOpaque]
@@ -869,9 +903,12 @@ describe("dynamic legacy theme compatibility", () => {
     rootListeners.get("load")?.({ target: new TestElement() } as unknown as Event)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.469)
+    fontListeners.get("loadingdone")?.({} as Event)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.4695)
 
     dispatchedEvents.length = 0
-    const namedStyle = insertedStandardRule as TestStyle & { fontSize: string }
+    const namedStyle = typedCssRule.style as TestStyle & { fontSize: string }
     namedStyle.fontSize = "20px"
     await Promise.resolve()
     expect(dispatchedEvents).toContain("avibe-show-theme-change")

@@ -15,6 +15,8 @@ describe("legacy theme compatibility", () => {
     expect(themeCompatibilityClientScript()).not.toContain("registerProperty")
     expect(SHOW_PORTAL_THEME_PROPERTIES).toContain("--chart-1")
     expect(SHOW_PORTAL_THEME_PROPERTIES).toContain("--sidebar")
+    expect(SHOW_PORTAL_THEME_PROPERTIES).toContain("letter-spacing")
+    expect(SHOW_PORTAL_THEME_PROPERTIES).toContain("word-spacing")
   })
 
   it("installs for direct component and ThemeProvider consumers", () => {
@@ -67,7 +69,10 @@ describe("legacy theme compatibility", () => {
     expect(script).toContain("opaqueImportAncestors")
     expect(script).toContain("sampleLocalThemeProperties")
     expect(script).toContain("syncAllOpaqueLegacyThemesNow")
-    expect(script).toContain("patchPortalStyleProperty")
+    expect(script).toContain("patchRuleStyleOwner")
+    expect(script).toContain("patchNamedRuleStyleProperties")
+    expect(script).toContain("patchCustomStateSet")
+    expect(script).toContain('document.fonts?.addEventListener?.("loadingdone"')
     expect(script).toContain("scheduleOpaqueLegacyRelationalScan")
     expect(script).toContain("CustomElementRegistry")
     expect(script).toContain("parentStyleSheet")

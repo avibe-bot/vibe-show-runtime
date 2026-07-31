@@ -11,6 +11,10 @@ export const SHOW_PORTAL_THEME_PROPERTIES = [
   "--avs-background", "--avs-foreground", "--avs-muted", "--avs-muted-foreground",
   "--avs-border", "--avs-primary", "--avs-primary-foreground", "--avs-ring",
   "--avs-success", "--avs-warning", "--avs-destructive", "color-scheme", "color", "direction",
-  "font-family", "font-size", "font-stretch", "font-style", "font-variant",
-  "font-weight", "line-height"
+  "font-family", "font-feature-settings", "font-kerning", "font-optical-sizing",
+  "font-size", "font-stretch", "font-style", "font-synthesis", "font-variant",
+  "font-variation-settings", "font-weight", "hyphens", "letter-spacing", "line-break",
+  "line-height", "overflow-wrap", "tab-size", "text-align", "text-align-last",
+  "text-indent", "text-justify", "text-orientation", "text-shadow", "text-transform",
+  "white-space", "word-break", "word-spacing", "writing-mode"
 ] as const

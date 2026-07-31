@@ -70,6 +70,8 @@ function installLegacyThemeCompatibilityWithMigrations(
   const opaqueStyleSheetScopes = new Map<CSSStyleSheet, Document | ShadowRoot | undefined>()
   const styleSheetScopes = new WeakMap<CSSStyleSheet, Document | ShadowRoot | undefined>()
   const ruleStyleDeclarations = new WeakSet<CSSStyleDeclaration>()
+  const patchedRuleStyleDeclarations = new WeakSet<CSSStyleDeclaration>()
+  const patchedCustomStateSets = new WeakSet<object>()
   const stylePropertyMapOwners = new WeakMap<object, CSSStyleDeclaration>()
   const adoptedListProxies = new WeakMap<object, CSSStyleSheet[]>()
   const observedAdoptedLists = new Map<CSSStyleSheet[], {
@@ -93,6 +95,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   let themeChangePending = false
   let adoptedListPollTimer = 0
   let mutatingOpaqueSheetState = false
+  let inspectingRuleStyles = false
   const opaqueScanRoots = new Set<Node>()
   let mutatingOpaqueBridge = false
 
@@ -193,20 +196,27 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
 
   function syncLegacyRuleList(rules: CSSRuleList | CSSRule[], scope?: Document | ShadowRoot) {
-    for (const rule of Array.from(rules)) {
-      const candidate = rule as CSSRule & {
-        style?: CSSStyleDeclaration
-        styleMap?: object
-        cssRules?: CSSRuleList
-        styleSheet?: CSSStyleSheet | null
+    const wasInspectingRuleStyles = inspectingRuleStyles
+    inspectingRuleStyles = true
+    try {
+      for (const rule of Array.from(rules)) {
+        const candidate = rule as CSSRule & {
+          style?: CSSStyleDeclaration
+          styleMap?: object
+          cssRules?: CSSRuleList
+          styleSheet?: CSSStyleSheet | null
+        }
+        const style = candidate.style
+        if (style) ruleStyleDeclarations.add(style)
+        if (style && candidate.styleMap) stylePropertyMapOwners.set(candidate.styleMap, style)
+        if (style && (ownedDeclarations.has(style) || style.cssText.includes("--avs-"))) {
+          syncLegacyDeclaration(style, true)
+        }
+        if (candidate.cssRules) syncLegacyRuleList(candidate.cssRules, scope)
+        if (candidate.styleSheet) syncLegacyStyleSheet(candidate.styleSheet, scope)
       }
-      if (candidate.style) ruleStyleDeclarations.add(candidate.style)
-      if (candidate.style && candidate.styleMap) stylePropertyMapOwners.set(candidate.styleMap, candidate.style)
-      if (candidate.style && (ownedDeclarations.has(candidate.style) || candidate.style.cssText.includes("--avs-"))) {
-        syncLegacyDeclaration(candidate.style, true)
-      }
-      if (candidate.cssRules) syncLegacyRuleList(candidate.cssRules, scope)
-      if (candidate.styleSheet) syncLegacyStyleSheet(candidate.styleSheet, scope)
+    } finally {
+      inspectingRuleStyles = wasInspectingRuleStyles
     }
   }
 
@@ -1085,6 +1095,43 @@ function installLegacyThemeCompatibilityWithMigrations(
     })
   }
 
+  function patchCustomStateSet(input: object | undefined) {
+    if (!input || patchedCustomStateSets.has(input)) return
+    patchedCustomStateSets.add(input)
+    const prototype = input as Record<string, (...args: string[]) => unknown> & { size: number }
+    for (const name of ["add", "delete", "clear"] as const) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, name)
+      if (descriptor?.configurable === false) continue
+      const mutate = prototype[name]
+      if (typeof mutate !== "function") continue
+      Object.defineProperty(input, name, {
+        ...descriptor,
+        configurable: true,
+        writable: true,
+        value(this: typeof prototype, ...args: string[]) {
+          const before = this.size
+          const result = mutate.apply(this, args)
+          if (before !== this.size) scheduleAllOpaqueLegacyScans()
+          return result
+        }
+      })
+    }
+  }
+
+  function patchCustomStateSetOwner(input: object | undefined) {
+    if (!input) return
+    const descriptor = Object.getOwnPropertyDescriptor(input, "states")
+    if (!descriptor?.get || descriptor.configurable === false) return
+    Object.defineProperty(input, "states", {
+      ...descriptor,
+      get() {
+        const states = descriptor.get?.call(this)
+        if (states) patchCustomStateSet(Object.getPrototypeOf(states))
+        return states
+      }
+    })
+  }
+
   function patchSelectValue(input: object | undefined) {
     if (!input) return
     const descriptor = Object.getOwnPropertyDescriptor(input, "value")
@@ -1349,38 +1396,79 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
-  function patchPortalStyleProperty(input: object | undefined, property: string) {
+  function namedStyleProperty(cssProperty: string) {
+    return cssProperty.replace(/-([a-z])/g, (_, character: string) => character.toUpperCase())
+  }
+
+  function cssPropertyForNamedStyle(property: string) {
+    if (property === "cssFloat") return "float"
+    const cssProperty = property.replace(/[A-Z]/g, (character) => `-${character.toLowerCase()}`)
+    return /^(webkit|moz|ms|o)-/.test(cssProperty) ? `-${cssProperty}` : cssProperty
+  }
+
+  function patchNamedRuleStyleProperties(style: CSSStyleDeclaration) {
+    if (!nativeSetProperty || patchedRuleStyleDeclarations.has(style)) return
+    const descriptors = new Map<string, PropertyDescriptor>()
+    for (const property of Object.getOwnPropertyNames(style)) {
+      if (property === "cssText" || !/^[A-Za-z][A-Za-z0-9]*$/.test(property)) continue
+      const descriptor = Object.getOwnPropertyDescriptor(style, property)
+      if (descriptor?.configurable !== false && descriptor?.writable && typeof descriptor.value === "string") {
+        descriptors.set(property, descriptor)
+      }
+    }
+    for (let prototype = Object.getPrototypeOf(style);
+      prototype && prototype !== Object.prototype;
+      prototype = Object.getPrototypeOf(prototype)) {
+      for (const property of Object.getOwnPropertyNames(prototype)) {
+        if (descriptors.has(property) || property === "cssText") continue
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, property)
+        if (descriptor?.get && descriptor.set && descriptor.configurable !== false) {
+          descriptors.set(property, descriptor)
+        }
+      }
+    }
+    for (const cssProperty of portalThemeProperties.filter((property) => !property.startsWith("--"))) {
+      const property = namedStyleProperty(cssProperty)
+      if (!descriptors.has(property)) descriptors.set(property, { configurable: true, enumerable: true })
+    }
+    for (const [property, descriptor] of descriptors) {
+      const cssProperty = cssPropertyForNamedStyle(property)
+      Object.defineProperty(style, property, {
+        configurable: true,
+        enumerable: descriptor.enumerable ?? true,
+        get() {
+          return descriptor.get?.call(this) ?? this.getPropertyValue(cssProperty)
+        },
+        set(value: string | null) {
+          const before = this.getPropertyValue(cssProperty)
+          if (descriptor.set) descriptor.set.call(this, value)
+          else nativeSetProperty.call(this, cssProperty, value)
+          if (!mutatingOpaqueBridge && before !== this.getPropertyValue(cssProperty)) {
+            scheduleAllOpaqueLegacyScans()
+          }
+        }
+      })
+    }
+    patchedRuleStyleDeclarations.add(style)
+  }
+
+  function patchRuleStyleOwner(input: object | undefined) {
     for (let prototype = input; prototype; prototype = Object.getPrototypeOf(prototype)) {
-      const descriptor = Object.getOwnPropertyDescriptor(prototype, property)
-      if (!descriptor?.get || !descriptor.set) continue
-      Object.defineProperty(prototype, property, {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, "style")
+      if (!descriptor?.get || descriptor.configurable === false) continue
+      Object.defineProperty(prototype, "style", {
         ...descriptor,
         get() {
-          return descriptor.get?.call(this)
-        },
-        set(value: string) {
-          const before = descriptor.get?.call(this)
-          descriptor.set?.call(this, value)
-          if (!mutatingOpaqueBridge && before !== descriptor.get?.call(this)) notifyThemeChange()
+          const style = descriptor.get?.call(this)
+          if (style) {
+            ruleStyleDeclarations.add(style)
+            if (!inspectingRuleStyles) patchNamedRuleStyleProperties(style)
+          }
+          return style
         }
       })
       return
     }
-    if (!input || !nativeSetProperty) return
-    const cssProperty = property.replace(/[A-Z]/g, (character) => `-${character.toLowerCase()}`)
-    Object.defineProperty(input, property, {
-      configurable: true,
-      enumerable: true,
-      get() {
-        return (this as CSSStyleDeclaration).getPropertyValue(cssProperty)
-      },
-      set(value: string) {
-        const style = this as CSSStyleDeclaration
-        const before = style.getPropertyValue(cssProperty)
-        nativeSetProperty.call(style, cssProperty, value)
-        if (!mutatingOpaqueBridge && before !== style.getPropertyValue(cssProperty)) notifyThemeChange()
-      }
-    })
   }
 
   if (stylePrototype && nativeSetProperty && nativeRemoveProperty) {
@@ -1472,14 +1560,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
 
   const sheetPrototype = globalThis.CSSStyleSheet?.prototype
-  for (const [property, cssProperty] of [
-    ["colorScheme", "color-scheme"], ["color", "color"], ["direction", "direction"],
-    ["fontFamily", "font-family"], ["fontSize", "font-size"], ["fontStretch", "font-stretch"],
-    ["fontStyle", "font-style"], ["fontVariant", "font-variant"], ["fontWeight", "font-weight"],
-    ["lineHeight", "line-height"]
-  ]) {
-    if (portalThemePropertySet.has(cssProperty)) patchPortalStyleProperty(stylePrototype, property)
-  }
+  patchRuleStyleOwner(globalThis.CSSStyleRule?.prototype)
   const stylePropertyMap = (globalThis as typeof globalThis & {
     StylePropertyMap?: { prototype: object }
   }).StylePropertyMap
@@ -1518,6 +1599,11 @@ function installLegacyThemeCompatibilityWithMigrations(
   patchHistoryMethod(globalThis.History?.prototype, "pushState")
   patchHistoryMethod(globalThis.History?.prototype, "replaceState")
   patchCustomElementRegistry(globalThis.CustomElementRegistry?.prototype)
+  const customStateSet = (globalThis as typeof globalThis & {
+    CustomStateSet?: { prototype: object }
+  }).CustomStateSet
+  patchCustomStateSet(customStateSet?.prototype)
+  patchCustomStateSetOwner(globalThis.ElementInternals?.prototype)
   const styleRulePrototype = globalThis.CSSStyleRule?.prototype
   const selectorText = styleRulePrototype && Object.getOwnPropertyDescriptor(styleRulePrototype, "selectorText")
   if (styleRulePrototype && selectorText?.get && selectorText.set) {
@@ -1575,6 +1661,8 @@ function installLegacyThemeCompatibilityWithMigrations(
           if (record.target.getAttribute("style")?.includes("--avs-") || ownedDeclarations.has(target.style)) {
             syncLegacyTheme(target)
           }
+          if (!pendingOpaqueBridgeMutations.has(record.target)
+            && !opaqueBridgeIsCurrent(target.style)) notifyThemeChange()
         } else {
           scanLegacyStyleSheets(record.target)
         }
@@ -1695,6 +1783,8 @@ function installLegacyThemeCompatibilityWithMigrations(
 
   globalThis.addEventListener?.("beforeprint", syncAllOpaqueLegacyThemesNow, true)
   globalThis.addEventListener?.(themeChangeEvent, refreshShadowHostThemes, true)
+  document.fonts?.addEventListener?.("loadingdone", scheduleAllOpaqueLegacyScans)
+  document.fonts?.addEventListener?.("loadingerror", scheduleAllOpaqueLegacyScans)
   for (const event of [
     "resize", "orientationchange", "pageshow", "hashchange", "popstate", "fullscreenchange", "afterprint"
   ]) {
