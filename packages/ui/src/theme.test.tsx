@@ -11,6 +11,7 @@ describe("ThemeProvider", () => {
     expect(defaultMarkup).not.toContain("--primary")
     const rootMarkup = renderToStaticMarkup(<ThemeProvider preset={null}><span>content</span></ThemeProvider>)
     expect(rootMarkup).not.toContain("data-theme-preset")
+    expect(rootMarkup).not.toContain("avs-theme")
   })
 
   it("writes complete CSS colors to the standard shadcn variables", () => {
@@ -115,9 +116,11 @@ describe("theme.css", () => {
   })
 
   it("supports dark utilities on theme roots and dark-aware presets", () => {
-    expect(css).toContain('@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *))')
+    expect(css).toContain(":host(.dark) *")
+    expect(css).toContain(".avs-dark *")
     expect(css).toContain('.dark .avs-theme[data-theme-preset="zinc"],')
     expect(css).toContain('.avs-theme.dark[data-theme-preset="zinc"],')
+    expect(css).toContain('.avs-theme.avs-dark[data-theme-preset="zinc"],')
     expect(css).toContain('[data-theme="dark"] .avs-theme[data-theme-preset="blue"]')
   })
 

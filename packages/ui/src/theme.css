@@ -8,7 +8,7 @@
  * plain `var(...)` outside Tailwind.
  */
 
-@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *));
+@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *, .avs-dark, .avs-dark *, :host(.dark) *, :host([data-theme="dark"]) *));
 
 @theme inline {
   --color-background: var(--background);
@@ -119,6 +119,7 @@
 :host(.dark),
 :host([data-theme="dark"]),
 .avs-theme.dark,
+.avs-theme.avs-dark,
 .dark .avs-theme,
 [data-theme="dark"] .avs-theme {
   color-scheme: dark;
@@ -202,6 +203,7 @@
 }
 
 .avs-theme.dark[data-theme-preset="zinc"],
+.avs-theme.avs-dark[data-theme-preset="zinc"],
 .dark .avs-theme[data-theme-preset="zinc"],
 [data-theme="dark"] .avs-theme[data-theme-preset="zinc"] {
   --primary: hsl(0 0% 98%);
@@ -211,6 +213,7 @@
 }
 
 .avs-theme.dark[data-theme-preset="slate"],
+.avs-theme.avs-dark[data-theme-preset="slate"],
 .dark .avs-theme[data-theme-preset="slate"],
 [data-theme="dark"] .avs-theme[data-theme-preset="slate"] {
   --primary: hsl(210 40% 98%);
@@ -220,6 +223,7 @@
 }
 
 .avs-theme.dark[data-theme-preset="green"],
+.avs-theme.avs-dark[data-theme-preset="green"],
 .dark .avs-theme[data-theme-preset="green"],
 [data-theme="dark"] .avs-theme[data-theme-preset="green"] {
   --primary: hsl(158 64% 52%);
@@ -229,6 +233,7 @@
 }
 
 .avs-theme.dark[data-theme-preset="blue"],
+.avs-theme.avs-dark[data-theme-preset="blue"],
 .dark .avs-theme[data-theme-preset="blue"],
 [data-theme="dark"] .avs-theme[data-theme-preset="blue"] {
   --primary: hsl(221 83% 63%);

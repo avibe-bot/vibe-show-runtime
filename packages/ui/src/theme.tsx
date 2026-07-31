@@ -245,9 +245,12 @@ export function ThemeProvider({
 }) {
   const scopeRef = React.useRef<HTMLDivElement>(null)
   const composedDark = useComposedDark(scopeRef)
+  const className = [preset === null ? null : "avs-theme", composedDark ? "avs-dark" : null]
+    .filter(Boolean)
+    .join(" ") || undefined
   return (
     <ThemeScopeContext.Provider value={scopeRef}>
-      <div ref={scopeRef} className={composedDark ? "avs-theme dark" : "avs-theme"} data-theme-preset={preset} style={toStyle(theme)}>{children}</div>
+      <div ref={scopeRef} className={className} data-theme-preset={preset} style={toStyle(theme)}>{children}</div>
     </ThemeScopeContext.Provider>
   )
 }

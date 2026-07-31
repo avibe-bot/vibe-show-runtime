@@ -48,6 +48,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   const ownedDeclarations = new WeakMap<CSSStyleDeclaration, Map<string, OwnedDeclaration>>()
   const opaqueOwnedDeclarations = new Map<CSSStyleDeclaration, OpaqueOwnedDeclarations>()
   const opaqueBridgeSignatures = new WeakMap<CSSStyleDeclaration, string>()
+  const pendingOpaqueBridgeMutations = new Set<Element>()
   const opaqueStyleSheets = new Set<CSSStyleSheet>()
   const observedAdoptedLists = new WeakSet<object>()
   const stylePrototype = globalThis.CSSStyleDeclaration?.prototype
@@ -55,6 +56,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   const nativeRemoveProperty = stylePrototype?.removeProperty
   let opaqueScanFrame = 0
   let opaqueFullScanPending = false
+  let opaqueMutationCleanupPending = false
   const opaqueScanRoots = new Set<Node>()
   let mutatingOpaqueBridge = false
 
@@ -193,6 +195,21 @@ function installLegacyThemeCompatibilityWithMigrations(
     scheduleOpaqueLegacyScan()
   }
 
+  function markOpaqueBridgeMutation(element: Element) {
+    pendingOpaqueBridgeMutations.add(element)
+  }
+
+  function scheduleOpaqueMutationCleanup() {
+    if (opaqueMutationCleanupPending || !pendingOpaqueBridgeMutations.size) return
+    opaqueMutationCleanupPending = true
+    const enqueue = globalThis.queueMicrotask
+      ?? ((callback: VoidFunction) => void Promise.resolve().then(callback))
+    enqueue(() => {
+      pendingOpaqueBridgeMutations.clear()
+      opaqueMutationCleanupPending = false
+    })
+  }
+
   function clearOpaqueOwnedDeclarations(styles?: Set<CSSStyleDeclaration>) {
     mutatingOpaqueBridge = true
     try {
@@ -201,6 +218,7 @@ function installLegacyThemeCompatibilityWithMigrations(
         for (const [target, previous] of ownership.declarations) {
           if (style.getPropertyValue(target).trim() === previous.value
             && style.getPropertyPriority(target) === previous.priority) {
+            markOpaqueBridgeMutation(ownership.element)
             if (nativeRemoveProperty) nativeRemoveProperty.call(style, target)
             else style.removeProperty(target)
           }
@@ -210,6 +228,7 @@ function installLegacyThemeCompatibilityWithMigrations(
       }
     } finally {
       mutatingOpaqueBridge = false
+      scheduleOpaqueMutationCleanup()
     }
   }
 
@@ -277,6 +296,12 @@ function installLegacyThemeCompatibilityWithMigrations(
   // Cross-origin rules are opaque to CSSOM. Compare their computed effect with the
   // sheets disabled, then bridge only legacy deltas that did not also set a standard token.
   function syncOpaqueLegacyThemes() {
+    const disconnectedStyles = new Set(
+      Array.from(opaqueOwnedDeclarations)
+        .filter(([, ownership]) => !ownership.element.isConnected)
+        .map(([style]) => style)
+    )
+    clearOpaqueOwnedDeclarations(disconnectedStyles)
     const roots = opaqueFullScanPending ? null : new Set(opaqueScanRoots)
     opaqueFullScanPending = false
     opaqueScanRoots.clear()
@@ -291,9 +316,7 @@ function installLegacyThemeCompatibilityWithMigrations(
           continue
         }
         if (sheet.disabled) continue
-        const disabled = sheet.disabled
-        sheet.disabled = true
-        activeSheets.push({ sheet, disabled })
+        activeSheets.push({ sheet, disabled: sheet.disabled })
       } catch {
         // A stylesheet that cannot be toggled cannot be compared without changing page semantics.
         opaqueStyleSheets.delete(sheet)
@@ -301,45 +324,78 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
     if (!activeSheets.length) return
 
-    let baseline: Map<Element, Map<string, string>>
-    try {
-      baseline = sampleThemeValues(elements)
-    } finally {
-      for (const { sheet, disabled } of activeSheets) sheet.disabled = disabled
-    }
-    const actual = sampleThemeValues(elements)
-    mutatingOpaqueBridge = true
-    try {
-      for (const element of affected) {
-        const before = baseline.get(element)
-        const after = actual.get(element)
-        if (!before || !after) continue
-        const parent = composedParentElement(element)
-        const parentBefore = parent ? baseline.get(parent) : undefined
-        const parentAfter = parent ? actual.get(parent) : undefined
-        const owned = new Map<string, OwnedDeclaration>()
-        const inlineDeclarations = declaredProperties(element.style)
-        for (const [source, targets] of Object.entries(migrations)) {
-          if (before.get(source) === after.get(source)) continue
-          if (parentBefore?.get(source) === before.get(source)
-            && parentAfter?.get(source) === after.get(source)) continue
-          for (const target of targets) {
-            if (inlineDeclarations.has(target)) continue
-            if (parentBefore && parentBefore.get(target) !== before.get(target)) continue
-            if (before.get(target) !== after.get(target)) continue
-            const value = migratedValue(source, target)
-            if (nativeSetProperty) nativeSetProperty.call(element.style, target, value, "important")
-            else element.style.setProperty(target, value, "important")
-            owned.set(target, { value, priority: "important" })
+    for (let pass = 0; pass <= migratedTargets.size; pass += 1) {
+      for (const { sheet } of activeSheets) sheet.disabled = true
+      let baseline: Map<Element, Map<string, string>>
+      try {
+        baseline = sampleThemeValues(elements)
+      } finally {
+        for (const { sheet, disabled } of activeSheets) sheet.disabled = disabled
+      }
+      const actual = sampleThemeValues(elements)
+      let changed = false
+      mutatingOpaqueBridge = true
+      try {
+        for (const element of affected) {
+          const before = baseline.get(element)
+          const after = actual.get(element)
+          if (!before || !after) continue
+          const parent = composedParentElement(element)
+          const parentBefore = parent ? baseline.get(parent) : undefined
+          const parentAfter = parent ? actual.get(parent) : undefined
+          const previous = opaqueOwnedDeclarations.get(element.style)?.declarations
+          const owned = new Map<string, OwnedDeclaration>()
+          for (const [target, declaration] of previous ?? []) {
+            if (element.style.getPropertyValue(target).trim() === declaration.value
+              && element.style.getPropertyPriority(target) === declaration.priority) {
+              owned.set(target, declaration)
+            }
+          }
+          const inlineDeclarations = declaredProperties(element.style)
+          for (const target of owned.keys()) inlineDeclarations.delete(target)
+          const required = new Set<string>()
+          for (const [source, targets] of Object.entries(migrations)) {
+            if (before.get(source) === after.get(source)) continue
+            if (parentBefore?.get(source) === before.get(source)
+              && parentAfter?.get(source) === after.get(source)) continue
+            for (const target of targets) {
+              if (inlineDeclarations.has(target)) continue
+              if (parentBefore && parentBefore.get(target) !== before.get(target)) continue
+              if (!owned.has(target) && before.get(target) !== after.get(target)) continue
+              required.add(target)
+              if (owned.has(target)) continue
+              const value = migratedValue(source, target)
+              markOpaqueBridgeMutation(element)
+              if (nativeSetProperty) nativeSetProperty.call(element.style, target, value, "important")
+              else element.style.setProperty(target, value, "important")
+              owned.set(target, { value, priority: "important" })
+              changed = true
+            }
+          }
+          for (const [target, declaration] of owned) {
+            if (required.has(target)) continue
+            if (element.style.getPropertyValue(target).trim() === declaration.value
+              && element.style.getPropertyPriority(target) === declaration.priority) {
+              markOpaqueBridgeMutation(element)
+              if (nativeRemoveProperty) nativeRemoveProperty.call(element.style, target)
+              else element.style.removeProperty(target)
+            }
+            owned.delete(target)
+            changed = true
+          }
+          if (owned.size) {
+            opaqueOwnedDeclarations.set(element.style, { element, declarations: owned })
+            opaqueBridgeSignatures.set(element.style, element.style.cssText)
+          } else {
+            opaqueOwnedDeclarations.delete(element.style)
+            opaqueBridgeSignatures.delete(element.style)
           }
         }
-        if (owned.size) {
-          opaqueOwnedDeclarations.set(element.style, { element, declarations: owned })
-          opaqueBridgeSignatures.set(element.style, element.style.cssText)
-        }
+      } finally {
+        mutatingOpaqueBridge = false
+        scheduleOpaqueMutationCleanup()
       }
-    } finally {
-      mutatingOpaqueBridge = false
+      if (!changed) break
     }
   }
 
@@ -556,7 +612,8 @@ function installLegacyThemeCompatibilityWithMigrations(
     for (const record of records) {
       if (record.type === "attributes" && record.attributeName === "style"
         && record.target instanceof Element
-        && opaqueBridgeIsCurrent((record.target as HTMLElement).style)) continue
+        && (pendingOpaqueBridgeMutations.has(record.target)
+          || opaqueBridgeIsCurrent((record.target as HTMLElement).style))) continue
       const stylesheetTreeChanged = record.type === "childList"
         && [...record.addedNodes, ...record.removedNodes].some((node) => node instanceof Element
           && (node.matches("style, link[rel~=stylesheet]") || node.querySelector("style, link[rel~=stylesheet]")))
@@ -618,7 +675,12 @@ function installLegacyThemeCompatibilityWithMigrations(
       scheduleOpaqueLegacyScan(target instanceof Node ? target.parentNode ?? target : undefined)
     }, true)
   }
-  for (const query of ["(prefers-color-scheme: dark)", "(prefers-contrast: more)"]) {
+  for (const query of [
+    "(prefers-color-scheme: dark)", "(prefers-contrast: more)",
+    "(prefers-reduced-motion: reduce)", "(prefers-reduced-transparency: reduce)",
+    "(forced-colors: active)", "(inverted-colors: inverted)",
+    "(any-hover: hover)", "(any-pointer: fine)", "(dynamic-range: high)"
+  ]) {
     globalThis.matchMedia?.(query).addEventListener("change", () => scheduleOpaqueLegacyScan())
   }
 

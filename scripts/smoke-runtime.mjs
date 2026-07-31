@@ -1088,6 +1088,9 @@ export default function App() {
       throw new Error(`Expected the example's built CSS to include the "${rule}" utility (build path silently unstyled otherwise)`)
     }
   }
+  if (!builtCss.includes(":host(.dark)") || !builtCss.includes(".avs-dark") || !builtCss.includes(".dark\\:bg-primary")) {
+    throw new Error("Expected built dark utilities to cover document, shadow-host, and ThemeProvider dark scopes")
+  }
 
   // (6) A legacy styles.css whose Tailwind import is COMMENTED OUT must still migrate:
   // detection ignores comments, so a real import is prepended (else it stays unstyled).
@@ -1196,8 +1199,9 @@ export default function App() {
   if (!shadcnCss.includes("--background:") || !shadcnCss.includes("--card:") || !shadcnCss.includes("--chart-5:") || !shadcnCss.includes("--sidebar-ring:")) {
     throw new Error("Expected the complete standard shadcn token contract in served runtime CSS")
   }
-  if (!shadcnCss.includes(".dark\\:bg-primary") || !shadcnCss.includes('[data-theme="dark"]')) {
-    throw new Error("Expected class/data-theme dark-mode selectors in served runtime CSS")
+  if (!shadcnCss.includes(".dark\\:bg-primary") || !shadcnCss.includes('[data-theme="dark"]')
+    || !shadcnCss.includes(":host(.dark)") || !shadcnCss.includes(".avs-dark")) {
+    throw new Error("Expected document, shadow-host, and ThemeProvider dark-mode selectors in served runtime CSS")
   }
   if (!shadcnStyles.includes("background: var(--background)") || !shadcnStyles.includes("color: var(--foreground)")) {
     throw new Error("Expected the scaffold to use standard tokens directly through native var() CSS")

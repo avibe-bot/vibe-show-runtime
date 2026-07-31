@@ -273,7 +273,7 @@ describe("dynamic legacy theme compatibility", () => {
     expect(groupedRule.getPropertyValue("--border")).toBe("hsl(var(--avs-border))")
   })
 
-  it("bridges opaque stylesheet legacy overrides without replacing authored standard tokens", () => {
+  it("bridges opaque stylesheet legacy overrides without replacing authored standard tokens", async () => {
     class TestElement {
       style = new TestStyle()
       isConnected = true
@@ -281,6 +281,7 @@ describe("dynamic legacy theme compatibility", () => {
       shadowRoot = null
       descendants: TestElement[] = []
       constructor(readonly standard = false) {}
+      get parentNode() { return this.parentElement }
       getAttribute() { return null }
       getRootNode() { return null }
       matches() { return false }
@@ -298,13 +299,16 @@ describe("dynamic legacy theme compatibility", () => {
         throw Object.assign(new Error("opaque"), { name: "SecurityError" })
       }
     }
+    const mutationCallbacks: MutationCallback[] = []
     class TestMutationObserver {
+      constructor(callback: MutationCallback) { mutationCallbacks.push(callback) }
       observe() {}
     }
 
     const standard = new TestElement(true)
     const inlineStandard = new TestElement()
     const inherited = new TestElement()
+    const external = new TestElement()
     inlineStandard.style.setProperty("--primary", "oklch(0.7 0.15 255)")
     const root = new TestElement()
     standard.parentElement = root
@@ -314,26 +318,43 @@ describe("dynamic legacy theme compatibility", () => {
     const opaque = new OpaqueStyleSheet()
     const frames: FrameRequestCallback[] = []
     const listeners = new Map<string, EventListener>()
+    const mediaListeners = new Map<string, EventListener>()
     let legacyActive = false
     const context = {
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: OpaqueStyleSheet,
       Element: TestElement,
       HTMLLinkElement: class {},
+      HTMLStyleElement: class {},
       MutationObserver: TestMutationObserver,
+      Node: TestElement,
       ShadowRoot: TestShadowRoot,
       addEventListener(name: string, listener: EventListener) { listeners.set(name, listener) },
       getComputedStyle(element: TestElement) {
         return {
           getPropertyValue(name: string) {
             if (name === "--avs-primary") return opaque.disabled || !legacyActive ? "222 47% 11%" : "221 83% 53%"
+            if (name === "--avs-warning") {
+              return !opaque.disabled && legacyActive && element.style.cssText ? "32 95% 44%" : ""
+            }
             if (name === "--primary") {
               const inline = element.style.getPropertyValue(name)
+              if (inline === "hsl(var(--avs-primary))") {
+                return opaque.disabled ? "" : "hsl(221 83% 53%)"
+              }
               if (inline) return inline
               if (!opaque.disabled && legacyActive && element.standard) return "oklch(0.62 0.19 255)"
               return "hsl(222 47% 11%)"
             }
+            if (name === "--warning") return element.style.getPropertyValue(name)
             return ""
+          }
+        }
+      },
+      matchMedia(query: string) {
+        return {
+          addEventListener(name: string, listener: EventListener) {
+            if (name === "change") mediaListeners.set(query, listener)
           }
         }
       },
@@ -356,26 +377,44 @@ describe("dynamic legacy theme compatibility", () => {
     expect(root.style.getPropertyValue("--primary")).toBe("")
 
     legacyActive = true
-    listeners.get("resize")?.({} as Event)
+    expect(mediaListeners.has("(prefers-reduced-motion: reduce)")).toBe(true)
+    mediaListeners.get("(prefers-reduced-motion: reduce)")?.({} as Event)
     expect(frames).toHaveLength(1)
     frames.shift()?.(1)
 
     expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(root.style.getPropertyPriority("--primary")).toBe("important")
+    expect(root.style.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
     expect(standard.style.getPropertyValue("--primary")).toBe("")
     expect(inlineStandard.style.getPropertyValue("--primary")).toBe("oklch(0.7 0.15 255)")
     expect(inherited.style.getPropertyValue("--primary")).toBe("")
+
+    mutationCallbacks[1]?.([{ type: "attributes", attributeName: "style", target: root }] as unknown as MutationRecord[], {} as MutationObserver)
+    expect(frames).toHaveLength(0)
+    await Promise.resolve()
+    root.style.setProperty("color", "blue")
+    mutationCallbacks[1]?.([{ type: "attributes", attributeName: "style", target: root }] as unknown as MutationRecord[], {} as MutationObserver)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(2)
+    expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+
+    root.isConnected = false
+    listeners.get("focus")?.({ target: external } as unknown as Event)
+    frames.shift()?.(3)
+    expect(root.style.getPropertyValue("--primary")).toBe("")
+    root.isConnected = true
 
     root.style.cssText += "; color: red"
     expect(root.style.getPropertyValue("--primary")).toBe("")
     expect(root.style.getPropertyValue("color")).toBe("red")
     listeners.get("resize")?.({} as Event)
-    frames.shift()?.(2)
+    frames.shift()?.(4)
     expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    expect(root.style.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
 
     opaque.disabled = true
     listeners.get("resize")?.({} as Event)
-    frames.shift()?.(3)
+    frames.shift()?.(5)
     expect(root.style.getPropertyValue("--primary")).toBe("")
     expect(opaque.disabled).toBe(true)
   })
