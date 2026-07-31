@@ -1,4 +1,4 @@
-import { SHOW_PORTAL_THEME_PROPERTIES } from "./theme-properties"
+import { SHOW_PORTAL_MOTION_PROPERTIES, SHOW_PORTAL_THEME_PROPERTIES } from "./theme-properties"
 
 export const LEGACY_THEME_MIGRATIONS: Record<string, readonly string[]> = {
   "--avs-background": ["--background", "--card", "--popover"],
@@ -48,7 +48,8 @@ function installLegacyThemeCompatibilityWithMigrations(
   migrations: Record<string, readonly string[]>,
   ownershipPrefix: string,
   themeChangeEvent: string,
-  portalThemeProperties: readonly string[]
+  portalThemeProperties: readonly string[],
+  portalMotionProperties: readonly string[]
 ) {
   if (typeof document === "undefined") return
 
@@ -62,12 +63,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   const legacySourceSet = new Set(legacySources)
   const migratedTargets = new Set(Object.values(migrations).flat())
   const portalThemeMutationPropertySet = new Set([...portalThemeProperties, "all", "font"])
-  const themeMotionPropertySet = new Set([
-    ...portalThemeProperties, "all", "font",
-    "width", "min-width", "max-width", "height", "min-height", "max-height",
-    "inline-size", "min-inline-size", "max-inline-size",
-    "block-size", "min-block-size", "max-block-size", "contain", "container-type"
-  ])
+  const themeMotionPropertySet = new Set(portalMotionProperties)
   const ownedDeclarations = new WeakMap<CSSStyleDeclaration, Map<string, OwnedDeclaration>>()
   const opaqueOwnedDeclarations = new Map<CSSStyleDeclaration, OpaqueOwnedDeclarations>()
   const opaqueBridgeSignatures = new WeakMap<CSSStyleDeclaration, string>()
@@ -195,6 +191,15 @@ function installLegacyThemeCompatibilityWithMigrations(
 
   function syncLegacyTheme(element: Element & { style: CSSStyleDeclaration }) {
     syncLegacyDeclaration(element.style, true)
+  }
+
+  function relinquishReadableOwnership(style: CSSStyleDeclaration, target: string) {
+    const owned = ownedDeclarations.get(style)
+    if (!owned?.delete(target)) return
+    const marker = ownershipMarker(target)
+    if (nativeRemoveProperty) nativeRemoveProperty.call(style, marker)
+    else style.removeProperty(marker)
+    if (!owned.size) ownedDeclarations.delete(style)
   }
 
   function scanLegacyThemes(root: Node & ParentNode) {
@@ -1625,6 +1630,8 @@ function installLegacyThemeCompatibilityWithMigrations(
       const tracksChange = tracksOpaqueTarget || tracksPortalTheme || tracksRuleStyle
       const ownedOpaqueTarget = tracksOpaqueTarget
         && Boolean(opaqueOwnedDeclarations.get(this)?.declarations.has(propertyName))
+      const ownedReadableTarget = tracksOpaqueTarget
+        && Boolean(ownedDeclarations.get(this)?.has(propertyName))
       const declaredBefore = tracksChange ? declaredProperties(this).has(propertyName) : false
       const valueBefore = tracksChange ? this.getPropertyValue(propertyName) : ""
       const priorityBefore = tracksChange ? this.getPropertyPriority(propertyName) : ""
@@ -1638,6 +1645,9 @@ function installLegacyThemeCompatibilityWithMigrations(
         || String(value) === ""
         || priorityValue === ""
         || priorityValue.toLowerCase() === "important"
+      if (acceptedPriority && ownedReadableTarget) {
+        relinquishReadableOwnership(this, propertyName)
+      }
       if (tracksOpaqueTarget && acceptedPriority && (changed || ownedOpaqueTarget)) {
         relinquishOpaqueOwnership(this, propertyName)
         scheduleAllOpaqueLegacyScans()
@@ -1836,6 +1846,7 @@ function installLegacyThemeCompatibilityWithMigrations(
         && record.target instanceof Element
         && (pendingOpaqueBridgeMutations.has(record.target)
           || opaqueBridgeIsCurrent((record.target as HTMLElement).style))) continue
+      if (record.type === "childList") scheduleOpaqueLegacyRelationalScan()
       const stylesheetTreeChanged = record.type === "childList"
         && [...record.addedNodes, ...record.removedNodes].some((node) => node instanceof Element
           && (node.matches("style, link[rel~=stylesheet]") || node.querySelector("style, link[rel~=stylesheet]")))
@@ -1998,12 +2009,13 @@ export function installLegacyThemeCompatibility() {
     LEGACY_THEME_MIGRATIONS,
     LEGACY_THEME_OWNERSHIP_PREFIX,
     SHOW_THEME_CHANGE_EVENT,
-    SHOW_PORTAL_THEME_PROPERTIES
+    SHOW_PORTAL_THEME_PROPERTIES,
+    SHOW_PORTAL_MOTION_PROPERTIES
   )
 }
 
 export function themeCompatibilityClientScript(): string {
-  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)},${JSON.stringify(LEGACY_THEME_OWNERSHIP_PREFIX)},${JSON.stringify(SHOW_THEME_CHANGE_EVENT)},${JSON.stringify(SHOW_PORTAL_THEME_PROPERTIES)});`
+  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)},${JSON.stringify(LEGACY_THEME_OWNERSHIP_PREFIX)},${JSON.stringify(SHOW_THEME_CHANGE_EVENT)},${JSON.stringify(SHOW_PORTAL_THEME_PROPERTIES)},${JSON.stringify(SHOW_PORTAL_MOTION_PROPERTIES)});`
 }
 
 installLegacyThemeCompatibility()

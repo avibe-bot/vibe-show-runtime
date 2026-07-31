@@ -63,5 +63,8 @@ describe("Dialog", () => {
     expect(animationAffectsShowPortalTheme(animationWithKeyframes([
       { inlineSize: "30rem" }
     ]))).toBe(true)
+    expect(animationAffectsShowPortalTheme(animationWithKeyframes([
+      { flexBasis: "30rem", gridTemplateColumns: "1fr 2fr" }
+    ]))).toBe(true)
   })
 })

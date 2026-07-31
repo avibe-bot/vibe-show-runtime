@@ -186,6 +186,10 @@ describe("dynamic legacy theme compatibility", () => {
     generatedRule.setProperty("--avs-primary", "221 83% 53%")
     generatedRule.setProperty("--primary", "hsl(var(--avs-primary))")
     generatedRule.setProperty("--avibe-show-theme-owner-primary", "--avs-primary")
+    const equalReadableRule = new TestStyle()
+    equalReadableRule.setProperty("--avs-primary", "221 83% 53%")
+    equalReadableRule.setProperty("--primary", "hsl(var(--avs-primary))")
+    equalReadableRule.setProperty("--avibe-show-theme-owner-primary", "--avs-primary")
     const relinquishedRule = new TestStyle()
     relinquishedRule.setProperty("--avs-primary", "221 83% 53%")
     relinquishedRule.setProperty("--primary", "hsl(var(--avs-primary))")
@@ -203,6 +207,7 @@ describe("dynamic legacy theme compatibility", () => {
       { style: emptyLegacyRule },
       { style: emptyStandardRule },
       { style: generatedRule },
+      { style: equalReadableRule },
       { style: relinquishedRule },
       { style: unrelatedInitialRule },
       { cssRules: [{ style: nestedRule }] },
@@ -317,6 +322,10 @@ describe("dynamic legacy theme compatibility", () => {
     generatedRule.removeProperty("--avs-primary")
     expect(generatedRule.getPropertyValue("--primary")).toBe("")
     expect(generatedRule.getPropertyValue("--avibe-show-theme-owner-primary")).toBe("")
+    equalReadableRule.setProperty("--primary", "hsl(var(--avs-primary))")
+    expect(equalReadableRule.getPropertyValue("--avibe-show-theme-owner-primary")).toBe("")
+    equalReadableRule.removeProperty("--avs-primary")
+    expect(equalReadableRule.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     relinquishedRule.setProperty("--primary", "oklch(0.62 0.19 255)")
     expect(relinquishedRule.getPropertyValue("--avibe-show-theme-owner-primary")).toBe("")
     relinquishedRule.setProperty("--primary", "hsl(var(--avs-primary))", "important")
@@ -795,7 +804,7 @@ describe("dynamic legacy theme compatibility", () => {
           return activeCssMotion
             ? [{
                 constructor: { name: "CSSAnimation" },
-                effect: { getKeyframes: () => [{ width: "40rem" }] },
+                effect: { getKeyframes: () => [{ flexBasis: "40rem", gridTemplateColumns: "1fr 2fr" }] },
                 playState: "running",
                 pending: false
               }]
@@ -1161,6 +1170,19 @@ describe("dynamic legacy theme compatibility", () => {
     frames.shift()?.(3.125)
     frames.shift()?.(3.25)
     expect(ancestorPanel.style.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
+
+    ancestorActive = false
+    mutationCallbacks[1]?.([{
+      type: "childList",
+      target: ancestorChild,
+      addedNodes: [new TestNode()],
+      removedNodes: []
+    }] as unknown as MutationRecord[], {} as MutationObserver)
+    expect(frames).toHaveLength(2)
+    frames.shift()?.(3.375)
+    frames.shift()?.(3.5)
+    frames.shift()?.(3.625)
+    expect(ancestorPanel.style.getPropertyValue("--ring")).toBe("")
 
     root.isConnected = false
     listeners.get("focus")?.({ target: external } as unknown as Event)
