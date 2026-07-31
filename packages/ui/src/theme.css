@@ -58,88 +58,48 @@
 }
 
 /*
- * A shadow stylesheet cannot select the document root. Snapshot inherited host
- * tokens into internal aliases, then expose them (or light defaults) at each
- * shadow-tree entry without reserving the public names through @property.
+ * A shadow stylesheet cannot select the document root. The compatibility
+ * runtime snapshots resolved host tokens into internal aliases; direct CSS-only
+ * consumers fall back to the light contract without reserving public names.
  */
-:host {
-  --avibe-show-host-radius: var(--radius, 0.5rem);
-  --avibe-show-host-background: var(--background, hsl(0 0% 100%));
-  --avibe-show-host-foreground: var(--foreground, hsl(222 47% 11%));
-  --avibe-show-host-card: var(--card, hsl(0 0% 100%));
-  --avibe-show-host-card-foreground: var(--card-foreground, hsl(222 47% 11%));
-  --avibe-show-host-popover: var(--popover, hsl(0 0% 100%));
-  --avibe-show-host-popover-foreground: var(--popover-foreground, hsl(222 47% 11%));
-  --avibe-show-host-primary: var(--primary, hsl(222 47% 11%));
-  --avibe-show-host-primary-foreground: var(--primary-foreground, hsl(210 40% 98%));
-  --avibe-show-host-secondary: var(--secondary, hsl(210 40% 96%));
-  --avibe-show-host-secondary-foreground: var(--secondary-foreground, hsl(222 47% 11%));
-  --avibe-show-host-muted: var(--muted, hsl(210 40% 96%));
-  --avibe-show-host-muted-foreground: var(--muted-foreground, hsl(215 16% 47%));
-  --avibe-show-host-accent: var(--accent, hsl(210 40% 96%));
-  --avibe-show-host-accent-foreground: var(--accent-foreground, hsl(222 47% 11%));
-  --avibe-show-host-destructive: var(--destructive, hsl(0 84% 60%));
-  --avibe-show-host-destructive-foreground: var(--destructive-foreground, hsl(0 0% 100%));
-  --avibe-show-host-border: var(--border, hsl(214 32% 91%));
-  --avibe-show-host-input: var(--input, hsl(214 32% 91%));
-  --avibe-show-host-ring: var(--ring, hsl(221 83% 53%));
-  --avibe-show-host-chart-1: var(--chart-1, hsl(12 76% 61%));
-  --avibe-show-host-chart-2: var(--chart-2, hsl(173 58% 39%));
-  --avibe-show-host-chart-3: var(--chart-3, hsl(197 37% 24%));
-  --avibe-show-host-chart-4: var(--chart-4, hsl(43 74% 66%));
-  --avibe-show-host-chart-5: var(--chart-5, hsl(27 87% 67%));
-  --avibe-show-host-sidebar: var(--sidebar, hsl(210 40% 98%));
-  --avibe-show-host-sidebar-foreground: var(--sidebar-foreground, hsl(222 47% 11%));
-  --avibe-show-host-sidebar-primary: var(--sidebar-primary, hsl(222 47% 11%));
-  --avibe-show-host-sidebar-primary-foreground: var(--sidebar-primary-foreground, hsl(210 40% 98%));
-  --avibe-show-host-sidebar-accent: var(--sidebar-accent, hsl(210 40% 96%));
-  --avibe-show-host-sidebar-accent-foreground: var(--sidebar-accent-foreground, hsl(222 47% 11%));
-  --avibe-show-host-sidebar-border: var(--sidebar-border, hsl(214 32% 91%));
-  --avibe-show-host-sidebar-ring: var(--sidebar-ring, hsl(221 83% 53%));
-  --avibe-show-host-success: var(--success, hsl(158 64% 24%));
-  --avibe-show-host-success-foreground: var(--success-foreground, hsl(0 0% 100%));
-  --avibe-show-host-warning: var(--warning, hsl(32 95% 44%));
-  --avibe-show-host-warning-foreground: var(--warning-foreground, hsl(0 0% 100%));
-}
-
 :where(:host) > :where(*) {
-  --radius: var(--avibe-show-host-radius);
-  --background: var(--avibe-show-host-background);
-  --foreground: var(--avibe-show-host-foreground);
-  --card: var(--avibe-show-host-card);
-  --card-foreground: var(--avibe-show-host-card-foreground);
-  --popover: var(--avibe-show-host-popover);
-  --popover-foreground: var(--avibe-show-host-popover-foreground);
-  --primary: var(--avibe-show-host-primary);
-  --primary-foreground: var(--avibe-show-host-primary-foreground);
-  --secondary: var(--avibe-show-host-secondary);
-  --secondary-foreground: var(--avibe-show-host-secondary-foreground);
-  --muted: var(--avibe-show-host-muted);
-  --muted-foreground: var(--avibe-show-host-muted-foreground);
-  --accent: var(--avibe-show-host-accent);
-  --accent-foreground: var(--avibe-show-host-accent-foreground);
-  --destructive: var(--avibe-show-host-destructive);
-  --destructive-foreground: var(--avibe-show-host-destructive-foreground);
-  --border: var(--avibe-show-host-border);
-  --input: var(--avibe-show-host-input);
-  --ring: var(--avibe-show-host-ring);
-  --chart-1: var(--avibe-show-host-chart-1);
-  --chart-2: var(--avibe-show-host-chart-2);
-  --chart-3: var(--avibe-show-host-chart-3);
-  --chart-4: var(--avibe-show-host-chart-4);
-  --chart-5: var(--avibe-show-host-chart-5);
-  --sidebar: var(--avibe-show-host-sidebar);
-  --sidebar-foreground: var(--avibe-show-host-sidebar-foreground);
-  --sidebar-primary: var(--avibe-show-host-sidebar-primary);
-  --sidebar-primary-foreground: var(--avibe-show-host-sidebar-primary-foreground);
-  --sidebar-accent: var(--avibe-show-host-sidebar-accent);
-  --sidebar-accent-foreground: var(--avibe-show-host-sidebar-accent-foreground);
-  --sidebar-border: var(--avibe-show-host-sidebar-border);
-  --sidebar-ring: var(--avibe-show-host-sidebar-ring);
-  --success: var(--avibe-show-host-success);
-  --success-foreground: var(--avibe-show-host-success-foreground);
-  --warning: var(--avibe-show-host-warning);
-  --warning-foreground: var(--avibe-show-host-warning-foreground);
+  --radius: var(--avibe-show-host-radius, 0.5rem);
+  --background: var(--avibe-show-host-background, hsl(0 0% 100%));
+  --foreground: var(--avibe-show-host-foreground, hsl(222 47% 11%));
+  --card: var(--avibe-show-host-card, hsl(0 0% 100%));
+  --card-foreground: var(--avibe-show-host-card-foreground, hsl(222 47% 11%));
+  --popover: var(--avibe-show-host-popover, hsl(0 0% 100%));
+  --popover-foreground: var(--avibe-show-host-popover-foreground, hsl(222 47% 11%));
+  --primary: var(--avibe-show-host-primary, hsl(222 47% 11%));
+  --primary-foreground: var(--avibe-show-host-primary-foreground, hsl(210 40% 98%));
+  --secondary: var(--avibe-show-host-secondary, hsl(210 40% 96%));
+  --secondary-foreground: var(--avibe-show-host-secondary-foreground, hsl(222 47% 11%));
+  --muted: var(--avibe-show-host-muted, hsl(210 40% 96%));
+  --muted-foreground: var(--avibe-show-host-muted-foreground, hsl(215 16% 47%));
+  --accent: var(--avibe-show-host-accent, hsl(210 40% 96%));
+  --accent-foreground: var(--avibe-show-host-accent-foreground, hsl(222 47% 11%));
+  --destructive: var(--avibe-show-host-destructive, hsl(0 84% 60%));
+  --destructive-foreground: var(--avibe-show-host-destructive-foreground, hsl(0 0% 100%));
+  --border: var(--avibe-show-host-border, hsl(214 32% 91%));
+  --input: var(--avibe-show-host-input, hsl(214 32% 91%));
+  --ring: var(--avibe-show-host-ring, hsl(221 83% 53%));
+  --chart-1: var(--avibe-show-host-chart-1, hsl(12 76% 61%));
+  --chart-2: var(--avibe-show-host-chart-2, hsl(173 58% 39%));
+  --chart-3: var(--avibe-show-host-chart-3, hsl(197 37% 24%));
+  --chart-4: var(--avibe-show-host-chart-4, hsl(43 74% 66%));
+  --chart-5: var(--avibe-show-host-chart-5, hsl(27 87% 67%));
+  --sidebar: var(--avibe-show-host-sidebar, hsl(210 40% 98%));
+  --sidebar-foreground: var(--avibe-show-host-sidebar-foreground, hsl(222 47% 11%));
+  --sidebar-primary: var(--avibe-show-host-sidebar-primary, hsl(222 47% 11%));
+  --sidebar-primary-foreground: var(--avibe-show-host-sidebar-primary-foreground, hsl(210 40% 98%));
+  --sidebar-accent: var(--avibe-show-host-sidebar-accent, hsl(210 40% 96%));
+  --sidebar-accent-foreground: var(--avibe-show-host-sidebar-accent-foreground, hsl(222 47% 11%));
+  --sidebar-border: var(--avibe-show-host-sidebar-border, hsl(214 32% 91%));
+  --sidebar-ring: var(--avibe-show-host-sidebar-ring, hsl(221 83% 53%));
+  --success: var(--avibe-show-host-success, hsl(158 64% 24%));
+  --success-foreground: var(--avibe-show-host-success-foreground, hsl(0 0% 100%));
+  --warning: var(--avibe-show-host-warning, hsl(32 95% 44%));
+  --warning-foreground: var(--avibe-show-host-warning-foreground, hsl(0 0% 100%));
 }
 
 :root,

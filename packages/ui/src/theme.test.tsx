@@ -118,14 +118,14 @@ describe("theme.css", () => {
     expect(css).toContain("--background: hsl(")
   })
 
-  it("provides shadow defaults without reserving consumer-owned standard properties", () => {
+  it("provides cycle-free shadow defaults without reserving consumer-owned standard properties", () => {
     expect(css).toContain(":where(:host) > :where(*) {")
     for (const property of SHOW_PORTAL_THEME_PROPERTIES.filter(
       (property) => property.startsWith("--") && !property.startsWith("--avs-")
     )) {
       const name = property.slice(2)
-      expect(css).toContain(`--avibe-show-host-${name}: var(${property},`)
-      expect(css).toContain(`${property}: var(--avibe-show-host-${name});`)
+      expect(css).not.toContain(`--avibe-show-host-${name}: var(${property},`)
+      expect(css).toContain(`${property}: var(--avibe-show-host-${name},`)
     }
   })
 

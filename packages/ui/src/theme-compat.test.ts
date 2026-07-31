@@ -44,6 +44,8 @@ describe("legacy theme compatibility", () => {
     expect(script).toContain("new Proxy(list")
     expect(script).toContain("rootCandidates")
     expect(script).toContain("scheduleAdoptedListPoll")
+    expect(script).toContain("snapshotShadowHostTheme")
+    expect(script).toContain("inactiveShadowRoots")
     expect(script).toContain("patchMediaList")
     expect(script).toContain("selectorText")
     expect(script).toContain("addRule")

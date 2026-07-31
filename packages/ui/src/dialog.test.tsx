@@ -28,6 +28,8 @@ describe("Dialog", () => {
     expect(source).toContain("if (controlledOpen.current === false) clearOpeningTheme()")
     expect(source).toContain('["color-scheme", computed.colorScheme]')
     expect(source).toContain('["direction", context.direction]')
+    expect(source).toContain('node.hasAttribute("lang")')
+    expect(source).toContain('bridge.setAttribute("lang", theme.language)')
     expect(source).toContain('node.classList.contains("avs-dark")')
     expect(source).toContain("window.addEventListener(SHOW_THEME_CHANGE_EVENT, schedule)")
     expect(source).toContain('window.addEventListener("beforeprint", updateBeforePrint)')

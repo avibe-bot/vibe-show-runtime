@@ -12,6 +12,7 @@ const PORTAL_THEME_TOKENS = SHOW_PORTAL_THEME_PROPERTIES.filter((property) => pr
 
 type PortalThemeSnapshot = {
   dark: boolean
+  language: string | null
   signature: string
   properties: Record<string, string>
 }
@@ -19,6 +20,13 @@ type PortalThemeSnapshot = {
 type PortalThemeSource = {
   context: Element
   tokens: HTMLElement
+}
+
+function composedLanguage(element: Element): string | null {
+  for (let node: Node | null = element; node; node = composedParentNode(node)) {
+    if (node instanceof Element && node.hasAttribute("lang")) return node.getAttribute("lang")
+  }
+  return document.documentElement.getAttribute("lang")
 }
 
 function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
@@ -40,10 +48,12 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
     if (value) properties[property] = value
   }
   const dark = hasComposedDarkTheme(source.tokens)
+  const language = composedLanguage(source.tokens)
   return {
     dark,
+    language,
     signature: JSON.stringify([
-      dark, computed.colorScheme, context.color, context.direction, context.fontFamily, context.fontSize,
+      dark, language, computed.colorScheme, context.color, context.direction, context.fontFamily, context.fontSize,
       context.fontStretch, context.fontStyle, context.fontVariant, context.fontWeight,
       context.lineHeight, ...values
     ]),
@@ -59,6 +69,7 @@ function applyPortalTheme(
   for (const property of copiedProperties) bridge.style.removeProperty(property)
   if (!theme) {
     bridge.removeAttribute("data-theme")
+    bridge.removeAttribute("lang")
     bridge.style.visibility = "hidden"
     return []
   }
@@ -69,6 +80,8 @@ function applyPortalTheme(
   }
   if (theme.dark) bridge.setAttribute("data-theme", "dark")
   else bridge.removeAttribute("data-theme")
+  if (theme.language === null) bridge.removeAttribute("lang")
+  else bridge.setAttribute("lang", theme.language)
   bridge.style.visibility = ""
   return copied
 }

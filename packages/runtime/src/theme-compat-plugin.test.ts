@@ -92,11 +92,13 @@ describe("dynamic legacy theme compatibility", () => {
       querySelectorAll(selector: string) { return selector === "*" ? this.descendants : [] }
       attachShadow() {
         this.shadowRoot = this.nextShadowRoot ?? new TestShadowRoot()
+        this.shadowRoot.host = this
         return this.shadowRoot
       }
     }
     class TestShadowRoot {
       adoptedStyleSheets: TestStyleSheet[] = []
+      host!: TestElement
       parentElement = null
 
       addEventListener() {}
@@ -193,6 +195,7 @@ describe("dynamic legacy theme compatibility", () => {
     existingShadow.adoptedStyleSheets.push(shadowSheet)
     const shadowHost = new TestElement()
     shadowHost.shadowRoot = existingShadow
+    existingShadow.host = shadowHost
     root.descendants.push(shadowHost)
     const lateAdoptedRule = new TestStyle()
     lateAdoptedRule.setProperty("--avs-success", "142 71% 45%")
@@ -541,6 +544,7 @@ describe("dynamic legacy theme compatibility", () => {
     const frames: FrameRequestCallback[] = []
     const timers: Array<() => void> = []
     const listeners = new Map<string, EventListener>()
+    const rootListeners = new Map<string, EventListener>()
     const mediaListeners = new Map<string, EventListener>()
     const dispatchedEvents: string[] = []
     const registeredProperties: Array<{
@@ -681,7 +685,7 @@ describe("dynamic legacy theme compatibility", () => {
       },
       document: {
         adoptedStyleSheets: [],
-        addEventListener() {},
+        addEventListener(name: string, listener: EventListener) { rootListeners.set(name, listener) },
         documentElement: root,
         getAnimations() {
           return activeCssMotion
@@ -708,6 +712,7 @@ describe("dynamic legacy theme compatibility", () => {
     expect(root.style.getPropertyValue("--primary")).toBe("")
     expect(root.style.getPropertyValue("--border")).toBe("")
     expect(closedElement.style.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
+    expect(closedHost.style.getPropertyValue("--avibe-show-host-primary")).toBe("hsl(222 47% 11%)")
     expect(listeners.has("pointerdown")).toBe(true)
     expect(listeners.has("pointerup")).toBe(true)
     expect(listeners.has("keydown")).toBe(true)
@@ -861,6 +866,10 @@ describe("dynamic legacy theme compatibility", () => {
     staleAdoptedSheets.push(new OpaqueStyleSheet())
     expect(frames).toHaveLength(0)
 
+    rootListeners.get("load")?.({ target: new TestElement() } as unknown as Event)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.469)
+
     dispatchedEvents.length = 0
     const namedStyle = insertedStandardRule as TestStyle & { fontSize: string }
     namedStyle.fontSize = "20px"
@@ -903,6 +912,23 @@ describe("dynamic legacy theme compatibility", () => {
     expect(closedElement.style.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
     frames.shift()?.(0.51)
     frames.shift()?.(0.52)
+
+    closedHost.isConnected = false
+    closedElement.isConnected = false
+    listeners.get("focus")?.({ target: external } as unknown as Event)
+    while (frames.length) frames.shift()?.(0.53)
+    const closedWritesAfterDisconnect = closedOpaque.disabledWrites
+    closedHost.isConnected = true
+    closedElement.isConnected = true
+    mutationCallbacks[0]?.([{
+      type: "childList",
+      target: new TestNode(),
+      addedNodes: [closedHost],
+      removedNodes: []
+    }] as unknown as MutationRecord[], {} as MutationObserver)
+    while (frames.length) frames.shift()?.(0.54)
+    expect(closedOpaque.disabledWrites).toBeGreaterThan(closedWritesAfterDisconnect)
+    expect(closedElement.style.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
 
     legacyActive = true
     expect(mediaListeners.has("(prefers-reduced-motion: reduce)")).toBe(true)

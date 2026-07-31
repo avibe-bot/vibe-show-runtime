@@ -76,6 +76,12 @@ function installLegacyThemeCompatibilityWithMigrations(
     scope?: Document | ShadowRoot
     snapshot: CSSStyleSheet[]
   }>()
+  const knownShadowRoots = new WeakMap<Element, ShadowRoot>()
+  const activeShadowRoots = new Set<ShadowRoot>()
+  const inactiveShadowRoots = new WeakSet<ShadowRoot>()
+  const shadowHostThemeProperties = portalThemeProperties.filter(
+    (property) => property.startsWith("--") && !property.startsWith("--avs-")
+  )
   const stylePrototype = globalThis.CSSStyleDeclaration?.prototype
   const nativeSetProperty = stylePrototype?.setProperty
   const nativeRemoveProperty = stylePrototype?.removeProperty
@@ -210,6 +216,32 @@ function installLegacyThemeCompatibilityWithMigrations(
         () => callback(globalThis.performance?.now() ?? Date.now()), 0
       ) as unknown as number)
     return requestFrame(callback)
+  }
+
+  function snapshotShadowHostTheme(root: ShadowRoot) {
+    const host = root.host as HTMLElement
+    if (!host.isConnected) {
+      activeShadowRoots.delete(root)
+      return
+    }
+    activeShadowRoots.add(root)
+    const computed = getComputedStyle(host)
+    for (const property of shadowHostThemeProperties) {
+      const alias = `--avibe-show-host-${property.slice(2)}`
+      const value = computed.getPropertyValue(property).trim()
+      if (value) {
+        if (host.style.getPropertyValue(alias).trim() === value) continue
+        if (nativeSetProperty) nativeSetProperty.call(host.style, alias, value)
+        else host.style.setProperty(alias, value)
+      } else if (host.style.getPropertyValue(alias)) {
+        if (nativeRemoveProperty) nativeRemoveProperty.call(host.style, alias)
+        else host.style.removeProperty(alias)
+      }
+    }
+  }
+
+  function refreshShadowHostThemes() {
+    for (const root of activeShadowRoots) snapshotShadowHostTheme(root)
   }
 
   function notifyThemeChange() {
@@ -766,6 +798,10 @@ function installLegacyThemeCompatibilityWithMigrations(
         if ((sheet.ownerNode && !sheet.ownerNode.isConnected)
           || (importMedia && !ownerRule?.parentStyleSheet)
           || (typeof ShadowRoot !== "undefined" && scope instanceof ShadowRoot && !scope.host.isConnected)) {
+          if (typeof ShadowRoot !== "undefined" && scope instanceof ShadowRoot) {
+            activeShadowRoots.delete(scope)
+            inactiveShadowRoots.add(scope)
+          }
           opaqueStyleSheets.delete(sheet)
           opaqueStyleSheetScopes.delete(sheet)
           continue
@@ -1526,7 +1562,9 @@ function installLegacyThemeCompatibilityWithMigrations(
           : undefined
       )
       scheduleAllOpaqueLegacyScans()
+      return
     }
+    scheduleAllOpaqueLegacyScans()
   }
   const observer = new MutationObserver((records) => {
     for (const record of records) {
@@ -1603,15 +1641,23 @@ function installLegacyThemeCompatibilityWithMigrations(
   function scanShadowRoots(root: Node & ParentNode) {
     const hosts = root instanceof Element ? [root, ...root.querySelectorAll("*")] : Array.from(root.querySelectorAll("*"))
     for (const host of hosts) {
-      if (host.shadowRoot) observeCompatibilityRoot(host.shadowRoot)
+      const shadowRoot = host.shadowRoot ?? knownShadowRoots.get(host)
+      if (shadowRoot) observeCompatibilityRoot(shadowRoot, inactiveShadowRoots.has(shadowRoot))
     }
   }
 
-  function observeCompatibilityRoot(root: Document | ShadowRoot) {
-    if (observedRoots.has(root)) return
+  function observeCompatibilityRoot(root: Document | ShadowRoot, rescan = false) {
     const container = root === document ? document.documentElement : root
     if (!container) return
-    observedRoots.add(root)
+    if (typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot) {
+      knownShadowRoots.set(root.host, root)
+      snapshotShadowHostTheme(root)
+    }
+    if (observedRoots.has(root) && !rescan) {
+      scanShadowRoots(container)
+      return
+    }
+    inactiveShadowRoots.delete(root as ShadowRoot)
     scanLegacyThemes(container)
     scanLegacyStyleSheets(container)
     const styleSheets = root === document ? document.styleSheets : []
@@ -1620,6 +1666,8 @@ function installLegacyThemeCompatibilityWithMigrations(
     observeAdoptedStyleSheetList(adoptedStyleSheets, root)
     for (const sheet of Array.from(adoptedStyleSheets)) syncLegacyStyleSheet(sheet, root)
     scanShadowRoots(container)
+    if (observedRoots.has(root)) return
+    observedRoots.add(root)
     observer.observe(container, {
       attributes: true,
       attributeFilter: ["style", "href", "rel", "media", "disabled"],
@@ -1646,6 +1694,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
 
   globalThis.addEventListener?.("beforeprint", syncAllOpaqueLegacyThemesNow, true)
+  globalThis.addEventListener?.(themeChangeEvent, refreshShadowHostThemes, true)
   for (const event of [
     "resize", "orientationchange", "pageshow", "hashchange", "popstate", "fullscreenchange", "afterprint"
   ]) {
