@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { MetricCard } from "@/components/ui/metric-card"
 import { Progress } from "@/components/ui/progress"
-import { ThemeProvider } from "@avibe/show-ui/theme"
+import { ThemeProvider } from "@/components/ui/theme"
 
 const step = 1
 
@@ -40,7 +40,7 @@ const cards = [
 
 export default function App() {
   return (
-    <ThemeProvider preset="zinc" theme={{ radius: "0.625rem", colors: { primary: "222 47% 11%", ring: "199 89% 48%" } }}>
+    <ThemeProvider preset="zinc" theme={{ radius: "0.625rem", colors: { primary: "hsl(222 47% 11%)", ring: "hsl(199 89% 48%)" } }}>
       <main className="page">
         <section className="hero">
           <div className="eyebrow">

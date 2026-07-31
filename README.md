@@ -42,7 +42,6 @@ Direct package imports are also supported:
 
 ```tsx
 import { Button } from "@avibe/show-ui/button"
-import { ThemeProvider } from "@avibe/show-ui/theme"
 ```
 
 ## Show Page Interaction Model
@@ -88,11 +87,41 @@ also exposes the same endpoint as an SSE stream for replay and live updates.
 
 ## Theme Customization
 
-`@avibe/show-ui` uses CSS-variable-backed tokens. Agents can use presets or
-override tokens directly:
+The workspace theme import exposes the standard shadcn token contract. Define
+complete CSS colors on `:root`, and override the same tokens under `.dark` (or
+`[data-theme="dark"]`) for dark mode:
+
+```css
+:root {
+  --radius: 0.75rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --primary: oklch(0.55 0.2 255);
+  --primary-foreground: oklch(0.985 0 0);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+}
+```
+
+The same values drive Tailwind semantic utilities and native CSS:
 
 ```tsx
-import { ThemeProvider } from "@avibe/show-ui/theme"
+<main className="bg-background text-foreground">
+  <section style={{ borderColor: "var(--border)" }} />
+</main>
+```
+
+An optional provider is available through the normal component alias when a
+subtree needs a preset or runtime-computed values. It writes the same standard
+variables; complete CSS colors are preferred. Presets follow an ancestor
+`.dark` class or `data-theme="dark"` attribute automatically, while explicit
+`theme` values intentionally override either palette:
+
+```tsx
+import { ThemeProvider } from "@/components/ui/theme"
 
 export default function App() {
   return (
@@ -101,9 +130,9 @@ export default function App() {
       theme={{
         radius: "0.75rem",
         colors: {
-          primary: "221 83% 53%",
-          background: "0 0% 100%",
-          foreground: "222 47% 11%"
+          primary: "oklch(0.55 0.2 255)",
+          background: "oklch(1 0 0)",
+          foreground: "oklch(0.145 0 0)"
         }
       }}
     >
@@ -112,6 +141,18 @@ export default function App() {
   )
 }
 ```
+
+For backward compatibility, omitting `preset` selects `zinc`. Pass
+`preset={null}` when the subtree should inherit the standard root palette
+without a preset override.
+
+A `var(--brand-color)` theme value is treated as a complete color. Legacy HSL
+channel references remain supported when the custom property name ends in
+`-hsl` or `-channels`.
+
+Show UI installs its legacy-token migration from both direct component entry
+points and the managed runtime. That bridge is compatibility-only; new page
+code should author the standard variables above.
 
 ## Examples
 

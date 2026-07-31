@@ -1,3 +1,5 @@
+import "./theme-compat"
+
 type ViteHotContext = {
   on: (event: string, callback: () => void) => void
 }

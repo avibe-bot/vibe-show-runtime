@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Progress } from "@/components/ui/progress"
-import { ThemeProvider } from "@avibe/show-ui/theme"
+import { ThemeProvider } from "@/components/ui/theme"
 
 export default function App() {
   return (
@@ -14,7 +14,7 @@ export default function App() {
           <Badge variant="success">shadcn alias</Badge>
           <h1>Agent-friendly Show UI</h1>
           <p>Imports use normal shadcn paths, while Vite resolves them to @avibe/show-ui.</p>
-          <span className="inline-flex items-center gap-2 rounded-md bg-emerald-500/10 px-3 py-1 text-sm font-medium text-emerald-700">
+          <span className="inline-flex items-center gap-2 rounded-md bg-emerald-500/10 px-3 py-1 text-sm font-medium text-emerald-700 dark:bg-primary dark:text-primary-foreground">
             Tailwind utility classes are built in
           </span>
           <div className="flex gap-2">

@@ -373,16 +373,47 @@ visual system for the runtime.
 
 ## Theme Customization
 
-The UI package should expose token-based theming through CSS variables.
-Agents should be able to use a preset:
+The UI package exposes the standard shadcn CSS-variable contract. Agents should
+prefer normal semantic utilities and complete CSS color values:
+
+```css
+:root {
+  --radius: 0.75rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --primary: oklch(0.55 0.2 255);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+}
+```
+
+These values work through both Tailwind (`bg-background`, `text-foreground`)
+and native CSS (`var(--background)`). An optional provider supports subtree
+presets and runtime-computed overrides through the same standard variables.
+Presets follow an ancestor `.dark` class or `data-theme="dark"` attribute;
+explicit `theme` values intentionally override either palette:
 
 ```tsx
-import { ThemeProvider } from "@avibe/show-ui/theme"
+import { ThemeProvider } from "@/components/ui/theme"
 
 export default function App() {
   return <ThemeProvider preset="zinc"><Dashboard /></ThemeProvider>
 }
 ```
+
+Omitting `preset` retains the historical `zinc` default. Use `preset={null}`
+to inherit the standard root palette without a preset override.
+
+A `var(--brand-color)` value is treated as a complete color. Legacy HSL channel
+references remain supported when the custom property name ends in `-hsl` or
+`-channels`.
+
+The legacy-token migration is owned by Show UI and runs for both direct package
+consumers and managed runtime pages. It is a compatibility bridge, not an
+authoring contract; generated pages use only the standard variables.
 
 or override selected tokens:
 
@@ -391,9 +422,9 @@ or override selected tokens:
   theme={{
     radius: "0.75rem",
     colors: {
-      primary: "221 83% 53%",
-      background: "0 0% 100%",
-      foreground: "222 47% 11%",
+      primary: "oklch(0.55 0.2 255)",
+      background: "oklch(1 0 0)",
+      foreground: "oklch(0.145 0 0)",
     },
   }}
 >

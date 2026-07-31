@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs"
 import { request as httpRequest } from "node:http"
 import { isFileLoadingAllowed } from "vite"
 import { showHmrTransitionPlugin } from "../packages/runtime/dist/hmr-transition-plugin.js"
+import { showThemeCompatibilityPlugin } from "../packages/runtime/dist/theme-compat-plugin.js"
 import { startShowRuntimeServer } from "../packages/runtime/dist/server.js"
 import { cn } from "../packages/ui/dist/utils.js"
 import { dependencyFingerprint, pruneSupersededCacheDirs } from "../packages/runtime/dist/vendor.js"
@@ -105,6 +106,22 @@ if (!defaultHmrStyleTag?.children?.includes("avs-show-fallback-recovery-in 0.22s
   throw new Error("Expected standalone runtime fallback recovery delay to default to 5 seconds")
 }
 
+const themeCompatPlugin = showThemeCompatibilityPlugin()
+const themeCompatClientCode = themeCompatPlugin.load?.("\0virtual:avibe-show-theme-compat-client")
+const themeCompatIndexHtml = themeCompatPlugin.transformIndexHtml?.()
+const themeCompatScriptTag = Array.isArray(themeCompatIndexHtml)
+  ? themeCompatIndexHtml.find((tag) => tag.tag === "script")
+  : undefined
+if (
+  typeof themeCompatClientCode !== "string" ||
+  !themeCompatClientCode.includes("__avibeShowThemeCompatInstalled") ||
+  !themeCompatClientCode.includes("CSSGroupingRule") ||
+  !themeCompatClientCode.includes("adoptedStyleSheets") ||
+  !themeCompatScriptTag?.attrs?.src?.includes("virtual:avibe-show-theme-compat-client")
+) {
+  throw new Error("Expected the runtime to install the one-way dynamic legacy theme migration")
+}
+
 const hmrPlugin = showHmrTransitionPlugin({ fallbackDelaySeconds: 30 })
 const hmrClientCode = hmrPlugin.load?.("\0virtual:avibe-show-hmr-transition-client")
 if (typeof hmrClientCode !== "string") {
@@ -121,6 +138,9 @@ if (
   typeof hmrIndexHtml !== "object" ||
   !hmrIndexHtml.html.includes("avs-fallback-shell") ||
   !hmrIndexHtml.html.includes("Ready to visualize") ||
+  !hmrIndexHtml.html.includes("standard shadcn theme variables") ||
+  !hmrIndexHtml.html.includes("--background") ||
+  hmrIndexHtml.html.includes("components from @/components/ui and @avibe/show-ui") ||
   !hmrStyleTag?.children?.includes("Loading Show Page") ||
   !hmrStyleTag.children.includes(".avs-fallback") ||
   hmrStyleTag.children.includes(".fallback-shell {") ||
@@ -356,6 +376,7 @@ try {
   }
   const scaffoldRouter = await readFile(join(root, "smoke", "src", "router.tsx"), "utf8")
   const scaffoldMain = await readFile(join(root, "smoke", "src", "main.tsx"), "utf8")
+  const scaffoldApp = await readFile(join(root, "smoke", "src", "App.tsx"), "utf8")
   const scaffoldHome = await readFile(join(root, "smoke", "src", "pages", "index.tsx"), "utf8")
   if (!scaffoldRouter.includes("popstate") || scaffoldRouter.includes("hashchange") || !scaffoldRouter.includes("__AVIBE_SHOW__?.basePath")) {
     throw new Error("Expected the fresh scaffold router to use History mode with the injected base path")
@@ -371,6 +392,9 @@ try {
   }
   if (!scaffoldHome.includes('baseUrl.pathname.endsWith("/")')) {
     throw new Error("Expected the fresh scaffold handler URL to normalize a slashless injected base path")
+  }
+  if (scaffoldApp.includes("ThemeProvider") || !scaffoldApp.includes("bg-background text-foreground")) {
+    throw new Error("Expected the fresh scaffold to expose standard theme utilities without an inline ThemeProvider override")
   }
   const visibleAsset = await fetch(`${runtime.url}/sessions/smoke/app/visible.txt`)
   if (visibleAsset.status !== 200 || (await visibleAsset.text()) !== "visible public asset\n") {
@@ -1064,6 +1088,9 @@ export default function App() {
       throw new Error(`Expected the example's built CSS to include the "${rule}" utility (build path silently unstyled otherwise)`)
     }
   }
+  if (!builtCss.includes(":host(.dark)") || !builtCss.includes(".avs-dark") || !builtCss.includes(".dark\\:bg-primary")) {
+    throw new Error("Expected built dark utilities to cover document, shadow-host, and ThemeProvider dark scopes")
+  }
 
   // (6) A legacy styles.css whose Tailwind import is COMMENTED OUT must still migrate:
   // detection ignores comments, so a real import is prepended (else it stays unstyled).
@@ -1131,34 +1158,68 @@ export default function App() {
 
   // (9) Component pipeline (new workspace): the scaffolded entry imports the show-ui theme,
   // whose @theme registers the tokens and whose @source generates the component utilities.
-  // The served CSS must carry `.bg-primary` mapped to the --avs- palette (default parity)
-  // and the agent's own `.bg-red-500` override utility.
+  // The served CSS must carry `.bg-primary` mapped to the standard shadcn variable,
+  // direct var() usage, dark-mode selectors, and the agent's own utility override.
   await mkdir(join(root, "shadcn", "src"), { recursive: true })
   await writeFile(join(root, "shadcn", "src", "App.tsx"), `import { Button } from "@/components/ui/button"
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog"
+import { ThemeProvider } from "@/components/ui/theme"
 export default function App() {
-  return <Button className="bg-red-500">Ship</Button>
+  return (
+    <main data-theme="dark" className="dark:bg-primary">
+      <ThemeProvider preset="blue" theme={{ colors: { ring: "oklch(0.62 0.19 255)" } }}>
+        <Button className="bg-red-500 text-foreground" style={{ borderColor: "var(--border)" }}>Ship</Button>
+        <Dialog defaultOpen>
+          <DialogContent><DialogTitle>Scoped theme</DialogTitle><DialogDescription>Portal smoke</DialogDescription></DialogContent>
+        </Dialog>
+      </ThemeProvider>
+    </main>
+  )
 }
 `)
   const shadcnEnsure = await fetch(`${runtime.url}/sessions/shadcn/ensure`, { method: "POST" }).then((res) => res.json())
   if (shadcnEnsure.state !== "active") {
     throw new Error(`Expected shadcn session to warm active, got ${JSON.stringify(shadcnEnsure)}`)
   }
+  const shadcnDocument = await fetch(`${runtime.url}/sessions/shadcn/app/`).then((res) => res.text())
+  if (!shadcnDocument.includes("virtual:avibe-show-theme-compat-client")) {
+    throw new Error("Expected the live runtime document to install dynamic legacy theme compatibility")
+  }
   const shadcnStyles = await readFile(join(root, "shadcn", "src", "styles.css"), "utf8")
   if (!/@import\s+["']tailwindcss["']/.test(shadcnStyles) || !/@import\s+["']@avibe\/show-ui\/theme\.css["']/.test(shadcnStyles)) {
     throw new Error(`Expected the scaffolded entry to import both tailwindcss and the show-ui theme, got ${JSON.stringify(shadcnStyles.slice(0, 90))}`)
   }
   const shadcnCss = await fetch(`${runtime.url}/sessions/shadcn/app/src/styles.css?direct`).then((res) => res.text())
-  if (!/\.bg-primary\s*\{[^}]*var\(--avs-primary\)[^}]*\}/.test(shadcnCss)) {
-    throw new Error("Expected .bg-primary generated from the @source'd components and mapped to hsl(var(--avs-primary)) (default parity + @theme registration)")
+  if (!/\.bg-primary\s*\{[^}]*var\(--primary\)[^}]*\}/.test(shadcnCss)) {
+    throw new Error("Expected .bg-primary to resolve through the standard --primary shadcn token")
   }
   if (!shadcnCss.includes(".bg-red-500")) {
     throw new Error("Expected the agent's .bg-red-500 override utility to be generated")
+  }
+  if (!shadcnCss.includes("--background:") || !shadcnCss.includes("--card:") || !shadcnCss.includes("--chart-5:") || !shadcnCss.includes("--sidebar-ring:")) {
+    throw new Error("Expected the complete standard shadcn token contract in served runtime CSS")
+  }
+  if (!shadcnCss.includes(".dark\\:bg-primary") || !shadcnCss.includes('[data-theme="dark"]')
+    || !shadcnCss.includes(":host(.dark)") || !shadcnCss.includes(".avs-dark")) {
+    throw new Error("Expected document, shadow-host, and ThemeProvider dark-mode selectors in served runtime CSS")
+  }
+  if (!shadcnStyles.includes("background: var(--background)") || !shadcnStyles.includes("color: var(--foreground)")) {
+    throw new Error("Expected the scaffold to use standard tokens directly through native var() CSS")
+  }
+  const shadcnAppResponse = await fetch(`${runtime.url}/sessions/shadcn/app/src/App.tsx`)
+  if (!shadcnAppResponse.ok || !(await shadcnAppResponse.text()).includes("ThemeProvider")) {
+    throw new Error("Expected the shadcn-style ThemeProvider alias to resolve in the live runtime")
   }
 
   // (10) Legacy workspace (predates the theme import): a styles.css with only the Tailwind
   // entry must gain the show-ui theme import on warm so component tokens/utilities work.
   await mkdir(join(root, "shadcn-legacy", "src"), { recursive: true })
-  await writeFile(join(root, "shadcn-legacy", "src", "styles.css"), "@import \"tailwindcss\";\nbody { margin: 0; }\n")
+  await mkdir(join(root, "shadcn-legacy", "src", "features"), { recursive: true })
+  await writeFile(join(root, "shadcn-legacy", "src", "styles.css"), `@import "tailwindcss";
+.brand { --avs-primary: 221, 83%, 53%; --avs-border: 214 32% 91%; }
+body { margin: 0; }
+`)
+  await writeFile(join(root, "shadcn-legacy", "src", "features", "panel.module.css"), `.panel { --avs-muted: 210 40% 96%; }\n`)
   await writeFile(join(root, "shadcn-legacy", "src", "App.tsx"), `export default function App() {
   return <main className="p-4">legacy</main>
 }
@@ -1170,6 +1231,13 @@ export default function App() {
   const shadcnLegacyStyles = await readFile(join(root, "shadcn-legacy", "src", "styles.css"), "utf8")
   if (!/@import\s+["']@avibe\/show-ui\/theme\.css["']/.test(shadcnLegacyStyles) || !shadcnLegacyStyles.includes("margin: 0")) {
     throw new Error(`Expected the legacy entry to gain the show-ui theme import while preserving prior rules, got ${JSON.stringify(shadcnLegacyStyles.slice(0, 90))}`)
+  }
+  if (!shadcnLegacyStyles.includes("--primary: hsl(var(--avs-primary))") || !shadcnLegacyStyles.includes("--input: hsl(var(--avs-border))")) {
+    throw new Error("Expected scoped legacy theme declarations to migrate to standard tokens in the same rule")
+  }
+  const shadcnLegacyModule = await readFile(join(root, "shadcn-legacy", "src", "features", "panel.module.css"), "utf8")
+  if (!shadcnLegacyModule.includes("--muted: hsl(var(--avs-muted))")) {
+    throw new Error("Expected legacy theme declarations in nested stylesheets to migrate to standard tokens")
   }
   const shadcnLegacyCss = await fetch(`${runtime.url}/sessions/shadcn-legacy/app/src/styles.css?direct`).then((res) => res.text())
   if (!shadcnLegacyCss.includes(".bg-primary")) {
