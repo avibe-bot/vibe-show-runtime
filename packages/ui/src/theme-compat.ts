@@ -18,6 +18,46 @@ export const LEGACY_THEME_MIGRATIONS: Record<string, readonly string[]> = {
 export const LEGACY_THEME_OWNERSHIP_PREFIX = "--avibe-show-theme-owner-"
 export const SHOW_THEME_CHANGE_EVENT = "avibe-show-theme-change"
 
+export const STANDARD_THEME_INITIAL_VALUES: Record<string, string> = {
+  "--radius": "0.5rem",
+  "--background": "hsl(0 0% 100%)",
+  "--foreground": "hsl(222 47% 11%)",
+  "--card": "hsl(0 0% 100%)",
+  "--card-foreground": "hsl(222 47% 11%)",
+  "--popover": "hsl(0 0% 100%)",
+  "--popover-foreground": "hsl(222 47% 11%)",
+  "--primary": "hsl(222 47% 11%)",
+  "--primary-foreground": "hsl(210 40% 98%)",
+  "--secondary": "hsl(210 40% 96%)",
+  "--secondary-foreground": "hsl(222 47% 11%)",
+  "--muted": "hsl(210 40% 96%)",
+  "--muted-foreground": "hsl(215 16% 47%)",
+  "--accent": "hsl(210 40% 96%)",
+  "--accent-foreground": "hsl(222 47% 11%)",
+  "--destructive": "hsl(0 84% 60%)",
+  "--destructive-foreground": "hsl(0 0% 100%)",
+  "--border": "hsl(214 32% 91%)",
+  "--input": "hsl(214 32% 91%)",
+  "--ring": "hsl(221 83% 53%)",
+  "--chart-1": "hsl(12 76% 61%)",
+  "--chart-2": "hsl(173 58% 39%)",
+  "--chart-3": "hsl(197 37% 24%)",
+  "--chart-4": "hsl(43 74% 66%)",
+  "--chart-5": "hsl(27 87% 67%)",
+  "--sidebar": "hsl(210 40% 98%)",
+  "--sidebar-foreground": "hsl(222 47% 11%)",
+  "--sidebar-primary": "hsl(222 47% 11%)",
+  "--sidebar-primary-foreground": "hsl(210 40% 98%)",
+  "--sidebar-accent": "hsl(210 40% 96%)",
+  "--sidebar-accent-foreground": "hsl(222 47% 11%)",
+  "--sidebar-border": "hsl(214 32% 91%)",
+  "--sidebar-ring": "hsl(221 83% 53%)",
+  "--success": "hsl(158 64% 24%)",
+  "--success-foreground": "hsl(0 0% 100%)",
+  "--warning": "hsl(32 95% 44%)",
+  "--warning-foreground": "hsl(0 0% 100%)"
+}
+
 export function legacyThemeOwnershipMarker(target: string): string {
   return `${LEGACY_THEME_OWNERSHIP_PREFIX}${target.slice(2)}`
 }
@@ -48,7 +88,8 @@ function installLegacyThemeCompatibilityWithMigrations(
   migrations: Record<string, readonly string[]>,
   ownershipPrefix: string,
   themeChangeEvent: string,
-  portalThemeProperties: readonly string[]
+  portalThemeProperties: readonly string[],
+  standardThemeInitialValues: Record<string, string>
 ) {
   if (typeof document === "undefined") return
 
@@ -57,6 +98,17 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
   if (runtime.__avibeShowThemeCompatInstalled) return
   runtime.__avibeShowThemeCompatInstalled = true
+
+  const registerProperty = globalThis.CSS?.registerProperty?.bind(globalThis.CSS)
+  if (registerProperty) {
+    for (const [name, initialValue] of Object.entries(standardThemeInitialValues)) {
+      try {
+        registerProperty({ name, syntax: "*", inherits: true, initialValue })
+      } catch {
+        // Consumers may have registered a stricter definition before Show UI loads.
+      }
+    }
+  }
 
   const legacySources = Object.keys(migrations)
   const legacySourceSet = new Set(legacySources)
@@ -398,7 +450,13 @@ function installLegacyThemeCompatibilityWithMigrations(
       const values = samples.get(element)
       const parent = composedParentElement(element)
       const parentValues = parent ? samples.get(parent) : undefined
-      if (!values || !parent || !parentValues || !("style" in parent)) continue
+      if (!values) continue
+      if (!parent || !parentValues || !("style" in parent)) {
+        for (const source of legacySources) {
+          if (values.get(source)) markLocal(element, source)
+        }
+        continue
+      }
       for (const source of legacySources) {
         const value = values.get(source)
         if (value && value !== parentValues.get(source)) markLocal(element, source)
@@ -1210,6 +1268,40 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
+  function patchPortalStyleProperty(input: object | undefined, property: string) {
+    for (let prototype = input; prototype; prototype = Object.getPrototypeOf(prototype)) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, property)
+      if (!descriptor?.get || !descriptor.set) continue
+      Object.defineProperty(prototype, property, {
+        ...descriptor,
+        get() {
+          return descriptor.get?.call(this)
+        },
+        set(value: string) {
+          const before = descriptor.get?.call(this)
+          descriptor.set?.call(this, value)
+          if (!mutatingOpaqueBridge && before !== descriptor.get?.call(this)) notifyThemeChange()
+        }
+      })
+      return
+    }
+    if (!input || !nativeSetProperty) return
+    const cssProperty = property.replace(/[A-Z]/g, (character) => `-${character.toLowerCase()}`)
+    Object.defineProperty(input, property, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return (this as CSSStyleDeclaration).getPropertyValue(cssProperty)
+      },
+      set(value: string) {
+        const style = this as CSSStyleDeclaration
+        const before = style.getPropertyValue(cssProperty)
+        nativeSetProperty.call(style, cssProperty, value)
+        if (!mutatingOpaqueBridge && before !== style.getPropertyValue(cssProperty)) notifyThemeChange()
+      }
+    })
+  }
+
   if (stylePrototype && nativeSetProperty && nativeRemoveProperty) {
     const cssText = Object.getOwnPropertyDescriptor(stylePrototype, "cssText")
     stylePrototype.setProperty = function(name: string, value: string | null, priority?: string) {
@@ -1217,6 +1309,8 @@ function installLegacyThemeCompatibilityWithMigrations(
       const tracksOpaqueTarget = !mutatingOpaqueBridge && migratedTargets.has(propertyName)
       const tracksPortalTheme = !mutatingOpaqueBridge && portalThemePropertySet.has(propertyName)
       const tracksChange = tracksOpaqueTarget || tracksPortalTheme
+      const ownedOpaqueTarget = tracksOpaqueTarget
+        && Boolean(opaqueOwnedDeclarations.get(this)?.declarations.has(propertyName))
       const declaredBefore = tracksChange ? declaredProperties(this).has(propertyName) : false
       const valueBefore = tracksChange ? this.getPropertyValue(propertyName) : ""
       const priorityBefore = tracksChange ? this.getPropertyPriority(propertyName) : ""
@@ -1225,7 +1319,12 @@ function installLegacyThemeCompatibilityWithMigrations(
         && (declaredBefore !== declaredProperties(this).has(propertyName)
           || valueBefore !== this.getPropertyValue(propertyName)
           || priorityBefore !== this.getPropertyPriority(propertyName))
-      if (changed && tracksOpaqueTarget) {
+      const priorityValue = priority == null ? "" : String(priority)
+      const acceptedPriority = value == null
+        || String(value) === ""
+        || priorityValue === ""
+        || priorityValue.toLowerCase() === "important"
+      if (tracksOpaqueTarget && acceptedPriority && (changed || ownedOpaqueTarget)) {
         relinquishOpaqueOwnership(this, propertyName)
         scheduleAllOpaqueLegacyScans()
       } else if (changed) {
@@ -1282,6 +1381,14 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
 
   const sheetPrototype = globalThis.CSSStyleSheet?.prototype
+  for (const [property, cssProperty] of [
+    ["colorScheme", "color-scheme"], ["color", "color"], ["direction", "direction"],
+    ["fontFamily", "font-family"], ["fontSize", "font-size"], ["fontStretch", "font-stretch"],
+    ["fontStyle", "font-style"], ["fontVariant", "font-variant"], ["fontWeight", "font-weight"],
+    ["lineHeight", "line-height"]
+  ]) {
+    if (portalThemePropertySet.has(cssProperty)) patchPortalStyleProperty(stylePrototype, property)
+  }
   patchStyleSheetDisabled(sheetPrototype)
   patchRuleContainer(sheetPrototype)
   patchRuleContainer(globalThis.CSSGroupingRule?.prototype)
@@ -1462,9 +1569,19 @@ function installLegacyThemeCompatibilityWithMigrations(
     root.addEventListener("load", stylesheetLoad, true)
   }
 
+  function syncAllOpaqueLegacyThemesNow() {
+    if (!opaqueStyleSheets.size) return
+    opaqueFullScanPending = true
+    for (const scope of opaqueStyleSheetScopes.values()) {
+      if (typeof ShadowRoot !== "undefined" && scope instanceof ShadowRoot) opaqueScanRoots.add(scope)
+    }
+    syncOpaqueLegacyThemes()
+    if (typeof Event !== "undefined") globalThis.dispatchEvent?.(new Event(themeChangeEvent))
+  }
+
+  globalThis.addEventListener?.("beforeprint", syncAllOpaqueLegacyThemesNow, true)
   for (const event of [
-    "resize", "orientationchange", "pageshow", "hashchange", "popstate", "fullscreenchange",
-    "beforeprint", "afterprint"
+    "resize", "orientationchange", "pageshow", "hashchange", "popstate", "fullscreenchange", "afterprint"
   ]) {
     globalThis.addEventListener?.(event, scheduleAllOpaqueLegacyScans, true)
   }
@@ -1512,12 +1629,13 @@ export function installLegacyThemeCompatibility() {
     LEGACY_THEME_MIGRATIONS,
     LEGACY_THEME_OWNERSHIP_PREFIX,
     SHOW_THEME_CHANGE_EVENT,
-    SHOW_PORTAL_THEME_PROPERTIES
+    SHOW_PORTAL_THEME_PROPERTIES,
+    STANDARD_THEME_INITIAL_VALUES
   )
 }
 
 export function themeCompatibilityClientScript(): string {
-  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)},${JSON.stringify(LEGACY_THEME_OWNERSHIP_PREFIX)},${JSON.stringify(SHOW_THEME_CHANGE_EVENT)},${JSON.stringify(SHOW_PORTAL_THEME_PROPERTIES)});`
+  return `(${installLegacyThemeCompatibilityWithMigrations.toString()})(${JSON.stringify(LEGACY_THEME_MIGRATIONS)},${JSON.stringify(LEGACY_THEME_OWNERSHIP_PREFIX)},${JSON.stringify(SHOW_THEME_CHANGE_EVENT)},${JSON.stringify(SHOW_PORTAL_THEME_PROPERTIES)},${JSON.stringify(STANDARD_THEME_INITIAL_VALUES)});`
 }
 
 installLegacyThemeCompatibility()

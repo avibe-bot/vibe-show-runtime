@@ -33,6 +33,28 @@ describe("legacy theme migration", () => {
     expect(await readFile(join(workspace, "src", "styles.css"), "utf8")).toBe(migrated)
   })
 
+  it("ignores import-shaped strings when locating the theme import", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "show-theme-import-string-"))
+    workspaces.push(workspace)
+    await mkdir(join(workspace, "src"), { recursive: true })
+    await writeFile(join(workspace, "src", "App.tsx"), "export default function App() { return null }\n")
+    await writeFile(join(workspace, "src", "styles.css"), `.label {
+  content: '@import "@avibe/show-ui/theme.css";';
+}
+@import "tailwindcss";
+`)
+
+    await ensureSessionTemplate(workspace)
+    const migrated = await readFile(join(workspace, "src", "styles.css"), "utf8")
+    expect(migrated).toContain(`content: '@import "@avibe/show-ui/theme.css";';`)
+    expect(migrated.indexOf('@import "tailwindcss";')).toBeLessThan(
+      migrated.lastIndexOf('@import "@avibe/show-ui/theme.css";')
+    )
+
+    await ensureSessionTemplate(workspace)
+    expect(await readFile(join(workspace, "src", "styles.css"), "utf8")).toBe(migrated)
+  })
+
   it("adds standard tokens in each legacy declaration scope and is idempotent", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "show-theme-migration-"))
     workspaces.push(workspace)

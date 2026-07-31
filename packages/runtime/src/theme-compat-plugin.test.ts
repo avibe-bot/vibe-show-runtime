@@ -504,6 +504,12 @@ describe("dynamic legacy theme compatibility", () => {
     const listeners = new Map<string, EventListener>()
     const mediaListeners = new Map<string, EventListener>()
     const dispatchedEvents: string[] = []
+    const registeredProperties: Array<{
+      name: string
+      initialValue: string
+      inherits: boolean
+      syntax: string
+    }> = []
     let legacyActive = false
     let ancestorActive = false
     let eventPanelActive = false
@@ -581,6 +587,11 @@ describe("dynamic legacy theme compatibility", () => {
     const context = {
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: OpaqueStyleSheet,
+      CSS: {
+        registerProperty(definition: { name: string; initialValue: string; inherits: boolean; syntax: string }) {
+          registeredProperties.push(definition)
+        }
+      },
       CSSImportRule: TestImportRule,
       CSSGroupingRule: TestGroupingRule,
       CSSAnimation: class {},
@@ -660,10 +671,27 @@ describe("dynamic legacy theme compatibility", () => {
     expect(listeners.has("animationcancel")).toBe(true)
     expect(listeners.has("transitioncancel")).toBe(true)
     expect(listeners.has("fullscreenchange")).toBe(true)
+    expect(listeners.has("beforeprint")).toBe(true)
     expect(listeners.get("pointerdown")).not.toBe(listeners.get("resize"))
     expect(listeners.get("pointerdown")).not.toBe(listeners.get("animationstart"))
     expect(mediaListeners.has("(any-pointer: coarse)")).toBe(true)
     expect(mediaListeners.has("(any-pointer: none)")).toBe(true)
+    expect(registeredProperties).toContainEqual({
+      name: "--background",
+      initialValue: "hsl(0 0% 100%)",
+      inherits: true,
+      syntax: "*"
+    })
+
+    legacyActive = true
+    listeners.get("beforeprint")?.({} as Event)
+    expect(frames).toHaveLength(0)
+    expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    legacyActive = false
+    listeners.get("afterprint")?.({} as Event)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.0625)
+    expect(root.style.getPropertyValue("--primary")).toBe("")
 
     computedReads.clear()
     eventPanelActive = true
@@ -678,12 +706,13 @@ describe("dynamic legacy theme compatibility", () => {
     frames.shift()?.(0.175)
     expect(computedReads.get(unrelatedEventSibling)).toBeGreaterThan(0)
 
+    eventPanel.style.setProperty("--primary", "hsl(var(--avs-primary))", "important")
     authoredPanel.style.cssText = authoredPanel.style.cssText
     eventPanelActive = false
     listeners.get("reset")?.({ target: eventCard } as unknown as Event)
     expect(frames).toHaveLength(2)
     frames.shift()?.(0.18)
-    expect(eventPanel.style.getPropertyValue("--primary")).toBe("")
+    expect(eventPanel.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(authoredPanel.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     frames.shift()?.(0.185)
     frames.shift()?.(0.19)
@@ -746,21 +775,30 @@ describe("dynamic legacy theme compatibility", () => {
     await Promise.resolve()
     expect(dispatchedEvents).toContain("avibe-show-theme-change")
 
+    dispatchedEvents.length = 0
+    const namedStyle = insertedStandardRule as TestStyle & { fontSize: string }
+    namedStyle.fontSize = "20px"
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
+
     const opaqueWritesBeforeMotion = opaque.disabledWrites
     activeCssMotion = true
+    legacyActive = true
     eventPanelActive = true
     listeners.get("pointerdown")?.({ target: eventTarget } as unknown as Event)
     frames.shift()?.(0.47)
     frames.shift()?.(0.475)
     frames.shift()?.(0.48)
     expect(opaque.disabledWrites).toBe(opaqueWritesBeforeMotion)
+    expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(eventPanel.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     activeCssMotion = false
+    legacyActive = false
     eventPanelActive = false
     listeners.get("animationcancel")?.({ target: eventTarget } as unknown as Event)
     frames.shift()?.(0.485)
     expect(opaque.disabledWrites).toBeGreaterThan(opaqueWritesBeforeMotion)
-    expect(eventPanel.style.getPropertyValue("--primary")).toBe("")
+    expect(eventPanel.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
 
     chainActive = true
     listeners.get("resize")?.({} as Event)

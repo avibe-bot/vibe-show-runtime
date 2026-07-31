@@ -125,10 +125,12 @@ function PortalThemeBridge({
     }
     update()
     window.addEventListener(SHOW_THEME_CHANGE_EVENT, schedule)
+    window.addEventListener("beforeprint", update)
     window.addEventListener("animationstart", schedule, true)
     window.addEventListener("transitionrun", schedule, true)
     return () => {
       window.removeEventListener(SHOW_THEME_CHANGE_EVENT, schedule)
+      window.removeEventListener("beforeprint", update)
       window.removeEventListener("animationstart", schedule, true)
       window.removeEventListener("transitionrun", schedule, true)
       if (frame) window.cancelAnimationFrame(frame)
