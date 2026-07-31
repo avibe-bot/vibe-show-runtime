@@ -113,18 +113,26 @@ function hasComposedDarkTheme(element: Element): boolean {
   return false
 }
 
-function hasActivePortalThemeMotion(source: PortalThemeSource | null): boolean {
-  if (!source) return false
+function portalThemeSourceElements(source: PortalThemeSource | null): Element[] {
+  if (!source) return []
+  const elements: Element[] = []
   const seen = new Set<Element>()
   for (const start of [source.tokens, source.context]) {
     for (let node: Node | null = start; node; node = composedParentNode(node)) {
       if (!(node instanceof Element) || seen.has(node)) continue
       seen.add(node)
-      if (node.getAnimations().some((animation) =>
-        (animation.playState === "running" || animation.pending)
-        && animationAffectsShowPortalTheme(animation))) {
-        return true
-      }
+      elements.push(node)
+    }
+  }
+  return elements
+}
+
+function hasActivePortalThemeMotion(source: PortalThemeSource | null): boolean {
+  for (const element of portalThemeSourceElements(source)) {
+    if (element.getAnimations().some((animation) =>
+      (animation.playState === "running" || animation.pending)
+      && animationAffectsShowPortalTheme(animation))) {
+      return true
     }
   }
   return false
@@ -146,8 +154,27 @@ function PortalThemeBridge({
   React.useLayoutEffect(() => {
     let frame = 0
     let signature = ""
+    let observedElements = new Set<Element>()
+    const schedule = () => {
+      if (!frame) frame = window.requestAnimationFrame(update)
+    }
+    const resizeObserver = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(schedule)
+    const observeThemeSource = () => {
+      if (!resizeObserver) return
+      const nextElements = new Set(portalThemeSourceElements(getThemeSource()))
+      for (const element of observedElements) {
+        if (!nextElements.has(element)) resizeObserver.unobserve(element)
+      }
+      for (const element of nextElements) {
+        if (!observedElements.has(element)) resizeObserver.observe(element)
+      }
+      observedElements = nextElements
+    }
     const update = () => {
       frame = 0
+      observeThemeSource()
       const next = getTheme()
       if (next.signature !== signature) {
         signature = next.signature
@@ -167,9 +194,6 @@ function PortalThemeBridge({
       }
       if (hasActivePortalThemeMotion(getThemeSource())) schedule()
     }
-    const schedule = () => {
-      if (!frame) frame = window.requestAnimationFrame(update)
-    }
     update()
     window.addEventListener(SHOW_THEME_CHANGE_EVENT, schedule)
     window.addEventListener("beforeprint", updateBeforePrint)
@@ -180,6 +204,7 @@ function PortalThemeBridge({
       window.removeEventListener("beforeprint", updateBeforePrint)
       window.removeEventListener("animationstart", schedule, true)
       window.removeEventListener("transitionrun", schedule, true)
+      resizeObserver?.disconnect()
       if (frame) window.cancelAnimationFrame(frame)
     }
   }, [getTheme, getThemeSource])

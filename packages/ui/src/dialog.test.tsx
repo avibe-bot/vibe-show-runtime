@@ -44,6 +44,9 @@ describe("Dialog", () => {
     expect(source).toContain('window.addEventListener("animationstart", schedule, true)')
     expect(source).toContain("hasActivePortalThemeMotion(getThemeSource())")
     expect(source).toContain("animationAffectsShowPortalTheme(animation)")
+    expect(source).toContain("new ResizeObserver(schedule)")
+    expect(source).toContain("resizeObserver.observe(element)")
+    expect(source).toContain("resizeObserver?.disconnect()")
     expect(source.match(/requestAnimationFrame\(update\)/g)).toHaveLength(1)
   })
 

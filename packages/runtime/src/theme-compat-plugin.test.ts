@@ -93,6 +93,13 @@ function loadClientCode() {
 
 describe("dynamic legacy theme compatibility", () => {
   it("installs CSSOM migration without scanning unrelated inline animations", async () => {
+    class TestAnimation {
+      effect = { getKeyframes: () => [{ "--primary": "red" }] }
+      pending = false
+      playState = "running"
+      pause() { this.playState = "paused" }
+      play() { this.playState = "running" }
+    }
     class TestElement {
       style = new TestStyle()
       parentElement = null
@@ -103,6 +110,7 @@ describe("dynamic legacy theme compatibility", () => {
       getAttribute() { return null }
       matches() { return false }
       querySelectorAll(selector: string) { return selector === "*" ? this.descendants : [] }
+      animate() { return new TestAnimation() }
       attachShadow() {
         this.shadowRoot = this.nextShadowRoot ?? new TestShadowRoot()
         this.shadowRoot.host = this
@@ -235,6 +243,7 @@ describe("dynamic legacy theme compatibility", () => {
       CSSKeyframesRule: TestKeyframesRule,
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: TestStyleSheet,
+      Animation: TestAnimation,
       Element: TestElement,
       HTMLLinkElement: class {},
       MutationObserver: TestMutationObserver,
@@ -268,6 +277,14 @@ describe("dynamic legacy theme compatibility", () => {
     expect(dispatchedEvents).toContain("avibe-show-theme-change")
     dispatchedEvents.length = 0
     directRule.removeProperty("CoLoR")
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
+    dispatchedEvents.length = 0
+    const webAnimation = root.animate()
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
+    dispatchedEvents.length = 0
+    webAnimation.pause()
     await Promise.resolve()
     expect(dispatchedEvents).toContain("avibe-show-theme-change")
 
@@ -374,10 +391,12 @@ describe("dynamic legacy theme compatibility", () => {
       nextShadowRoot: TestShadowRoot | null = null
       rootNode: TestShadowRoot | null = null
       descendants: TestElement[] = []
+      animations: Animation[] = []
       constructor(readonly standard = false) { super() }
       getAttribute() { return null }
       getRootNode() { return this.rootNode }
       matches() { return false }
+      getAnimations() { return this.animations }
       closest(selector: string) { return selector === "style" && this instanceof TestStyleElement ? this : null }
       contains(node: TestNode): boolean {
         return node === this || this.descendants.some((element) => element.contains(node))
@@ -613,6 +632,7 @@ describe("dynamic legacy theme compatibility", () => {
     let chainActive = false
     let activeCssMotion = false
     let rootStandardActive = false
+    let shadowHostPrimary = ""
     let insertedClosedOpaque: OpaqueStyleSheet | null = null
     const computedReads = new Map<TestElement, number>()
     const computedProperty = (element: TestElement, name: string): string => {
@@ -657,6 +677,7 @@ describe("dynamic legacy theme compatibility", () => {
           return opaque.disabled ? "" : "hsl(221 83% 53%)"
         }
         if (inline) return inline
+        if (element === closedHost && shadowHostPrimary) return shadowHostPrimary
         if (element === root && !opaque.disabled && rootStandardActive) return "oklch(0.72 0.18 255)"
         if (!opaque.disabled && legacyActive && element.standard) return "oklch(0.62 0.19 255)"
         return parent ? computedProperty(parent, name) : readableThemeSheet.disabled ? "" : "hsl(222 47% 11%)"
@@ -719,6 +740,7 @@ describe("dynamic legacy theme compatibility", () => {
       customElements: new TestCustomElementRegistry(),
       dispatchEvent(event: { type: string }) {
         dispatchedEvents.push(event.type)
+        listeners.get(event.type)?.(event as unknown as Event)
         return true
       },
       getComputedStyle(element: TestElement) {
@@ -798,6 +820,8 @@ describe("dynamic legacy theme compatibility", () => {
     expect(mediaListeners.has("(any-pointer: none)")).toBe(true)
     expect(fontListeners.has("loadingdone")).toBe(true)
     expect(fontListeners.has("loadingerror")).toBe(true)
+    expect(rootListeners.has("scroll")).toBe(true)
+    expect(rootListeners.has("scrollend")).toBe(true)
     expect(registeredProperties).toEqual([])
 
     mutationCallbacks[0]?.([{
@@ -809,6 +833,10 @@ describe("dynamic legacy theme compatibility", () => {
     await Promise.resolve()
     expect(dispatchedEvents).toContain("avibe-show-theme-change")
     dispatchedEvents.length = 0
+
+    rootListeners.get("scroll")?.({ target: eventTarget } as unknown as Event)
+    expect(frames.length).toBeGreaterThan(0)
+    while (frames.length) frames.shift()?.(0.005)
 
     listeners.get("play")?.({ target: eventTarget } as unknown as Event)
     expect(frames).toHaveLength(0)
@@ -1110,6 +1138,27 @@ describe("dynamic legacy theme compatibility", () => {
     frames.shift()?.(5)
     expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(root.style.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
+
+    const hostAnimation = {
+      effect: { getKeyframes: () => [{ "--primary": "rgb(1 2 3)" }] },
+      pending: false,
+      playState: "running"
+    } as unknown as Animation
+    closedHost.animations = [hostAnimation]
+    shadowHostPrimary = "rgb(1 2 3)"
+    listeners.get("animationstart")?.({ target: closedHost } as unknown as Event)
+    await Promise.resolve()
+    expect(closedHost.style.getPropertyValue("--avibe-show-host-primary")).toBe("rgb(1 2 3)")
+    shadowHostPrimary = "rgb(4 5 6)"
+    const motionFrames = frames.splice(0)
+    for (const callback of motionFrames) callback(5.25)
+    expect(closedHost.style.getPropertyValue("--avibe-show-host-primary")).toBe("rgb(4 5 6)")
+    Object.assign(hostAnimation, { playState: "finished" })
+    shadowHostPrimary = "rgb(7 8 9)"
+    const finalMotionFrames = frames.splice(0)
+    for (const callback of finalMotionFrames) callback(5.5)
+    expect(closedHost.style.getPropertyValue("--avibe-show-host-primary")).toBe("rgb(7 8 9)")
+    while (frames.length) frames.shift()?.(5.75)
 
     root.style.setProperty("--primary", "oklch(0.62 0.19 255)", "invalid")
     expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")

@@ -62,6 +62,12 @@ function installLegacyThemeCompatibilityWithMigrations(
   const legacySourceSet = new Set(legacySources)
   const migratedTargets = new Set(Object.values(migrations).flat())
   const portalThemeMutationPropertySet = new Set([...portalThemeProperties, "all", "font"])
+  const themeMotionPropertySet = new Set([
+    ...portalThemeProperties, "all", "font",
+    "width", "min-width", "max-width", "height", "min-height", "max-height",
+    "inline-size", "min-inline-size", "max-inline-size",
+    "block-size", "min-block-size", "max-block-size", "contain", "container-type"
+  ])
   const ownedDeclarations = new WeakMap<CSSStyleDeclaration, Map<string, OwnedDeclaration>>()
   const opaqueOwnedDeclarations = new Map<CSSStyleDeclaration, OpaqueOwnedDeclarations>()
   const opaqueBridgeSignatures = new WeakMap<CSSStyleDeclaration, string>()
@@ -96,6 +102,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   let opaqueMutationCleanupPending = false
   let themeChangePending = false
   let adoptedListPollTimer = 0
+  let shadowHostThemeFrame = 0
   let mutatingOpaqueSheetState = false
   let inspectingRuleStyles = false
   const opaqueScanRoots = new Set<Node>()
@@ -252,8 +259,43 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
+  function animationAffectsThemeContext(animation: Animation) {
+    const effect = animation.effect
+    if (!effect || !("getKeyframes" in effect) || typeof effect.getKeyframes !== "function") return false
+    try {
+      return effect.getKeyframes().some((keyframe: ComputedKeyframe) => Object.keys(keyframe).some((property) => {
+        const name = cssPropertyForNamedStyle(property)
+        return name.startsWith("--") || themeMotionPropertySet.has(name)
+      }))
+    } catch {
+      return false
+    }
+  }
+
+  function hasActiveShadowHostThemeMotion() {
+    const seen = new Set<Element>()
+    for (const root of activeShadowRoots) {
+      for (let element: Element | null = root.host; element; element = composedParentElement(element)) {
+        if (seen.has(element)) continue
+        seen.add(element)
+        if (element.getAnimations?.().some((animation) =>
+          (animation.playState === "running" || animation.pending)
+          && animationAffectsThemeContext(animation))) {
+          return true
+        }
+      }
+    }
+    return false
+  }
+
   function refreshShadowHostThemes() {
     for (const root of activeShadowRoots) snapshotShadowHostTheme(root)
+    if (!shadowHostThemeFrame && hasActiveShadowHostThemeMotion()) {
+      shadowHostThemeFrame = requestCompatibilityFrame(() => {
+        shadowHostThemeFrame = 0
+        refreshShadowHostThemes()
+      })
+    }
   }
 
   function notifyThemeChange() {
@@ -1141,6 +1183,18 @@ function installLegacyThemeCompatibilityWithMigrations(
     })
   }
 
+  function patchThemeMotionMethod(input: object | undefined, name: string) {
+    if (!input) return
+    const prototype = input as Record<string, unknown>
+    const method = prototype[name]
+    if (typeof method !== "function") return
+    prototype[name] = function(this: unknown, ...args: unknown[]) {
+      const result = method.apply(this, args)
+      scheduleAllOpaqueLegacyScans()
+      return result
+    }
+  }
+
   function patchCustomStateSet(input: object | undefined) {
     if (!input || patchedCustomStateSets.has(input)) return
     patchedCustomStateSets.add(input)
@@ -1792,6 +1846,7 @@ function installLegacyThemeCompatibilityWithMigrations(
     if (typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot) {
       knownShadowRoots.set(root.host, root)
       snapshotShadowHostTheme(root)
+      refreshShadowHostThemes()
     }
     if (observedRoots.has(root) && !rescan) {
       scanShadowRoots(container)
@@ -1821,6 +1876,8 @@ function installLegacyThemeCompatibilityWithMigrations(
       subtree: true
     })
     root.addEventListener("load", stylesheetLoad, true)
+    root.addEventListener("scroll", scheduleOpaqueLegacyRelationalEventScan, true)
+    root.addEventListener("scrollend", scheduleOpaqueLegacyRelationalEventScan, true)
   }
 
   function syncAllOpaqueLegacyThemesNow() {
@@ -1877,6 +1934,16 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
 
   const elementPrototype = globalThis.Element?.prototype
+  patchThemeMotionMethod(elementPrototype, "animate")
+  const animationPrototype = globalThis.Animation?.prototype
+  for (const method of [
+    "cancel", "commitStyles", "finish", "pause", "play", "reverse", "updatePlaybackRate"
+  ]) {
+    patchThemeMotionMethod(animationPrototype, method)
+  }
+  for (const property of ["currentTime", "playbackRate", "startTime"]) {
+    patchStateProperty(animationPrototype, property)
+  }
   if (elementPrototype?.attachShadow) {
     const attachShadow = elementPrototype.attachShadow
     elementPrototype.attachShadow = function(init: ShadowRootInit) {
