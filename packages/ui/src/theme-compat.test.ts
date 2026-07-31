@@ -21,7 +21,7 @@ describe("legacy theme compatibility", () => {
 
   it("serializes the opaque stylesheet state observers", () => {
     const script = themeCompatibilityClientScript()
-    for (const event of ["pointerdown", "pointerup", "pointercancel", "keydown", "keyup"]) {
+    for (const event of ["pointerdown", "pointerup", "pointercancel", "keydown", "keyup", "beforetoggle", "toggle"]) {
       expect(script).toContain(`"${event}"`)
     }
     for (const query of [
@@ -35,6 +35,8 @@ describe("legacy theme compatibility", () => {
     expect(script).toContain("new Proxy(list")
     expect(script).toContain("rootCandidates")
     expect(script).toContain("scheduleAdoptedListPoll")
+    expect(script).toContain("patchMediaList")
+    expect(script).toContain("selectorText")
     expect(script).toContain('"removeRule"')
     expect(script).toContain("opaqueStyleSheetScopes.values()")
     expect(script).toContain('"hashchange"')

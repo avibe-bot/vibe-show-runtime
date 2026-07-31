@@ -166,6 +166,8 @@ export function Dialog({
   const activeTrigger = React.useRef<HTMLElement>(null)
   const openingTheme = React.useRef<PortalThemeSnapshot>(null)
   const triggers = React.useRef(new Set<HTMLElement>()).current
+  const controlledOpen = React.useRef(open)
+  controlledOpen.current = open
   const scope = React.useMemo(() => ({ activeTrigger, openingTheme, triggers }), [triggers])
   const clearOpeningTheme = React.useCallback(() => {
     activeTrigger.current = null
@@ -177,6 +179,11 @@ export function Dialog({
   const handleOpenChange = React.useCallback((nextOpen: boolean) => {
     if (!nextOpen && open === undefined) clearOpeningTheme()
     onOpenChange?.(nextOpen)
+    if (nextOpen && open === false) {
+      queueMicrotask(() => {
+        if (controlledOpen.current === false) clearOpeningTheme()
+      })
+    }
   }, [clearOpeningTheme, onOpenChange, open])
   return (
     <DialogScopeContext.Provider value={scope}>

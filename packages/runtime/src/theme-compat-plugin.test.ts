@@ -345,6 +345,19 @@ describe("dynamic legacy theme compatibility", () => {
         throw Object.assign(new Error("opaque"), { name: "SecurityError" })
       }
     }
+    class TestGroupingRule {
+      cssRules: Array<{ style: TestStyle }> = []
+      nextStyle?: TestStyle
+      insertRule() {
+        if (this.nextStyle) this.cssRules.push({ style: this.nextStyle })
+        return this.cssRules.length - 1
+      }
+    }
+    class TestMediaList {
+      mediaText = ""
+      appendMedium(value: string) { this.mediaText = value }
+      deleteMedium() { this.mediaText = "" }
+    }
     const mutationCallbacks: MutationCallback[] = []
     class TestMutationObserver {
       constructor(callback: MutationCallback) { mutationCallbacks.push(callback) }
@@ -381,6 +394,10 @@ describe("dynamic legacy theme compatibility", () => {
     root.descendants.push(standard, inlineStandard, inherited, ancestor, closedHost)
     const opaque = new OpaqueStyleSheet()
     const readableThemeSheet = { cssRules: [], disabled: false }
+    const insertedStandardRule = new TestStyle()
+    insertedStandardRule.setProperty("--primary", "rgb(1 2 3)")
+    const groupingRule = new TestGroupingRule()
+    groupingRule.nextStyle = insertedStandardRule
     const frames: FrameRequestCallback[] = []
     const listeners = new Map<string, EventListener>()
     const mediaListeners = new Map<string, EventListener>()
@@ -438,10 +455,12 @@ describe("dynamic legacy theme compatibility", () => {
     const context = {
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: OpaqueStyleSheet,
+      CSSGroupingRule: TestGroupingRule,
       Element: TestElement,
       HTMLLinkElement: class {},
       HTMLStyleElement: class {},
       MutationObserver: TestMutationObserver,
+      MediaList: TestMediaList,
       Node: TestNode,
       ShadowRoot: TestShadowRoot,
       addEventListener(name: string, listener: EventListener) { listeners.set(name, listener) },
@@ -483,8 +502,18 @@ describe("dynamic legacy theme compatibility", () => {
     expect(listeners.has("pointerdown")).toBe(true)
     expect(listeners.has("pointerup")).toBe(true)
     expect(listeners.has("keydown")).toBe(true)
+    expect(listeners.has("beforetoggle")).toBe(true)
+    expect(listeners.has("toggle")).toBe(true)
     expect(mediaListeners.has("(any-pointer: coarse)")).toBe(true)
     expect(mediaListeners.has("(any-pointer: none)")).toBe(true)
+
+    groupingRule.insertRule()
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.25)
+    const media = new TestMediaList()
+    media.appendMedium("screen")
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.375)
 
     mutationCallbacks[1]?.([{ type: "attributes", attributeName: "class", target: closedHost }] as unknown as MutationRecord[], {} as MutationObserver)
     expect(frames).toHaveLength(1)

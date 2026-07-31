@@ -25,5 +25,6 @@ describe("Dialog", () => {
     expect(source).toContain("scope.openingTheme.current = readPortalTheme")
     expect(source).toContain("if (!active?.isConnected && opening) return opening")
     expect(source).toContain("if (!nextOpen && open === undefined) clearOpeningTheme()")
+    expect(source).toContain("if (controlledOpen.current === false) clearOpeningTheme()")
   })
 })

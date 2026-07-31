@@ -417,6 +417,8 @@ function installLegacyThemeCompatibilityWithMigrations(
         }
       }
       if (readableSheets.length) {
+        const wasMutatingSheetState = mutatingOpaqueSheetState
+        mutatingOpaqueSheetState = true
         try {
           for (const { sheet } of readableSheets) sheet.disabled = true
           for (const [root, targets] of rootCandidates) {
@@ -428,7 +430,11 @@ function installLegacyThemeCompatibilityWithMigrations(
             }
           }
         } finally {
-          for (const { sheet, disabled } of readableSheets) sheet.disabled = disabled
+          try {
+            for (const { sheet, disabled } of readableSheets) sheet.disabled = disabled
+          } finally {
+            mutatingOpaqueSheetState = wasMutatingSheetState
+          }
         }
       }
     }
@@ -639,6 +645,7 @@ function installLegacyThemeCompatibilityWithMigrations(
         const insertedIndex = insertRule.call(this, rule, index)
         const insertedRule = this.cssRules[insertedIndex]
         if (insertedRule) syncLegacyRuleList([insertedRule])
+        scheduleAllOpaqueLegacyScans()
         return insertedIndex
       }
     }
@@ -675,6 +682,31 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
+  function patchMediaList(input: object | undefined) {
+    if (!input) return
+    const prototype = input as MediaList
+    const mediaText = Object.getOwnPropertyDescriptor(input, "mediaText")
+    if (mediaText?.get && mediaText.set) {
+      Object.defineProperty(input, "mediaText", {
+        ...mediaText,
+        set(value: string) {
+          const before = mediaText.get?.call(this)
+          mediaText.set?.call(this, value)
+          if (before !== mediaText.get?.call(this)) scheduleAllOpaqueLegacyScans()
+        }
+      })
+    }
+    for (const name of ["appendMedium", "deleteMedium"] as const) {
+      const mutate = prototype[name]
+      if (typeof mutate !== "function") continue
+      prototype[name] = function(this: MediaList, medium: string) {
+        const before = this.mediaText
+        mutate.call(this, medium)
+        if (before !== this.mediaText) scheduleAllOpaqueLegacyScans()
+      }
+    }
+  }
+
   function syncObservedAdoptedList(list: CSSStyleSheet[], scope?: Document | ShadowRoot) {
     const sheets = Array.from(list)
     const record = observedAdoptedLists.get(list)
@@ -685,6 +717,7 @@ function installLegacyThemeCompatibilityWithMigrations(
       observedAdoptedLists.set(list, { scope, snapshot: sheets })
     }
     for (const sheet of sheets) syncLegacyStyleSheet(sheet, scope)
+    scheduleAllOpaqueLegacyScans()
   }
 
   function scheduleAdoptedListPoll() {
@@ -792,9 +825,10 @@ function installLegacyThemeCompatibilityWithMigrations(
           const before = descriptor.get?.call(this)
           descriptor.set?.call(this, value)
           const after = descriptor.get?.call(this)
-          if (!mutatingOpaqueSheetState && before !== after
-            && opaqueStyleSheets.has(this as CSSStyleSheet)) {
-            scheduleOpaqueLegacyScan(opaqueStyleSheetScopes.get(this as CSSStyleSheet))
+          if (!mutatingOpaqueSheetState && before !== after) {
+            const sheet = this as CSSStyleSheet
+            if (opaqueStyleSheets.has(sheet)) scheduleOpaqueLegacyScan(opaqueStyleSheetScopes.get(sheet))
+            else scheduleAllOpaqueLegacyScans()
           }
         }
       })
@@ -817,6 +851,7 @@ function installLegacyThemeCompatibilityWithMigrations(
           || priorityBefore !== this.getPropertyPriority(propertyName))
       if (changed) {
         relinquishOpaqueOwnership(this, propertyName)
+        scheduleAllOpaqueLegacyScans()
       }
       if (legacySources.includes(propertyName) || (migratedTargets.has(propertyName) && (ownedDeclarations.has(this) || hasLegacyDeclaration(this)))) {
         syncLegacyDeclaration(this)
@@ -835,6 +870,7 @@ function installLegacyThemeCompatibilityWithMigrations(
           || priorityBefore !== this.getPropertyPriority(propertyName))
       if (changed) {
         relinquishOpaqueOwnership(this, propertyName)
+        scheduleAllOpaqueLegacyScans()
       }
       if (legacySources.includes(propertyName) || (migratedTargets.has(propertyName) && (ownedDeclarations.has(this) || hasLegacyDeclaration(this)))) {
         syncLegacyDeclaration(this)
@@ -846,10 +882,12 @@ function installLegacyThemeCompatibilityWithMigrations(
         ...cssText,
         set(value: string | null) {
           const wasOwned = ownedDeclarations.has(this)
+          const before = cssText.get?.call(this) ?? ""
           cssText.set?.call(this, value)
           if (!mutatingOpaqueBridge) removeOpaqueOwnedFromStyle(this)
           const current = cssText.get?.call(this) ?? ""
           if (wasOwned || current.includes("--avs-")) syncLegacyDeclaration(this, current.includes("--avs-"))
+          if (!mutatingOpaqueBridge && before !== current) scheduleAllOpaqueLegacyScans()
         }
       })
     }
@@ -860,11 +898,25 @@ function installLegacyThemeCompatibilityWithMigrations(
   patchRuleContainer(sheetPrototype)
   patchRuleContainer(globalThis.CSSGroupingRule?.prototype)
   patchKeyframesRule(globalThis.CSSKeyframesRule?.prototype)
+  patchMediaList(globalThis.MediaList?.prototype)
+  const styleRulePrototype = globalThis.CSSStyleRule?.prototype
+  const selectorText = styleRulePrototype && Object.getOwnPropertyDescriptor(styleRulePrototype, "selectorText")
+  if (styleRulePrototype && selectorText?.get && selectorText.set) {
+    Object.defineProperty(styleRulePrototype, "selectorText", {
+      ...selectorText,
+      set(value: string) {
+        const before = selectorText.get?.call(this)
+        selectorText.set?.call(this, value)
+        if (before !== selectorText.get?.call(this)) scheduleAllOpaqueLegacyScans()
+      }
+    })
+  }
   if (sheetPrototype?.replaceSync) {
     const replaceSync = sheetPrototype.replaceSync
     sheetPrototype.replaceSync = function(text: string) {
       replaceSync.call(this, text)
       syncLegacyStyleSheet(this)
+      scheduleAllOpaqueLegacyScans()
     }
   }
   if (sheetPrototype?.replace) {
@@ -872,6 +924,7 @@ function installLegacyThemeCompatibilityWithMigrations(
     sheetPrototype.replace = async function(text: string) {
       const result = await replace.call(this, text)
       syncLegacyStyleSheet(this)
+      scheduleAllOpaqueLegacyScans()
       return result
     }
   }
@@ -1004,7 +1057,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   for (const event of [
     "focus", "pointerover", "pointerout", "pointerdown", "pointerup", "pointercancel",
     "mousedown", "mouseup", "touchstart", "touchend", "touchcancel", "keydown", "keyup",
-    "focusin", "focusout", "input", "change",
+    "focusin", "focusout", "input", "change", "beforetoggle", "toggle",
     "animationstart", "animationiteration", "animationend", "transitionrun", "transitionend"
   ]) {
     globalThis.addEventListener?.(event, scheduleAllOpaqueLegacyScans, true)
