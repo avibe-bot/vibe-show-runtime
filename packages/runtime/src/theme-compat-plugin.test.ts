@@ -38,6 +38,18 @@ class TestStyle {
     this.declarations.set(name, { value, priority })
   }
 
+  assignProperty(name: string, value: string, priority = "") {
+    this.declarations.set(name, { value, priority })
+  }
+
+  deleteProperty(name: string) {
+    this.declarations.delete(name)
+  }
+
+  clearProperties() {
+    this.declarations.clear()
+  }
+
   get cssText() {
     return Array.from(this.declarations, ([name, declaration]) =>
       `${name}: ${declaration.value}${declaration.priority ? ` !${declaration.priority}` : ""}`
@@ -409,6 +421,21 @@ describe("dynamic legacy theme compatibility", () => {
         this.valueAsNumber -= amount
         this.value = String(this.valueAsNumber)
       }
+      setRangeText(replacement: string, start = 0, end = this.value.length) {
+        this.value = `${this.value.slice(0, start)}${replacement}${this.value.slice(end)}`
+      }
+    }
+    class TestTextAreaElement extends TestInputElement {}
+    class TestHistory {
+      pushState() {}
+      replaceState() {}
+    }
+    class TestStylePropertyMap {
+      constructor(private readonly style: TestStyle) {}
+      set(name: string, value: unknown) { this.style.assignProperty(name, String(value)) }
+      append(name: string, value: unknown) { this.style.assignProperty(name, String(value)) }
+      delete(name: string) { this.style.deleteProperty(name) }
+      clear() { this.style.clearProperties() }
     }
     class TestCustomElementRegistry {
       private definitions = new Set<string>()
@@ -494,7 +521,9 @@ describe("dynamic legacy theme compatibility", () => {
       }
     }
     importedOpaque.ownerRule.parentStyleSheet = readableImportParent as unknown as CSSStyleSheet
-    const readableThemeSheet = { cssRules: [], disabled: false }
+    const typedRule = new TestStyle()
+    const typedStyleMap = new TestStylePropertyMap(typedRule)
+    const readableThemeSheet = { cssRules: [{ style: typedRule, styleMap: typedStyleMap }], disabled: false }
     const insertedStandardRule = new TestStyle()
     insertedStandardRule.setProperty("--primary", "rgb(1 2 3)")
     const groupingRule = new TestGroupingRule()
@@ -586,6 +615,7 @@ describe("dynamic legacy theme compatibility", () => {
     }
     const context = {
       CSSStyleDeclaration: TestStyle,
+      StylePropertyMap: TestStylePropertyMap,
       CSSStyleSheet: OpaqueStyleSheet,
       CSS: {
         registerProperty(definition: { name: string; initialValue: string; inherits: boolean; syntax: string }) {
@@ -601,12 +631,16 @@ describe("dynamic legacy theme compatibility", () => {
       Event: class { constructor(readonly type: string) {} },
       HTMLLinkElement: class {},
       HTMLInputElement: TestInputElement,
+      HTMLTextAreaElement: TestTextAreaElement,
       HTMLStyleElement: class {},
       MutationObserver: TestMutationObserver,
       MediaList: TestMediaList,
       Node: TestNode,
+      History: TestHistory,
       ShadowRoot: TestShadowRoot,
       addEventListener(name: string, listener: EventListener) { listeners.set(name, listener) },
+      history: new TestHistory(),
+      typedStyleMap,
       customElements: new TestCustomElementRegistry(),
       dispatchEvent(event: { type: string }) {
         dispatchedEvents.push(event.type)
@@ -672,6 +706,7 @@ describe("dynamic legacy theme compatibility", () => {
     expect(listeners.has("transitioncancel")).toBe(true)
     expect(listeners.has("fullscreenchange")).toBe(true)
     expect(listeners.has("beforeprint")).toBe(true)
+    expect(listeners.has("invalid")).toBe(true)
     expect(listeners.get("pointerdown")).not.toBe(listeners.get("resize"))
     expect(listeners.get("pointerdown")).not.toBe(listeners.get("animationstart"))
     expect(mediaListeners.has("(any-pointer: coarse)")).toBe(true)
@@ -767,6 +802,21 @@ describe("dynamic legacy theme compatibility", () => {
     runInNewContext("const stepInput = new HTMLInputElement(); stepInput.stepUp()", context)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.455)
+    runInNewContext("const rangeInput = new HTMLInputElement(); rangeInput.setRangeText('changed')", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.4575)
+    runInNewContext("const rangeTextArea = new HTMLTextAreaElement(); rangeTextArea.setRangeText('changed')", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.45775)
+    runInNewContext("history.pushState({}, '', '#theme-panel')", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.458)
+    runInNewContext("history.replaceState({}, '', '#other-theme-panel')", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.4585)
+    listeners.get("invalid")?.({ target: eventTarget } as unknown as Event)
+    expect(frames.length).toBeGreaterThan(0)
+    while (frames.length) frames.shift()?.(0.459)
     runInNewContext("customElements.define('theme-swatch', class {})", context)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.46)
@@ -774,6 +824,18 @@ describe("dynamic legacy theme compatibility", () => {
     insertedStandardRule.setProperty("--chart-1", "oklch(0.7 0.15 255)")
     await Promise.resolve()
     expect(dispatchedEvents).toContain("avibe-show-theme-change")
+
+    typedStyleMap.set("--avs-muted", "210 40% 96%")
+    expect(typedRule.getPropertyValue("--accent")).toBe("hsl(var(--avs-muted))")
+    typedStyleMap.delete("--avs-muted")
+    expect(typedRule.getPropertyValue("--accent")).toBe("")
+    typedStyleMap.append("--avs-warning", "32 95% 44%")
+    expect(typedRule.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
+    typedStyleMap.clear()
+    expect(typedRule.getPropertyValue("--warning")).toBe("")
+    await Promise.resolve()
+    expect(dispatchedEvents).toContain("avibe-show-theme-change")
+    while (frames.length) frames.shift()?.(0.465)
 
     dispatchedEvents.length = 0
     const namedStyle = insertedStandardRule as TestStyle & { fontSize: string }

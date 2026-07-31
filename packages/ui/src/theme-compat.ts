@@ -121,6 +121,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   const opaqueStyleSheets = new Set<CSSStyleSheet>()
   const opaqueStyleSheetScopes = new Map<CSSStyleSheet, Document | ShadowRoot | undefined>()
   const styleSheetScopes = new WeakMap<CSSStyleSheet, Document | ShadowRoot | undefined>()
+  const stylePropertyMapOwners = new WeakMap<object, CSSStyleDeclaration>()
   const adoptedListProxies = new WeakMap<object, CSSStyleSheet[]>()
   const observedAdoptedLists = new Map<CSSStyleSheet[], {
     scope?: Document | ShadowRoot
@@ -240,9 +241,11 @@ function installLegacyThemeCompatibilityWithMigrations(
     for (const rule of Array.from(rules)) {
       const candidate = rule as CSSRule & {
         style?: CSSStyleDeclaration
+        styleMap?: object
         cssRules?: CSSRuleList
         styleSheet?: CSSStyleSheet | null
       }
+      if (candidate.style && candidate.styleMap) stylePropertyMapOwners.set(candidate.styleMap, candidate.style)
       if (candidate.style && (ownedDeclarations.has(candidate.style) || candidate.style.cssText.includes("--avs-"))) {
         syncLegacyDeclaration(candidate.style, true)
       }
@@ -1124,6 +1127,70 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
+  function patchRangeTextMethod(input: object | undefined) {
+    if (!input) return
+    const prototype = input as HTMLInputElement | HTMLTextAreaElement
+    const setRangeText = prototype.setRangeText
+    if (typeof setRangeText !== "function") return
+    prototype.setRangeText = function(
+      this: HTMLInputElement | HTMLTextAreaElement,
+      ...args: [replacement: string, start?: number, end?: number, selectionMode?: SelectionMode]
+    ) {
+      const before = [this.value, this.validity.valid]
+      const result = (setRangeText as (...values: unknown[]) => void).apply(this, args)
+      if (before[0] !== this.value || before[1] !== this.validity.valid) scheduleAllOpaqueLegacyScans()
+      return result
+    }
+  }
+
+  function patchHistoryMethod(input: object | undefined, name: "pushState" | "replaceState") {
+    if (!input) return
+    const prototype = input as History
+    const update = prototype[name]
+    if (typeof update !== "function") return
+    prototype[name] = function(
+      this: History,
+      ...args: [data: unknown, unused: string, url?: string | URL | null]
+    ) {
+      const result = (update as (...values: unknown[]) => void).apply(this, args)
+      scheduleAllOpaqueLegacyScans()
+      return result
+    }
+  }
+
+  function patchStylePropertyMap(input: object | undefined) {
+    if (!input) return
+    const prototype = input as Record<string, (...args: unknown[]) => unknown>
+    for (const name of ["set", "append", "delete", "clear"] as const) {
+      const mutate = prototype[name]
+      if (typeof mutate !== "function") continue
+      prototype[name] = function(this: unknown, ...args: unknown[]) {
+        const result = mutate.apply(this, args)
+        const style = typeof this === "object" && this ? stylePropertyMapOwners.get(this) : undefined
+        if (style) syncLegacyDeclaration(style)
+        scheduleAllOpaqueLegacyScans()
+        return result
+      }
+    }
+  }
+
+  function patchStylePropertyMapOwner(input: object | undefined, property: string) {
+    for (let prototype = input; prototype; prototype = Object.getPrototypeOf(prototype)) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, property)
+      if (!descriptor?.get) continue
+      Object.defineProperty(prototype, property, {
+        ...descriptor,
+        get() {
+          const map = descriptor.get?.call(this)
+          const style = (this as { style?: CSSStyleDeclaration }).style
+          if (map && style) stylePropertyMapOwners.set(map, style)
+          return map
+        }
+      })
+      return
+    }
+  }
+
   function patchCustomElementRegistry(input: object | undefined) {
     if (!input) return
     const prototype = input as CustomElementRegistry
@@ -1389,6 +1456,12 @@ function installLegacyThemeCompatibilityWithMigrations(
   ]) {
     if (portalThemePropertySet.has(cssProperty)) patchPortalStyleProperty(stylePrototype, property)
   }
+  const stylePropertyMap = (globalThis as typeof globalThis & {
+    StylePropertyMap?: { prototype: object }
+  }).StylePropertyMap
+  patchStylePropertyMapOwner(globalThis.CSSStyleRule?.prototype, "styleMap")
+  patchStylePropertyMapOwner(globalThis.Element?.prototype, "attributeStyleMap")
+  patchStylePropertyMap(stylePropertyMap?.prototype)
   patchStyleSheetDisabled(sheetPrototype)
   patchRuleContainer(sheetPrototype)
   patchRuleContainer(globalThis.CSSGroupingRule?.prototype)
@@ -1415,6 +1488,10 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
   patchInputStepMethod(globalThis.HTMLInputElement?.prototype, "stepUp")
   patchInputStepMethod(globalThis.HTMLInputElement?.prototype, "stepDown")
+  patchRangeTextMethod(globalThis.HTMLInputElement?.prototype)
+  patchRangeTextMethod(globalThis.HTMLTextAreaElement?.prototype)
+  patchHistoryMethod(globalThis.History?.prototype, "pushState")
+  patchHistoryMethod(globalThis.History?.prototype, "replaceState")
   patchCustomElementRegistry(globalThis.CustomElementRegistry?.prototype)
   const styleRulePrototype = globalThis.CSSStyleRule?.prototype
   const selectorText = styleRulePrototype && Object.getOwnPropertyDescriptor(styleRulePrototype, "selectorText")
@@ -1588,7 +1665,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   for (const event of [
     "focus", "pointerover", "pointerout", "pointerdown", "pointerup", "pointercancel",
     "mousedown", "mouseup", "touchstart", "touchend", "touchcancel", "keydown", "keyup",
-    "focusin", "focusout", "input", "change", "reset", "beforetoggle", "toggle"
+    "focusin", "focusout", "input", "change", "invalid", "reset", "beforetoggle", "toggle"
   ]) {
     globalThis.addEventListener?.(event, scheduleOpaqueLegacyRelationalEventScan, true)
   }

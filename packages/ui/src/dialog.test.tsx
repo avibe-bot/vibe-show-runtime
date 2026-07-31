@@ -30,6 +30,8 @@ describe("Dialog", () => {
     expect(source).toContain('["direction", context.direction]')
     expect(source).toContain('node.classList.contains("avs-dark")')
     expect(source).toContain("window.addEventListener(SHOW_THEME_CHANGE_EVENT, schedule)")
+    expect(source).toContain('window.addEventListener("beforeprint", updateBeforePrint)')
+    expect(source).toContain("if (bridge) copiedProperties.current = applyPortalTheme(bridge, next")
     expect(source).toContain('window.addEventListener("animationstart", schedule, true)')
     expect(source).toContain("hasActivePortalThemeMotion(getThemeSource())")
     expect(source.match(/requestAnimationFrame\(update\)/g)).toHaveLength(1)

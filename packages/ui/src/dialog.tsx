@@ -51,6 +51,28 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
   }
 }
 
+function applyPortalTheme(
+  bridge: HTMLDivElement,
+  theme: PortalThemeSnapshot | undefined,
+  copiedProperties: string[]
+): string[] {
+  for (const property of copiedProperties) bridge.style.removeProperty(property)
+  if (!theme) {
+    bridge.removeAttribute("data-theme")
+    bridge.style.visibility = "hidden"
+    return []
+  }
+  const copied: string[] = []
+  for (const [property, value] of Object.entries(theme.properties)) {
+    bridge.style.setProperty(property, value, "important")
+    copied.push(property)
+  }
+  if (theme.dark) bridge.setAttribute("data-theme", "dark")
+  else bridge.removeAttribute("data-theme")
+  bridge.style.visibility = ""
+  return copied
+}
+
 function composedParentNode(node: Node): Node | null {
   if (node instanceof Element) {
     if (node.assignedSlot) return node.assignedSlot
@@ -120,17 +142,29 @@ function PortalThemeBridge({
       }
       if (hasActivePortalThemeMotion(getThemeSource())) schedule()
     }
+    const updateBeforePrint = () => {
+      if (frame) window.cancelAnimationFrame(frame)
+      frame = 0
+      const next = getTheme()
+      const bridge = bridgeRef.current
+      if (bridge) copiedProperties.current = applyPortalTheme(bridge, next, copiedProperties.current)
+      if (next.signature !== signature) {
+        signature = next.signature
+        setTheme(next)
+      }
+      if (hasActivePortalThemeMotion(getThemeSource())) schedule()
+    }
     const schedule = () => {
       if (!frame) frame = window.requestAnimationFrame(update)
     }
     update()
     window.addEventListener(SHOW_THEME_CHANGE_EVENT, schedule)
-    window.addEventListener("beforeprint", update)
+    window.addEventListener("beforeprint", updateBeforePrint)
     window.addEventListener("animationstart", schedule, true)
     window.addEventListener("transitionrun", schedule, true)
     return () => {
       window.removeEventListener(SHOW_THEME_CHANGE_EVENT, schedule)
-      window.removeEventListener("beforeprint", update)
+      window.removeEventListener("beforeprint", updateBeforePrint)
       window.removeEventListener("animationstart", schedule, true)
       window.removeEventListener("transitionrun", schedule, true)
       if (frame) window.cancelAnimationFrame(frame)
@@ -140,13 +174,7 @@ function PortalThemeBridge({
   React.useLayoutEffect(() => {
     const bridge = bridgeRef.current
     if (!bridge) return
-    for (const property of copiedProperties.current) bridge.style.removeProperty(property)
-    copiedProperties.current = []
-    if (!theme) return
-    for (const [property, value] of Object.entries(theme.properties)) {
-      bridge.style.setProperty(property, value, "important")
-      copiedProperties.current.push(property)
-    }
+    copiedProperties.current = applyPortalTheme(bridge, theme, copiedProperties.current)
   }, [theme])
 
   return (
