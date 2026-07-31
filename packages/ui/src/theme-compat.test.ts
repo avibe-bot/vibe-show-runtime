@@ -21,7 +21,9 @@ describe("legacy theme compatibility", () => {
 
   it("serializes the opaque stylesheet state observers", () => {
     const script = themeCompatibilityClientScript()
-    for (const event of ["pointerdown", "pointerup", "pointercancel", "keydown", "keyup", "beforetoggle", "toggle"]) {
+    for (const event of [
+      "pointerdown", "pointerup", "pointercancel", "keydown", "keyup", "beforetoggle", "toggle", "fullscreenchange"
+    ]) {
       expect(script).toContain(`"${event}"`)
     }
     for (const query of [

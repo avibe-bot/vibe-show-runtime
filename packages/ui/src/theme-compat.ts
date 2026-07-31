@@ -228,7 +228,13 @@ function installLegacyThemeCompatibilityWithMigrations(
       scheduleAllOpaqueLegacyScans()
       return
     }
-    scheduleOpaqueLegacyScan(element)
+    let scanRoot = element
+    for (let parent = composedParentElement(element);
+      parent && parent !== document.body && parent !== document.documentElement;
+      parent = composedParentElement(parent)) {
+      scanRoot = parent
+    }
+    scheduleOpaqueLegacyScan(scanRoot)
     const targetRoot = element.getRootNode()
     for (const scope of opaqueStyleSheetScopes.values()) {
       if (typeof ShadowRoot === "undefined" || !(scope instanceof ShadowRoot)) continue
@@ -1103,7 +1109,8 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
 
   for (const event of [
-    "resize", "orientationchange", "pageshow", "hashchange", "popstate", "beforeprint", "afterprint"
+    "resize", "orientationchange", "pageshow", "hashchange", "popstate", "fullscreenchange",
+    "beforeprint", "afterprint"
   ]) {
     globalThis.addEventListener?.(event, scheduleAllOpaqueLegacyScans, true)
   }

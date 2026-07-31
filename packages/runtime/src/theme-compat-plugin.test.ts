@@ -386,6 +386,10 @@ describe("dynamic legacy theme compatibility", () => {
     const ancestor = new TestElement()
     const ancestorMiddle = new TestElement()
     const ancestorChild = new TestElement()
+    const eventCard = new TestElement()
+    const eventTarget = new TestElement()
+    const eventPanel = new TestElement()
+    const unrelatedEventSibling = new TestElement()
     const closedHost = new TestElement()
     const closedElement = new TestElement()
     const closedRoot = new TestShadowRoot()
@@ -400,13 +404,20 @@ describe("dynamic legacy theme compatibility", () => {
     ancestorChild.parentElement = ancestorMiddle
     ancestor.descendants.push(ancestorMiddle)
     ancestorMiddle.descendants.push(ancestorChild)
+    eventCard.parentElement = root
+    eventTarget.parentElement = eventCard
+    eventPanel.parentElement = eventCard
+    eventCard.descendants.push(eventTarget, eventPanel)
+    unrelatedEventSibling.parentElement = root
     closedHost.parentElement = root
     closedHost.nextShadowRoot = closedRoot
     closedRoot.host = closedHost
     closedRoot.adoptedStyleSheets.push(closedOpaque)
     closedRoot.descendants.push(closedElement)
     closedElement.rootNode = closedRoot
-    root.descendants.push(standard, inlineStandard, inherited, ancestor, closedHost)
+    root.descendants.push(
+      standard, inlineStandard, inherited, ancestor, eventCard, unrelatedEventSibling, closedHost
+    )
     const opaque = new OpaqueStyleSheet()
     const readableThemeSheet = { cssRules: [], disabled: false }
     const insertedStandardRule = new TestStyle()
@@ -418,9 +429,12 @@ describe("dynamic legacy theme compatibility", () => {
     const mediaListeners = new Map<string, EventListener>()
     let legacyActive = false
     let ancestorActive = false
+    let eventPanelActive = false
+    const computedReads = new Map<TestElement, number>()
     const computedProperty = (element: TestElement, name: string): string => {
       const inClosedRoot = element.rootNode === closedRoot
       if (name === "--avs-primary") {
+        if (element === eventPanel && eventPanelActive && !opaque.disabled) return "262 83% 58%"
         return inClosedRoot || opaque.disabled || !legacyActive ? "222 47% 11%" : "221 83% 53%"
       }
       if (name === "--avs-warning") {
@@ -481,6 +495,7 @@ describe("dynamic legacy theme compatibility", () => {
       ShadowRoot: TestShadowRoot,
       addEventListener(name: string, listener: EventListener) { listeners.set(name, listener) },
       getComputedStyle(element: TestElement) {
+        computedReads.set(element, (computedReads.get(element) ?? 0) + 1)
         return {
           getPropertyValue(name: string) { return computedProperty(element, name) }
         }
@@ -520,9 +535,24 @@ describe("dynamic legacy theme compatibility", () => {
     expect(listeners.has("keydown")).toBe(true)
     expect(listeners.has("beforetoggle")).toBe(true)
     expect(listeners.has("toggle")).toBe(true)
+    expect(listeners.has("fullscreenchange")).toBe(true)
     expect(listeners.get("pointerdown")).not.toBe(listeners.get("resize"))
     expect(mediaListeners.has("(any-pointer: coarse)")).toBe(true)
     expect(mediaListeners.has("(any-pointer: none)")).toBe(true)
+
+    computedReads.clear()
+    eventPanelActive = true
+    listeners.get("pointerdown")?.({ target: eventTarget } as unknown as Event)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.125)
+    expect(eventPanel.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    expect(computedReads.get(unrelatedEventSibling)).toBeUndefined()
+
+    computedReads.clear()
+    listeners.get("fullscreenchange")?.({} as Event)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.1875)
+    expect(computedReads.get(unrelatedEventSibling)).toBeGreaterThan(0)
 
     groupingRule.insertRule()
     expect(frames).toHaveLength(1)
