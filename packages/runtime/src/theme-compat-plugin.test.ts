@@ -473,10 +473,13 @@ describe("dynamic legacy theme compatibility", () => {
     class TestInputElement {
       private checkedValue = false
       private customValidity = ""
+      private filesValue: unknown = null
       value = "0"
       valueAsNumber = 0
       get checked() { return this.checkedValue }
       set checked(value: boolean) { this.checkedValue = value }
+      get files() { return this.filesValue }
+      set files(value: unknown) { this.filesValue = value }
       get validity() { return { valid: !this.customValidity } }
       setCustomValidity(message: string) { this.customValidity = message }
       stepUp(amount = 1) {
@@ -822,6 +825,8 @@ describe("dynamic legacy theme compatibility", () => {
     expect(listeners.has("ended")).toBe(true)
     expect(listeners.has("seeking")).toBe(true)
     expect(listeners.has("volumechange")).toBe(true)
+    expect(listeners.has("enterpictureinpicture")).toBe(true)
+    expect(listeners.has("leavepictureinpicture")).toBe(true)
     expect(listeners.get("play")).not.toBe(listeners.get("pointerdown"))
     expect(listeners.has("animationcancel")).toBe(true)
     expect(listeners.has("transitioncancel")).toBe(true)
@@ -859,6 +864,12 @@ describe("dynamic legacy theme compatibility", () => {
     listeners.get("play")?.({ target: mediaTarget } as unknown as Event)
     expect(frames).toHaveLength(2)
     while (frames.length) frames.shift()?.(0.01)
+    listeners.get("enterpictureinpicture")?.({ target: mediaTarget } as unknown as Event)
+    expect(frames).toHaveLength(2)
+    while (frames.length) frames.shift()?.(0.02)
+    listeners.get("leavepictureinpicture")?.({ target: mediaTarget } as unknown as Event)
+    expect(frames).toHaveLength(2)
+    while (frames.length) frames.shift()?.(0.03)
 
     legacyActive = true
     listeners.get("beforeprint")?.({} as Event)
@@ -938,6 +949,9 @@ describe("dynamic legacy theme compatibility", () => {
     runInNewContext("const input = new HTMLInputElement(); input.checked = true", context)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.4375)
+    runInNewContext("const fileInput = new HTMLInputElement(); fileInput.files = { length: 1 }", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.44)
     runInNewContext("const validityInput = new HTMLInputElement(); validityInput.setCustomValidity('invalid')", context)
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.45)

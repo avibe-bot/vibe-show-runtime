@@ -61,8 +61,8 @@ async function fileExists(path: string) {
  * Keep the workspace Tailwind entry importing BOTH `tailwindcss` and the `@avibe/show-ui`
  * theme, in that order. New workspaces already lead with both (see stylesCss); this is the
  * idempotent, HMR-safe migration for workspaces whose `src/styles.css` predates them — it
- * adds whichever import is missing and repairs a reversed existing pair. Runs on every warm
- * before the Vite server is created.
+ * adds whichever import is missing and places the theme immediately after Tailwind, ahead
+ * of workspace override imports. Runs on every warm before the Vite server is created.
  *
  * Detection parses top-level CSS at-rules so comments and import-shaped strings never count.
  */
@@ -103,13 +103,18 @@ function orderThemeAfterTailwind(contents: string, uiPackageName: string): strin
   if (!imports) return contents
   const tailwind = imports.find((statement) => statement.specifier === "tailwindcss")
   const theme = imports.find((statement) => statement.specifier === `${uiPackageName}/theme.css`)
-  if (!tailwind || !theme || tailwind.start < theme.start) return contents
+  if (!tailwind || !theme) return contents
+  const tailwindIndex = imports.indexOf(tailwind)
+  if (imports[tailwindIndex + 1] === theme) return contents
   const statement = contents.slice(theme.start, theme.endExclusive)
   const removedLength = theme.endExclusive - theme.start
   const withoutTheme = `${contents.slice(0, theme.start)}${contents.slice(theme.endExclusive)}`
   return insertAfterImport(
     withoutTheme,
-    { ...tailwind, endExclusive: tailwind.endExclusive - removedLength },
+    {
+      ...tailwind,
+      endExclusive: tailwind.endExclusive - (theme.start < tailwind.start ? removedLength : 0)
+    },
     statement
   )
 }

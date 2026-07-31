@@ -1715,7 +1715,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   patchKeyframesRule(globalThis.CSSKeyframesRule?.prototype)
   patchMediaList(globalThis.MediaList?.prototype)
   for (const [prototype, properties] of [
-    [globalThis.HTMLInputElement?.prototype, ["checked", "indeterminate", "value", "valueAsDate", "valueAsNumber"]],
+    [globalThis.HTMLInputElement?.prototype, ["checked", "files", "indeterminate", "value", "valueAsDate", "valueAsNumber"]],
     [globalThis.HTMLTextAreaElement?.prototype, ["value"]],
     [globalThis.HTMLSelectElement?.prototype, ["selectedIndex"]],
     [globalThis.HTMLOptionElement?.prototype, ["selected"]]
@@ -1946,7 +1946,8 @@ function installLegacyThemeCompatibilityWithMigrations(
   for (const event of [
     "play", "playing", "pause", "ended", "seeking", "seeked", "waiting", "stalled",
     "suspend", "progress", "emptied", "abort", "error", "loadstart", "loadedmetadata",
-    "loadeddata", "durationchange", "canplay", "canplaythrough", "volumechange", "ratechange"
+    "loadeddata", "durationchange", "canplay", "canplaythrough", "volumechange", "ratechange",
+    "enterpictureinpicture", "leavepictureinpicture"
   ]) {
     globalThis.addEventListener?.(event, scheduleMediaStateEventScan, true)
   }
