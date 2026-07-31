@@ -91,6 +91,7 @@ describe("ThemeProvider", () => {
     const source = readFileSync(new URL("./theme.tsx", import.meta.url), "utf8")
     expect(source.indexOf("node.assignedSlot")).toBeLessThan(source.indexOf("node.parentElement"))
     expect(source).toContain('node.addEventListener("slotchange", update)')
+    expect(source).toContain('node.classList.contains("avs-dark")')
   })
 })
 

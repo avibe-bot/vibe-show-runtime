@@ -42,7 +42,7 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
     return value
   })
   for (const [property, value] of [
-    ["color-scheme", context.colorScheme], ["color", context.color],
+    ["color-scheme", computed.colorScheme], ["color", context.color],
     ["font-family", context.fontFamily], ["font-size", context.fontSize],
     ["font-stretch", context.fontStretch], ["font-style", context.fontStyle],
     ["font-variant", context.fontVariant], ["font-weight", context.fontWeight],
@@ -54,7 +54,7 @@ function readPortalTheme(source: PortalThemeSource): PortalThemeSnapshot {
   return {
     dark,
     signature: JSON.stringify([
-      dark, context.colorScheme, context.color, context.fontFamily, context.fontSize,
+      dark, computed.colorScheme, context.color, context.fontFamily, context.fontSize,
       context.fontStretch, context.fontStyle, context.fontVariant, context.fontWeight,
       context.lineHeight, ...values
     ]),
@@ -82,7 +82,9 @@ function composedParentElement(node: Node): Element | null {
 function hasComposedDarkTheme(element: Element): boolean {
   for (let node: Node | null = element; node; node = composedParentNode(node)) {
     if (node instanceof Element
-      && (node.classList.contains("dark") || node.getAttribute("data-theme") === "dark")) {
+      && (node.classList.contains("dark")
+        || node.classList.contains("avs-dark")
+        || node.getAttribute("data-theme") === "dark")) {
       return true
     }
   }

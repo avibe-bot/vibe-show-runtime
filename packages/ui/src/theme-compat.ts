@@ -28,6 +28,7 @@ type OpaqueOwnedDeclarations = {
 type RuleContainer = {
   cssRules: CSSRuleList
   insertRule: (rule: string, index?: number) => number
+  addRule?: (selector?: string, style?: string, index?: number) => number
   deleteRule?: (index: number) => void
   removeRule?: (index: number) => void
 }
@@ -649,6 +650,15 @@ function installLegacyThemeCompatibilityWithMigrations(
         return insertedIndex
       }
     }
+    const addRule = prototype.addRule
+    if (typeof addRule === "function") {
+      prototype.addRule = function(this: RuleContainer, selector?: string, style?: string, index?: number) {
+        const result = addRule.call(this, selector, style, index)
+        syncLegacyRuleList(this.cssRules)
+        scheduleAllOpaqueLegacyScans()
+        return result
+      }
+    }
     for (const name of ["deleteRule", "removeRule"] as const) {
       const remove = prototype[name]
       if (typeof remove !== "function") continue
@@ -671,6 +681,7 @@ function installLegacyThemeCompatibilityWithMigrations(
           const insertedRule = this.cssRules[index]
           if (insertedRule) syncLegacyRuleList([insertedRule])
         }
+        scheduleAllOpaqueLegacyScans()
       }
     }
     const deleteRule = prototype.deleteRule
@@ -705,6 +716,20 @@ function installLegacyThemeCompatibilityWithMigrations(
         if (before !== this.mediaText) scheduleAllOpaqueLegacyScans()
       }
     }
+  }
+
+  function patchStateProperty(input: object | undefined, name: string) {
+    if (!input) return
+    const descriptor = Object.getOwnPropertyDescriptor(input, name)
+    if (!descriptor?.get || !descriptor.set) return
+    Object.defineProperty(input, name, {
+      ...descriptor,
+      set(value: unknown) {
+        const before = descriptor.get?.call(this)
+        descriptor.set?.call(this, value)
+        if (!Object.is(before, descriptor.get?.call(this))) scheduleAllOpaqueLegacyScans()
+      }
+    })
   }
 
   function syncObservedAdoptedList(list: CSSStyleSheet[], scope?: Document | ShadowRoot) {
@@ -899,6 +924,14 @@ function installLegacyThemeCompatibilityWithMigrations(
   patchRuleContainer(globalThis.CSSGroupingRule?.prototype)
   patchKeyframesRule(globalThis.CSSKeyframesRule?.prototype)
   patchMediaList(globalThis.MediaList?.prototype)
+  for (const [prototype, properties] of [
+    [globalThis.HTMLInputElement?.prototype, ["checked", "indeterminate", "value", "valueAsDate", "valueAsNumber"]],
+    [globalThis.HTMLTextAreaElement?.prototype, ["value"]],
+    [globalThis.HTMLSelectElement?.prototype, ["value", "selectedIndex"]],
+    [globalThis.HTMLOptionElement?.prototype, ["selected"]]
+  ] as const) {
+    for (const property of properties) patchStateProperty(prototype, property)
+  }
   const styleRulePrototype = globalThis.CSSStyleRule?.prototype
   const selectorText = styleRulePrototype && Object.getOwnPropertyDescriptor(styleRulePrototype, "selectorText")
   if (styleRulePrototype && selectorText?.get && selectorText.set) {

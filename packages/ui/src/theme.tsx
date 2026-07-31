@@ -133,7 +133,9 @@ function useComposedDark(elementRef: React.RefObject<HTMLElement | null>): boole
       observer.observe(element, { attributes: true, attributeFilter: ["slot"] })
       for (let node = composedParentNode(element); node; node = composedParentNode(node)) {
         if (node instanceof Element) {
-          if (node.classList.contains("dark") || node.getAttribute("data-theme") === "dark") nextDark = true
+          if (node.classList.contains("dark")
+            || node.classList.contains("avs-dark")
+            || node.getAttribute("data-theme") === "dark") nextDark = true
           observer.observe(node, {
             attributes: true,
             attributeFilter: ["class", "data-theme", "name", "slot"],

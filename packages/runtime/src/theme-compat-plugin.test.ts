@@ -99,6 +99,11 @@ describe("dynamic legacy theme compatibility", () => {
         return this.cssRules.length - 1
       }
 
+      addRule(_selector?: string, _style?: string, _index?: number) {
+        if (this.nextStyle) this.cssRules.push({ style: this.nextStyle })
+        return -1
+      }
+
       deleteRule(index: number) {
         this.cssRules.splice(index, 1)
       }
@@ -284,6 +289,11 @@ describe("dynamic legacy theme compatibility", () => {
     sheet.insertRule(".brand {}")
     expect(rule.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
     expect(unrelatedRule.reads).toBe(0)
+    const legacyAddRule = new TestStyle()
+    legacyAddRule.setProperty("--avs-success", "142 71% 45%")
+    sheet.nextStyle = legacyAddRule
+    sheet.addRule(".legacy", "--avs-success: 142 71% 45%")
+    expect(legacyAddRule.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
 
     const keyframes = new TestKeyframesRule()
     const keyframeRule = new TestStyle()
@@ -357,6 +367,11 @@ describe("dynamic legacy theme compatibility", () => {
       mediaText = ""
       appendMedium(value: string) { this.mediaText = value }
       deleteMedium() { this.mediaText = "" }
+    }
+    class TestInputElement {
+      private checkedValue = false
+      get checked() { return this.checkedValue }
+      set checked(value: boolean) { this.checkedValue = value }
     }
     const mutationCallbacks: MutationCallback[] = []
     class TestMutationObserver {
@@ -458,6 +473,7 @@ describe("dynamic legacy theme compatibility", () => {
       CSSGroupingRule: TestGroupingRule,
       Element: TestElement,
       HTMLLinkElement: class {},
+      HTMLInputElement: TestInputElement,
       HTMLStyleElement: class {},
       MutationObserver: TestMutationObserver,
       MediaList: TestMediaList,
@@ -514,6 +530,9 @@ describe("dynamic legacy theme compatibility", () => {
     media.appendMedium("screen")
     expect(frames).toHaveLength(1)
     frames.shift()?.(0.375)
+    runInNewContext("const input = new HTMLInputElement(); input.checked = true", context)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.4375)
 
     mutationCallbacks[1]?.([{ type: "attributes", attributeName: "class", target: closedHost }] as unknown as MutationRecord[], {} as MutationObserver)
     expect(frames).toHaveLength(1)

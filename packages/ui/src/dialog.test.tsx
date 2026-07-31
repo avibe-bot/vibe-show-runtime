@@ -26,5 +26,7 @@ describe("Dialog", () => {
     expect(source).toContain("if (!active?.isConnected && opening) return opening")
     expect(source).toContain("if (!nextOpen && open === undefined) clearOpeningTheme()")
     expect(source).toContain("if (controlledOpen.current === false) clearOpeningTheme()")
+    expect(source).toContain('["color-scheme", computed.colorScheme]')
+    expect(source).toContain('node.classList.contains("avs-dark")')
   })
 })

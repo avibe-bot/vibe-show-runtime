@@ -37,7 +37,11 @@ describe("legacy theme compatibility", () => {
     expect(script).toContain("scheduleAdoptedListPoll")
     expect(script).toContain("patchMediaList")
     expect(script).toContain("selectorText")
+    expect(script).toContain("addRule")
     expect(script).toContain('"removeRule"')
+    for (const property of ["checked", "indeterminate", "valueAsDate", "selectedIndex", "selected"]) {
+      expect(script).toContain(`"${property}"`)
+    }
     expect(script).toContain("opaqueStyleSheetScopes.values()")
     expect(script).toContain('"hashchange"')
     expect(script).toContain('"popstate"')
