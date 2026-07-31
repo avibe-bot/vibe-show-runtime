@@ -51,7 +51,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   const pendingOpaqueBridgeMutations = new Set<Element>()
   const opaqueStyleSheets = new Set<CSSStyleSheet>()
   const opaqueStyleSheetScopes = new Map<CSSStyleSheet, Document | ShadowRoot | undefined>()
-  const observedAdoptedLists = new WeakSet<object>()
+  const adoptedListProxies = new WeakMap<object, CSSStyleSheet[]>()
   const stylePrototype = globalThis.CSSStyleDeclaration?.prototype
   const nativeSetProperty = stylePrototype?.setProperty
   const nativeRemoveProperty = stylePrototype?.removeProperty
@@ -301,6 +301,88 @@ function installLegacyThemeCompatibilityWithMigrations(
     return samples
   }
 
+  function sampleLocalThemeBoundaries(
+    elements: ThemeElement[],
+    baseline: Map<Element, Map<string, string>>,
+    actual: Map<Element, Map<string, string>>
+  ) {
+    const localTargets = new Map<Element, Set<string>>()
+    const inheritedCandidates = new Map<ThemeElement, Map<string, ThemeElement[]>>()
+    const markLocal = (element: Element, target: string) => {
+      let targets = localTargets.get(element)
+      if (!targets) {
+        targets = new Set()
+        localTargets.set(element, targets)
+      }
+      targets.add(target)
+    }
+
+    for (const element of elements) {
+      const before = baseline.get(element)
+      const after = actual.get(element)
+      const parent = composedParentElement(element)
+      const parentBefore = parent ? baseline.get(parent) : undefined
+      const parentAfter = parent ? actual.get(parent) : undefined
+      if (!before || !after || !parent || !parentBefore || !parentAfter || !("style" in parent)) continue
+      const synthetic = opaqueOwnedDeclarations.get(element.style)?.declarations
+      for (const [source, targets] of Object.entries(migrations)) {
+        if (before.get(source) === after.get(source)) continue
+        if (parentBefore.get(source) === before.get(source)
+          && parentAfter.get(source) === after.get(source)) continue
+        for (const target of targets) {
+          if (synthetic?.has(target) || before.get(target) !== after.get(target)) continue
+          if (parentBefore.get(target) !== before.get(target)
+            || parentAfter.get(target) !== after.get(target)) {
+            markLocal(element, target)
+            continue
+          }
+          let byTarget = inheritedCandidates.get(parent as ThemeElement)
+          if (!byTarget) {
+            byTarget = new Map()
+            inheritedCandidates.set(parent as ThemeElement, byTarget)
+          }
+          const candidates = byTarget.get(target) ?? []
+          candidates.push(element)
+          byTarget.set(target, candidates)
+        }
+      }
+    }
+
+    // Equal computed values do not prove inheritance. Perturb the immediate parent
+    // briefly so local declarations, including opaque ones, remain authoritative.
+    const wasMutatingOpaqueBridge = mutatingOpaqueBridge
+    mutatingOpaqueBridge = true
+    try {
+      let probeIndex = 0
+      for (const [parent, byTarget] of inheritedCandidates) {
+        for (const [target, candidates] of byTarget) {
+          const declared = declaredProperties(parent.style).has(target)
+          const value = parent.style.getPropertyValue(target)
+          const priority = parent.style.getPropertyPriority(target)
+          const probe = `__avibe-show-inheritance-probe-${probeIndex += 1}__`
+          markOpaqueBridgeMutation(parent)
+          if (nativeSetProperty) nativeSetProperty.call(parent.style, target, probe, "important")
+          else parent.style.setProperty(target, probe, "important")
+          for (const element of candidates) {
+            if (getComputedStyle(element).getPropertyValue(target).trim() !== probe) {
+              markLocal(element, target)
+            }
+          }
+          markOpaqueBridgeMutation(parent)
+          if (declared) {
+            if (nativeSetProperty) nativeSetProperty.call(parent.style, target, value, priority)
+            else parent.style.setProperty(target, value, priority)
+          } else if (nativeRemoveProperty) nativeRemoveProperty.call(parent.style, target)
+          else parent.style.removeProperty(target)
+        }
+      }
+    } finally {
+      mutatingOpaqueBridge = wasMutatingOpaqueBridge
+      scheduleOpaqueMutationCleanup()
+    }
+    return localTargets
+  }
+
   function composedParentElement(element: Element): Element | null {
     if (element.assignedSlot) return element.assignedSlot
     if (element.parentElement) return element.parentElement
@@ -327,7 +409,9 @@ function installLegacyThemeCompatibilityWithMigrations(
     const activeSheets: Array<{ sheet: CSSStyleSheet; disabled: boolean }> = []
     for (const sheet of opaqueStyleSheets) {
       try {
-        if (sheet.ownerNode && !sheet.ownerNode.isConnected) {
+        const scope = opaqueStyleSheetScopes.get(sheet)
+        if ((sheet.ownerNode && !sheet.ownerNode.isConnected)
+          || (typeof ShadowRoot !== "undefined" && scope instanceof ShadowRoot && !scope.host.isConnected)) {
           opaqueStyleSheets.delete(sheet)
           opaqueStyleSheetScopes.delete(sheet)
           continue
@@ -356,6 +440,7 @@ function installLegacyThemeCompatibilityWithMigrations(
         }
       }
       const actual = sampleThemeValues(elements)
+      const localTargets = sampleLocalThemeBoundaries(elements, baseline, actual)
       let changed = false
       mutatingOpaqueBridge = true
       try {
@@ -383,7 +468,8 @@ function installLegacyThemeCompatibilityWithMigrations(
               && parentAfter?.get(source) === after.get(source)) continue
             for (const target of targets) {
               if (inlineDeclarations.has(target)) continue
-              if (parentBefore && parentBefore.get(target) !== before.get(target)) continue
+              if (localTargets.get(element)?.has(target)) continue
+              if (!owned.has(target) && parentBefore && parentBefore.get(target) !== before.get(target)) continue
               if (!owned.has(target) && before.get(target) !== after.get(target)) continue
               required.add(target)
               if (owned.has(target)) continue
@@ -523,8 +609,11 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
 
   function observeAdoptedStyleSheetList(list: CSSStyleSheet[], scope?: Document | ShadowRoot) {
-    if (observedAdoptedLists.has(list)) return
-    observedAdoptedLists.add(list)
+    const existing = adoptedListProxies.get(list)
+    if (existing) return existing
+    const syncList = (input: CSSStyleSheet[]) => {
+      for (const sheet of Array.from(input)) syncLegacyStyleSheet(sheet, scope)
+    }
     const methods = ["copyWithin", "fill", "pop", "push", "reverse", "shift", "sort", "splice", "unshift"] as const
     for (const name of methods) {
       const method = list[name]
@@ -535,7 +624,7 @@ function installLegacyThemeCompatibilityWithMigrations(
           writable: true,
           value: function(this: CSSStyleSheet[], ...args: unknown[]) {
             const result = (method as (...values: unknown[]) => unknown).apply(this, args)
-            for (const sheet of Array.from(this)) syncLegacyStyleSheet(sheet, scope)
+            syncList(this)
             return result
           }
         })
@@ -543,6 +632,29 @@ function installLegacyThemeCompatibilityWithMigrations(
         // Older FrozenArray implementations cannot be mutated in place.
       }
     }
+    if (typeof Proxy === "undefined") return list
+    const indexedProperty = (property: PropertyKey) => typeof property === "string"
+      && (property === "length" || /^(0|[1-9]\d*)$/.test(property))
+    const proxy = new Proxy(list, {
+      set(target, property, value) {
+        const result = Reflect.set(target, property, value, target)
+        if (result && indexedProperty(property)) syncList(target)
+        return result
+      },
+      defineProperty(target, property, descriptor) {
+        const result = Reflect.defineProperty(target, property, descriptor)
+        if (result && indexedProperty(property)) syncList(target)
+        return result
+      },
+      deleteProperty(target, property) {
+        const result = Reflect.deleteProperty(target, property)
+        if (result && indexedProperty(property)) syncList(target)
+        return result
+      }
+    })
+    adoptedListProxies.set(list, proxy)
+    adoptedListProxies.set(proxy, proxy)
+    return proxy
   }
 
   function patchAdoptedStyleSheets(input: object | undefined) {
@@ -551,6 +663,11 @@ function installLegacyThemeCompatibilityWithMigrations(
     if (!descriptor?.get || !descriptor.set) return
     Object.defineProperty(input, "adoptedStyleSheets", {
       ...descriptor,
+      get() {
+        const list = descriptor.get?.call(this) ?? []
+        const scope = this instanceof Document || this instanceof ShadowRoot ? this : undefined
+        return observeAdoptedStyleSheetList(list, scope)
+      },
       set(value: CSSStyleSheet[]) {
         descriptor.set?.call(this, value)
         const list = descriptor.get?.call(this) ?? []
@@ -721,10 +838,24 @@ function installLegacyThemeCompatibilityWithMigrations(
           typeof ShadowRoot !== "undefined" && ownerRoot instanceof ShadowRoot ? ownerRoot : undefined
         )
       } else {
+        const mutationRoot = record.target.getRootNode()
+        if (typeof ShadowRoot !== "undefined" && mutationRoot instanceof ShadowRoot) {
+          scheduleOpaqueLegacyScan(mutationRoot)
+          continue
+        }
         const root = record.target instanceof Element
           ? record.target.parentElement ?? record.target
           : record.target.parentElement ?? record.target
         scheduleOpaqueLegacyScan(root)
+        for (const scope of new Set(opaqueStyleSheetScopes.values())) {
+          if (typeof ShadowRoot === "undefined" || !(scope instanceof ShadowRoot)) continue
+          const host = scope.host
+          if (record.target === host
+            || (record.target instanceof Element
+              && (record.target.contains(host) || host.contains(record.target)))) {
+            scheduleOpaqueLegacyScan(scope)
+          }
+        }
       }
     }
   })
@@ -768,7 +899,9 @@ function installLegacyThemeCompatibilityWithMigrations(
     globalThis.addEventListener?.(event, scheduleAllOpaqueLegacyScans, true)
   }
   for (const event of [
-    "focus", "pointerover", "pointerout", "focusin", "focusout", "input", "change",
+    "focus", "pointerover", "pointerout", "pointerdown", "pointerup", "pointercancel",
+    "mousedown", "mouseup", "touchstart", "touchend", "touchcancel", "keydown", "keyup",
+    "focusin", "focusout", "input", "change",
     "animationstart", "animationiteration", "animationend", "transitionrun", "transitionend"
   ]) {
     globalThis.addEventListener?.(event, (input) => {
@@ -777,10 +910,15 @@ function installLegacyThemeCompatibilityWithMigrations(
     }, true)
   }
   for (const query of [
-    "(prefers-color-scheme: dark)", "(prefers-contrast: more)",
+    "(prefers-color-scheme: dark)",
+    "(prefers-contrast: more)", "(prefers-contrast: less)", "(prefers-contrast: custom)",
     "(prefers-reduced-motion: reduce)", "(prefers-reduced-transparency: reduce)",
     "(forced-colors: active)", "(inverted-colors: inverted)",
-    "(any-hover: hover)", "(any-pointer: fine)", "(dynamic-range: high)"
+    "(hover: hover)", "(hover: none)",
+    "(pointer: fine)", "(pointer: coarse)", "(pointer: none)",
+    "(any-hover: hover)", "(any-hover: none)",
+    "(any-pointer: fine)", "(any-pointer: coarse)", "(any-pointer: none)",
+    "(dynamic-range: high)", "(video-dynamic-range: high)"
   ]) {
     globalThis.matchMedia?.(query).addEventListener("change", scheduleAllOpaqueLegacyScans)
   }

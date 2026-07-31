@@ -181,6 +181,14 @@ describe("dynamic legacy theme compatibility", () => {
     lateAdoptedRule.setProperty("--avs-success", "142 71% 45%")
     const lateAdoptedSheet = new TestStyleSheet()
     lateAdoptedSheet.cssRules.push({ style: lateAdoptedRule })
+    class TestDocument {
+      private adoptedSheets: TestStyleSheet[] = []
+      documentElement = root
+      styleSheets = [directSheet]
+      addEventListener() {}
+      get adoptedStyleSheets() { return this.adoptedSheets }
+      set adoptedStyleSheets(value: TestStyleSheet[]) { this.adoptedSheets = Array.from(value) }
+    }
     const context = {
       CSSGroupingRule: TestGroupingRule,
       CSSKeyframesRule: TestKeyframesRule,
@@ -190,12 +198,8 @@ describe("dynamic legacy theme compatibility", () => {
       HTMLLinkElement: class {},
       MutationObserver: TestMutationObserver,
       ShadowRoot: TestShadowRoot,
-      document: {
-        adoptedStyleSheets: [] as TestStyleSheet[],
-        addEventListener() {},
-        documentElement: root,
-        styleSheets: [directSheet]
-      }
+      Document: TestDocument,
+      document: new TestDocument()
     }
     runInNewContext(loadClientCode(), context)
 
@@ -229,6 +233,12 @@ describe("dynamic legacy theme compatibility", () => {
 
     context.document.adoptedStyleSheets.push(lateAdoptedSheet)
     expect(lateAdoptedRule.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
+    const indexedRule = new TestStyle()
+    indexedRule.setProperty("--avs-warning", "32 95% 44%")
+    const indexedSheet = new TestStyleSheet()
+    indexedSheet.cssRules.push({ style: indexedRule })
+    context.document.adoptedStyleSheets[0] = indexedSheet
+    expect(indexedRule.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
 
     const animated = new TestStyle()
     animated.setProperty("opacity", "0.5")
@@ -290,6 +300,9 @@ describe("dynamic legacy theme compatibility", () => {
       getAttribute() { return null }
       getRootNode() { return this.rootNode }
       matches() { return false }
+      contains(node: TestNode): boolean {
+        return node === this || this.descendants.some((element) => element.contains(node))
+      }
       querySelectorAll(selector: string): TestElement[] {
         if (selector !== "*") return []
         return this.descendants.flatMap((element) => [element, ...element.querySelectorAll("*")])
@@ -356,6 +369,44 @@ describe("dynamic legacy theme compatibility", () => {
     const mediaListeners = new Map<string, EventListener>()
     let legacyActive = false
     let ancestorActive = false
+    const computedProperty = (element: TestElement, name: string): string => {
+      const inClosedRoot = element.rootNode === closedRoot
+      if (name === "--avs-primary") {
+        return inClosedRoot || opaque.disabled || !legacyActive ? "222 47% 11%" : "221 83% 53%"
+      }
+      if (name === "--avs-warning") {
+        return !inClosedRoot && !opaque.disabled && legacyActive && element.style.cssText ? "32 95% 44%" : ""
+      }
+      if (name === "--avs-ring") {
+        return !opaque.disabled && ancestorActive && element === ancestor ? "199 89% 48%" : ""
+      }
+      if (name === "--avs-success") {
+        return inClosedRoot && !closedOpaque.disabled ? "142 71% 45%" : ""
+      }
+      const parent = element.parentElement ?? element.rootNode?.host
+      if (name === "--primary") {
+        const inline = element.style.getPropertyValue(name)
+        if (inline === "hsl(var(--avs-primary))") {
+          return opaque.disabled ? "" : "hsl(221 83% 53%)"
+        }
+        if (inline) return inline
+        if (!opaque.disabled && legacyActive && element.standard) return "oklch(0.62 0.19 255)"
+        return parent ? computedProperty(parent, name) : "hsl(222 47% 11%)"
+      }
+      if (name === "--warning") return element.style.getPropertyValue(name)
+      if (name === "--ring" || name === "--success") {
+        const inline = element.style.getPropertyValue(name)
+        if (!inline) return parent ? computedProperty(parent, name) : ""
+        if (inline !== `hsl(var(--avs-${name.slice(2)}))`) return inline
+        const sourceDisabled = name === "--success" ? closedOpaque.disabled : opaque.disabled
+        return sourceDisabled ? "" : inline.replace(
+          `var(--avs-${name.slice(2)})`,
+          name === "--ring" ? "199 89% 48%" : "142 71% 45%"
+        )
+      }
+      const inline = element.style.getPropertyValue(name)
+      return inline || (parent ? computedProperty(parent, name) : "")
+    }
     const context = {
       CSSStyleDeclaration: TestStyle,
       CSSStyleSheet: OpaqueStyleSheet,
@@ -368,38 +419,7 @@ describe("dynamic legacy theme compatibility", () => {
       addEventListener(name: string, listener: EventListener) { listeners.set(name, listener) },
       getComputedStyle(element: TestElement) {
         return {
-          getPropertyValue(name: string) {
-            const inClosedRoot = element.rootNode === closedRoot
-            if (name === "--avs-primary") {
-              return inClosedRoot || opaque.disabled || !legacyActive ? "222 47% 11%" : "221 83% 53%"
-            }
-            if (name === "--avs-warning") {
-              return !inClosedRoot && !opaque.disabled && legacyActive && element.style.cssText ? "32 95% 44%" : ""
-            }
-            if (name === "--avs-ring") {
-              return !opaque.disabled && ancestorActive && element === ancestor ? "199 89% 48%" : ""
-            }
-            if (name === "--avs-success") {
-              return inClosedRoot && !closedOpaque.disabled ? "142 71% 45%" : ""
-            }
-            if (name === "--primary") {
-              const inline = element.style.getPropertyValue(name)
-              if (inline === "hsl(var(--avs-primary))") {
-                return opaque.disabled ? "" : "hsl(221 83% 53%)"
-              }
-              if (inline) return inline
-              if (!opaque.disabled && legacyActive && element.standard) return "oklch(0.62 0.19 255)"
-              return "hsl(222 47% 11%)"
-            }
-            if (name === "--warning") return element.style.getPropertyValue(name)
-            if (name === "--ring" || name === "--success") {
-              const inline = element.style.getPropertyValue(name)
-              if (!inline) return ""
-              const sourceDisabled = name === "--success" ? closedOpaque.disabled : opaque.disabled
-              return sourceDisabled ? "" : inline.replace(`var(--avs-${name.slice(2)})`, name === "--ring" ? "199 89% 48%" : "142 71% 45%")
-            }
-            return ""
-          }
+          getPropertyValue(name: string) { return computedProperty(element, name) }
         }
       },
       matchMedia(query: string) {
@@ -430,6 +450,16 @@ describe("dynamic legacy theme compatibility", () => {
     expect(frames).toHaveLength(1)
     frames.shift()?.(0)
     expect(root.style.getPropertyValue("--primary")).toBe("")
+    expect(closedElement.style.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
+    expect(listeners.has("pointerdown")).toBe(true)
+    expect(listeners.has("pointerup")).toBe(true)
+    expect(listeners.has("keydown")).toBe(true)
+    expect(mediaListeners.has("(any-pointer: coarse)")).toBe(true)
+    expect(mediaListeners.has("(any-pointer: none)")).toBe(true)
+
+    mutationCallbacks[1]?.([{ type: "attributes", attributeName: "class", target: closedHost }] as unknown as MutationRecord[], {} as MutationObserver)
+    expect(frames).toHaveLength(1)
+    frames.shift()?.(0.5)
     expect(closedElement.style.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
 
     legacyActive = true

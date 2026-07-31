@@ -18,4 +18,22 @@ describe("legacy theme compatibility", () => {
       expect(contents).toContain('import "./theme-compat"')
     }
   })
+
+  it("serializes the opaque stylesheet state observers", () => {
+    const script = themeCompatibilityClientScript()
+    for (const event of ["pointerdown", "pointerup", "pointercancel", "keydown", "keyup"]) {
+      expect(script).toContain(`"${event}"`)
+    }
+    for (const query of [
+      "(pointer: coarse)",
+      "(pointer: none)",
+      "(any-pointer: coarse)",
+      "(any-pointer: none)"
+    ]) {
+      expect(script).toContain(`"${query}"`)
+    }
+    expect(script).toContain("new Proxy(list")
+    expect(script).toContain("__avibe-show-inheritance-probe-")
+    expect(script).toContain("opaqueStyleSheetScopes.values()")
+  })
 })
