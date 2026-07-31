@@ -20,6 +20,11 @@ export function legacyThemeOwnershipMarker(target: string): string {
 }
 
 type OwnedDeclaration = { value: string; priority: string }
+type ThemeElement = Element & { style: CSSStyleDeclaration }
+type OpaqueOwnedDeclarations = {
+  element: ThemeElement
+  declarations: Map<string, OwnedDeclaration>
+}
 type RuleContainer = {
   cssRules: CSSRuleList
   insertRule: (rule: string, index?: number) => number
@@ -41,7 +46,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   const legacySourceSet = new Set(legacySources)
   const migratedTargets = new Set(Object.values(migrations).flat())
   const ownedDeclarations = new WeakMap<CSSStyleDeclaration, Map<string, OwnedDeclaration>>()
-  const opaqueOwnedDeclarations = new Map<CSSStyleDeclaration, Map<string, OwnedDeclaration>>()
+  const opaqueOwnedDeclarations = new Map<CSSStyleDeclaration, OpaqueOwnedDeclarations>()
   const opaqueBridgeSignatures = new WeakMap<CSSStyleDeclaration, string>()
   const opaqueStyleSheets = new Set<CSSStyleSheet>()
   const observedAdoptedLists = new WeakSet<object>()
@@ -49,6 +54,8 @@ function installLegacyThemeCompatibilityWithMigrations(
   const nativeSetProperty = stylePrototype?.setProperty
   const nativeRemoveProperty = stylePrototype?.removeProperty
   let opaqueScanFrame = 0
+  let opaqueFullScanPending = false
+  const opaqueScanRoots = new Set<Node>()
   let mutatingOpaqueBridge = false
 
   function migratedValue(source: string, target: string) {
@@ -162,10 +169,19 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
   }
 
-  function scheduleOpaqueLegacyScan() {
-    if (!opaqueStyleSheets.size || opaqueScanFrame) return
+  function scheduleOpaqueLegacyScan(root?: Node) {
+    if (!opaqueStyleSheets.size) return
+    if (typeof Node !== "undefined" && root instanceof Node && root !== document) {
+      if (!opaqueFullScanPending) opaqueScanRoots.add(root)
+    } else {
+      opaqueFullScanPending = true
+      opaqueScanRoots.clear()
+    }
+    if (opaqueScanFrame) return
     const requestFrame = globalThis.requestAnimationFrame
-      ?? ((callback: FrameRequestCallback) => globalThis.setTimeout(() => callback(performance.now()), 0) as unknown as number)
+      ?? ((callback: FrameRequestCallback) => globalThis.setTimeout(
+        () => callback(globalThis.performance?.now() ?? Date.now()), 0
+      ) as unknown as number)
     opaqueScanFrame = requestFrame(() => {
       opaqueScanFrame = 0
       syncOpaqueLegacyThemes()
@@ -177,11 +193,12 @@ function installLegacyThemeCompatibilityWithMigrations(
     scheduleOpaqueLegacyScan()
   }
 
-  function clearOpaqueOwnedDeclarations() {
+  function clearOpaqueOwnedDeclarations(styles?: Set<CSSStyleDeclaration>) {
     mutatingOpaqueBridge = true
     try {
-      for (const [style, owned] of opaqueOwnedDeclarations) {
-        for (const [target, previous] of owned) {
+      for (const [style, ownership] of opaqueOwnedDeclarations) {
+        if (styles && !styles.has(style)) continue
+        for (const [target, previous] of ownership.declarations) {
           if (style.getPropertyValue(target).trim() === previous.value
             && style.getPropertyPriority(target) === previous.priority) {
             if (nativeRemoveProperty) nativeRemoveProperty.call(style, target)
@@ -189,34 +206,57 @@ function installLegacyThemeCompatibilityWithMigrations(
           }
         }
         opaqueBridgeSignatures.delete(style)
+        opaqueOwnedDeclarations.delete(style)
       }
-      opaqueOwnedDeclarations.clear()
     } finally {
       mutatingOpaqueBridge = false
     }
   }
 
-  function compatibilityElements() {
-    const elements: Array<Element & { style: CSSStyleDeclaration }> = []
+  function compatibilityElements(roots: Set<Node> | null) {
+    const affected = new Set<ThemeElement>()
     const seenRoots = new Set<Document | ShadowRoot>()
-    const visit = (root: Document | ShadowRoot) => {
-      if (seenRoots.has(root)) return
-      seenRoots.add(root)
-      const candidates = root === document
-        ? [document.documentElement, ...document.querySelectorAll("*")]
-        : Array.from(root.querySelectorAll("*"))
-      for (const element of candidates) {
-        if (element && "style" in element) {
-          elements.push(element as Element & { style: CSSStyleDeclaration })
-        }
-        if (element?.shadowRoot) visit(element.shadowRoot)
+    const addElement = (element: Element) => {
+      if ("style" in element) affected.add(element as ThemeElement)
+      if (element.shadowRoot) visitRoot(element.shadowRoot)
+      if (typeof HTMLSlotElement !== "undefined" && element instanceof HTMLSlotElement) {
+        for (const assigned of element.assignedElements({ flatten: true })) addTree(assigned)
       }
     }
-    visit(document)
-    return elements
+    const addTree = (element: Element) => {
+      addElement(element)
+      for (const descendant of element.querySelectorAll("*")) addElement(descendant)
+    }
+    const visitRoot = (root: Document | ShadowRoot) => {
+      if (seenRoots.has(root)) return
+      seenRoots.add(root)
+      if (root === document && document.documentElement) addTree(document.documentElement)
+      else for (const element of root.querySelectorAll("*")) addElement(element)
+    }
+    if (!roots) {
+      visitRoot(document)
+    } else {
+      for (const root of roots) {
+        if (root === document || (typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot)) {
+          visitRoot(root as Document | ShadowRoot)
+        } else if (root instanceof Element) {
+          addTree(root)
+        } else if (root.parentElement) {
+          addTree(root.parentElement)
+        }
+      }
+    }
+
+    const elements = new Set(affected)
+    for (const element of affected) {
+      for (let parent = composedParentElement(element); parent; parent = composedParentElement(parent)) {
+        if ("style" in parent) elements.add(parent as ThemeElement)
+      }
+    }
+    return { affected: Array.from(affected), elements: Array.from(elements) }
   }
 
-  function sampleThemeValues(elements: Array<Element & { style: CSSStyleDeclaration }>) {
+  function sampleThemeValues(elements: ThemeElement[]) {
     const properties = [...legacySources, ...migratedTargets]
     const samples = new Map<Element, Map<string, string>>()
     for (const element of elements) {
@@ -237,9 +277,19 @@ function installLegacyThemeCompatibilityWithMigrations(
   // Cross-origin rules are opaque to CSSOM. Compare their computed effect with the
   // sheets disabled, then bridge only legacy deltas that did not also set a standard token.
   function syncOpaqueLegacyThemes() {
+    const roots = opaqueFullScanPending ? null : new Set(opaqueScanRoots)
+    opaqueFullScanPending = false
+    opaqueScanRoots.clear()
+    const { affected, elements } = compatibilityElements(roots)
+    clearOpaqueOwnedDeclarations(new Set(affected.map((element) => element.style)))
+
     const activeSheets: Array<{ sheet: CSSStyleSheet; disabled: boolean }> = []
     for (const sheet of opaqueStyleSheets) {
       try {
+        if (sheet.ownerNode && !sheet.ownerNode.isConnected) {
+          opaqueStyleSheets.delete(sheet)
+          continue
+        }
         if (sheet.disabled) continue
         const disabled = sheet.disabled
         sheet.disabled = true
@@ -251,8 +301,6 @@ function installLegacyThemeCompatibilityWithMigrations(
     }
     if (!activeSheets.length) return
 
-    clearOpaqueOwnedDeclarations()
-    const elements = compatibilityElements()
     let baseline: Map<Element, Map<string, string>>
     try {
       baseline = sampleThemeValues(elements)
@@ -262,7 +310,7 @@ function installLegacyThemeCompatibilityWithMigrations(
     const actual = sampleThemeValues(elements)
     mutatingOpaqueBridge = true
     try {
-      for (const element of elements) {
+      for (const element of affected) {
         const before = baseline.get(element)
         const after = actual.get(element)
         if (!before || !after) continue
@@ -286,7 +334,7 @@ function installLegacyThemeCompatibilityWithMigrations(
           }
         }
         if (owned.size) {
-          opaqueOwnedDeclarations.set(element.style, owned)
+          opaqueOwnedDeclarations.set(element.style, { element, declarations: owned })
           opaqueBridgeSignatures.set(element.style, element.style.cssText)
         }
       }
@@ -296,9 +344,9 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
 
   function opaqueBridgeIsCurrent(style: CSSStyleDeclaration) {
-    const owned = opaqueOwnedDeclarations.get(style)
-    if (!owned || opaqueBridgeSignatures.get(style) !== style.cssText) return false
-    for (const [target, previous] of owned) {
+    const ownership = opaqueOwnedDeclarations.get(style)
+    if (!ownership || opaqueBridgeSignatures.get(style) !== style.cssText) return false
+    for (const [target, previous] of ownership.declarations) {
       if (style.getPropertyValue(target).trim() !== previous.value
         || style.getPropertyPriority(target) !== previous.priority) return false
     }
@@ -306,12 +354,26 @@ function installLegacyThemeCompatibilityWithMigrations(
   }
 
   function relinquishOpaqueOwnership(style: CSSStyleDeclaration, target?: string) {
-    const owned = opaqueOwnedDeclarations.get(style)
-    if (!owned) return
-    if (target) owned.delete(target)
-    else owned.clear()
+    const ownership = opaqueOwnedDeclarations.get(style)
+    if (!ownership) return
+    if (target) ownership.declarations.delete(target)
+    else ownership.declarations.clear()
     opaqueBridgeSignatures.delete(style)
-    if (!owned.size) opaqueOwnedDeclarations.delete(style)
+    if (!ownership.declarations.size) opaqueOwnedDeclarations.delete(style)
+  }
+
+  function removeOpaqueOwnedFromStyle(style: CSSStyleDeclaration) {
+    const ownership = opaqueOwnedDeclarations.get(style)
+    if (!ownership) return
+    for (const [target, previous] of ownership.declarations) {
+      if (style.getPropertyValue(target).trim() === previous.value
+        && style.getPropertyPriority(target) === previous.priority) {
+        if (nativeRemoveProperty) nativeRemoveProperty.call(style, target)
+        else style.removeProperty(target)
+      }
+    }
+    opaqueBridgeSignatures.delete(style)
+    opaqueOwnedDeclarations.delete(style)
   }
 
   function syncLegacyStyleSheet(sheet: CSSStyleSheet | null | undefined) {
@@ -412,7 +474,6 @@ function installLegacyThemeCompatibilityWithMigrations(
       if (legacySources.includes(propertyName) || (migratedTargets.has(propertyName) && (ownedDeclarations.has(this) || hasLegacyDeclaration(this)))) {
         syncLegacyDeclaration(this)
       }
-      if (!mutatingOpaqueBridge && opaqueStyleSheets.size) scheduleOpaqueLegacyScan()
     }
     stylePrototype.removeProperty = function(name: string) {
       const propertyName = String(name)
@@ -421,7 +482,6 @@ function installLegacyThemeCompatibilityWithMigrations(
       if (legacySources.includes(propertyName) || (migratedTargets.has(propertyName) && (ownedDeclarations.has(this) || hasLegacyDeclaration(this)))) {
         syncLegacyDeclaration(this)
       }
-      if (!mutatingOpaqueBridge && opaqueStyleSheets.size) scheduleOpaqueLegacyScan()
       return value
     }
     if (cssText?.get && cssText.set) {
@@ -429,11 +489,10 @@ function installLegacyThemeCompatibilityWithMigrations(
         ...cssText,
         set(value: string | null) {
           const wasOwned = ownedDeclarations.has(this)
-          if (!mutatingOpaqueBridge) relinquishOpaqueOwnership(this)
           cssText.set?.call(this, value)
+          if (!mutatingOpaqueBridge) removeOpaqueOwnedFromStyle(this)
           const current = cssText.get?.call(this) ?? ""
           if (wasOwned || current.includes("--avs-")) syncLegacyDeclaration(this, current.includes("--avs-"))
-          if (!mutatingOpaqueBridge && opaqueStyleSheets.size) scheduleOpaqueLegacyScan()
         }
       })
     }
@@ -498,8 +557,17 @@ function installLegacyThemeCompatibilityWithMigrations(
       if (record.type === "attributes" && record.attributeName === "style"
         && record.target instanceof Element
         && opaqueBridgeIsCurrent((record.target as HTMLElement).style)) continue
-      scheduleOpaqueLegacyScan()
-      return
+      const stylesheetTreeChanged = record.type === "childList"
+        && [...record.addedNodes, ...record.removedNodes].some((node) => node instanceof Element
+          && (node.matches("style, link[rel~=stylesheet]") || node.querySelector("style, link[rel~=stylesheet]")))
+      if (stylesheetTreeChanged || record.target instanceof HTMLLinkElement || record.target instanceof HTMLStyleElement) {
+        scheduleOpaqueLegacyScan()
+      } else {
+        const root = record.target instanceof Element
+          ? record.target.parentElement ?? record.target
+          : record.target.parentElement ?? record.target
+        scheduleOpaqueLegacyScan(root)
+      }
     }
   })
 
@@ -532,19 +600,26 @@ function installLegacyThemeCompatibilityWithMigrations(
     })
     opaqueObserver.observe(container, {
       attributes: true,
-      characterData: true,
       childList: true,
       subtree: true
     })
     root.addEventListener("load", stylesheetLoad, true)
   }
 
+  for (const event of ["resize", "orientationchange", "pageshow", "beforeprint", "afterprint"]) {
+    globalThis.addEventListener?.(event, () => scheduleOpaqueLegacyScan(), true)
+  }
   for (const event of [
-    "resize", "orientationchange", "pageshow", "focus", "pointerover", "pointerout",
-    "focusin", "focusout", "input", "change", "animationstart", "animationiteration",
-    "animationend", "transitionrun", "transitionend"
+    "focus", "pointerover", "pointerout", "focusin", "focusout", "input", "change",
+    "animationstart", "animationiteration", "animationend", "transitionrun", "transitionend"
   ]) {
-    globalThis.addEventListener?.(event, scheduleOpaqueLegacyScan, true)
+    globalThis.addEventListener?.(event, (input) => {
+      const target = input.target
+      scheduleOpaqueLegacyScan(target instanceof Node ? target.parentNode ?? target : undefined)
+    }, true)
+  }
+  for (const query of ["(prefers-color-scheme: dark)", "(prefers-contrast: more)"]) {
+    globalThis.matchMedia?.(query).addEventListener("change", () => scheduleOpaqueLegacyScan())
   }
 
   const elementPrototype = globalThis.Element?.prototype

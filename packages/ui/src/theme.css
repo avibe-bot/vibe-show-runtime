@@ -57,7 +57,9 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
-:root {
+:root,
+:host,
+.avs-theme {
   color-scheme: light;
   --radius: 0.5rem;
   --background: hsl(0 0% 100%);
@@ -113,7 +115,12 @@
 }
 
 .dark,
-[data-theme="dark"] {
+[data-theme="dark"],
+:host(.dark),
+:host([data-theme="dark"]),
+.avs-theme.dark,
+.dark .avs-theme,
+[data-theme="dark"] .avs-theme {
   color-scheme: dark;
   --background: hsl(222 47% 11%);
   --foreground: hsl(210 40% 98%);

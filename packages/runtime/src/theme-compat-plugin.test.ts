@@ -38,12 +38,22 @@ class TestStyle {
   }
 
   get cssText() {
-    return Array.from(this.declarations, ([name, declaration]) => `${name}: ${declaration.value}`).join("; ")
+    return Array.from(this.declarations, ([name, declaration]) =>
+      `${name}: ${declaration.value}${declaration.priority ? ` !${declaration.priority}` : ""}`
+    ).join("; ")
   }
 
   set cssText(value: string | null) {
     this.declarations.clear()
-    if (value) this.declarations.set("text", { value: String(value), priority: "" })
+    for (const entry of String(value ?? "").split(";")) {
+      const separator = entry.indexOf(":")
+      if (separator < 0) continue
+      const name = entry.slice(0, separator).trim()
+      const raw = entry.slice(separator + 1).trim()
+      const important = /\s*!important\s*$/i.test(raw)
+      const propertyValue = important ? raw.replace(/\s*!important\s*$/i, "").trim() : raw
+      if (name) this.declarations.set(name, { value: propertyValue, priority: important ? "important" : "" })
+    }
   }
 }
 
@@ -355,6 +365,18 @@ describe("dynamic legacy theme compatibility", () => {
     expect(standard.style.getPropertyValue("--primary")).toBe("")
     expect(inlineStandard.style.getPropertyValue("--primary")).toBe("oklch(0.7 0.15 255)")
     expect(inherited.style.getPropertyValue("--primary")).toBe("")
-    expect(opaque.disabled).toBe(false)
+
+    root.style.cssText += "; color: red"
+    expect(root.style.getPropertyValue("--primary")).toBe("")
+    expect(root.style.getPropertyValue("color")).toBe("red")
+    listeners.get("resize")?.({} as Event)
+    frames.shift()?.(2)
+    expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+
+    opaque.disabled = true
+    listeners.get("resize")?.({} as Event)
+    frames.shift()?.(3)
+    expect(root.style.getPropertyValue("--primary")).toBe("")
+    expect(opaque.disabled).toBe(true)
   })
 })
