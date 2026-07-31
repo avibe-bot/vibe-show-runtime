@@ -58,7 +58,6 @@
 }
 
 :root,
-:host,
 .avs-theme {
   color-scheme: light;
   --radius: 0.5rem;

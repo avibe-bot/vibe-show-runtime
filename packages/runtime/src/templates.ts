@@ -68,8 +68,8 @@ async function fileExists(path: string) {
  * Keep the workspace Tailwind entry importing BOTH `tailwindcss` and the `@avibe/show-ui`
  * theme, in that order. New workspaces already lead with both (see stylesCss); this is the
  * idempotent, HMR-safe migration for workspaces whose `src/styles.css` predates them — it
- * adds whichever import is missing and skips (no write) when both are present. Runs on every
- * warm before the Vite server is created.
+ * adds whichever import is missing and repairs a reversed existing pair. Runs on every warm
+ * before the Vite server is created.
  *
  * Detection runs against a comment-stripped copy so a commented-out import is not mistaken
  * for a real one (which would skip migration and leave the page unstyled).
@@ -87,6 +87,8 @@ async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_
   const hasTailwind = TAILWIND_IMPORT_PATTERN.test(scanned)
   const hasTheme = themeImportPattern(uiPackageName).test(scanned)
   if (hasTailwind && hasTheme) {
+    const ordered = orderThemeAfterTailwind(contents, uiPackageName)
+    if (ordered !== contents) await writeFile(path, ordered, "utf8")
     return
   }
   if (!hasTailwind) {
@@ -99,6 +101,18 @@ async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_
     contents = insertThemeAfterTailwind(contents, theme)
   }
   await writeFile(path, contents, "utf8")
+}
+
+function orderThemeAfterTailwind(contents: string, uiPackageName: string): string {
+  const scanned = maskCssComments(contents)
+  const tailwind = /@import\s+["']tailwindcss["'][^;]*;/.exec(scanned)
+  const theme = new RegExp(
+    `@import\\s+["']${escapeRegExp(uiPackageName)}/theme\\.css["'][^;]*;`
+  ).exec(scanned)
+  if (!tailwind || !theme || tailwind.index < theme.index) return contents
+  const statement = contents.slice(theme.index, theme.index + theme[0].length)
+  const withoutTheme = `${contents.slice(0, theme.index)}${contents.slice(theme.index + theme[0].length)}`
+  return insertThemeAfterTailwind(withoutTheme, statement)
 }
 
 async function migrateWorkspaceThemeDeclarations(path: string): Promise<void> {

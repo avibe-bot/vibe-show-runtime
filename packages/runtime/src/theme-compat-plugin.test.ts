@@ -430,6 +430,7 @@ describe("dynamic legacy theme compatibility", () => {
     const ancestor = new TestElement()
     const ancestorMiddle = new TestElement()
     const ancestorChild = new TestElement()
+    const ancestorPanel = new TestElement()
     const eventCard = new TestElement()
     const eventTarget = new TestElement()
     const eventPanel = new TestElement()
@@ -452,7 +453,8 @@ describe("dynamic legacy theme compatibility", () => {
     ancestor.parentElement = root
     ancestorMiddle.parentElement = ancestor
     ancestorChild.parentElement = ancestorMiddle
-    ancestor.descendants.push(ancestorMiddle)
+    ancestorPanel.parentElement = ancestor
+    ancestor.descendants.push(ancestorMiddle, ancestorPanel)
     ancestorMiddle.descendants.push(ancestorChild)
     eventCard.parentElement = root
     eventTarget.parentElement = eventCard
@@ -534,7 +536,7 @@ describe("dynamic legacy theme compatibility", () => {
             && (chainIndex === 0 || previous.style.getPropertyValue("--ring"))) return "280 65% 60%"
           return computedProperty(root, name)
         }
-        return !opaque.disabled && ancestorActive && element === ancestor ? "199 89% 48%" : ""
+        return !opaque.disabled && ancestorActive && element === ancestorPanel ? "199 89% 48%" : ""
       }
       if (name === "--avs-success") {
         return inClosedRoot && !closedOpaque.disabled ? "142 71% 45%" : ""
@@ -746,15 +748,19 @@ describe("dynamic legacy theme compatibility", () => {
 
     const opaqueWritesBeforeMotion = opaque.disabledWrites
     activeCssMotion = true
+    eventPanelActive = true
     listeners.get("pointerdown")?.({ target: eventTarget } as unknown as Event)
     frames.shift()?.(0.47)
     frames.shift()?.(0.475)
     frames.shift()?.(0.48)
     expect(opaque.disabledWrites).toBe(opaqueWritesBeforeMotion)
+    expect(eventPanel.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     activeCssMotion = false
+    eventPanelActive = false
     listeners.get("animationcancel")?.({ target: eventTarget } as unknown as Event)
     frames.shift()?.(0.485)
     expect(opaque.disabledWrites).toBeGreaterThan(opaqueWritesBeforeMotion)
+    expect(eventPanel.style.getPropertyValue("--primary")).toBe("")
 
     chainActive = true
     listeners.get("resize")?.({} as Event)
@@ -768,15 +774,23 @@ describe("dynamic legacy theme compatibility", () => {
     expect(readableImportParent.disabledWrites).toBe(0)
 
     mutationCallbacks[1]?.([{ type: "attributes", attributeName: "class", target: closedHost }] as unknown as MutationRecord[], {} as MutationObserver)
-    expect(frames).toHaveLength(1)
+    expect(frames).toHaveLength(2)
     frames.shift()?.(0.5)
     expect(closedElement.style.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
+    frames.shift()?.(0.51)
+    frames.shift()?.(0.52)
 
     legacyActive = true
     expect(mediaListeners.has("(prefers-reduced-motion: reduce)")).toBe(true)
     mediaListeners.get("(prefers-reduced-motion: reduce)")?.({} as Event)
     expect(frames).toHaveLength(1)
     frames.shift()?.(1)
+    let mediaContinuationFrames = 0
+    while (frames.length && mediaContinuationFrames < 10) {
+      mediaContinuationFrames += 1
+      frames.shift()?.(1 + mediaContinuationFrames / 100)
+    }
+    expect(frames).toHaveLength(0)
 
     expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
     expect(root.style.getPropertyPriority("--primary")).toBe("important")
@@ -790,16 +804,21 @@ describe("dynamic legacy theme compatibility", () => {
     await Promise.resolve()
     root.style.setProperty("color", "blue")
     mutationCallbacks[1]?.([{ type: "attributes", attributeName: "style", target: root }] as unknown as MutationRecord[], {} as MutationObserver)
-    expect(frames).toHaveLength(1)
+    expect(frames).toHaveLength(2)
     frames.shift()?.(2)
     expect(root.style.getPropertyValue("--primary")).toBe("hsl(var(--avs-primary))")
+    frames.shift()?.(2.125)
+    frames.shift()?.(2.25)
 
     await Promise.resolve()
     ancestorActive = true
     mutationCallbacks[1]?.([{ type: "attributes", attributeName: "class", target: ancestorChild }] as unknown as MutationRecord[], {} as MutationObserver)
-    expect(frames).toHaveLength(1)
+    expect(frames).toHaveLength(2)
     frames.shift()?.(3)
-    expect(ancestor.style.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
+    expect(ancestorPanel.style.getPropertyValue("--ring")).toBe("")
+    frames.shift()?.(3.125)
+    frames.shift()?.(3.25)
+    expect(ancestorPanel.style.getPropertyValue("--ring")).toBe("hsl(var(--avs-ring))")
 
     root.isConnected = false
     listeners.get("focus")?.({ target: external } as unknown as Event)

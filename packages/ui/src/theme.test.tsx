@@ -110,7 +110,8 @@ describe("theme.css", () => {
   })
 
   it("defines light and class/data-attribute dark palettes with complete colors", () => {
-    expect(css).toContain("\n:root,\n:host,\n.avs-theme {\n  color-scheme: light;")
+    expect(css).toContain("\n:root,\n.avs-theme {\n  color-scheme: light;")
+    expect(css).not.toContain("\n:root,\n:host,\n.avs-theme {")
     expect(css).toContain("\n.dark,\n[data-theme=\"dark\"],\n:host(.dark),")
     expect(css).toContain("[data-theme=\"dark\"] .avs-theme {\n  color-scheme: dark;")
     expect(css).toContain("--background: hsl(")

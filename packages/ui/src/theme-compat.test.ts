@@ -62,6 +62,8 @@ describe("legacy theme compatibility", () => {
     expect(script).toContain("stepUp")
     expect(script).toContain("opaqueContinuationPending")
     expect(script).toContain("opaqueImportAncestors")
+    expect(script).toContain("sampleLocalThemeProperties")
+    expect(script).toContain("scheduleOpaqueLegacyRelationalScan")
     expect(script).toContain("CustomElementRegistry")
     expect(script).toContain("parentStyleSheet")
   })
