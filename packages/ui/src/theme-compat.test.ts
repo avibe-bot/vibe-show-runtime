@@ -33,7 +33,11 @@ describe("legacy theme compatibility", () => {
       expect(script).toContain(`"${query}"`)
     }
     expect(script).toContain("new Proxy(list")
-    expect(script).toContain("__avibe-show-inheritance-probe-")
+    expect(script).toContain("rootCandidates")
+    expect(script).toContain("scheduleAdoptedListPoll")
+    expect(script).toContain('"removeRule"')
     expect(script).toContain("opaqueStyleSheetScopes.values()")
+    expect(script).toContain('"hashchange"')
+    expect(script).toContain('"popstate"')
   })
 })

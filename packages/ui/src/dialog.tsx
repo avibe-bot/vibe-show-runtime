@@ -175,9 +175,9 @@ export function Dialog({
     if (open === false) clearOpeningTheme()
   }, [clearOpeningTheme, open])
   const handleOpenChange = React.useCallback((nextOpen: boolean) => {
-    if (!nextOpen) clearOpeningTheme()
+    if (!nextOpen && open === undefined) clearOpeningTheme()
     onOpenChange?.(nextOpen)
-  }, [clearOpeningTheme, onOpenChange])
+  }, [clearOpeningTheme, onOpenChange, open])
   return (
     <DialogScopeContext.Provider value={scope}>
       <DialogPrimitive.Root open={open} onOpenChange={handleOpenChange} {...props} />

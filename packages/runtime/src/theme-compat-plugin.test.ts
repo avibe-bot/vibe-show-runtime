@@ -181,6 +181,10 @@ describe("dynamic legacy theme compatibility", () => {
     lateAdoptedRule.setProperty("--avs-success", "142 71% 45%")
     const lateAdoptedSheet = new TestStyleSheet()
     lateAdoptedSheet.cssRules.push({ style: lateAdoptedRule })
+    const retainedRule = new TestStyle()
+    retainedRule.setProperty("--avs-border", "214 32% 91%")
+    const retainedSheet = new TestStyleSheet()
+    retainedSheet.cssRules.push({ style: retainedRule })
     class TestDocument {
       private adoptedSheets: TestStyleSheet[] = []
       documentElement = root
@@ -189,6 +193,9 @@ describe("dynamic legacy theme compatibility", () => {
       get adoptedStyleSheets() { return this.adoptedSheets }
       set adoptedStyleSheets(value: TestStyleSheet[]) { this.adoptedSheets = Array.from(value) }
     }
+    const testDocument = new TestDocument()
+    const retainedAdoptedSheets = testDocument.adoptedStyleSheets
+    const timers: Array<() => void> = []
     const context = {
       CSSGroupingRule: TestGroupingRule,
       CSSKeyframesRule: TestKeyframesRule,
@@ -199,7 +206,11 @@ describe("dynamic legacy theme compatibility", () => {
       MutationObserver: TestMutationObserver,
       ShadowRoot: TestShadowRoot,
       Document: TestDocument,
-      document: new TestDocument()
+      document: testDocument,
+      setTimeout(callback: () => void) {
+        timers.push(callback)
+        return timers.length
+      }
     }
     runInNewContext(loadClientCode(), context)
 
@@ -239,6 +250,11 @@ describe("dynamic legacy theme compatibility", () => {
     indexedSheet.cssRules.push({ style: indexedRule })
     context.document.adoptedStyleSheets[0] = indexedSheet
     expect(indexedRule.getPropertyValue("--warning")).toBe("hsl(var(--avs-warning))")
+    expect(timers.length).toBeGreaterThan(0)
+    retainedAdoptedSheets[0] = retainedSheet
+    expect(retainedRule.getPropertyValue("--border")).toBe("")
+    for (const timer of timers.splice(0)) timer()
+    expect(retainedRule.getPropertyValue("--border")).toBe("hsl(var(--avs-border))")
 
     const animated = new TestStyle()
     animated.setProperty("opacity", "0.5")
@@ -364,6 +380,7 @@ describe("dynamic legacy theme compatibility", () => {
     closedElement.rootNode = closedRoot
     root.descendants.push(standard, inlineStandard, inherited, ancestor, closedHost)
     const opaque = new OpaqueStyleSheet()
+    const readableThemeSheet = { cssRules: [], disabled: false }
     const frames: FrameRequestCallback[] = []
     const listeners = new Map<string, EventListener>()
     const mediaListeners = new Map<string, EventListener>()
@@ -383,6 +400,11 @@ describe("dynamic legacy theme compatibility", () => {
       if (name === "--avs-success") {
         return inClosedRoot && !closedOpaque.disabled ? "142 71% 45%" : ""
       }
+      if (name === "--avs-border") {
+        if (element === root) return opaque.disabled ? "" : "214 32% 91%"
+        const parent = element.parentElement ?? element.rootNode?.host
+        return parent ? computedProperty(parent, name) : ""
+      }
       const parent = element.parentElement ?? element.rootNode?.host
       if (name === "--primary") {
         const inline = element.style.getPropertyValue(name)
@@ -391,7 +413,13 @@ describe("dynamic legacy theme compatibility", () => {
         }
         if (inline) return inline
         if (!opaque.disabled && legacyActive && element.standard) return "oklch(0.62 0.19 255)"
-        return parent ? computedProperty(parent, name) : "hsl(222 47% 11%)"
+        return parent ? computedProperty(parent, name) : readableThemeSheet.disabled ? "" : "hsl(222 47% 11%)"
+      }
+      if (name === "--border") {
+        const inline = element.style.getPropertyValue(name)
+        if (inline) return inline
+        if (element === root && !opaque.disabled) return "rgb(10 20 30)"
+        return parent ? computedProperty(parent, name) : readableThemeSheet.disabled ? "" : "rgb(10 20 30)"
       }
       if (name === "--warning") return element.style.getPropertyValue(name)
       if (name === "--ring" || name === "--success") {
@@ -438,7 +466,7 @@ describe("dynamic legacy theme compatibility", () => {
         addEventListener() {},
         documentElement: root,
         querySelectorAll() { return root.querySelectorAll("*") },
-        styleSheets: [opaque]
+        styleSheets: [readableThemeSheet, opaque]
       }
     }
 
@@ -450,6 +478,7 @@ describe("dynamic legacy theme compatibility", () => {
     expect(frames).toHaveLength(1)
     frames.shift()?.(0)
     expect(root.style.getPropertyValue("--primary")).toBe("")
+    expect(root.style.getPropertyValue("--border")).toBe("")
     expect(closedElement.style.getPropertyValue("--success")).toBe("hsl(var(--avs-success))")
     expect(listeners.has("pointerdown")).toBe(true)
     expect(listeners.has("pointerup")).toBe(true)

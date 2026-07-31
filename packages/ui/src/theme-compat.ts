@@ -28,6 +28,8 @@ type OpaqueOwnedDeclarations = {
 type RuleContainer = {
   cssRules: CSSRuleList
   insertRule: (rule: string, index?: number) => number
+  deleteRule?: (index: number) => void
+  removeRule?: (index: number) => void
 }
 
 function installLegacyThemeCompatibilityWithMigrations(
@@ -52,12 +54,17 @@ function installLegacyThemeCompatibilityWithMigrations(
   const opaqueStyleSheets = new Set<CSSStyleSheet>()
   const opaqueStyleSheetScopes = new Map<CSSStyleSheet, Document | ShadowRoot | undefined>()
   const adoptedListProxies = new WeakMap<object, CSSStyleSheet[]>()
+  const observedAdoptedLists = new Map<CSSStyleSheet[], {
+    scope?: Document | ShadowRoot
+    snapshot: CSSStyleSheet[]
+  }>()
   const stylePrototype = globalThis.CSSStyleDeclaration?.prototype
   const nativeSetProperty = stylePrototype?.setProperty
   const nativeRemoveProperty = stylePrototype?.removeProperty
   let opaqueScanFrame = 0
   let opaqueFullScanPending = false
   let opaqueMutationCleanupPending = false
+  let adoptedListPollTimer = 0
   let mutatingOpaqueSheetState = false
   const opaqueScanRoots = new Set<Node>()
   let mutatingOpaqueBridge = false
@@ -308,6 +315,7 @@ function installLegacyThemeCompatibilityWithMigrations(
   ) {
     const localTargets = new Map<Element, Set<string>>()
     const inheritedCandidates = new Map<ThemeElement, Map<string, ThemeElement[]>>()
+    const rootCandidates = new Map<ThemeElement, Set<string>>()
     const markLocal = (element: Element, target: string) => {
       let targets = localTargets.get(element)
       if (!targets) {
@@ -323,14 +331,22 @@ function installLegacyThemeCompatibilityWithMigrations(
       const parent = composedParentElement(element)
       const parentBefore = parent ? baseline.get(parent) : undefined
       const parentAfter = parent ? actual.get(parent) : undefined
-      if (!before || !after || !parent || !parentBefore || !parentAfter || !("style" in parent)) continue
+      if (!before || !after) continue
       const synthetic = opaqueOwnedDeclarations.get(element.style)?.declarations
       for (const [source, targets] of Object.entries(migrations)) {
         if (before.get(source) === after.get(source)) continue
-        if (parentBefore.get(source) === before.get(source)
-          && parentAfter.get(source) === after.get(source)) continue
+        if (parentBefore?.get(source) === before.get(source)
+          && parentAfter?.get(source) === after.get(source)) continue
         for (const target of targets) {
           if (synthetic?.has(target) || before.get(target) !== after.get(target)) continue
+          if (!parent || !parentBefore || !parentAfter || !("style" in parent)) {
+            if (element === document.documentElement) {
+              const candidates = rootCandidates.get(element) ?? new Set<string>()
+              candidates.add(target)
+              rootCandidates.set(element, candidates)
+            }
+            continue
+          }
           if (parentBefore.get(target) !== before.get(target)
             || parentAfter.get(target) !== after.get(target)) {
             markLocal(element, target)
@@ -359,12 +375,16 @@ function installLegacyThemeCompatibilityWithMigrations(
           const declared = declaredProperties(parent.style).has(target)
           const value = parent.style.getPropertyValue(target)
           const priority = parent.style.getPropertyPriority(target)
-          const probe = `__avibe-show-inheritance-probe-${probeIndex += 1}__`
+          probeIndex += 1
+          const probe = target === "--radius"
+            ? `${1000 + probeIndex / 1000}px`
+            : `rgb(${probeIndex % 251} ${(probeIndex * 3) % 251} ${(probeIndex * 7) % 251} / 0.937)`
           markOpaqueBridgeMutation(parent)
           if (nativeSetProperty) nativeSetProperty.call(parent.style, target, probe, "important")
           else parent.style.setProperty(target, probe, "important")
+          const inheritedProbe = getComputedStyle(parent).getPropertyValue(target).trim()
           for (const element of candidates) {
-            if (getComputedStyle(element).getPropertyValue(target).trim() !== probe) {
+            if (getComputedStyle(element).getPropertyValue(target).trim() !== inheritedProbe) {
               markLocal(element, target)
             }
           }
@@ -379,6 +399,38 @@ function installLegacyThemeCompatibilityWithMigrations(
     } finally {
       mutatingOpaqueBridge = wasMutatingOpaqueBridge
       scheduleOpaqueMutationCleanup()
+    }
+
+    if (rootCandidates.size) {
+      const readableSheets: Array<{ sheet: CSSStyleSheet; disabled: boolean }> = []
+      const candidates = new Set<CSSStyleSheet>([
+        ...Array.from(document.styleSheets),
+        ...Array.from(document.adoptedStyleSheets ?? [])
+      ])
+      for (const sheet of candidates) {
+        if (opaqueStyleSheets.has(sheet)) continue
+        try {
+          void sheet.cssRules
+          if (!sheet.disabled) readableSheets.push({ sheet, disabled: sheet.disabled })
+        } catch {
+          // Opaque sheets are sampled by leaving them active.
+        }
+      }
+      if (readableSheets.length) {
+        try {
+          for (const { sheet } of readableSheets) sheet.disabled = true
+          for (const [root, targets] of rootCandidates) {
+            const computed = getComputedStyle(root)
+            const after = actual.get(root)
+            for (const target of targets) {
+              const opaqueValue = computed.getPropertyValue(target).trim()
+              if (opaqueValue && opaqueValue === after?.get(target)) markLocal(root, target)
+            }
+          }
+        } finally {
+          for (const { sheet, disabled } of readableSheets) sheet.disabled = disabled
+        }
+      }
     }
     return localTargets
   }
@@ -590,6 +642,14 @@ function installLegacyThemeCompatibilityWithMigrations(
         return insertedIndex
       }
     }
+    for (const name of ["deleteRule", "removeRule"] as const) {
+      const remove = prototype[name]
+      if (typeof remove !== "function") continue
+      prototype[name] = function(this: RuleContainer, index: number) {
+        remove.call(this, index)
+        scheduleAllOpaqueLegacyScans()
+      }
+    }
   }
 
   function patchKeyframesRule(input: object | undefined) {
@@ -606,13 +666,54 @@ function installLegacyThemeCompatibilityWithMigrations(
         }
       }
     }
+    const deleteRule = prototype.deleteRule
+    if (typeof deleteRule === "function") {
+      prototype.deleteRule = function(this: CSSKeyframesRule, rule: string) {
+        deleteRule.call(this, rule)
+        scheduleAllOpaqueLegacyScans()
+      }
+    }
+  }
+
+  function syncObservedAdoptedList(list: CSSStyleSheet[], scope?: Document | ShadowRoot) {
+    const sheets = Array.from(list)
+    const record = observedAdoptedLists.get(list)
+    if (record) {
+      record.scope = scope ?? record.scope
+      record.snapshot = sheets
+    } else {
+      observedAdoptedLists.set(list, { scope, snapshot: sheets })
+    }
+    for (const sheet of sheets) syncLegacyStyleSheet(sheet, scope)
+  }
+
+  function scheduleAdoptedListPoll() {
+    if (adoptedListPollTimer || !globalThis.setTimeout) return
+    adoptedListPollTimer = globalThis.setTimeout(() => {
+      adoptedListPollTimer = 0
+      for (const [list, record] of observedAdoptedLists) {
+        if (typeof ShadowRoot !== "undefined"
+          && record.scope instanceof ShadowRoot
+          && !record.scope.host?.isConnected) {
+          observedAdoptedLists.delete(list)
+          continue
+        }
+        const sheets = Array.from(list)
+        if (sheets.length === record.snapshot.length
+          && sheets.every((sheet, index) => sheet === record.snapshot[index])) continue
+        syncObservedAdoptedList(list, record.scope)
+      }
+      if (observedAdoptedLists.size) scheduleAdoptedListPoll()
+    }, 250) as unknown as number
   }
 
   function observeAdoptedStyleSheetList(list: CSSStyleSheet[], scope?: Document | ShadowRoot) {
     const existing = adoptedListProxies.get(list)
     if (existing) return existing
-    const syncList = (input: CSSStyleSheet[]) => {
-      for (const sheet of Array.from(input)) syncLegacyStyleSheet(sheet, scope)
+    observedAdoptedLists.set(list, { scope, snapshot: Array.from(list) })
+    scheduleAdoptedListPoll()
+    const syncList = () => {
+      syncObservedAdoptedList(list, scope)
     }
     const methods = ["copyWithin", "fill", "pop", "push", "reverse", "shift", "sort", "splice", "unshift"] as const
     for (const name of methods) {
@@ -624,7 +725,7 @@ function installLegacyThemeCompatibilityWithMigrations(
           writable: true,
           value: function(this: CSSStyleSheet[], ...args: unknown[]) {
             const result = (method as (...values: unknown[]) => unknown).apply(this, args)
-            syncList(this)
+            syncList()
             return result
           }
         })
@@ -638,17 +739,17 @@ function installLegacyThemeCompatibilityWithMigrations(
     const proxy = new Proxy(list, {
       set(target, property, value) {
         const result = Reflect.set(target, property, value, target)
-        if (result && indexedProperty(property)) syncList(target)
+        if (result && indexedProperty(property)) syncList()
         return result
       },
       defineProperty(target, property, descriptor) {
         const result = Reflect.defineProperty(target, property, descriptor)
-        if (result && indexedProperty(property)) syncList(target)
+        if (result && indexedProperty(property)) syncList()
         return result
       },
       deleteProperty(target, property) {
         const result = Reflect.deleteProperty(target, property)
-        if (result && indexedProperty(property)) syncList(target)
+        if (result && indexedProperty(property)) syncList()
         return result
       }
     })
@@ -673,7 +774,7 @@ function installLegacyThemeCompatibilityWithMigrations(
         const list = descriptor.get?.call(this) ?? []
         const scope = this instanceof Document || this instanceof ShadowRoot ? this : undefined
         observeAdoptedStyleSheetList(list, scope)
-        for (const sheet of list) syncLegacyStyleSheet(sheet, scope)
+        syncObservedAdoptedList(list, scope)
       }
     })
   }
@@ -895,7 +996,9 @@ function installLegacyThemeCompatibilityWithMigrations(
     root.addEventListener("load", stylesheetLoad, true)
   }
 
-  for (const event of ["resize", "orientationchange", "pageshow", "beforeprint", "afterprint"]) {
+  for (const event of [
+    "resize", "orientationchange", "pageshow", "hashchange", "popstate", "beforeprint", "afterprint"
+  ]) {
     globalThis.addEventListener?.(event, scheduleAllOpaqueLegacyScans, true)
   }
   for (const event of [
@@ -904,10 +1007,7 @@ function installLegacyThemeCompatibilityWithMigrations(
     "focusin", "focusout", "input", "change",
     "animationstart", "animationiteration", "animationend", "transitionrun", "transitionend"
   ]) {
-    globalThis.addEventListener?.(event, (input) => {
-      const target = input.target
-      scheduleOpaqueLegacyScan(target instanceof Node ? target.parentNode ?? target : undefined)
-    }, true)
+    globalThis.addEventListener?.(event, scheduleAllOpaqueLegacyScans, true)
   }
   for (const query of [
     "(prefers-color-scheme: dark)",

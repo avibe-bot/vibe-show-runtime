@@ -24,5 +24,6 @@ describe("Dialog", () => {
     expect(source).toContain('bridge.style.setProperty(property, value, "important")')
     expect(source).toContain("scope.openingTheme.current = readPortalTheme")
     expect(source).toContain("if (!active?.isConnected && opening) return opening")
+    expect(source).toContain("if (!nextOpen && open === undefined) clearOpeningTheme()")
   })
 })
