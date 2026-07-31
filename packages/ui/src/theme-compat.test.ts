@@ -59,6 +59,12 @@ describe("legacy theme compatibility", () => {
     expect(script).toContain("addEventListener?.(event, scheduleOpaqueLegacyEventScan, true)")
     expect(script).toContain("addEventListener?.(event, scheduleOpaqueLegacyRelationalEventScan, true)")
     expect(script).toContain('"reset"')
+    for (const event of [
+      "play", "playing", "pause", "ended", "seeking", "seeked", "waiting", "stalled",
+      "volumechange"
+    ]) {
+      expect(script).toContain(`"${event}"`)
+    }
     expect(script).toContain('"hashchange"')
     expect(script).toContain('"popstate"')
     expect(script).toContain('"animationcancel"')

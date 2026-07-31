@@ -4,7 +4,7 @@ import { useComposedRefs } from "@radix-ui/react-compose-refs"
 import { X } from "lucide-react"
 import { ThemeScopeContext } from "./theme-context"
 import { SHOW_THEME_CHANGE_EVENT } from "./theme-compat"
-import { SHOW_PORTAL_THEME_PROPERTIES } from "./theme-properties"
+import { animationAffectsShowPortalTheme, SHOW_PORTAL_THEME_PROPERTIES } from "./theme-properties"
 import { cn } from "./utils"
 
 // Radix portals escape scoped inheritance; copy the source theme onto a contents-only bridge.
@@ -120,7 +120,9 @@ function hasActivePortalThemeMotion(source: PortalThemeSource | null): boolean {
     for (let node: Node | null = start; node; node = composedParentNode(node)) {
       if (!(node instanceof Element) || seen.has(node)) continue
       seen.add(node)
-      if (node.getAnimations().some((animation) => animation.playState === "running" || animation.pending)) {
+      if (node.getAnimations().some((animation) =>
+        (animation.playState === "running" || animation.pending)
+        && animationAffectsShowPortalTheme(animation))) {
         return true
       }
     }

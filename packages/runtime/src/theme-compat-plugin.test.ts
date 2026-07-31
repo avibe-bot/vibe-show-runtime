@@ -379,6 +379,7 @@ describe("dynamic legacy theme compatibility", () => {
         return root
       }
     }
+    class TestMediaElement extends TestElement {}
     class TestShadowRoot extends TestNode {
       private adoptedSheets: OpaqueStyleSheet[] = []
       host!: TestElement
@@ -502,6 +503,7 @@ describe("dynamic legacy theme compatibility", () => {
     const ancestorPanel = new TestElement()
     const eventCard = new TestElement()
     const eventTarget = new TestElement()
+    const mediaTarget = new TestMediaElement()
     const eventPanel = new TestElement()
     const authoredPanel = new TestElement()
     const unrelatedEventSibling = new TestElement()
@@ -527,9 +529,10 @@ describe("dynamic legacy theme compatibility", () => {
     ancestorMiddle.descendants.push(ancestorChild)
     eventCard.parentElement = root
     eventTarget.parentElement = eventCard
+    mediaTarget.parentElement = eventCard
     eventPanel.parentElement = eventCard
     authoredPanel.parentElement = eventCard
-    eventCard.descendants.push(eventTarget, eventPanel, authoredPanel)
+    eventCard.descendants.push(eventTarget, mediaTarget, eventPanel, authoredPanel)
     unrelatedEventSibling.parentElement = root
     closedHost.parentElement = root
     closedHost.nextShadowRoot = closedRoot
@@ -678,6 +681,7 @@ describe("dynamic legacy theme compatibility", () => {
       Event: class { constructor(readonly type: string) {} },
       Document: class {},
       HTMLLinkElement: class {},
+      HTMLMediaElement: TestMediaElement,
       HTMLInputElement: TestInputElement,
       HTMLSelectElement: TestSelectElement,
       HTMLTextAreaElement: TestTextAreaElement,
@@ -755,6 +759,12 @@ describe("dynamic legacy theme compatibility", () => {
     expect(listeners.has("beforetoggle")).toBe(true)
     expect(listeners.has("toggle")).toBe(true)
     expect(listeners.has("reset")).toBe(true)
+    expect(listeners.has("play")).toBe(true)
+    expect(listeners.has("pause")).toBe(true)
+    expect(listeners.has("ended")).toBe(true)
+    expect(listeners.has("seeking")).toBe(true)
+    expect(listeners.has("volumechange")).toBe(true)
+    expect(listeners.get("play")).not.toBe(listeners.get("pointerdown"))
     expect(listeners.has("animationcancel")).toBe(true)
     expect(listeners.has("transitioncancel")).toBe(true)
     expect(listeners.has("fullscreenchange")).toBe(true)
@@ -767,6 +777,12 @@ describe("dynamic legacy theme compatibility", () => {
     expect(fontListeners.has("loadingdone")).toBe(true)
     expect(fontListeners.has("loadingerror")).toBe(true)
     expect(registeredProperties).toEqual([])
+
+    listeners.get("play")?.({ target: eventTarget } as unknown as Event)
+    expect(frames).toHaveLength(0)
+    listeners.get("play")?.({ target: mediaTarget } as unknown as Event)
+    expect(frames).toHaveLength(2)
+    while (frames.length) frames.shift()?.(0.01)
 
     legacyActive = true
     listeners.get("beforeprint")?.({} as Event)

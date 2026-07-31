@@ -18,3 +18,32 @@ export const SHOW_PORTAL_THEME_PROPERTIES = [
   "text-indent", "text-justify", "text-orientation", "text-shadow", "text-transform",
   "white-space", "word-break", "word-spacing", "writing-mode"
 ] as const
+
+const SHOW_PORTAL_MOTION_PROPERTIES = new Set([
+  ...SHOW_PORTAL_THEME_PROPERTIES,
+  "all", "font",
+  "width", "min-width", "max-width", "height", "min-height", "max-height",
+  "inline-size", "min-inline-size", "max-inline-size",
+  "block-size", "min-block-size", "max-block-size",
+  "contain", "container-type"
+])
+
+function cssPropertyName(property: string): string {
+  if (property.startsWith("--")) return property
+  return property.replace(/[A-Z]/g, (character) => `-${character.toLowerCase()}`)
+}
+
+export function animationAffectsShowPortalTheme(animation: Animation): boolean {
+  const effect = animation.effect
+  if (!effect || !("getKeyframes" in effect)) return false
+  const getKeyframes = effect.getKeyframes
+  if (typeof getKeyframes !== "function") return false
+  try {
+    return getKeyframes.call(effect).some((keyframe: ComputedKeyframe) => Object.keys(keyframe).some((property) => {
+      const name = cssPropertyName(property)
+      return name.startsWith("--") || SHOW_PORTAL_MOTION_PROPERTIES.has(name)
+    }))
+  } catch {
+    return false
+  }
+}

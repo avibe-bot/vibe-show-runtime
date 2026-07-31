@@ -331,6 +331,11 @@ function installLegacyThemeCompatibilityWithMigrations(
     scheduleOpaqueLegacyRelationalScan()
   }
 
+  function scheduleMediaStateEventScan(event: Event) {
+    if (typeof HTMLMediaElement !== "undefined" && !(event.target instanceof HTMLMediaElement)) return
+    scheduleOpaqueLegacyRelationalEventScan(event)
+  }
+
   function scheduleOpaqueLegacyRelationalScan() {
     if (!opaqueStyleSheets.size || opaqueRelationalScanFrame) return
     opaqueRelationalScanFrame = requestCompatibilityFrame(() => {
@@ -1796,6 +1801,13 @@ function installLegacyThemeCompatibilityWithMigrations(
     "focusin", "focusout", "input", "change", "invalid", "reset", "beforetoggle", "toggle"
   ]) {
     globalThis.addEventListener?.(event, scheduleOpaqueLegacyRelationalEventScan, true)
+  }
+  for (const event of [
+    "play", "playing", "pause", "ended", "seeking", "seeked", "waiting", "stalled",
+    "suspend", "progress", "emptied", "abort", "error", "loadstart", "loadedmetadata",
+    "loadeddata", "durationchange", "canplay", "canplaythrough", "volumechange", "ratechange"
+  ]) {
+    globalThis.addEventListener?.(event, scheduleMediaStateEventScan, true)
   }
   for (const event of [
     "animationstart", "animationiteration", "animationend", "animationcancel",

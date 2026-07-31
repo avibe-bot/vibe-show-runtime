@@ -3,6 +3,13 @@ import { readFileSync } from "node:fs"
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
 import { Dialog, DialogContent, DialogTrigger } from "./dialog"
+import { animationAffectsShowPortalTheme } from "./theme-properties"
+
+function animationWithKeyframes(keyframes: Array<Record<string, unknown>>): Animation {
+  return {
+    effect: { getKeyframes: () => keyframes }
+  } as unknown as Animation
+}
 
 describe("Dialog", () => {
   it("captures its source scope without inserting a marker element", () => {
@@ -36,6 +43,22 @@ describe("Dialog", () => {
     expect(source).toContain("if (bridge) copiedProperties.current = applyPortalTheme(bridge, next")
     expect(source).toContain('window.addEventListener("animationstart", schedule, true)')
     expect(source).toContain("hasActivePortalThemeMotion(getThemeSource())")
+    expect(source).toContain("animationAffectsShowPortalTheme(animation)")
     expect(source.match(/requestAnimationFrame\(update\)/g)).toHaveLength(1)
+  })
+
+  it("polls only animations that can change portal theme context", () => {
+    expect(animationAffectsShowPortalTheme(animationWithKeyframes([
+      { transform: "translateX(10px)", opacity: 0.5 }
+    ]))).toBe(false)
+    expect(animationAffectsShowPortalTheme(animationWithKeyframes([
+      { fontSize: "20px" }
+    ]))).toBe(true)
+    expect(animationAffectsShowPortalTheme(animationWithKeyframes([
+      { "--brand-primary": "red" }
+    ]))).toBe(true)
+    expect(animationAffectsShowPortalTheme(animationWithKeyframes([
+      { inlineSize: "30rem" }
+    ]))).toBe(true)
   })
 })
