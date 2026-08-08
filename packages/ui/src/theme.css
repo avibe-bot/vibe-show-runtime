@@ -1,77 +1,236 @@
 /*
- * @avibe/show-ui theme — the token bridge for the shadcn/ui components.
+ * Public Show UI theme contract.
  *
- * This file is `@import`ed INTO the workspace's Tailwind entry (`src/styles.css`, the file
- * with `@import "tailwindcss";`) so its `@theme` registers in that compilation — a CSS file
- * imported only as a side effect via main.tsx would NOT contribute `@theme` to the entry.
- *
- * It does three things:
- *   1. Keeps the legacy `--avs-*` variables defined (existing workspace CSS references them,
- *      e.g. `hsl(var(--avs-ring))` in the scaffold placeholder) and holds the palette values.
- *   2. Maps shadcn's token namespace onto those `--avs-*` values via `@theme inline`, so the
- *      components look identical to the old hand-written skin by default. `inline` means the
- *      utilities emit `var(--color-*)`, so `ThemeProvider`'s inline `--avs-*` overrides still
- *      apply at runtime. Swapping to a stock shadcn palette later is a values-only edit here.
- *   3. `@source`s the compiled component code so Tailwind generates the utility classes the
- *      components use (they live in node_modules, which Tailwind does not auto-scan).
+ * Import this file from the workspace Tailwind entry, after Tailwind itself.
+ * Standard shadcn variables are the source of truth and contain complete CSS
+ * values, so they work through both semantic utilities and native var().
  */
 
-:root,
-.avs-theme {
+@custom-variant dark (&:where(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  color-scheme: light;
+  --radius: 0.5rem;
+  --background: hsl(0 0% 100%);
+  --foreground: hsl(222 47% 11%);
+  --card: hsl(0 0% 100%);
+  --card-foreground: hsl(222 47% 11%);
+  --popover: hsl(0 0% 100%);
+  --popover-foreground: hsl(222 47% 11%);
+  --primary: hsl(240 5% 10%);
+  --primary-foreground: hsl(0 0% 98%);
+  --secondary: hsl(210 40% 96%);
+  --secondary-foreground: hsl(222 47% 11%);
+  --muted: hsl(210 40% 96%);
+  --muted-foreground: hsl(215 16% 47%);
+  --accent: hsl(210 40% 96%);
+  --accent-foreground: hsl(222 47% 11%);
+  --destructive: hsl(0 84% 60%);
+  --destructive-foreground: hsl(0 0% 100%);
+  --border: hsl(214 32% 91%);
+  --input: hsl(214 32% 91%);
+  --ring: hsl(240 5% 64%);
+  --chart-1: hsl(12 76% 61%);
+  --chart-2: hsl(173 58% 39%);
+  --chart-3: hsl(197 37% 24%);
+  --chart-4: hsl(43 74% 66%);
+  --chart-5: hsl(27 87% 67%);
+  --sidebar: hsl(210 40% 98%);
+  --sidebar-foreground: hsl(222 47% 11%);
+  --sidebar-primary: hsl(222 47% 11%);
+  --sidebar-primary-foreground: hsl(210 40% 98%);
+  --sidebar-accent: hsl(210 40% 96%);
+  --sidebar-accent-foreground: hsl(222 47% 11%);
+  --sidebar-border: hsl(214 32% 91%);
+  --sidebar-ring: hsl(221 83% 53%);
+  --success: hsl(158 64% 24%);
+  --success-foreground: hsl(0 0% 100%);
+  --warning: hsl(32 95% 44%);
+  --warning-foreground: hsl(0 0% 100%);
+
+  /* Static aliases for pages that still consume hsl(var(--avs-*)). */
   --avs-background: 0 0% 100%;
   --avs-foreground: 222 47% 11%;
   --avs-muted: 210 40% 96%;
   --avs-muted-foreground: 215 16% 47%;
   --avs-border: 214 32% 91%;
-  --avs-primary: 222 47% 11%;
-  --avs-primary-foreground: 210 40% 98%;
-  --avs-ring: 221 83% 53%;
+  --avs-primary: 240 5% 10%;
+  --avs-primary-foreground: 0 0% 98%;
+  --avs-ring: 240 5% 64%;
   --avs-success: 158 64% 24%;
   --avs-warning: 32 95% 44%;
   --avs-destructive: 0 84% 60%;
   --avs-radius: 0.5rem;
 }
 
-@theme inline {
-  --color-background: hsl(var(--avs-background));
-  --color-foreground: hsl(var(--avs-foreground));
-  --color-card: hsl(var(--avs-background));
-  --color-card-foreground: hsl(var(--avs-foreground));
-  --color-popover: hsl(var(--avs-background));
-  --color-popover-foreground: hsl(var(--avs-foreground));
-  --color-primary: hsl(var(--avs-primary));
-  --color-primary-foreground: hsl(var(--avs-primary-foreground));
-  --color-secondary: hsl(var(--avs-muted));
-  --color-secondary-foreground: hsl(var(--avs-foreground));
-  --color-muted: hsl(var(--avs-muted));
-  --color-muted-foreground: hsl(var(--avs-muted-foreground));
-  --color-accent: hsl(var(--avs-muted));
-  --color-accent-foreground: hsl(var(--avs-foreground));
-  --color-destructive: hsl(var(--avs-destructive));
-  --color-destructive-foreground: hsl(0 0% 100%);
-  --color-border: hsl(var(--avs-border));
-  --color-input: hsl(var(--avs-border));
-  --color-ring: hsl(var(--avs-ring));
-  --color-success: hsl(var(--avs-success));
-  --color-success-foreground: hsl(0 0% 100%);
-  --color-warning: hsl(var(--avs-warning));
-  --color-warning-foreground: hsl(0 0% 100%);
+.dark,
+[data-theme="dark"] {
+  color-scheme: dark;
+  --background: hsl(222 47% 11%);
+  --foreground: hsl(210 40% 98%);
+  --card: hsl(222 47% 14%);
+  --card-foreground: hsl(210 40% 98%);
+  --popover: hsl(222 47% 14%);
+  --popover-foreground: hsl(210 40% 98%);
+  --primary: hsl(0 0% 98%);
+  --primary-foreground: hsl(240 5% 10%);
+  --secondary: hsl(217 33% 18%);
+  --secondary-foreground: hsl(210 40% 98%);
+  --muted: hsl(217 33% 18%);
+  --muted-foreground: hsl(215 20% 65%);
+  --accent: hsl(217 33% 18%);
+  --accent-foreground: hsl(210 40% 98%);
+  --destructive: hsl(0 63% 31%);
+  --destructive-foreground: hsl(210 40% 98%);
+  --border: hsl(217 33% 22%);
+  --input: hsl(217 33% 22%);
+  --ring: hsl(240 5% 64%);
+  --chart-1: hsl(220 70% 50%);
+  --chart-2: hsl(160 60% 45%);
+  --chart-3: hsl(30 80% 55%);
+  --chart-4: hsl(280 65% 60%);
+  --chart-5: hsl(340 75% 55%);
+  --sidebar: hsl(222 47% 14%);
+  --sidebar-foreground: hsl(210 40% 98%);
+  --sidebar-primary: hsl(221 83% 63%);
+  --sidebar-primary-foreground: hsl(222 47% 11%);
+  --sidebar-accent: hsl(217 33% 18%);
+  --sidebar-accent-foreground: hsl(210 40% 98%);
+  --sidebar-border: hsl(217 33% 22%);
+  --sidebar-ring: hsl(212 27% 84%);
+  --success: hsl(158 64% 52%);
+  --success-foreground: hsl(222 47% 11%);
+  --warning: hsl(38 92% 50%);
+  --warning-foreground: hsl(222 47% 11%);
 
-  --radius-sm: calc(var(--avs-radius) - 4px);
-  --radius-md: calc(var(--avs-radius) - 2px);
-  --radius-lg: var(--avs-radius);
-  --radius-xl: calc(var(--avs-radius) + 4px);
+  --avs-background: 222 47% 11%;
+  --avs-foreground: 210 40% 98%;
+  --avs-muted: 217 33% 18%;
+  --avs-muted-foreground: 215 20% 65%;
+  --avs-border: 217 33% 22%;
+  --avs-primary: 0 0% 98%;
+  --avs-primary-foreground: 240 5% 10%;
+  --avs-ring: 240 5% 64%;
+  --avs-success: 158 64% 52%;
+  --avs-warning: 38 92% 50%;
+  --avs-destructive: 0 63% 31%;
 }
 
-/*
- * Generate the utility classes the shadcn components use. The components ship compiled to
- * this package's `dist` (next to this file once installed), and Tailwind does not scan
- * node_modules automatically, so opt them in explicitly. Paths are relative to THIS file.
- *
- * Exclude the bundled `tailwind-merge` chunk (`utils-<hash>.js`): its internal class-name
- * data (every class group, e.g. `scroll-m*`) would otherwise be scanned as candidates and
- * generate a large amount of unused CSS. The component class strings live in the named
- * entry files, so scanning the rest of `dist` is sufficient.
- */
+/* ThemeProvider presets stay CSS-owned so they follow the active mode. */
+[data-show-theme-preset="zinc"] {
+  --primary: hsl(240 5% 10%);
+  --primary-foreground: hsl(0 0% 98%);
+  --ring: hsl(240 5% 64%);
+  --avs-primary: 240 5% 10%;
+  --avs-primary-foreground: 0 0% 98%;
+  --avs-ring: 240 5% 64%;
+}
+
+[data-show-theme-preset="slate"] {
+  --primary: hsl(222 47% 11%);
+  --primary-foreground: hsl(210 40% 98%);
+  --ring: hsl(215 20% 65%);
+  --avs-primary: 222 47% 11%;
+  --avs-primary-foreground: 210 40% 98%;
+  --avs-ring: 215 20% 65%;
+}
+
+[data-show-theme-preset="green"] {
+  --primary: hsl(158 64% 24%);
+  --primary-foreground: hsl(0 0% 100%);
+  --ring: hsl(158 64% 40%);
+  --avs-primary: 158 64% 24%;
+  --avs-primary-foreground: 0 0% 100%;
+  --avs-ring: 158 64% 40%;
+}
+
+[data-show-theme-preset="blue"] {
+  --primary: hsl(221 83% 53%);
+  --primary-foreground: hsl(0 0% 100%);
+  --ring: hsl(221 83% 63%);
+  --avs-primary: 221 83% 53%;
+  --avs-primary-foreground: 0 0% 100%;
+  --avs-ring: 221 83% 63%;
+}
+
+.dark [data-show-theme-preset="zinc"],
+[data-theme="dark"] [data-show-theme-preset="zinc"] {
+  --primary: hsl(0 0% 98%);
+  --primary-foreground: hsl(240 5% 10%);
+  --avs-primary: 0 0% 98%;
+  --avs-primary-foreground: 240 5% 10%;
+}
+
+.dark [data-show-theme-preset="slate"],
+[data-theme="dark"] [data-show-theme-preset="slate"] {
+  --primary: hsl(210 40% 98%);
+  --primary-foreground: hsl(222 47% 11%);
+  --avs-primary: 210 40% 98%;
+  --avs-primary-foreground: 222 47% 11%;
+}
+
+.dark [data-show-theme-preset="green"],
+[data-theme="dark"] [data-show-theme-preset="green"] {
+  --primary: hsl(158 64% 52%);
+  --primary-foreground: hsl(222 47% 11%);
+  --ring: hsl(158 64% 52%);
+  --avs-primary: 158 64% 52%;
+  --avs-primary-foreground: 222 47% 11%;
+  --avs-ring: 158 64% 52%;
+}
+
+.dark [data-show-theme-preset="blue"],
+[data-theme="dark"] [data-show-theme-preset="blue"] {
+  --primary: hsl(221 83% 63%);
+  --primary-foreground: hsl(222 47% 11%);
+  --avs-primary: 221 83% 63%;
+  --avs-primary-foreground: 222 47% 11%;
+}
+
+/* Tailwind does not scan installed packages automatically. */
 @source "./*.js";
 @source not "./utils-*.js";

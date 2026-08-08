@@ -373,11 +373,29 @@ visual system for the runtime.
 
 ## Theme Customization
 
-The UI package should expose token-based theming through CSS variables.
-Agents should be able to use a preset:
+The UI package exposes the standard shadcn CSS-variable contract. Agents
+should use normal semantic utilities and complete CSS color values:
+
+```css
+:root {
+  --radius: 0.75rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --primary: oklch(0.55 0.2 255);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+}
+```
+
+These values work through both Tailwind (`bg-background`, `text-foreground`)
+and native CSS (`var(--background)`). The optional provider supports subtree
+presets and runtime-computed values through the same variables:
 
 ```tsx
-import { ThemeProvider } from "@avibe/show-ui/theme"
+import { ThemeProvider } from "@/components/ui/theme"
 
 export default function App() {
   return <ThemeProvider preset="zinc"><Dashboard /></ThemeProvider>
@@ -391,9 +409,9 @@ or override selected tokens:
   theme={{
     radius: "0.75rem",
     colors: {
-      primary: "221 83% 53%",
-      background: "0 0% 100%",
-      foreground: "222 47% 11%",
+      primary: "oklch(0.55 0.2 255)",
+      background: "oklch(1 0 0)",
+      foreground: "oklch(0.145 0 0)",
     },
   }}
 >
@@ -401,9 +419,8 @@ or override selected tokens:
 </ThemeProvider>
 ```
 
-The theme implementation should write CSS variables onto a root element rather
-than requiring component source edits. This keeps per-page customization
-flexible and cheap, while keeping generated Tailwind class names predictable.
+The detailed contract and compatibility boundary live in
+[`docs/theme-contract.md`](theme-contract.md).
 
 ## Default Visualization Dependencies
 

@@ -1,12 +1,17 @@
 import * as React from "react"
 import * as DialogPrimitive from "@radix-ui/react-dialog"
 import { X } from "lucide-react"
+import { ThemeScopeContext } from "./theme-context"
 import { cn } from "./utils"
 
 export const Dialog = DialogPrimitive.Root
 export const DialogTrigger = DialogPrimitive.Trigger
-export const DialogPortal = DialogPrimitive.Portal
 export const DialogClose = DialogPrimitive.Close
+
+export function DialogPortal({ container, ...props }: React.ComponentProps<typeof DialogPrimitive.Portal>) {
+  const themeScope = React.useContext(ThemeScopeContext)
+  return <DialogPrimitive.Portal container={container ?? themeScope ?? undefined} {...props} />
+}
 
 export const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
