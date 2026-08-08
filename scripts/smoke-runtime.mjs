@@ -121,6 +121,9 @@ if (
   typeof hmrIndexHtml !== "object" ||
   !hmrIndexHtml.html.includes("avs-fallback-shell") ||
   !hmrIndexHtml.html.includes("Ready to visualize") ||
+  !hmrIndexHtml.html.includes("standard theme variables") ||
+  !hmrIndexHtml.html.includes("--background") ||
+  hmrIndexHtml.html.includes("components from @/components/ui and @avibe/show-ui") ||
   !hmrStyleTag?.children?.includes("Loading Show Page") ||
   !hmrStyleTag.children.includes(".avs-fallback") ||
   hmrStyleTag.children.includes(".fallback-shell {") ||
@@ -356,6 +359,7 @@ try {
   }
   const scaffoldRouter = await readFile(join(root, "smoke", "src", "router.tsx"), "utf8")
   const scaffoldMain = await readFile(join(root, "smoke", "src", "main.tsx"), "utf8")
+  const scaffoldApp = await readFile(join(root, "smoke", "src", "App.tsx"), "utf8")
   const scaffoldHome = await readFile(join(root, "smoke", "src", "pages", "index.tsx"), "utf8")
   if (!scaffoldRouter.includes("popstate") || scaffoldRouter.includes("hashchange") || !scaffoldRouter.includes("__AVIBE_SHOW__?.basePath")) {
     throw new Error("Expected the fresh scaffold router to use History mode with the injected base path")
@@ -371,6 +375,9 @@ try {
   }
   if (!scaffoldHome.includes('baseUrl.pathname.endsWith("/")')) {
     throw new Error("Expected the fresh scaffold handler URL to normalize a slashless injected base path")
+  }
+  if (scaffoldApp.includes("ThemeProvider") || !scaffoldApp.includes("bg-background text-foreground")) {
+    throw new Error("Expected the fresh scaffold to use standard theme utilities without a provider override")
   }
   const visibleAsset = await fetch(`${runtime.url}/sessions/smoke/app/visible.txt`)
   if (visibleAsset.status !== 200 || (await visibleAsset.text()) !== "visible public asset\n") {
@@ -1131,12 +1138,19 @@ export default function App() {
 
   // (9) Component pipeline (new workspace): the scaffolded entry imports the show-ui theme,
   // whose @theme registers the tokens and whose @source generates the component utilities.
-  // The served CSS must carry `.bg-primary` mapped to the --avs- palette (default parity)
-  // and the agent's own `.bg-red-500` override utility.
+  // The served CSS must map semantic utilities directly to standard variables, support
+  // dark selectors and native var(), and preserve the agent's own utility override.
   await mkdir(join(root, "shadcn", "src"), { recursive: true })
   await writeFile(join(root, "shadcn", "src", "App.tsx"), `import { Button } from "@/components/ui/button"
+import { ThemeProvider } from "@/components/ui/theme"
 export default function App() {
-  return <Button className="bg-red-500">Ship</Button>
+  return (
+    <ThemeProvider theme={{ colors: { primary: "oklch(0.62 0.19 255)" } }}>
+      <main className="dark bg-background text-foreground">
+        <Button className="bg-red-500 dark:bg-primary" style={{ borderColor: "var(--border)" }}>Ship</Button>
+      </main>
+    </ThemeProvider>
+  )
 }
 `)
   const shadcnEnsure = await fetch(`${runtime.url}/sessions/shadcn/ensure`, { method: "POST" }).then((res) => res.json())
@@ -1148,11 +1162,25 @@ export default function App() {
     throw new Error(`Expected the scaffolded entry to import both tailwindcss and the show-ui theme, got ${JSON.stringify(shadcnStyles.slice(0, 90))}`)
   }
   const shadcnCss = await fetch(`${runtime.url}/sessions/shadcn/app/src/styles.css?direct`).then((res) => res.text())
-  if (!/\.bg-primary\s*\{[^}]*var\(--avs-primary\)[^}]*\}/.test(shadcnCss)) {
-    throw new Error("Expected .bg-primary generated from the @source'd components and mapped to hsl(var(--avs-primary)) (default parity + @theme registration)")
+  if (!/\.bg-primary\s*\{[^}]*var\(--primary\)[^}]*\}/.test(shadcnCss)) {
+    throw new Error("Expected .bg-primary to resolve through the standard --primary token")
   }
   if (!shadcnCss.includes(".bg-red-500")) {
     throw new Error("Expected the agent's .bg-red-500 override utility to be generated")
+  }
+  if (!shadcnCss.includes("--background:") || !shadcnCss.includes("--card:") || !shadcnCss.includes("--chart-5:") || !shadcnCss.includes("--sidebar-ring:")) {
+    throw new Error("Expected the complete standard shadcn token contract in served runtime CSS")
+  }
+  if (!shadcnCss.includes(".dark\\:bg-primary") || !shadcnCss.includes('[data-theme="dark"]')) {
+    throw new Error("Expected class and data-theme dark selectors in served runtime CSS")
+  }
+  if (!shadcnStyles.includes("background: var(--background)") || !shadcnStyles.includes("color: var(--foreground)")) {
+    throw new Error("Expected the scaffold to use standard tokens through native var() CSS")
+  }
+  const shadcnAppResponse = await fetch(`${runtime.url}/sessions/shadcn/app/src/App.tsx`)
+  const shadcnApp = await shadcnAppResponse.text()
+  if (!shadcnAppResponse.ok || (!shadcnApp.includes('from "/@id/@avibe/show-ui/theme"') && !shadcnApp.includes("ThemeProvider"))) {
+    throw new Error("Expected the ThemeProvider shadcn alias to resolve in the live runtime")
   }
 
   // (10) Legacy workspace (predates the theme import): a styles.css with only the Tailwind
