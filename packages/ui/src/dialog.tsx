@@ -1,12 +1,26 @@
 import * as React from "react"
 import * as DialogPrimitive from "@radix-ui/react-dialog"
 import { X } from "lucide-react"
+import { useThemeScope } from "./theme"
 import { cn } from "./utils"
 
 export const Dialog = DialogPrimitive.Root
 export const DialogTrigger = DialogPrimitive.Trigger
-export const DialogPortal = DialogPrimitive.Portal
 export const DialogClose = DialogPrimitive.Close
+
+/**
+ * Radix portals to `document.body` by default, which is outside the element
+ * `ThemeProvider` scopes presets and custom tokens to. Default the container to
+ * the active theme scope so overlays inherit the same palette as the page.
+ */
+export const DialogPortal = ({
+  container,
+  ...props
+}: React.ComponentPropsWithoutRef<typeof DialogPrimitive.Portal>) => {
+  const themeScope = useThemeScope()
+  return <DialogPrimitive.Portal {...props} container={container ?? themeScope ?? undefined} />
+}
+DialogPortal.displayName = "DialogPortal"
 
 export const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,

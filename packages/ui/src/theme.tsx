@@ -185,6 +185,19 @@ function toStyle(theme?: ShowTheme): React.CSSProperties {
   return style
 }
 
+const ThemeScopeContext = React.createContext<HTMLElement | null>(null)
+
+/**
+ * The element `ThemeProvider` applies the preset and inline theme tokens to.
+ *
+ * Overlay primitives portal into it instead of the document body: presets and
+ * custom themes are scoped to this element, so an overlay rendered outside it
+ * would silently fall back to the `:root` palette.
+ */
+export function useThemeScope(): HTMLElement | null {
+  return React.useContext(ThemeScopeContext)
+}
+
 export function ThemeProvider({
   preset,
   theme,
@@ -194,5 +207,12 @@ export function ThemeProvider({
   theme?: ShowTheme
   children: React.ReactNode
 }) {
-  return <div className="avs-theme" data-theme-preset={preset} style={toStyle(theme)}>{children}</div>
+  // State, not a ref: consumers have to re-render once the element exists, and
+  // mutating a ref does not schedule that render.
+  const [scope, setScope] = React.useState<HTMLDivElement | null>(null)
+  return (
+    <ThemeScopeContext.Provider value={scope}>
+      <div ref={setScope} className="avs-theme" data-theme-preset={preset} style={toStyle(theme)}>{children}</div>
+    </ThemeScopeContext.Provider>
+  )
 }

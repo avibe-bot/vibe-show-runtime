@@ -428,6 +428,9 @@ or override selected tokens:
 The theme implementation should write CSS variables onto a root element rather
 than requiring component source edits. This keeps per-page customization
 flexible and cheap, while keeping generated Tailwind class names predictable.
+Because the provider element is that root, overlay primitives default their
+portal container to it instead of the document body; otherwise a dialog would
+render outside the scope its own page theme lives in.
 
 ## Default Visualization Dependencies
 
