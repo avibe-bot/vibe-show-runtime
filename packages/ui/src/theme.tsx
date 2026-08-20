@@ -98,8 +98,66 @@ const legacyColorVars: Partial<Record<ThemeColor, string>> = {
   destructive: "--avs-destructive"
 }
 
-const LEGACY_HSL_CHANNELS = /^\s*-?(?:\d+(?:\.\d+)?|\.\d+)(?:deg|grad|rad|turn)?\s+-?(?:\d+(?:\.\d+)?|\.\d+)%\s+-?(?:\d+(?:\.\d+)?|\.\d+)%(?:\s*\/\s*(?:\d+(?:\.\d+)?|\.\d+)%?)?\s*$/i
-const LEGACY_COMMA_HSL_CHANNELS = /^\s*-?(?:\d+(?:\.\d+)?|\.\d+)(?:deg|grad|rad|turn)?\s*,\s*-?(?:\d+(?:\.\d+)?|\.\d+)%\s*,\s*-?(?:\d+(?:\.\d+)?|\.\d+)%(?:\s*,\s*(?:\d+(?:\.\d+)?|\.\d+)%?)?\s*$/i
+const legacyColorFanout: Partial<Record<ThemeColor, readonly ThemeColor[]>> = {
+  background: ["card", "popover"],
+  foreground: ["cardForeground", "popoverForeground", "secondaryForeground", "accentForeground"],
+  muted: ["secondary", "accent"],
+  border: ["input"]
+}
+
+function isLegacyHslChannels(value: string): boolean {
+  let components = 0
+  let depth = 0
+  let inComponent = false
+
+  const finishComponent = () => {
+    if (!inComponent) return
+    components += 1
+    inComponent = false
+  }
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]
+    if (character === "/" && value[index + 1] === "*") {
+      if (depth === 0) finishComponent()
+      const commentEnd = value.indexOf("*/", index + 2)
+      index = commentEnd === -1 ? value.length : commentEnd + 1
+      continue
+    }
+    if (character === '"' || character === "'") {
+      const quote = character
+      inComponent = true
+      while (index + 1 < value.length) {
+        index += 1
+        if (value[index] === "\\") index += 1
+        else if (value[index] === quote) break
+      }
+      continue
+    }
+    if (character === "(") {
+      depth += 1
+      inComponent = true
+      continue
+    }
+    if (character === ")") {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth === 0 && (character === "," || /\s/.test(character))) {
+      finishComponent()
+      continue
+    }
+    inComponent = true
+  }
+  finishComponent()
+
+  return components >= 3
+}
+
+function normalizeColor(value: string): { standard: string; legacyChannels: boolean } {
+  const legacyChannels = isLegacyHslChannels(value)
+  return { standard: legacyChannels ? `hsl(${value})` : value, legacyChannels }
+}
 
 function toStyle(theme?: ShowTheme): React.CSSProperties {
   const style = {} as React.CSSProperties & Record<string, string>
@@ -108,10 +166,18 @@ function toStyle(theme?: ShowTheme): React.CSSProperties {
     style["--radius"] = theme.radius
     style["--avs-radius"] = theme.radius
   }
+
+  for (const [key, aliases] of Object.entries(legacyColorFanout) as [ThemeColor, readonly ThemeColor[]][]) {
+    const value = theme.colors?.[key]
+    if (!value) continue
+    const { standard } = normalizeColor(value)
+    for (const alias of aliases) style[colorVars[alias]] = standard
+  }
+
   for (const [key, value] of Object.entries(theme.colors ?? {}) as [ThemeColor, string][]) {
     if (!value) continue
-    const legacyChannels = LEGACY_HSL_CHANNELS.test(value) || LEGACY_COMMA_HSL_CHANNELS.test(value)
-    style[colorVars[key]] = legacyChannels ? `hsl(${value})` : value
+    const { standard, legacyChannels } = normalizeColor(value)
+    style[colorVars[key]] = standard
     const legacyVar = legacyColorVars[key]
     if (legacyChannels && legacyVar) style[legacyVar] = value
   }

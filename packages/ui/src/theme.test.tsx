@@ -32,12 +32,42 @@ describe("ThemeProvider", () => {
     expect(markup).toContain("--avs-ring:199 89% 48%")
   })
 
-  it("normalizes legacy comma-separated HSL channels", () => {
+  it("normalizes legacy HSL channels by top-level CSS structure", () => {
     const markup = renderToStaticMarkup(
-      <ThemeProvider theme={{ colors: { primary: "221, 83%, 53%" } }}>content</ThemeProvider>
+      <ThemeProvider theme={{ colors: {
+        primary: "221, 83%, 53%",
+        ring: "var(--h)/**/var(--s)/**/var(--l)",
+        success: "+158 64% 24%",
+        warning: "3.2e1 95% 44%",
+        destructive: "calc(360 - 360) 84% 60%"
+      } }}>content</ThemeProvider>
     )
     expect(markup).toContain("--primary:hsl(221, 83%, 53%)")
     expect(markup).toContain("--avs-primary:221, 83%, 53%")
+    expect(markup).toContain("--ring:hsl(var(--h)/**/var(--s)/**/var(--l))")
+    expect(markup).toContain("--success:hsl(+158 64% 24%)")
+    expect(markup).toContain("--warning:hsl(3.2e1 95% 44%)")
+    expect(markup).toContain("--destructive:hsl(calc(360 - 360) 84% 60%)")
+  })
+
+  it("preserves legacy semantic fan-out while explicit standard tokens win", () => {
+    const markup = renderToStaticMarkup(
+      <ThemeProvider theme={{ colors: {
+        background: "0 0% 0%",
+        foreground: "0 0% 100%",
+        muted: "210 40% 96%",
+        border: "214 32% 91%",
+        card: "oklch(0.2 0 0)",
+        input: "#334455"
+      } }}>content</ThemeProvider>
+    )
+    expect(markup).toContain("--background:hsl(0 0% 0%)")
+    expect(markup).toContain("--popover:hsl(0 0% 0%)")
+    expect(markup).toContain("--card:oklch(0.2 0 0)")
+    expect(markup).toContain("--card-foreground:hsl(0 0% 100%)")
+    expect(markup).toContain("--secondary:hsl(210 40% 96%)")
+    expect(markup).toContain("--accent:hsl(210 40% 96%)")
+    expect(markup).toContain("--input:#334455")
   })
 
   it("delegates presets to dark-aware CSS instead of inline light colors", () => {
