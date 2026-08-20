@@ -20,18 +20,21 @@ async function workspaceWithStyles(styles: string): Promise<string> {
 }
 
 describe("theme import ordering", () => {
-  it("moves the theme directly after Tailwind and ahead of workspace overrides", async () => {
-    const workspace = await workspaceWithStyles(`@import "tailwindcss";
-@import "./brand.css";
-@import "@avibe/show-ui/theme.css";
-.page { color: var(--foreground); }
-`)
+  it.each([
+    ["both imports", `@import "./brand.css";\n@import "@avibe/show-ui/theme.css";\n@import "tailwindcss";\n`],
+    ["only Tailwind", `@import "./brand.css";\n@import "tailwindcss";\n`],
+    ["only the theme", `@import "./brand.css";\n@import "@avibe/show-ui/theme.css";\n`],
+    ["neither import", `@import "./brand.css";\n`]
+  ])("normalizes %s into one canonical prefix", async (_label, imports) => {
+    const workspace = await workspaceWithStyles(`${imports}.page { color: var(--foreground); }\n`)
 
     await ensureSessionTemplate(workspace)
     const path = join(workspace, "src", "styles.css")
     const migrated = await readFile(path, "utf8")
-    expect(migrated.indexOf('@import "tailwindcss";')).toBeLessThan(migrated.indexOf('@import "@avibe/show-ui/theme.css";'))
+    expect(migrated.startsWith('@import "tailwindcss";\n@import "@avibe/show-ui/theme.css";\n')).toBe(true)
     expect(migrated.indexOf('@import "@avibe/show-ui/theme.css";')).toBeLessThan(migrated.indexOf('@import "./brand.css";'))
+    expect(migrated.match(/@import "tailwindcss";/g)).toHaveLength(1)
+    expect(migrated.match(/@import "@avibe\/show-ui\/theme\.css";/g)).toHaveLength(1)
 
     await ensureSessionTemplate(workspace)
     expect(await readFile(path, "utf8")).toBe(migrated)

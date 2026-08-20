@@ -67,53 +67,47 @@ async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return
     throw error
   }
-  const theme = themeImport(uiPackageName)
   const imports = topLevelImports(contents)
   if (!imports) return
-  const tailwind = imports.find((statement) => statement.specifier === "tailwindcss")
-  const themeStatement = imports.find((statement) => statement.specifier === `${uiPackageName}/theme.css`)
-  const hasTailwind = Boolean(tailwind)
-  const hasTheme = Boolean(themeStatement)
-  if (hasTailwind && hasTheme) {
-    const ordered = orderThemeAfterTailwind(contents, tailwind!, themeStatement!, imports)
-    if (ordered !== contents) await writeFile(path, ordered, "utf8")
-    return
-  }
-  if (!hasTailwind) {
-    // No Tailwind entry yet: prepend it (plus the theme, unless the theme is already there)
-    // as the leading statement(s), after any `@charset`/BOM.
-    const block = hasTheme ? TAILWIND_IMPORT : `${TAILWIND_IMPORT}\n${theme}`
-    contents = prependImports(contents, block)
-  } else {
-    // Tailwind entry present but the theme is missing: insert it right after the import.
-    contents = insertAfterImport(contents, tailwind!, theme)
-  }
-  await writeFile(path, contents, "utf8")
+  const normalized = normalizeEntryImports(contents, imports, uiPackageName)
+  if (normalized !== contents) await writeFile(path, normalized, "utf8")
 }
 
-function orderThemeAfterTailwind(
+function normalizeEntryImports(
   contents: string,
-  tailwind: ImportStatement,
-  theme: ImportStatement,
-  imports: ImportStatement[]
+  imports: ImportStatement[],
+  uiPackageName: string
 ): string {
-  const tailwindIndex = imports.indexOf(tailwind)
-  if (imports[tailwindIndex + 1] === theme) return contents
-  const statement = contents.slice(theme.start, theme.endExclusive)
-  const removedLength = theme.endExclusive - theme.start
-  const withoutTheme = `${contents.slice(0, theme.start)}${contents.slice(theme.endExclusive)}`
-  return insertAfterImport(
-    withoutTheme,
-    {
-      ...tailwind,
-      endExclusive: tailwind.endExclusive - (theme.start < tailwind.start ? removedLength : 0)
-    },
-    statement
+  const themeSpecifier = `${uiPackageName}/theme.css`
+  const tailwindImports = imports.filter((statement) => statement.specifier === "tailwindcss")
+  const themeImports = imports.filter((statement) => statement.specifier === themeSpecifier)
+  const tailwindStatement = tailwindImports[0]
+    ? contents.slice(tailwindImports[0].start, tailwindImports[0].endExclusive)
+    : TAILWIND_IMPORT
+  const themeStatement = themeImports[0]
+    ? contents.slice(themeImports[0].start, themeImports[0].endExclusive)
+    : themeImport(uiPackageName)
+
+  let remainder = contents
+  const removed = [...tailwindImports, ...themeImports].sort((left, right) => right.start - left.start)
+  for (const statement of removed) {
+    remainder = `${remainder.slice(0, statement.start)}${remainder.slice(statement.endExclusive)}`
+  }
+  remainder = normalizeLeadingImportGap(remainder)
+  return prependImports(
+    remainder,
+    `${tailwindStatement}\n${themeStatement}`
   )
 }
 
-function insertAfterImport(contents: string, statement: ImportStatement, inserted: string): string {
-  return `${contents.slice(0, statement.endExclusive)}\n${inserted}${contents.slice(statement.endExclusive)}`
+function normalizeLeadingImportGap(contents: string): string {
+  const bom = contents.startsWith(BOM) ? BOM : ""
+  const body = bom ? contents.slice(1) : contents
+  const charset = LEADING_CHARSET_PATTERN.exec(body)
+  if (charset) {
+    return `${bom}${charset[0].trimEnd()}\n${body.slice(charset[0].length).replace(/^[ \t\r\n]+/, "")}`
+  }
+  return `${bom}${body.replace(/^[ \t\r\n]+/, "")}`
 }
 
 type ImportStatement = { start: number; endExclusive: number; specifier: string }
