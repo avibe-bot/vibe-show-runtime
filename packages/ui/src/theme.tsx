@@ -170,7 +170,8 @@ function toStyle(theme?: ShowTheme): React.CSSProperties {
   for (const [key, aliases] of Object.entries(legacyColorFanout) as [ThemeColor, readonly ThemeColor[]][]) {
     const value = theme.colors?.[key]
     if (!value) continue
-    const { standard } = normalizeColor(value)
+    const { standard, legacyChannels } = normalizeColor(value)
+    if (!legacyChannels) continue
     for (const alias of aliases) style[colorVars[alias]] = standard
   }
 

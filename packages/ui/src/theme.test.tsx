@@ -13,13 +13,16 @@ describe("ThemeProvider", () => {
 
   it("writes complete CSS colors to the standard shadcn variables", () => {
     const markup = renderToStaticMarkup(
-      <ThemeProvider theme={{ radius: "0.75rem", colors: { primary: "oklch(0.62 0.19 255)", cardForeground: "#102030" } }}>
+      <ThemeProvider theme={{ radius: "0.75rem", colors: { background: "oklch(1 0 0)", primary: "oklch(0.62 0.19 255)", cardForeground: "#102030" } }}>
         content
       </ThemeProvider>
     )
     expect(markup).toContain("--radius:0.75rem")
+    expect(markup).toContain("--background:oklch(1 0 0)")
     expect(markup).toContain("--primary:oklch(0.62 0.19 255)")
     expect(markup).toContain("--card-foreground:#102030")
+    expect(markup).not.toContain("--card:oklch(1 0 0)")
+    expect(markup).not.toContain("--popover:oklch(1 0 0)")
   })
 
   it("normalizes literal HSL channels while preserving complete color references", () => {
