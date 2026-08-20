@@ -78,4 +78,17 @@ describe("theme import ordering", () => {
     await ensureSessionTemplate(workspace)
     expect(await readFile(path, "utf8")).toBe(migrated)
   })
+
+  it("recognizes comments around managed import specifiers", async () => {
+    const workspace = await workspaceWithStyles(`@import /* managed */ "@avibe/show-ui/theme.css";
+@import "./brand.css";
+@import "tailwindcss"/* managed */;
+`)
+
+    await ensureSessionTemplate(workspace)
+    const migrated = await readFile(join(workspace, "src", "styles.css"), "utf8")
+    expect(migrated.startsWith('@import "tailwindcss";\n@import "@avibe/show-ui/theme.css";\n@import "./brand.css";')).toBe(true)
+    expect(migrated.match(/@import "tailwindcss"/g)).toHaveLength(1)
+    expect(migrated.match(/@import "@avibe\/show-ui\/theme\.css"/g)).toHaveLength(1)
+  })
 })

@@ -32,6 +32,14 @@ describe("ThemeProvider", () => {
     expect(markup).toContain("--avs-ring:199 89% 48%")
   })
 
+  it("normalizes legacy comma-separated HSL channels", () => {
+    const markup = renderToStaticMarkup(
+      <ThemeProvider theme={{ colors: { primary: "221, 83%, 53%" } }}>content</ThemeProvider>
+    )
+    expect(markup).toContain("--primary:hsl(221, 83%, 53%)")
+    expect(markup).toContain("--avs-primary:221, 83%, 53%")
+  })
+
   it("delegates presets to dark-aware CSS instead of inline light colors", () => {
     const markup = renderToStaticMarkup(<ThemeProvider preset="zinc">content</ThemeProvider>)
     expect(markup).toContain('data-theme-preset="zinc"')
@@ -61,8 +69,6 @@ describe("theme.css", () => {
 
   it("supports dark utilities on theme roots and dark-aware presets", () => {
     expect(css).toContain('@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *))')
-    expect(css).toContain('.avs-theme.dark[data-theme-preset="zinc"],')
-    expect(css).toContain('.avs-theme[data-theme="dark"][data-theme-preset="blue"],')
     expect(css).toContain('.dark .avs-theme[data-theme-preset="zinc"],')
     expect(css).toContain('[data-theme="dark"] .avs-theme[data-theme-preset="blue"]')
   })

@@ -98,7 +98,8 @@ const legacyColorVars: Partial<Record<ThemeColor, string>> = {
   destructive: "--avs-destructive"
 }
 
-const LEGACY_HSL_CHANNELS = /^\s*-?(?:\d+(?:\.\d+)?|\.\d+)(?:deg|grad|rad|turn)?\s+-?(?:\d+(?:\.\d+)?|\.\d+)%\s+-?(?:\d+(?:\.\d+)?|\.\d+)%(?:\s*\/\s*(?:\d+(?:\.\d+)?|\.\d+)%?)?\s*$/
+const LEGACY_HSL_CHANNELS = /^\s*-?(?:\d+(?:\.\d+)?|\.\d+)(?:deg|grad|rad|turn)?\s+-?(?:\d+(?:\.\d+)?|\.\d+)%\s+-?(?:\d+(?:\.\d+)?|\.\d+)%(?:\s*\/\s*(?:\d+(?:\.\d+)?|\.\d+)%?)?\s*$/i
+const LEGACY_COMMA_HSL_CHANNELS = /^\s*-?(?:\d+(?:\.\d+)?|\.\d+)(?:deg|grad|rad|turn)?\s*,\s*-?(?:\d+(?:\.\d+)?|\.\d+)%\s*,\s*-?(?:\d+(?:\.\d+)?|\.\d+)%(?:\s*,\s*(?:\d+(?:\.\d+)?|\.\d+)%?)?\s*$/i
 
 function toStyle(theme?: ShowTheme): React.CSSProperties {
   const style = {} as React.CSSProperties & Record<string, string>
@@ -109,7 +110,7 @@ function toStyle(theme?: ShowTheme): React.CSSProperties {
   }
   for (const [key, value] of Object.entries(theme.colors ?? {}) as [ThemeColor, string][]) {
     if (!value) continue
-    const legacyChannels = LEGACY_HSL_CHANNELS.test(value)
+    const legacyChannels = LEGACY_HSL_CHANNELS.test(value) || LEGACY_COMMA_HSL_CHANNELS.test(value)
     style[colorVars[key]] = legacyChannels ? `hsl(${value})` : value
     const legacyVar = legacyColorVars[key]
     if (legacyChannels && legacyVar) style[legacyVar] = value

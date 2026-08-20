@@ -194,8 +194,6 @@
   --avs-ring: 221 83% 63%;
 }
 
-.avs-theme.dark[data-theme-preset="zinc"],
-.avs-theme[data-theme="dark"][data-theme-preset="zinc"],
 .dark .avs-theme[data-theme-preset="zinc"],
 [data-theme="dark"] .avs-theme[data-theme-preset="zinc"] {
   --primary: hsl(0 0% 98%);
@@ -204,8 +202,6 @@
   --avs-ring: 240 5% 64%;
 }
 
-.avs-theme.dark[data-theme-preset="slate"],
-.avs-theme[data-theme="dark"][data-theme-preset="slate"],
 .dark .avs-theme[data-theme-preset="slate"],
 [data-theme="dark"] .avs-theme[data-theme-preset="slate"] {
   --primary: hsl(210 40% 98%);
@@ -214,8 +210,6 @@
   --avs-ring: 215 20% 65%;
 }
 
-.avs-theme.dark[data-theme-preset="green"],
-.avs-theme[data-theme="dark"][data-theme-preset="green"],
 .dark .avs-theme[data-theme-preset="green"],
 [data-theme="dark"] .avs-theme[data-theme-preset="green"] {
   --primary: hsl(158 64% 52%);
@@ -224,8 +218,6 @@
   --avs-ring: 158 64% 52%;
 }
 
-.avs-theme.dark[data-theme-preset="blue"],
-.avs-theme[data-theme="dark"][data-theme-preset="blue"],
 .dark .avs-theme[data-theme-preset="blue"],
 [data-theme="dark"] .avs-theme[data-theme-preset="blue"] {
   --primary: hsl(221 83% 63%);
