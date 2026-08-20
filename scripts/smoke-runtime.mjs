@@ -1085,8 +1085,10 @@ export default function App() {
     throw new Error(`Expected commented-import session to warm active, got ${JSON.stringify(commentedEnsure)}`)
   }
   const commentedStyles = await readFile(join(root, "tailwind-commented", "src", "styles.css"), "utf8")
-  if (!commentedStyles.startsWith(`@import "tailwindcss";`)) {
-    throw new Error(`Expected a real Tailwind import prepended over a commented-out one, got ${JSON.stringify(commentedStyles.slice(0, 60))}`)
+  const commentedTailwind = commentedStyles.indexOf(`@import "tailwindcss";`, commentedStyles.indexOf("*/") + 2)
+  const commentedTheme = commentedStyles.indexOf(`@import "@avibe/show-ui/theme.css";`)
+  if (commentedTailwind < 0 || commentedTheme < commentedTailwind) {
+    throw new Error(`Expected real managed imports after the preserved comment, got ${JSON.stringify(commentedStyles.slice(0, 100))}`)
   }
   const commentedCss = await fetch(`${runtime.url}/sessions/tailwind-commented/app/src/styles.css?direct`).then((res) => res.text())
   if (!commentedCss.includes(".p-5")) {
@@ -1207,8 +1209,11 @@ export default function App() {
   // already-present theme import instead of returning early merely because both exist.
   await mkdir(join(root, "shadcn-overrides", "src"), { recursive: true })
   await writeFile(join(root, "shadcn-overrides", "src", "brand.css"), ":root { --background: #123456; }\n")
-  await writeFile(join(root, "shadcn-overrides", "src", "styles.css"), `@import "tailwindcss";
+  await writeFile(join(root, "shadcn-overrides", "src", "styles.css"), `@layer theme, overrides;
+@import "tailwindcss" print;
 @import "./brand.css";
+@import "@avibe/show-ui/theme.css" screen;
+@import "tailwindcss";
 @import "@avibe/show-ui/theme.css";
 `)
   await writeFile(join(root, "shadcn-overrides", "src", "App.tsx"), `export default function App() {
@@ -1220,11 +1225,15 @@ export default function App() {
     throw new Error(`Expected ordered-override session to warm active, got ${JSON.stringify(shadcnOverridesEnsure)}`)
   }
   const orderedStyles = await readFile(join(root, "shadcn-overrides", "src", "styles.css"), "utf8")
+  const orderedLayers = orderedStyles.indexOf("@layer theme, overrides;")
   const orderedTailwind = orderedStyles.indexOf('@import "tailwindcss";')
   const orderedTheme = orderedStyles.indexOf('@import "@avibe/show-ui/theme.css";')
   const orderedBrand = orderedStyles.indexOf('@import "./brand.css";')
-  if (!(orderedTailwind < orderedTheme && orderedTheme < orderedBrand)) {
-    throw new Error(`Expected Tailwind, theme, then workspace override imports, got ${JSON.stringify(orderedStyles)}`)
+  if (!(orderedLayers < orderedTailwind && orderedTailwind < orderedTheme && orderedTheme < orderedBrand)) {
+    throw new Error(`Expected layer order, Tailwind, theme, then workspace override imports, got ${JSON.stringify(orderedStyles)}`)
+  }
+  if ((orderedStyles.match(/@import "tailwindcss"/g) || []).length !== 1 || (orderedStyles.match(/@import "@avibe\/show-ui\/theme\.css"/g) || []).length !== 1) {
+    throw new Error(`Expected one unconditional managed import for Tailwind and the theme, got ${JSON.stringify(orderedStyles)}`)
   }
   const orderedCss = await fetch(`${runtime.url}/sessions/shadcn-overrides/app/src/styles.css?direct`).then((res) => res.text())
   if (!orderedCss.includes("--background: #123456")) {

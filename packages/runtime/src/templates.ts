@@ -11,11 +11,6 @@ const TAILWIND_IMPORT = `@import "tailwindcss";`
 // configured `uiPackageName` (the alias/vendor/extras paths use the same name), so a custom
 // UI package resolves instead of a hardcoded `@avibe/show-ui`.
 const themeImport = (uiPackageName: string) => `@import "${uiPackageName}/theme.css";`
-// A leading `@charset "...";` is the only statement allowed before `@import`. Match only
-// through the `;` (plus trailing spaces/one line ending) so rules sharing the line — e.g.
-// minified `@charset "utf-8";body{...}` — are NOT swallowed, which would push the import
-// after them and make it invalid.
-const LEADING_CHARSET_PATTERN = /^@charset\s+["'][^"']*["'];[ \t]*\r?\n?/i
 // UTF-8 byte order mark, preserved at position 0 when re-emitting an existing file.
 const BOM = "\ufeff"
 
@@ -54,10 +49,10 @@ async function fileExists(path: string) {
 /**
  * Keep the workspace Tailwind entry importing BOTH `tailwindcss` and the `@avibe/show-ui`
  * theme, in that order. New workspaces already lead with both (see stylesCss); this is the
- * idempotent, HMR-safe migration for workspaces whose `src/styles.css` predates them. It adds
- * whichever import is missing and keeps the theme immediately after Tailwind, ahead of
- * workspace imports that intentionally override its defaults. Runs on every warm before the
- * Vite server is created.
+ * idempotent, HMR-safe migration for workspaces whose `src/styles.css` predates them. The two
+ * Runtime-owned imports are unique and unconditional; BOM, charset, comments, and layer-order
+ * statements remain ahead of them, while workspace imports follow so they can override theme
+ * defaults. Runs on every warm before the Vite server is created.
  */
 async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_UI_PACKAGE) {
   let contents: string
@@ -67,47 +62,48 @@ async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return
     throw error
   }
-  const imports = topLevelImports(contents)
-  if (!imports) return
-  const normalized = normalizeEntryImports(contents, imports, uiPackageName)
+  const normalized = normalizeEntryImports(contents, uiPackageName)
+  if (normalized == null) return
   if (normalized !== contents) await writeFile(path, normalized, "utf8")
 }
 
 function normalizeEntryImports(
   contents: string,
-  imports: ImportStatement[],
   uiPackageName: string
-): string {
+): string | null {
+  const bom = contents.startsWith(BOM) ? BOM : ""
+  const body = bom ? contents.slice(1) : contents
+  const imports = topLevelImports(body)
+  if (!imports) return null
   const themeSpecifier = `${uiPackageName}/theme.css`
   const tailwindImports = imports.filter((statement) => statement.specifier === "tailwindcss")
   const themeImports = imports.filter((statement) => statement.specifier === themeSpecifier)
-  const tailwindStatement = tailwindImports[0]
-    ? contents.slice(tailwindImports[0].start, tailwindImports[0].endExclusive)
-    : TAILWIND_IMPORT
-  const themeStatement = themeImports[0]
-    ? contents.slice(themeImports[0].start, themeImports[0].endExclusive)
-    : themeImport(uiPackageName)
-
-  let remainder = contents
+  let remainder = body
   const removed = [...tailwindImports, ...themeImports].sort((left, right) => right.start - left.start)
   for (const statement of removed) {
     remainder = `${remainder.slice(0, statement.start)}${remainder.slice(statement.endExclusive)}`
   }
-  remainder = normalizeLeadingImportGap(remainder)
-  return prependImports(
-    remainder,
-    `${tailwindStatement}\n${themeStatement}`
-  )
-}
 
-function normalizeLeadingImportGap(contents: string): string {
-  const bom = contents.startsWith(BOM) ? BOM : ""
-  const body = bom ? contents.slice(1) : contents
-  const charset = LEADING_CHARSET_PATTERN.exec(body)
-  if (charset) {
-    return `${bom}${charset[0].trimEnd()}\n${body.slice(charset[0].length).replace(/^[ \t\r\n]+/, "")}`
+  let remainderRoot: postcss.Root
+  try {
+    remainderRoot = postcss.parse(remainder)
+  } catch {
+    return null
   }
-  return `${bom}${body.replace(/^[ \t\r\n]+/, "")}`
+  let insertionOffset = 0
+  for (const node of remainderRoot.nodes) {
+    const leadingStatement =
+      node.type === "comment" ||
+      (node.type === "atrule" && node.name.toLowerCase() === "charset") ||
+      (node.type === "atrule" && node.name.toLowerCase() === "layer" && node.nodes == null)
+    if (!leadingStatement) break
+    insertionOffset = node.source?.end?.offset ?? insertionOffset
+  }
+
+  const prefix = remainder.slice(0, insertionOffset).replace(/[ \t\r\n]+$/, "")
+  const rest = remainder.slice(insertionOffset).replace(/^[ \t\r\n]+/, "")
+  const managedImports = `${TAILWIND_IMPORT}\n${themeImport(uiPackageName)}`
+  return `${bom}${prefix}${prefix ? "\n" : ""}${managedImports}${rest ? `\n${rest}` : "\n"}`
 }
 
 type ImportStatement = { start: number; endExclusive: number; specifier: string }
@@ -136,21 +132,6 @@ function importSpecifier(params: string): string | null {
   if (quoted) return quoted[2]
   const url = /^url\(\s*(["']?)(.*?)\1\s*\)(?:\s|$)/is.exec(params.trim())
   return url?.[2] ?? null
-}
-
-/**
- * Insert a leading `@import` block as the first CSS statement(s). `@import` must precede
- * every rule except a leading `@charset`, so when the file opens with one (after an optional
- * BOM) the block is placed right after it; otherwise it goes at the very top.
- */
-function prependImports(contents: string, block: string): string {
-  const bom = contents.startsWith(BOM) ? BOM : ""
-  const body = bom ? contents.slice(1) : contents
-  const charset = LEADING_CHARSET_PATTERN.exec(body)
-  if (charset) {
-    return `${bom}${charset[0]}${block}\n${body.slice(charset[0].length)}`
-  }
-  return `${bom}${block}\n${body}`
 }
 
 async function writeIfMissing(path: string, contents: string) {

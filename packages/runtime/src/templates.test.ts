@@ -47,7 +47,35 @@ describe("theme import ordering", () => {
 
     await ensureSessionTemplate(workspace)
     const migrated = await readFile(join(workspace, "src", "styles.css"), "utf8")
-    expect(migrated.startsWith('@import "tailwindcss";\n@import "@avibe/show-ui/theme.css";')).toBe(true)
+    expect(migrated.indexOf("/* @import")).toBeLessThan(migrated.indexOf('@import "tailwindcss";'))
+    expect(migrated).toContain('@import "tailwindcss";\n@import "@avibe/show-ui/theme.css";')
     expect(migrated).toContain(`content: '@import "tailwindcss";'`)
+  })
+
+  it("preserves leading layer order and replaces qualified duplicates with managed imports", async () => {
+    const workspace = await workspaceWithStyles(`@charset "utf-8";
+/* layer contract */
+@layer theme, overrides;
+@import "tailwindcss" print;
+@import "./brand.css";
+@import "@avibe/show-ui/theme.css" screen;
+@import "tailwindcss";
+@import "@avibe/show-ui/theme.css";
+`)
+
+    await ensureSessionTemplate(workspace)
+    const path = join(workspace, "src", "styles.css")
+    const migrated = await readFile(path, "utf8")
+    expect(migrated.startsWith(`@charset "utf-8";
+/* layer contract */
+@layer theme, overrides;
+@import "tailwindcss";
+@import "@avibe/show-ui/theme.css";
+@import "./brand.css";`)).toBe(true)
+    expect(migrated.match(/@import "tailwindcss"/g)).toHaveLength(1)
+    expect(migrated.match(/@import "@avibe\/show-ui\/theme\.css"/g)).toHaveLength(1)
+
+    await ensureSessionTemplate(workspace)
+    expect(await readFile(path, "utf8")).toBe(migrated)
   })
 })
