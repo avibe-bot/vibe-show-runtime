@@ -1203,6 +1203,34 @@ export default function App() {
     throw new Error("Expected component utilities to generate in a migrated legacy workspace (theme import + @source)")
   }
 
+  // (11) Existing workspace overrides must remain after the Show UI defaults. Reorder an
+  // already-present theme import instead of returning early merely because both exist.
+  await mkdir(join(root, "shadcn-overrides", "src"), { recursive: true })
+  await writeFile(join(root, "shadcn-overrides", "src", "brand.css"), ":root { --background: #123456; }\n")
+  await writeFile(join(root, "shadcn-overrides", "src", "styles.css"), `@import "tailwindcss";
+@import "./brand.css";
+@import "@avibe/show-ui/theme.css";
+`)
+  await writeFile(join(root, "shadcn-overrides", "src", "App.tsx"), `export default function App() {
+  return <main className="bg-background">overrides</main>
+}
+`)
+  const shadcnOverridesEnsure = await fetch(`${runtime.url}/sessions/shadcn-overrides/ensure`, { method: "POST" }).then((res) => res.json())
+  if (shadcnOverridesEnsure.state !== "active") {
+    throw new Error(`Expected ordered-override session to warm active, got ${JSON.stringify(shadcnOverridesEnsure)}`)
+  }
+  const orderedStyles = await readFile(join(root, "shadcn-overrides", "src", "styles.css"), "utf8")
+  const orderedTailwind = orderedStyles.indexOf('@import "tailwindcss";')
+  const orderedTheme = orderedStyles.indexOf('@import "@avibe/show-ui/theme.css";')
+  const orderedBrand = orderedStyles.indexOf('@import "./brand.css";')
+  if (!(orderedTailwind < orderedTheme && orderedTheme < orderedBrand)) {
+    throw new Error(`Expected Tailwind, theme, then workspace override imports, got ${JSON.stringify(orderedStyles)}`)
+  }
+  const orderedCss = await fetch(`${runtime.url}/sessions/shadcn-overrides/app/src/styles.css?direct`).then((res) => res.text())
+  if (!orderedCss.includes("--background: #123456")) {
+    throw new Error("Expected the served CSS to preserve the workspace standard-token override")
+  }
+
   console.log("smoke runtime ok")
 } finally {
   await runtime.close()

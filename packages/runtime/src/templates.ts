@@ -1,10 +1,9 @@
 import { access, mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
+import postcss from "postcss"
 
 const DEFAULT_UI_PACKAGE = "@avibe/show-ui"
 const TAILWIND_IMPORT = `@import "tailwindcss";`
-// Matches an existing Tailwind entry in any quote/spacing form so migration never double-imports.
-const TAILWIND_IMPORT_PATTERN = /@import\s+["']tailwindcss["']/
 // The UI theme entry (`<uiPackageName>/theme.css`). It MUST be imported into this Tailwind
 // entry (not merely as a main.tsx side effect) so its `@theme` tokens register in this
 // compilation and its `@source` makes the shadcn component utility classes get generated. It
@@ -12,11 +11,6 @@ const TAILWIND_IMPORT_PATTERN = /@import\s+["']tailwindcss["']/
 // configured `uiPackageName` (the alias/vendor/extras paths use the same name), so a custom
 // UI package resolves instead of a hardcoded `@avibe/show-ui`.
 const themeImport = (uiPackageName: string) => `@import "${uiPackageName}/theme.css";`
-const themeImportPattern = (uiPackageName: string) =>
-  new RegExp(`@import\\s+["']${escapeRegExp(uiPackageName)}/theme\\.css["']`)
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-}
 // A leading `@charset "...";` is the only statement allowed before `@import`. Match only
 // through the `;` (plus trailing spaces/one line ending) so rules sharing the line — e.g.
 // minified `@charset "utf-8";body{...}` — are NOT swallowed, which would push the import
@@ -60,12 +54,10 @@ async function fileExists(path: string) {
 /**
  * Keep the workspace Tailwind entry importing BOTH `tailwindcss` and the `@avibe/show-ui`
  * theme, in that order. New workspaces already lead with both (see stylesCss); this is the
- * idempotent, HMR-safe migration for workspaces whose `src/styles.css` predates them — it
- * adds whichever import is missing and skips (no write) when both are present. Runs on every
- * warm before the Vite server is created.
- *
- * Detection runs against a comment-stripped copy so a commented-out import is not mistaken
- * for a real one (which would skip migration and leave the page unstyled).
+ * idempotent, HMR-safe migration for workspaces whose `src/styles.css` predates them. It adds
+ * whichever import is missing and keeps the theme immediately after Tailwind, ahead of
+ * workspace imports that intentionally override its defaults. Runs on every warm before the
+ * Vite server is created.
  */
 async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_UI_PACKAGE) {
   let contents: string
@@ -76,10 +68,17 @@ async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_
     throw error
   }
   const theme = themeImport(uiPackageName)
-  const scanned = maskCssComments(contents)
-  const hasTailwind = TAILWIND_IMPORT_PATTERN.test(scanned)
-  const hasTheme = themeImportPattern(uiPackageName).test(scanned)
-  if (hasTailwind && hasTheme) return
+  const imports = topLevelImports(contents)
+  if (!imports) return
+  const tailwind = imports.find((statement) => statement.specifier === "tailwindcss")
+  const themeStatement = imports.find((statement) => statement.specifier === `${uiPackageName}/theme.css`)
+  const hasTailwind = Boolean(tailwind)
+  const hasTheme = Boolean(themeStatement)
+  if (hasTailwind && hasTheme) {
+    const ordered = orderThemeAfterTailwind(contents, tailwind!, themeStatement!, imports)
+    if (ordered !== contents) await writeFile(path, ordered, "utf8")
+    return
+  }
   if (!hasTailwind) {
     // No Tailwind entry yet: prepend it (plus the theme, unless the theme is already there)
     // as the leading statement(s), after any `@charset`/BOM.
@@ -87,30 +86,62 @@ async function ensureEntryImports(path: string, uiPackageName: string = DEFAULT_
     contents = prependImports(contents, block)
   } else {
     // Tailwind entry present but the theme is missing: insert it right after the import.
-    contents = insertThemeAfterTailwind(contents, theme)
+    contents = insertAfterImport(contents, tailwind!, theme)
   }
   await writeFile(path, contents, "utf8")
 }
 
-/**
- * Insert the theme import immediately after the FIRST REAL (non-commented) `@import
- * "tailwindcss";` statement. The match runs on the comment-masked copy so a commented-out
- * import is skipped; the masking is length-preserving, so the offset maps back to `contents`.
- */
-function insertThemeAfterTailwind(contents: string, theme: string): string {
-  const match = /@import\s+["']tailwindcss["'][^;]*;/.exec(maskCssComments(contents))
-  if (!match) return contents
-  const end = match.index + match[0].length
-  return `${contents.slice(0, end)}\n${theme}${contents.slice(end)}`
+function orderThemeAfterTailwind(
+  contents: string,
+  tailwind: ImportStatement,
+  theme: ImportStatement,
+  imports: ImportStatement[]
+): string {
+  const tailwindIndex = imports.indexOf(tailwind)
+  if (imports[tailwindIndex + 1] === theme) return contents
+  const statement = contents.slice(theme.start, theme.endExclusive)
+  const removedLength = theme.endExclusive - theme.start
+  const withoutTheme = `${contents.slice(0, theme.start)}${contents.slice(theme.endExclusive)}`
+  return insertAfterImport(
+    withoutTheme,
+    {
+      ...tailwind,
+      endExclusive: tailwind.endExclusive - (theme.start < tailwind.start ? removedLength : 0)
+    },
+    statement
+  )
 }
 
-/** Strip CSS block comments (used only for import detection, not for the emitted file). */
-// Blank out CSS block comments with EQUAL-LENGTH whitespace (not removal) so a match index
-// in the masked copy maps to the same offset in the source. Used both to detect real imports
-// and to locate where to insert after them — a commented-out import must never count or be
-// targeted (that would push a real import inside the comment and re-inject every warm).
-function maskCssComments(css: string): string {
-  return css.replace(/\/\*[\s\S]*?\*\//g, (match) => " ".repeat(match.length))
+function insertAfterImport(contents: string, statement: ImportStatement, inserted: string): string {
+  return `${contents.slice(0, statement.endExclusive)}\n${inserted}${contents.slice(statement.endExclusive)}`
+}
+
+type ImportStatement = { start: number; endExclusive: number; specifier: string }
+
+function topLevelImports(contents: string): ImportStatement[] | null {
+  let root: postcss.Root
+  try {
+    root = postcss.parse(contents)
+  } catch {
+    return null
+  }
+  const imports: ImportStatement[] = []
+  for (const node of root.nodes) {
+    if (node.type !== "atrule" || node.name.toLowerCase() !== "import") continue
+    const specifier = importSpecifier(node.params)
+    const start = node.source?.start?.offset
+    const endExclusive = node.source?.end?.offset
+    if (specifier == null || start == null || endExclusive == null) continue
+    imports.push({ start, endExclusive, specifier })
+  }
+  return imports
+}
+
+function importSpecifier(params: string): string | null {
+  const quoted = /^(["'])(.*?)\1(?:\s|$)/s.exec(params.trim())
+  if (quoted) return quoted[2]
+  const url = /^url\(\s*(["']?)(.*?)\1\s*\)(?:\s|$)/is.exec(params.trim())
+  return url?.[2] ?? null
 }
 
 /**
