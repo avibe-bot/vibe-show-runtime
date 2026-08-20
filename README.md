@@ -146,6 +146,11 @@ export default function App() {
 }
 ```
 
+Because the provider scopes those variables to its own element, overlays that
+would otherwise portal to the document body render inside the nearest provider
+instead, so a dialog carries the same preset and inline tokens as the page. Pass
+an explicit `container` to opt out.
+
 ## Examples
 
 ```bash

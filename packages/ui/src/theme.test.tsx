@@ -1,5 +1,5 @@
 import * as React from "react"
-import { readFileSync } from "node:fs"
+import { readdirSync, readFileSync } from "node:fs"
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
 import { ThemeProvider } from "./theme"
@@ -110,5 +110,56 @@ describe("theme.css", () => {
     expect(css).toContain('@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *))')
     expect(css).toContain('.dark .avs-theme[data-theme-preset="zinc"],')
     expect(css).toContain('[data-theme="dark"] .avs-theme[data-theme-preset="blue"]')
+  })
+
+  // The legacy mirrors are hardcoded duplicates rather than derived values, so a
+  // standard token edited without its mirror would leave pages that still read
+  // `hsl(var(--avs-*))` on a stale palette. Assert the relationship instead of
+  // listing the pairs: a mirror added later is covered without touching this test.
+  it("keeps every legacy mirror equal to the channel form of its standard token", () => {
+    let checked = 0
+    for (const [, selector, body] of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      const declared = new Map(
+        [...body.matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)].map(([, name, value]) => [name, value.trim()])
+      )
+      for (const [name, mirror] of declared) {
+        if (!name.startsWith("--avs-")) continue
+        const standardName = name.replace("--avs-", "--")
+        const standard = declared.get(standardName)
+        const scope = `${selector.trim()} ${name}`
+        expect(standard, `${scope} has no ${standardName} in the same block`).toBeDefined()
+        expect(
+          standard === mirror || standard === `hsl(${mirror})`,
+          `${scope}: ${standardName} is ${standard}, expected hsl(${mirror})`
+        ).toBe(true)
+        checked += 1
+      }
+    }
+    expect(checked).toBe([...css.matchAll(/--avs-[\w-]+\s*:/g)].length)
+  })
+})
+
+describe("theme scope", () => {
+  const here = new URL(".", import.meta.url)
+  const sources = readdirSync(here).filter((name) => name.endsWith(".tsx") && !name.endsWith(".test.tsx"))
+
+  // Presets and inline theme tokens live on the ThemeProvider element, so an
+  // overlay that portals to the document body renders with the `:root` palette
+  // instead of the page's. Stated as a property of every portal in the package:
+  // a popover or tooltip added later fails here rather than regressing silently.
+  it("routes every portal through the active theme scope", () => {
+    let portals = 0
+    for (const name of sources) {
+      const source = readFileSync(new URL(name, here), "utf8")
+      const tags = [...source.matchAll(/<[\w.]*Primitive\.Portal\b[^>]*/g)].map(([tag]) => tag)
+      const manual = [...source.matchAll(/\bcreatePortal\s*\(/g)]
+      if (!tags.length && !manual.length) continue
+      portals += tags.length + manual.length
+      expect(source, `${name} portals without reading the theme scope`).toContain("useThemeScope")
+      for (const tag of tags) {
+        expect(tag, `${name} renders a portal primitive without a container`).toContain("container=")
+      }
+    }
+    expect(portals).toBeGreaterThan(0)
   })
 })
