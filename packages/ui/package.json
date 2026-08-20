@@ -4,8 +4,7 @@
   "description": "shadcn-style UI primitives for Vibe Show Runtime.",
   "type": "module",
   "sideEffects": [
-    "./dist/show-ui.css",
-    "./dist/theme-compat*.js"
+    "./dist/show-ui.css"
   ],
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -61,10 +60,6 @@
       "types": "./dist/theme.d.ts",
       "import": "./dist/theme.js"
     },
-    "./theme-compat": {
-      "types": "./dist/theme-compat.d.ts",
-      "import": "./dist/theme-compat.js"
-    },
     "./utils": {
       "types": "./dist/utils.d.ts",
       "import": "./dist/utils.js"
@@ -76,14 +71,13 @@
   "scripts": {
     "build": "vite build && tsc -p tsconfig.json --emitDeclarationOnly && node -e \"require('fs').copyFileSync('src/theme.css','dist/theme.css')\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run src/theme.test.tsx src/theme-compat.test.ts src/dialog.test.tsx"
+    "test": "vitest run src/theme.test.tsx"
   },
   "peerDependencies": {
     "react": ">=18",
     "react-dom": ">=18"
   },
   "dependencies": {
-    "@radix-ui/react-compose-refs": "^1.1.2",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-slot": "^1.2.4",
     "class-variance-authority": "^0.7.1",

@@ -14,7 +14,7 @@ export default function App() {
           <Badge variant="success">shadcn alias</Badge>
           <h1>Agent-friendly Show UI</h1>
           <p>Imports use normal shadcn paths, while Vite resolves them to @avibe/show-ui.</p>
-          <span className="inline-flex items-center gap-2 rounded-md bg-emerald-500/10 px-3 py-1 text-sm font-medium text-emerald-700 dark:bg-primary dark:text-primary-foreground">
+          <span className="inline-flex items-center gap-2 rounded-md bg-emerald-500/10 px-3 py-1 text-sm font-medium text-emerald-700">
             Tailwind utility classes are built in
           </span>
           <div className="flex gap-2">

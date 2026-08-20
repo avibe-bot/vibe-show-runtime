@@ -8,7 +8,7 @@
  * plain `var(...)` outside Tailwind.
  */
 
-@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *, .avs-dark, .avs-dark *, :host(.dark) *, :host([data-theme="dark"]) *, :host(.avs-dark) *));
+@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *));
 
 @theme inline {
   --color-background: var(--background);
@@ -57,196 +57,7 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
-/*
- * Custom properties normally inherit across a shadow boundary. Style queries
- * add defaults only for tokens absent on the host, so CSS-only shadow consumers
- * keep inherited and host-authored palettes without reserving public names.
- */
-@container not style(--radius) {
-  :where(:host) > :where(*) { --radius: 0.5rem; }
-}
-
-@container not style(--background) {
-  :where(:host) > :where(*) { --background: hsl(0 0% 100%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --background: hsl(222 47% 11%); }
-}
-
-@container not style(--foreground) {
-  :where(:host) > :where(*) { --foreground: hsl(222 47% 11%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --foreground: hsl(210 40% 98%); }
-}
-
-@container not style(--card) {
-  :where(:host) > :where(*) { --card: hsl(0 0% 100%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --card: hsl(222 47% 14%); }
-}
-
-@container not style(--card-foreground) {
-  :where(:host) > :where(*) { --card-foreground: hsl(222 47% 11%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --card-foreground: hsl(210 40% 98%); }
-}
-
-@container not style(--popover) {
-  :where(:host) > :where(*) { --popover: hsl(0 0% 100%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --popover: hsl(222 47% 14%); }
-}
-
-@container not style(--popover-foreground) {
-  :where(:host) > :where(*) { --popover-foreground: hsl(222 47% 11%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --popover-foreground: hsl(210 40% 98%); }
-}
-
-@container not style(--primary) {
-  :where(:host) > :where(*) { --primary: hsl(222 47% 11%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --primary: hsl(210 40% 98%); }
-}
-
-@container not style(--primary-foreground) {
-  :where(:host) > :where(*) { --primary-foreground: hsl(210 40% 98%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --primary-foreground: hsl(222 47% 11%); }
-}
-
-@container not style(--secondary) {
-  :where(:host) > :where(*) { --secondary: hsl(210 40% 96%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --secondary: hsl(217 33% 18%); }
-}
-
-@container not style(--secondary-foreground) {
-  :where(:host) > :where(*) { --secondary-foreground: hsl(222 47% 11%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --secondary-foreground: hsl(210 40% 98%); }
-}
-
-@container not style(--muted) {
-  :where(:host) > :where(*) { --muted: hsl(210 40% 96%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --muted: hsl(217 33% 18%); }
-}
-
-@container not style(--muted-foreground) {
-  :where(:host) > :where(*) { --muted-foreground: hsl(215 16% 47%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --muted-foreground: hsl(215 20% 65%); }
-}
-
-@container not style(--accent) {
-  :where(:host) > :where(*) { --accent: hsl(210 40% 96%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --accent: hsl(217 33% 18%); }
-}
-
-@container not style(--accent-foreground) {
-  :where(:host) > :where(*) { --accent-foreground: hsl(222 47% 11%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --accent-foreground: hsl(210 40% 98%); }
-}
-
-@container not style(--destructive) {
-  :where(:host) > :where(*) { --destructive: hsl(0 84% 60%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --destructive: hsl(0 63% 31%); }
-}
-
-@container not style(--destructive-foreground) {
-  :where(:host) > :where(*) { --destructive-foreground: hsl(0 0% 100%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --destructive-foreground: hsl(210 40% 98%); }
-}
-
-@container not style(--border) {
-  :where(:host) > :where(*) { --border: hsl(214 32% 91%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --border: hsl(217 33% 22%); }
-}
-
-@container not style(--input) {
-  :where(:host) > :where(*) { --input: hsl(214 32% 91%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --input: hsl(217 33% 22%); }
-}
-
-@container not style(--ring) {
-  :where(:host) > :where(*) { --ring: hsl(221 83% 53%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --ring: hsl(212 27% 84%); }
-}
-
-@container not style(--chart-1) {
-  :where(:host) > :where(*) { --chart-1: hsl(12 76% 61%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --chart-1: hsl(220 70% 50%); }
-}
-
-@container not style(--chart-2) {
-  :where(:host) > :where(*) { --chart-2: hsl(173 58% 39%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --chart-2: hsl(160 60% 45%); }
-}
-
-@container not style(--chart-3) {
-  :where(:host) > :where(*) { --chart-3: hsl(197 37% 24%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --chart-3: hsl(30 80% 55%); }
-}
-
-@container not style(--chart-4) {
-  :where(:host) > :where(*) { --chart-4: hsl(43 74% 66%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --chart-4: hsl(280 65% 60%); }
-}
-
-@container not style(--chart-5) {
-  :where(:host) > :where(*) { --chart-5: hsl(27 87% 67%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --chart-5: hsl(340 75% 55%); }
-}
-
-@container not style(--sidebar) {
-  :where(:host) > :where(*) { --sidebar: hsl(210 40% 98%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --sidebar: hsl(222 47% 14%); }
-}
-
-@container not style(--sidebar-foreground) {
-  :where(:host) > :where(*) { --sidebar-foreground: hsl(222 47% 11%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --sidebar-foreground: hsl(210 40% 98%); }
-}
-
-@container not style(--sidebar-primary) {
-  :where(:host) > :where(*) { --sidebar-primary: hsl(222 47% 11%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --sidebar-primary: hsl(221 83% 53%); }
-}
-
-@container not style(--sidebar-primary-foreground) {
-  :where(:host) > :where(*) { --sidebar-primary-foreground: hsl(210 40% 98%); }
-}
-
-@container not style(--sidebar-accent) {
-  :where(:host) > :where(*) { --sidebar-accent: hsl(210 40% 96%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --sidebar-accent: hsl(217 33% 18%); }
-}
-
-@container not style(--sidebar-accent-foreground) {
-  :where(:host) > :where(*) { --sidebar-accent-foreground: hsl(222 47% 11%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --sidebar-accent-foreground: hsl(210 40% 98%); }
-}
-
-@container not style(--sidebar-border) {
-  :where(:host) > :where(*) { --sidebar-border: hsl(214 32% 91%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --sidebar-border: hsl(217 33% 22%); }
-}
-
-@container not style(--sidebar-ring) {
-  :where(:host) > :where(*) { --sidebar-ring: hsl(221 83% 53%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --sidebar-ring: hsl(212 27% 84%); }
-}
-
-@container not style(--success) {
-  :where(:host) > :where(*) { --success: hsl(158 64% 24%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --success: hsl(158 64% 52%); }
-}
-
-@container not style(--success-foreground) {
-  :where(:host) > :where(*) { --success-foreground: hsl(0 0% 100%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --success-foreground: hsl(222 47% 11%); }
-}
-
-@container not style(--warning) {
-  :where(:host) > :where(*) { --warning: hsl(32 95% 44%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --warning: hsl(38 92% 50%); }
-}
-
-@container not style(--warning-foreground) {
-  :where(:host) > :where(*) { --warning-foreground: hsl(0 0% 100%); }
-  :where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) { --warning-foreground: hsl(222 47% 11%); }
-}
-
-:root,
-.avs-theme {
+:root {
   color-scheme: light;
   --radius: 0.5rem;
   --background: hsl(0 0% 100%);
@@ -302,14 +113,7 @@
 }
 
 .dark,
-[data-theme="dark"],
-:host(.dark),
-:host([data-theme="dark"]),
-:host(.avs-dark),
-.avs-theme.dark,
-.avs-theme.avs-dark,
-.dark .avs-theme,
-[data-theme="dark"] .avs-theme {
+[data-theme="dark"] {
   color-scheme: dark;
   --background: hsl(222 47% 11%);
   --foreground: hsl(210 40% 98%);
@@ -391,7 +195,7 @@
 }
 
 .avs-theme.dark[data-theme-preset="zinc"],
-.avs-theme.avs-dark[data-theme-preset="zinc"],
+.avs-theme[data-theme="dark"][data-theme-preset="zinc"],
 .dark .avs-theme[data-theme-preset="zinc"],
 [data-theme="dark"] .avs-theme[data-theme-preset="zinc"] {
   --primary: hsl(0 0% 98%);
@@ -401,7 +205,7 @@
 }
 
 .avs-theme.dark[data-theme-preset="slate"],
-.avs-theme.avs-dark[data-theme-preset="slate"],
+.avs-theme[data-theme="dark"][data-theme-preset="slate"],
 .dark .avs-theme[data-theme-preset="slate"],
 [data-theme="dark"] .avs-theme[data-theme-preset="slate"] {
   --primary: hsl(210 40% 98%);
@@ -411,7 +215,7 @@
 }
 
 .avs-theme.dark[data-theme-preset="green"],
-.avs-theme.avs-dark[data-theme-preset="green"],
+.avs-theme[data-theme="dark"][data-theme-preset="green"],
 .dark .avs-theme[data-theme-preset="green"],
 [data-theme="dark"] .avs-theme[data-theme-preset="green"] {
   --primary: hsl(158 64% 52%);
@@ -421,7 +225,7 @@
 }
 
 .avs-theme.dark[data-theme-preset="blue"],
-.avs-theme.avs-dark[data-theme-preset="blue"],
+.avs-theme[data-theme="dark"][data-theme-preset="blue"],
 .dark .avs-theme[data-theme-preset="blue"],
 [data-theme="dark"] .avs-theme[data-theme-preset="blue"] {
   --primary: hsl(221 83% 63%);

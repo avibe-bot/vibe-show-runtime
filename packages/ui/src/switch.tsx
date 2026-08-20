@@ -1,5 +1,3 @@
-import "./theme-compat"
-
 export function Switch({
   checked,
   onCheckedChange,

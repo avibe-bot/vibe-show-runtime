@@ -17,7 +17,6 @@ export default defineConfig({
         progress: "src/progress.tsx",
         switch: "src/switch.tsx",
         theme: "src/theme.tsx",
-        "theme-compat": "src/theme-compat.ts",
         utils: "src/utils.ts"
       },
       formats: ["es"]

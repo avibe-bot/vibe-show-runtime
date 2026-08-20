@@ -3,16 +3,12 @@ import { readFileSync } from "node:fs"
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
 import { ThemeProvider } from "./theme"
-import { SHOW_PORTAL_THEME_PROPERTIES } from "./theme-properties"
 
 describe("ThemeProvider", () => {
-  it("preserves the zinc default and allows the standard root palette explicitly", () => {
-    const defaultMarkup = renderToStaticMarkup(<ThemeProvider><span>content</span></ThemeProvider>)
-    expect(defaultMarkup).toContain('data-theme-preset="zinc"')
-    expect(defaultMarkup).not.toContain("--primary")
-    const rootMarkup = renderToStaticMarkup(<ThemeProvider preset={null}><span>content</span></ThemeProvider>)
-    expect(rootMarkup).not.toContain("data-theme-preset")
-    expect(rootMarkup).not.toContain("avs-theme")
+  it("does not shadow the standard root tokens unless a preset is requested", () => {
+    const markup = renderToStaticMarkup(<ThemeProvider><span>content</span></ThemeProvider>)
+    expect(markup).not.toContain("--primary")
+    expect(markup).not.toContain("--avs-primary")
   })
 
   it("writes complete CSS colors to the standard shadcn variables", () => {
@@ -26,73 +22,20 @@ describe("ThemeProvider", () => {
     expect(markup).toContain("--card-foreground:#102030")
   })
 
-  it("normalizes literal, expression, and variable-backed HSL channels for old workspaces", () => {
+  it("normalizes literal HSL channels while preserving complete color references", () => {
     const markup = renderToStaticMarkup(
-      <ThemeProvider theme={{ colors: {
-        foreground: "var(--brand-color)",
-        primary: "var(--brand-hsl)",
-        accent: "221deg calc(83%) var(--lightness) / calc(var(--alpha))",
-        ring: "hsl(199 89% 48%)",
-        warning: "32, 95%, 44%",
-        success: "158 /* hue */ 64% 24%"
-      } }}>content</ThemeProvider>
+      <ThemeProvider theme={{ colors: { primary: "var(--brand-color)", ring: "199 89% 48%" } }}>content</ThemeProvider>
     )
-    expect(markup).toContain("--foreground:var(--brand-color)")
-    expect(markup).not.toContain("--avs-foreground:var(--brand-color)")
-    expect(markup).toContain("--primary:hsl(var(--brand-hsl))")
-    expect(markup).toContain("--avs-primary:var(--brand-hsl)")
-    expect(markup).toContain("--accent:hsl(221deg calc(83%) var(--lightness) / calc(var(--alpha)))")
+    expect(markup).toContain("--primary:var(--brand-color)")
+    expect(markup).not.toContain("--avs-primary")
     expect(markup).toContain("--ring:hsl(199 89% 48%)")
     expect(markup).toContain("--avs-ring:199 89% 48%")
-    expect(markup).toContain("--warning:hsl(32, 95%, 44%)")
-    expect(markup).toContain("--avs-warning:32, 95%, 44%")
-    expect(markup).toContain("--success:hsl(158 /* hue */ 64% 24%)")
-    expect(markup).toContain("--avs-success:158 /* hue */ 64% 24%")
-  })
-
-  it("treats only documented variable suffixes as legacy HSL channels", () => {
-    const markup = renderToStaticMarkup(
-      <ThemeProvider theme={{ colors: {
-        primary: "var(--brand-hsl-color)",
-        ring: "var(--brand-hsl)",
-        warning: "var(--brand-channels)"
-      } }}>content</ThemeProvider>
-    )
-    expect(markup).toContain("--primary:var(--brand-hsl-color)")
-    expect(markup).toContain("--ring:hsl(var(--brand-hsl))")
-    expect(markup).toContain("--warning:hsl(var(--brand-channels))")
-  })
-
-  it("fans out legacy channel shorthands without replacing explicit standard companions", () => {
-    const markup = renderToStaticMarkup(
-      <ThemeProvider theme={{ colors: {
-        background: "222 47% 11%",
-        foreground: "210 40% 98%",
-        muted: "217 33% 18%",
-        border: "217 33% 22%",
-        card: "oklch(0.3 0.02 250)",
-        popover: undefined
-      } }}>content</ThemeProvider>
-    )
-    expect(markup).toContain("--background:hsl(222 47% 11%)")
-    expect(markup).toContain("--popover:hsl(222 47% 11%)")
-    expect(markup).toContain("--card:oklch(0.3 0.02 250)")
-    expect(markup).toContain("--card-foreground:hsl(210 40% 98%)")
-    expect(markup).toContain("--secondary:hsl(217 33% 18%)")
-    expect(markup).toContain("--input:hsl(217 33% 22%)")
   })
 
   it("delegates presets to dark-aware CSS instead of inline light colors", () => {
     const markup = renderToStaticMarkup(<ThemeProvider preset="zinc">content</ThemeProvider>)
     expect(markup).toContain('data-theme-preset="zinc"')
     expect(markup).not.toContain("--primary")
-  })
-
-  it("follows the flattened slot tree when resolving dark preset context", () => {
-    const source = readFileSync(new URL("./theme.tsx", import.meta.url), "utf8")
-    expect(source.indexOf("node.assignedSlot")).toBeLessThan(source.indexOf("node.parentElement"))
-    expect(source).toContain('node.addEventListener("slotchange", update)')
-    expect(source).toContain('node.classList.contains("avs-dark")')
   })
 })
 
@@ -111,35 +54,16 @@ describe("theme.css", () => {
   })
 
   it("defines light and class/data-attribute dark palettes with complete colors", () => {
-    expect(css).toContain("\n:root,\n.avs-theme {\n  color-scheme: light;")
-    expect(css).not.toContain("\n:root,\n:host,\n.avs-theme {")
-    expect(css).toContain("\n.dark,\n[data-theme=\"dark\"],\n:host(.dark),")
-    expect(css).toContain("[data-theme=\"dark\"] .avs-theme {\n  color-scheme: dark;")
+    expect(css).toContain("\n:root {\n  color-scheme: light;")
+    expect(css).toContain("\n.dark,\n[data-theme=\"dark\"] {\n  color-scheme: dark;")
     expect(css).toContain("--background: hsl(")
   })
 
-  it("provides inheritance-preserving shadow defaults without reserving standard properties", () => {
-    expect(css).toContain(":where(:host) > :where(*) {")
-    expect(css).toContain(':where(:host(.dark), :host([data-theme="dark"]), :host(.avs-dark)) > :where(*) {')
-    for (const property of SHOW_PORTAL_THEME_PROPERTIES.filter(
-      (property) => property.startsWith("--") && !property.startsWith("--avs-")
-    )) {
-      expect(css).toContain(`@container not style(${property})`)
-    }
-    expect(css).not.toContain("--primary: var(--avibe-show-host-primary")
-    expect(css).toContain("--background: hsl(222 47% 11%);")
-    expect(css).toContain("--foreground: hsl(210 40% 98%);")
-    expect(css).toContain("--primary: hsl(210 40% 98%);")
-  })
-
   it("supports dark utilities on theme roots and dark-aware presets", () => {
-    expect(css).toContain(":host(.dark) *")
-    expect(css).toContain(":host(.avs-dark) *")
-    expect(css).toContain(".avs-dark *")
-    expect(css).toContain('.dark .avs-theme[data-theme-preset="zinc"],')
+    expect(css).toContain('@custom-variant dark (&:is(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *))')
     expect(css).toContain('.avs-theme.dark[data-theme-preset="zinc"],')
-    expect(css).toContain('.avs-theme.avs-dark[data-theme-preset="zinc"],')
+    expect(css).toContain('.avs-theme[data-theme="dark"][data-theme-preset="blue"],')
+    expect(css).toContain('.dark .avs-theme[data-theme-preset="zinc"],')
     expect(css).toContain('[data-theme="dark"] .avs-theme[data-theme-preset="blue"]')
   })
-
 })

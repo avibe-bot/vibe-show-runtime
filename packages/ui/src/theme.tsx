@@ -1,6 +1,4 @@
 import * as React from "react"
-import { ThemeScopeContext } from "./theme-context"
-import "./theme-compat"
 
 export type ThemePreset = "zinc" | "slate" | "green" | "blue"
 
@@ -100,122 +98,7 @@ const legacyColorVars: Partial<Record<ThemeColor, string>> = {
   destructive: "--avs-destructive"
 }
 
-const legacyColorFanOut: Partial<Record<ThemeColor, readonly ThemeColor[]>> = {
-  background: ["card", "popover"],
-  foreground: ["cardForeground", "popoverForeground", "secondaryForeground", "accentForeground"],
-  muted: ["secondary", "accent"],
-  border: ["input"]
-}
-
-function composedParentNode(node: Node): Node | null {
-  if (node instanceof Element) {
-    if (node.assignedSlot) return node.assignedSlot
-    if (node.parentElement) return node.parentElement
-    const root = node.getRootNode()
-    if (typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot) return root
-  }
-  return typeof ShadowRoot !== "undefined" && node instanceof ShadowRoot ? node.host : null
-}
-
-function useComposedDark(elementRef: React.RefObject<HTMLElement | null>): boolean {
-  const [dark, setDark] = React.useState(false)
-  React.useLayoutEffect(() => {
-    const current = elementRef.current
-    if (!current) return
-    const element: HTMLElement = current
-    const observer = new MutationObserver(update)
-    let observedSlots: HTMLSlotElement[] = []
-    function update() {
-      observer.disconnect()
-      for (const slot of observedSlots) slot.removeEventListener("slotchange", update)
-      observedSlots = []
-      let nextDark = false
-      observer.observe(element, { attributes: true, attributeFilter: ["slot"] })
-      for (let node = composedParentNode(element); node; node = composedParentNode(node)) {
-        if (node instanceof Element) {
-          if (node.classList.contains("dark")
-            || node.classList.contains("avs-dark")
-            || node.getAttribute("data-theme") === "dark") nextDark = true
-          observer.observe(node, {
-            attributes: true,
-            attributeFilter: ["class", "data-theme", "name", "slot"],
-            childList: true
-          })
-          if (typeof HTMLSlotElement !== "undefined" && node instanceof HTMLSlotElement) {
-            node.addEventListener("slotchange", update)
-            observedSlots.push(node)
-          }
-        } else {
-          observer.observe(node, { childList: true })
-        }
-      }
-      setDark(nextDark)
-    }
-    update()
-    return () => {
-      observer.disconnect()
-      for (const slot of observedSlots) slot.removeEventListener("slotchange", update)
-    }
-  }, [elementRef])
-  return dark
-}
-
-function splitTopLevel(value: string, delimiter: string): string[] {
-  const parts: string[] = []
-  let depth = 0
-  let start = 0
-  for (let index = 0; index < value.length; index += 1) {
-    const character = value[index]
-    if (character === "(") depth += 1
-    else if (character === ")") depth = Math.max(0, depth - 1)
-    else if (character === delimiter && depth === 0) {
-      parts.push(value.slice(start, index).trim())
-      start = index + 1
-    }
-  }
-  parts.push(value.slice(start).trim())
-  return parts
-}
-
-function splitSpaceChannels(value: string): string[] {
-  const channels: string[] = []
-  let depth = 0
-  let current = ""
-  const push = () => {
-    if (current) channels.push(current)
-    current = ""
-  }
-  for (const character of value.trim()) {
-    if (character === "(") depth += 1
-    else if (character === ")") depth = Math.max(0, depth - 1)
-    if (depth === 0 && /\s/.test(character)) {
-      push()
-    } else if (depth === 0 && character === "/") {
-      push()
-      channels.push(character)
-    } else {
-      current += character
-    }
-  }
-  push()
-  return channels
-}
-
-function usesLegacyHslChannels(value: string): boolean {
-  const tokenizable = value.replace(/\/\*[\s\S]*?\*\//g, " ")
-  const commaChannels = splitTopLevel(tokenizable, ",")
-  if (commaChannels.length === 3 || commaChannels.length === 4) return commaChannels.every(Boolean)
-  const spaceChannels = splitSpaceChannels(tokenizable)
-  if (spaceChannels.length === 3 || (spaceChannels.length === 5 && spaceChannels[3] === "/")) return true
-  const variable = tokenizable.match(/^\s*var\(\s*(--[^,\s)]+)/i)?.[1]
-  return Boolean(variable && /(?:^--avs-|[-_](?:hsl|channels?))$/i.test(variable))
-}
-
-function legacyHslChannels(value: string): string | null {
-  if (usesLegacyHslChannels(value)) return value
-  const functionMatch = value.trim().match(/^hsla?\(([\s\S]*)\)$/i)
-  return functionMatch && usesLegacyHslChannels(functionMatch[1]) ? functionMatch[1].trim() : null
-}
+const LEGACY_HSL_CHANNELS = /^\s*-?(?:\d+(?:\.\d+)?|\.\d+)(?:deg|grad|rad|turn)?\s+-?(?:\d+(?:\.\d+)?|\.\d+)%\s+-?(?:\d+(?:\.\d+)?|\.\d+)%(?:\s*\/\s*(?:\d+(?:\.\d+)?|\.\d+)%?)?\s*$/
 
 function toStyle(theme?: ShowTheme): React.CSSProperties {
   const style = {} as React.CSSProperties & Record<string, string>
@@ -224,44 +107,24 @@ function toStyle(theme?: ShowTheme): React.CSSProperties {
     style["--radius"] = theme.radius
     style["--avs-radius"] = theme.radius
   }
-  const colors = theme.colors ?? {}
-  const colorEntries = Object.entries(colors) as [ThemeColor, string | undefined][]
-  const explicitColors = new Set(colorEntries.filter(([, value]) => Boolean(value)).map(([key]) => key))
-  for (const [key, value] of colorEntries) {
+  for (const [key, value] of Object.entries(theme.colors ?? {}) as [ThemeColor, string][]) {
     if (!value) continue
-    const channelInput = usesLegacyHslChannels(value)
-    const channels = legacyHslChannels(value)
-    const standardValue = channelInput ? `hsl(${value})` : value
-    style[colorVars[key]] = standardValue
+    const legacyChannels = LEGACY_HSL_CHANNELS.test(value)
+    style[colorVars[key]] = legacyChannels ? `hsl(${value})` : value
     const legacyVar = legacyColorVars[key]
-    if (!channels || !legacyVar) continue
-    style[legacyVar] = channels
-    if (channelInput) {
-      for (const companion of legacyColorFanOut[key] ?? []) {
-        if (!explicitColors.has(companion)) style[colorVars[companion]] = standardValue
-      }
-    }
+    if (legacyChannels && legacyVar) style[legacyVar] = value
   }
   return style
 }
 
 export function ThemeProvider({
-  preset = "zinc",
+  preset,
   theme,
   children
 }: {
-  preset?: ThemePreset | null
+  preset?: ThemePreset
   theme?: ShowTheme
   children: React.ReactNode
 }) {
-  const scopeRef = React.useRef<HTMLDivElement>(null)
-  const composedDark = useComposedDark(scopeRef)
-  const className = [preset === null ? null : "avs-theme", composedDark ? "avs-dark" : null]
-    .filter(Boolean)
-    .join(" ") || undefined
-  return (
-    <ThemeScopeContext.Provider value={scopeRef}>
-      <div ref={scopeRef} className={className} data-theme-preset={preset} style={toStyle(theme)}>{children}</div>
-    </ThemeScopeContext.Provider>
-  )
+  return <div className="avs-theme" data-theme-preset={preset} style={toStyle(theme)}>{children}</div>
 }

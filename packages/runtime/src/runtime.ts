@@ -21,7 +21,6 @@ import type { ShowRuntime, ShowRuntimeOptions, ShowSession, ShowSessionStatus } 
 import { createShadcnAlias } from "./aliases.js"
 import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
 import { ensureSessionTemplate } from "./templates.js"
-import { showThemeCompatibilityPlugin } from "./theme-compat-plugin.js"
 import { createVendorExternalizePlugins, isProvidedVendorSpecifier } from "./vendor-externalize-plugin.js"
 import {
   defaultVendorCacheRoot,
@@ -501,7 +500,6 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
         ...(sharedDependencies.nodeModules === sharedDependencies.sharedNodeModules
           ? []
           : [sharedResolveFallbackPlugin(sharedDependencies.sharedNodeModules, providedSpecifiers)]),
-        showThemeCompatibilityPlugin(),
         showHmrTransitionPlugin({ fallbackDelaySeconds: options.fallbackDelaySeconds }),
         // Tailwind v4 is a built-in runtime capability: `src/styles.css` opts in with
         // `@import "tailwindcss";` (see templates.ensureSessionTemplate), and the plugin

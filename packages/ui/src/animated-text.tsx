@@ -1,6 +1,5 @@
 import * as React from "react"
 import { AnimatePresence, motion, useMotionValue, useReducedMotion, useTransform, animate } from "motion/react"
-import "./theme-compat"
 
 type TextMode = "stable" | "typewriter" | "flip" | "fade"
 
