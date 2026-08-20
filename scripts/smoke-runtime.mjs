@@ -121,6 +121,9 @@ if (
   typeof hmrIndexHtml !== "object" ||
   !hmrIndexHtml.html.includes("avs-fallback-shell") ||
   !hmrIndexHtml.html.includes("Ready to visualize") ||
+  !hmrIndexHtml.html.includes("standard shadcn theme variables") ||
+  !hmrIndexHtml.html.includes("--background") ||
+  hmrIndexHtml.html.includes("components from @/components/ui and @avibe/show-ui") ||
   !hmrStyleTag?.children?.includes("Loading Show Page") ||
   !hmrStyleTag.children.includes(".avs-fallback") ||
   hmrStyleTag.children.includes(".fallback-shell {") ||
@@ -356,6 +359,7 @@ try {
   }
   const scaffoldRouter = await readFile(join(root, "smoke", "src", "router.tsx"), "utf8")
   const scaffoldMain = await readFile(join(root, "smoke", "src", "main.tsx"), "utf8")
+  const scaffoldApp = await readFile(join(root, "smoke", "src", "App.tsx"), "utf8")
   const scaffoldHome = await readFile(join(root, "smoke", "src", "pages", "index.tsx"), "utf8")
   if (!scaffoldRouter.includes("popstate") || scaffoldRouter.includes("hashchange") || !scaffoldRouter.includes("__AVIBE_SHOW__?.basePath")) {
     throw new Error("Expected the fresh scaffold router to use History mode with the injected base path")
@@ -371,6 +375,9 @@ try {
   }
   if (!scaffoldHome.includes('baseUrl.pathname.endsWith("/")')) {
     throw new Error("Expected the fresh scaffold handler URL to normalize a slashless injected base path")
+  }
+  if (scaffoldApp.includes("ThemeProvider") || !scaffoldApp.includes("bg-background text-foreground")) {
+    throw new Error("Expected the fresh scaffold to expose standard theme utilities without an inline ThemeProvider override")
   }
   const visibleAsset = await fetch(`${runtime.url}/sessions/smoke/app/visible.txt`)
   if (visibleAsset.status !== 200 || (await visibleAsset.text()) !== "visible public asset\n") {
@@ -1078,8 +1085,10 @@ export default function App() {
     throw new Error(`Expected commented-import session to warm active, got ${JSON.stringify(commentedEnsure)}`)
   }
   const commentedStyles = await readFile(join(root, "tailwind-commented", "src", "styles.css"), "utf8")
-  if (!commentedStyles.startsWith(`@import "tailwindcss";`)) {
-    throw new Error(`Expected a real Tailwind import prepended over a commented-out one, got ${JSON.stringify(commentedStyles.slice(0, 60))}`)
+  const commentedTailwind = commentedStyles.indexOf(`@import "tailwindcss";`, commentedStyles.indexOf("*/") + 2)
+  const commentedTheme = commentedStyles.indexOf(`@import "@avibe/show-ui/theme.css";`)
+  if (commentedTailwind < 0 || commentedTheme < commentedTailwind) {
+    throw new Error(`Expected real managed imports after the preserved comment, got ${JSON.stringify(commentedStyles.slice(0, 100))}`)
   }
   const commentedCss = await fetch(`${runtime.url}/sessions/tailwind-commented/app/src/styles.css?direct`).then((res) => res.text())
   if (!commentedCss.includes(".p-5")) {
@@ -1131,12 +1140,19 @@ export default function App() {
 
   // (9) Component pipeline (new workspace): the scaffolded entry imports the show-ui theme,
   // whose @theme registers the tokens and whose @source generates the component utilities.
-  // The served CSS must carry `.bg-primary` mapped to the --avs- palette (default parity)
-  // and the agent's own `.bg-red-500` override utility.
+  // The served CSS must carry `.bg-primary` mapped to the standard shadcn variable,
+  // direct var() usage, dark-mode selectors, and the agent's own utility override.
   await mkdir(join(root, "shadcn", "src"), { recursive: true })
   await writeFile(join(root, "shadcn", "src", "App.tsx"), `import { Button } from "@/components/ui/button"
+import { ThemeProvider } from "@/components/ui/theme"
 export default function App() {
-  return <Button className="bg-red-500">Ship</Button>
+  return (
+    <main data-theme="dark" className="dark:bg-primary">
+      <ThemeProvider preset="blue" theme={{ colors: { ring: "oklch(0.62 0.19 255)" } }}>
+        <Button className="bg-red-500 text-foreground" style={{ borderColor: "var(--border)" }}>Ship</Button>
+      </ThemeProvider>
+    </main>
+  )
 }
 `)
   const shadcnEnsure = await fetch(`${runtime.url}/sessions/shadcn/ensure`, { method: "POST" }).then((res) => res.json())
@@ -1148,11 +1164,24 @@ export default function App() {
     throw new Error(`Expected the scaffolded entry to import both tailwindcss and the show-ui theme, got ${JSON.stringify(shadcnStyles.slice(0, 90))}`)
   }
   const shadcnCss = await fetch(`${runtime.url}/sessions/shadcn/app/src/styles.css?direct`).then((res) => res.text())
-  if (!/\.bg-primary\s*\{[^}]*var\(--avs-primary\)[^}]*\}/.test(shadcnCss)) {
-    throw new Error("Expected .bg-primary generated from the @source'd components and mapped to hsl(var(--avs-primary)) (default parity + @theme registration)")
+  if (!/\.bg-primary\s*\{[^}]*var\(--primary\)[^}]*\}/.test(shadcnCss)) {
+    throw new Error("Expected .bg-primary to resolve through the standard --primary shadcn token")
   }
   if (!shadcnCss.includes(".bg-red-500")) {
     throw new Error("Expected the agent's .bg-red-500 override utility to be generated")
+  }
+  if (!shadcnCss.includes("--background:") || !shadcnCss.includes("--card:") || !shadcnCss.includes("--chart-5:") || !shadcnCss.includes("--sidebar-ring:")) {
+    throw new Error("Expected the complete standard shadcn token contract in served runtime CSS")
+  }
+  if (!shadcnCss.includes(".dark\\:bg-primary") || !shadcnCss.includes('[data-theme="dark"]')) {
+    throw new Error("Expected class/data-theme dark-mode selectors in served runtime CSS")
+  }
+  if (!shadcnStyles.includes("background: var(--background)") || !shadcnStyles.includes("color: var(--foreground)")) {
+    throw new Error("Expected the scaffold to use standard tokens directly through native var() CSS")
+  }
+  const shadcnAppResponse = await fetch(`${runtime.url}/sessions/shadcn/app/src/App.tsx`)
+  if (!shadcnAppResponse.ok || !(await shadcnAppResponse.text()).includes("ThemeProvider")) {
+    throw new Error("Expected the shadcn-style ThemeProvider alias to resolve in the live runtime")
   }
 
   // (10) Legacy workspace (predates the theme import): a styles.css with only the Tailwind
@@ -1174,6 +1203,41 @@ export default function App() {
   const shadcnLegacyCss = await fetch(`${runtime.url}/sessions/shadcn-legacy/app/src/styles.css?direct`).then((res) => res.text())
   if (!shadcnLegacyCss.includes(".bg-primary")) {
     throw new Error("Expected component utilities to generate in a migrated legacy workspace (theme import + @source)")
+  }
+
+  // (11) Existing workspace overrides must remain after the Show UI defaults. Reorder an
+  // already-present theme import instead of returning early merely because both exist.
+  await mkdir(join(root, "shadcn-overrides", "src"), { recursive: true })
+  await writeFile(join(root, "shadcn-overrides", "src", "brand.css"), ":root { --background: #123456; }\n")
+  await writeFile(join(root, "shadcn-overrides", "src", "styles.css"), `@layer theme, overrides;
+@import "tailwindcss" print;
+@import "./brand.css";
+@import "@avibe/show-ui/theme.css" screen;
+@import "tailwindcss";
+@import "@avibe/show-ui/theme.css";
+`)
+  await writeFile(join(root, "shadcn-overrides", "src", "App.tsx"), `export default function App() {
+  return <main className="bg-background">overrides</main>
+}
+`)
+  const shadcnOverridesEnsure = await fetch(`${runtime.url}/sessions/shadcn-overrides/ensure`, { method: "POST" }).then((res) => res.json())
+  if (shadcnOverridesEnsure.state !== "active") {
+    throw new Error(`Expected ordered-override session to warm active, got ${JSON.stringify(shadcnOverridesEnsure)}`)
+  }
+  const orderedStyles = await readFile(join(root, "shadcn-overrides", "src", "styles.css"), "utf8")
+  const orderedLayers = orderedStyles.indexOf("@layer theme, overrides;")
+  const orderedTailwind = orderedStyles.indexOf('@import "tailwindcss";')
+  const orderedTheme = orderedStyles.indexOf('@import "@avibe/show-ui/theme.css";')
+  const orderedBrand = orderedStyles.indexOf('@import "./brand.css";')
+  if (!(orderedLayers < orderedTailwind && orderedTailwind < orderedTheme && orderedTheme < orderedBrand)) {
+    throw new Error(`Expected layer order, Tailwind, theme, then workspace override imports, got ${JSON.stringify(orderedStyles)}`)
+  }
+  if ((orderedStyles.match(/@import "tailwindcss"/g) || []).length !== 1 || (orderedStyles.match(/@import "@avibe\/show-ui\/theme\.css"/g) || []).length !== 1) {
+    throw new Error(`Expected one unconditional managed import for Tailwind and the theme, got ${JSON.stringify(orderedStyles)}`)
+  }
+  const orderedCss = await fetch(`${runtime.url}/sessions/shadcn-overrides/app/src/styles.css?direct`).then((res) => res.text())
+  if (!orderedCss.includes("--background: #123456")) {
+    throw new Error("Expected the served CSS to preserve the workspace standard-token override")
   }
 
   console.log("smoke runtime ok")
