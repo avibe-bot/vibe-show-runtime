@@ -79,6 +79,25 @@ describe("theme import ordering", () => {
     expect(await readFile(path, "utf8")).toBe(migrated)
   })
 
+  it("does not promote layer statements that followed managed imports", async () => {
+    const workspace = await workspaceWithStyles(`@import "tailwindcss";
+@layer overrides, theme;
+@import "@avibe/show-ui/theme.css";
+@import "./brand.css";
+`)
+
+    await ensureSessionTemplate(workspace)
+    const migrated = await readFile(join(workspace, "src", "styles.css"), "utf8")
+    const tailwind = migrated.indexOf('@import "tailwindcss";')
+    const theme = migrated.indexOf('@import "@avibe/show-ui/theme.css";')
+    const layer = migrated.indexOf("@layer overrides, theme;")
+    const brand = migrated.indexOf('@import "./brand.css";')
+    expect(tailwind).toBe(0)
+    expect(theme).toBeGreaterThan(tailwind)
+    expect(layer).toBeGreaterThan(theme)
+    expect(brand).toBeGreaterThan(layer)
+  })
+
   it("recognizes comments around managed import specifiers", async () => {
     const workspace = await workspaceWithStyles(`@import /* managed */ "@avibe/show-ui/theme.css";
 @import "./brand.css";

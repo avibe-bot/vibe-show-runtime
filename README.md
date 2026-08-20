@@ -120,6 +120,10 @@ variables; complete CSS colors are preferred. Presets follow an ancestor
 `.dark` class or `data-theme="dark"` attribute automatically, while explicit
 `theme` values intentionally override either palette:
 
+Literal legacy HSL channel lists are normalized during migration. A bare
+`var(...)` is treated as a complete color reference; wrap a variable that
+stores channels explicitly, for example `hsl(var(--brand-hsl))`.
+
 ```tsx
 import { ThemeProvider } from "@/components/ui/theme"
 

@@ -78,26 +78,32 @@ function normalizeEntryImports(
   const themeSpecifier = `${uiPackageName}/theme.css`
   const tailwindImports = imports.filter((statement) => statement.specifier === "tailwindcss")
   const themeImports = imports.filter((statement) => statement.specifier === themeSpecifier)
-  let remainder = body
   const removed = [...tailwindImports, ...themeImports].sort((left, right) => right.start - left.start)
-  for (const statement of removed) {
-    remainder = `${remainder.slice(0, statement.start)}${remainder.slice(statement.endExclusive)}`
-  }
+  const firstManagedImport = removed.length
+    ? Math.min(...removed.map((statement) => statement.start))
+    : Number.POSITIVE_INFINITY
 
-  let remainderRoot: postcss.Root
+  let originalRoot: postcss.Root
   try {
-    remainderRoot = postcss.parse(remainder)
+    originalRoot = postcss.parse(body)
   } catch {
     return null
   }
   let insertionOffset = 0
-  for (const node of remainderRoot.nodes) {
+  for (const node of originalRoot.nodes) {
+    const start = node.source?.start?.offset
+    if (start != null && start >= firstManagedImport) break
     const leadingStatement =
       node.type === "comment" ||
       (node.type === "atrule" && node.name.toLowerCase() === "charset") ||
       (node.type === "atrule" && node.name.toLowerCase() === "layer" && node.nodes == null)
     if (!leadingStatement) break
     insertionOffset = node.source?.end?.offset ?? insertionOffset
+  }
+
+  let remainder = body
+  for (const statement of removed) {
+    remainder = `${remainder.slice(0, statement.start)}${remainder.slice(statement.endExclusive)}`
   }
 
   const prefix = remainder.slice(0, insertionOffset).replace(/[ \t\r\n]+$/, "")

@@ -27,12 +27,18 @@ describe("ThemeProvider", () => {
 
   it("normalizes literal HSL channels while preserving complete color references", () => {
     const markup = renderToStaticMarkup(
-      <ThemeProvider theme={{ colors: { primary: "var(--brand-color)", ring: "199 89% 48%" } }}>content</ThemeProvider>
+      <ThemeProvider theme={{ colors: {
+        primary: "var(--brand-color)",
+        ring: "199 89% 48%",
+        warning: "hsl(var(--brand-hsl))"
+      } }}>content</ThemeProvider>
     )
     expect(markup).toContain("--primary:var(--brand-color)")
     expect(markup).not.toContain("--avs-primary")
     expect(markup).toContain("--ring:hsl(199 89% 48%)")
     expect(markup).toContain("--avs-ring:199 89% 48%")
+    expect(markup).toContain("--warning:hsl(var(--brand-hsl))")
+    expect(markup).not.toContain("--avs-warning")
   })
 
   it("normalizes legacy HSL channels by top-level CSS structure", () => {

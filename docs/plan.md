@@ -396,6 +396,10 @@ presets and runtime-computed overrides through the same standard variables.
 Presets follow an ancestor `.dark` class or `data-theme="dark"` attribute;
 explicit `theme` values intentionally override either palette:
 
+Literal legacy HSL channel lists are normalized during migration. Bare
+`var(...)` values are complete color references; channel-list variables must
+be wrapped explicitly, for example `hsl(var(--brand-hsl))`.
+
 ```tsx
 import { ThemeProvider } from "@/components/ui/theme"
 
