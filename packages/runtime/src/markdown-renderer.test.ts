@@ -13,6 +13,7 @@ import {
   type MarkdownBrowser,
   type MarkdownBrowserContext,
   type MarkdownNetworkRequest,
+  type MarkdownNetworkResponse,
   type MarkdownPage,
   type MarkdownRenderRequest
 } from "./markdown-renderer.js"
@@ -811,13 +812,95 @@ describe("browser resolution ladder", () => {
     }
   })
 
+  it("renders promptly when a fetch response stays open as server-sent events", async () => {
+    const workspace = await fixtureWorkspace("fetch-sse")
+    const browser = new FakeBrowser(() => ({
+      html: "<h1>Fetch SSE ready</h1>",
+      mode: "fetch-stream",
+      responseContentType: "TEXT/EVENT-STREAM; charset=utf-8"
+    }))
+    const renderer = createMarkdownRenderer({
+      timeoutMs: 300,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 20
+    })
+
+    try {
+      await expect(renderer.render(renderRequest(workspace))).resolves.toEqual({
+        markdown: "# Fetch SSE ready\n",
+        cache: "miss"
+      })
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("renders promptly when a fetch response stays open as NDJSON", async () => {
+    const workspace = await fixtureWorkspace("fetch-ndjson")
+    const browser = new FakeBrowser(() => ({
+      html: "<h1>NDJSON ready</h1>",
+      mode: "fetch-stream",
+      responseContentType: "Application/X-NDJSON; Charset=UTF-8"
+    }))
+    const renderer = createMarkdownRenderer({
+      timeoutMs: 300,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 20
+    })
+
+    try {
+      await expect(renderer.render(renderRequest(workspace))).resolves.toEqual({
+        markdown: "# NDJSON ready\n",
+        cache: "miss"
+      })
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("reclassifies an unlabeled response that remains open past the grace period", async () => {
+    const workspace = await fixtureWorkspace("fetch-long-poll")
+    const browser = new FakeBrowser(() => ({
+      html: "<h1>Long poll ready</h1>",
+      mode: "fetch-stream",
+      responseContentType: "application/octet-stream"
+    }))
+    const renderer = createMarkdownRenderer({
+      timeoutMs: 600,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 40
+    })
+
+    try {
+      await expect(renderer.render(renderRequest(workspace))).resolves.toEqual({
+        markdown: "# Long poll ready\n",
+        cache: "miss"
+      })
+    } finally {
+      await renderer.close()
+    }
+  })
+
   it("waits for a slow finite initial request before extracting the page", async () => {
     const workspace = await fixtureWorkspace("slow-initial-data")
     const browser = new FakeBrowser(() => ({
       html: "<h1>Loading report</h1>",
       completedHtml: "<h1>Loaded report</h1>",
-      initialDataDelayMs: 300,
-      mode: "slow-initial-data"
+      initialDataDelayMs: 150,
+      mode: "slow-initial-data",
+      responseContentType: "application/json; charset=utf-8"
     }))
     const renderer = createMarkdownRenderer({
       timeoutMs: 800,
@@ -826,13 +909,39 @@ describe("browser resolution ladder", () => {
         if (target !== "chrome") throw new Error("not found")
         return browser
       },
-      quietPeriodMs: 0
+      quietPeriodMs: 100
     })
 
     try {
       await expect(renderer.render(renderRequest(workspace))).resolves.toEqual({
         markdown: "# Loaded report\n",
         cache: "miss"
+      })
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("keeps the hard timeout for a request that never receives response headers", async () => {
+    const workspace = await fixtureWorkspace("never-settling-request")
+    const browser = new FakeBrowser(() => ({
+      html: "<h1>Never ready</h1>",
+      mode: "never-settling-request"
+    }))
+    const renderer = createMarkdownRenderer({
+      timeoutMs: 150,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 20
+    })
+
+    try {
+      await expect(renderer.render(renderRequest(workspace))).rejects.toMatchObject({
+        code: "render_timeout",
+        status: 504
       })
     } finally {
       await renderer.close()
@@ -2063,6 +2172,8 @@ type FakePageMode =
   | "failed"
   | "large"
   | "persistent-network"
+  | "fetch-stream"
+  | "never-settling-request"
   | "slow-initial-data"
 type FakePageState = {
   html: string
@@ -2073,6 +2184,7 @@ type FakePageState = {
   renderApiBody?: (body: string) => string
   completedHtml?: string
   initialDataDelayMs?: number
+  responseContentType?: string
 }
 
 class FakeBrowser implements MarkdownBrowser {
@@ -2115,7 +2227,10 @@ class FakeBrowser implements MarkdownBrowser {
 }
 
 class FakePage implements MarkdownPage {
-  private readonly listeners = new Map<string, Set<(request: MarkdownNetworkRequest) => void>>()
+  private readonly listeners = new Map<
+    string,
+    Set<(payload: MarkdownNetworkRequest | MarkdownNetworkResponse) => void>
+  >()
   private renderedHtml: string
 
   constructor(
@@ -2148,9 +2263,24 @@ class FakePage implements MarkdownPage {
         this.emit("request", new FakeNetworkRequest("GET", "fetch", `${url}api/status`))
       }, 20)
     }
+    if (mode === "fetch-stream") {
+      const stream = new FakeNetworkRequest("GET", "fetch", `${url}api/stream`)
+      this.emit("request", stream)
+      this.emit("response", new FakeNetworkResponse(stream, {
+        "Content-Type": this.state.responseContentType ?? "application/octet-stream"
+      }))
+    }
+    if (mode === "never-settling-request") {
+      this.emit("request", new FakeNetworkRequest("GET", "fetch", `${url}api/never-settles`))
+    }
     if (mode === "slow-initial-data") {
       const initialData = new FakeNetworkRequest("GET", "fetch", `${url}api/initial-data`)
       this.emit("request", initialData)
+      if (this.state.responseContentType) {
+        this.emit("response", new FakeNetworkResponse(initialData, {
+          "content-type": this.state.responseContentType
+        }))
+      }
       setTimeout(() => {
         this.renderedHtml = this.state.completedHtml ?? this.state.html
         this.emit("requestfinished", initialData)
@@ -2178,14 +2308,40 @@ class FakePage implements MarkdownPage {
     return { ok: () => true, status: () => 200 }
   }
 
-  on(event: string, listener: (request: MarkdownNetworkRequest) => void): void {
+  on(
+    event: "request" | "requestfinished" | "requestfailed",
+    listener: (request: MarkdownNetworkRequest) => void
+  ): void
+  on(event: "response", listener: (response: MarkdownNetworkResponse) => void): void
+  on(
+    event: string,
+    listener: (
+      (request: MarkdownNetworkRequest) => void
+    ) | (
+      (response: MarkdownNetworkResponse) => void
+    )
+  ): void {
     const listeners = this.listeners.get(event) ?? new Set()
-    listeners.add(listener)
+    listeners.add(listener as (payload: MarkdownNetworkRequest | MarkdownNetworkResponse) => void)
     this.listeners.set(event, listeners)
   }
 
-  off(event: string, listener: (request: MarkdownNetworkRequest) => void): void {
-    this.listeners.get(event)?.delete(listener)
+  off(
+    event: "request" | "requestfinished" | "requestfailed",
+    listener: (request: MarkdownNetworkRequest) => void
+  ): void
+  off(event: "response", listener: (response: MarkdownNetworkResponse) => void): void
+  off(
+    event: string,
+    listener: (
+      (request: MarkdownNetworkRequest) => void
+    ) | (
+      (response: MarkdownNetworkResponse) => void
+    )
+  ): void {
+    this.listeners.get(event)?.delete(
+      listener as (payload: MarkdownNetworkRequest | MarkdownNetworkResponse) => void
+    )
   }
 
   async evaluate<Result>(pageFunction: () => Result | Promise<Result>): Promise<Result>
@@ -2210,8 +2366,8 @@ class FakePage implements MarkdownPage {
     return await (pageFunction as (argument?: Argument) => Result | Promise<Result>)(argument)
   }
 
-  private emit(event: string, request: MarkdownNetworkRequest): void {
-    for (const listener of this.listeners.get(event) ?? []) listener(request)
+  private emit(event: string, payload: MarkdownNetworkRequest | MarkdownNetworkResponse): void {
+    for (const listener of this.listeners.get(event) ?? []) listener(payload)
   }
 }
 
@@ -2232,6 +2388,21 @@ class FakeNetworkRequest implements MarkdownNetworkRequest {
 
   url(): string {
     return this.requestUrl
+  }
+}
+
+class FakeNetworkResponse implements MarkdownNetworkResponse {
+  constructor(
+    private readonly networkRequest: MarkdownNetworkRequest,
+    private readonly responseHeaders: Record<string, string>
+  ) {}
+
+  request(): MarkdownNetworkRequest {
+    return this.networkRequest
+  }
+
+  headers(): Record<string, string> {
+    return this.responseHeaders
   }
 }
 

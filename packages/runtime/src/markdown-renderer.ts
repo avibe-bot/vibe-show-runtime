@@ -75,15 +75,22 @@ export type MarkdownNetworkRequest = {
   url(): string
 }
 
-type MarkdownNetworkEvent = "request" | "requestfinished" | "requestfailed"
+export type MarkdownNetworkResponse = {
+  request(): MarkdownNetworkRequest
+  headers(): Record<string, string>
+}
+
+type MarkdownNetworkRequestEvent = "request" | "requestfinished" | "requestfailed"
 
 export type MarkdownPage = {
   goto(
     url: string,
     options: { waitUntil: "domcontentloaded"; timeout: number }
   ): Promise<MarkdownNavigationResponse | null>
-  on(event: MarkdownNetworkEvent, listener: (request: MarkdownNetworkRequest) => void): void
-  off(event: MarkdownNetworkEvent, listener: (request: MarkdownNetworkRequest) => void): void
+  on(event: MarkdownNetworkRequestEvent, listener: (request: MarkdownNetworkRequest) => void): void
+  on(event: "response", listener: (response: MarkdownNetworkResponse) => void): void
+  off(event: MarkdownNetworkRequestEvent, listener: (request: MarkdownNetworkRequest) => void): void
+  off(event: "response", listener: (response: MarkdownNetworkResponse) => void): void
   evaluate<Result>(pageFunction: () => Result | Promise<Result>): Promise<Result>
   evaluate<Result, Argument>(
     pageFunction: (argument: Argument) => Result | Promise<Result>,
@@ -390,8 +397,12 @@ function trackRenderNetwork(
   page: MarkdownPage,
   quietPeriodMs: number
 ): RenderNetworkTracker {
-  const pending = new Map<MarkdownNetworkRequest, string>()
+  const pending = new Map<MarkdownNetworkRequest, {
+    key: string
+    responseAt?: number
+  }>()
   const completedPolls = new Set<string>()
+  const responseGracePeriodMs = quietPeriodMs * 2
   let activityVersion = 0
   let disposed = false
 
@@ -405,19 +416,27 @@ function trackRenderNetwork(
     // The first XHR/fetch populates the page; identical later requests are a
     // polling loop and must not make a snapshot impossible.
     if ((resourceType === "fetch" || resourceType === "xhr") && completedPolls.has(key)) return
-    pending.set(request, key)
+    pending.set(request, { key })
     activityVersion += 1
   }
   const requestSettled = (request: MarkdownNetworkRequest) => {
-    const key = pending.get(request)
-    if (key === undefined) return
+    const tracked = pending.get(request)
+    if (tracked === undefined) return
     pending.delete(request)
     const resourceType = request.resourceType().toLowerCase()
-    if (resourceType === "fetch" || resourceType === "xhr") completedPolls.add(key)
+    if (resourceType === "fetch" || resourceType === "xhr") completedPolls.add(tracked.key)
     activityVersion += 1
+  }
+  const responseReceived = (response: MarkdownNetworkResponse) => {
+    const request = response.request()
+    const tracked = pending.get(request)
+    if (tracked === undefined) return
+    tracked.responseAt = Date.now()
+    if (isStreamingContentType(response.headers())) requestSettled(request)
   }
 
   page.on("request", requestStarted)
+  page.on("response", responseReceived)
   page.on("requestfinished", requestSettled)
   page.on("requestfailed", requestSettled)
 
@@ -427,6 +446,14 @@ function trackRenderNetwork(
       let idleVersion = -1
       while (!disposed) {
         const now = Date.now()
+        for (const [request, tracked] of pending) {
+          if (
+            tracked.responseAt !== undefined &&
+            now - tracked.responseAt >= responseGracePeriodMs
+          ) {
+            requestSettled(request)
+          }
+        }
         if (pending.size === 0) {
           if (idleSince === undefined || idleVersion !== activityVersion) {
             idleSince = now
@@ -445,10 +472,19 @@ function trackRenderNetwork(
       disposed = true
       pending.clear()
       page.off("request", requestStarted)
+      page.off("response", responseReceived)
       page.off("requestfinished", requestSettled)
       page.off("requestfailed", requestSettled)
     }
   }
+}
+
+function isStreamingContentType(headers: Record<string, string>): boolean {
+  const contentType = Object.entries(headers).find(
+    ([name]) => name.toLowerCase() === "content-type"
+  )?.[1]
+  const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase()
+  return mediaType === "text/event-stream" || mediaType === "application/x-ndjson"
 }
 
 /**
