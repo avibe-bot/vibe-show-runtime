@@ -22,6 +22,10 @@ import {
   type RenderSnapshot,
   type RenderSnapshotManager
 } from "./render-snapshot.js"
+import {
+  createWorkspaceFingerprinter,
+  type WorkspaceFingerprinter
+} from "./workspace-fingerprint.js"
 
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 
@@ -31,6 +35,7 @@ export type ShowRuntimeServerDependencies = {
   browserDiscoveryDisabled?: boolean
   browserProvisioningDisabled?: boolean
   provisionBrowser?: BrowserProvisioner
+  workspaceFingerprinter?: WorkspaceFingerprinter
 }
 
 export async function startShowRuntimeServer(
@@ -39,6 +44,7 @@ export async function startShowRuntimeServer(
 ) {
   const host = options.host ?? "127.0.0.1"
   const port = options.port ?? 0
+  const workspaceFingerprinter = dependencies.workspaceFingerprinter ?? createWorkspaceFingerprinter()
   const markdownRenderer = createMarkdownRenderer({
     timeoutMs: options.renderTimeoutMs,
     cacheTtlMs: options.renderCacheTtlMs,
@@ -49,7 +55,8 @@ export async function startShowRuntimeServer(
     browserProvisioningDisabled: dependencies.browserProvisioningDisabled,
     browserProvisionTimeoutMs: options.renderBrowserProvisionTimeoutMs,
     launchBrowser: dependencies.launchBrowser,
-    provisionBrowser: dependencies.provisionBrowser
+    provisionBrowser: dependencies.provisionBrowser,
+    workspaceFingerprinter
   })
   const server = createServer(async (request, response) => {
     try {
@@ -81,7 +88,7 @@ export async function startShowRuntimeServer(
       )
     }
   })
-  renderSnapshots = createRenderSnapshotManager(runtime)
+  renderSnapshots = createRenderSnapshotManager(runtime, workspaceFingerprinter)
   const eventStreams = new ShowEventStreamBroker()
 
   await new Promise<void>((resolve) => server.listen(port, host, resolve))

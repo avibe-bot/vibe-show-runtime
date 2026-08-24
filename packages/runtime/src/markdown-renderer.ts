@@ -1,11 +1,15 @@
-import { createHash } from "node:crypto"
 import { spawn } from "node:child_process"
-import { lstat, readdir, stat } from "node:fs/promises"
 import { createRequire } from "node:module"
 import { dirname, join } from "node:path"
 import { chromium } from "playwright-core"
 import TurndownService from "turndown"
 import { gfm } from "turndown-plugin-gfm"
+import {
+  createWorkspaceFingerprinter,
+  type WorkspaceFingerprinter
+} from "./workspace-fingerprint.js"
+
+export { workspaceFingerprint } from "./workspace-fingerprint.js"
 
 export const DEFAULT_MARKDOWN_RENDER_TIMEOUT_MS = 30_000
 export const DEFAULT_MARKDOWN_CACHE_TTL_MS = 30_000
@@ -18,7 +22,6 @@ const DEFAULT_MARKDOWN_CACHE_MAINTENANCE_INTERVAL_MS = 5_000
 const DEFAULT_RENDER_QUIET_PERIOD_MS = 150
 const SYSTEM_BROWSER_CHANNELS = ["chrome", "msedge"] as const
 const MANAGED_BROWSER_TARGET = "managed" as const
-const WORKSPACE_FINGERPRINT_EXCLUDED_ENTRIES = new Set(["node_modules", ".git", "dist", "build"])
 const PLAYWRIGHT_CLI_PATH = join(
   dirname(createRequire(import.meta.url).resolve("playwright-core/package.json")),
   "cli.js"
@@ -129,6 +132,7 @@ export type MarkdownRendererOptions = {
   browserProvisionTimeoutMs?: number
   launchBrowser?: BrowserLauncher
   provisionBrowser?: BrowserProvisioner
+  workspaceFingerprinter?: WorkspaceFingerprinter
   now?: () => number
 }
 
@@ -188,6 +192,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
     )
   )
   const now = options.now ?? Date.now
+  const workspaceFingerprinter = options.workspaceFingerprinter ?? createWorkspaceFingerprinter()
   const browserPool = new BrowserPool({
     idleMs: browserIdleMs,
     discoveryDisabled: options.browserDiscoveryDisabled ?? envFlag("VIBE_SHOW_RENDER_DISABLE_BROWSER_DISCOVERY"),
@@ -218,7 +223,11 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
 
       try {
         const cacheKey = renderCacheKey(request)
-        const initialFingerprint = await deadline.wait(fingerprintOrRenderFailed(request.workspace))
+        const initialFingerprint = await deadline.wait(fingerprintOrRenderFailed(
+          workspaceFingerprinter,
+          request.sessionId,
+          request.workspace
+        ))
         const initialHit = cache.get(cacheKey, initialFingerprint)
         if (initialHit) {
           return { markdown: initialHit.markdown, cache: "hit" }
@@ -227,7 +236,11 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
         const waitStart = Date.now()
         return await mutex.runExclusive(async () => {
           deadline.extendBy(Date.now() - waitStart)
-          const lockedFingerprint = await deadline.wait(fingerprintOrRenderFailed(request.workspace))
+          const lockedFingerprint = await deadline.wait(fingerprintOrRenderFailed(
+            workspaceFingerprinter,
+            request.sessionId,
+            request.workspace
+          ))
           const lockedHit = cache.get(cacheKey, lockedFingerprint)
           if (lockedHit) {
             return { markdown: lockedHit.markdown, cache: "hit" }
@@ -263,6 +276,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
       if (closed) return
       await mutex.runExclusive(async () => {
         cache.invalidateSession(sessionId)
+        workspaceFingerprinter.invalidateSession(sessionId)
         await releaseResources?.()
       })
     },
@@ -270,6 +284,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
       closed = true
       if (cacheMaintenanceTimer) clearInterval(cacheMaintenanceTimer)
       cache.clear()
+      workspaceFingerprinter.clear()
       await mutex.runExclusive(() => browserPool.close())
     }
   }
@@ -568,52 +583,13 @@ export function convertRenderedHtmlToMarkdown(html: string): string {
   return markdown ? `${markdown}\n` : ""
 }
 
-export async function workspaceFingerprint(workspace: string): Promise<string> {
-  const hash = createHash("sha256")
-  await fingerprintDirectory(workspace, "", hash)
-  return hash.digest("hex")
-}
-
-async function fingerprintDirectory(
-  workspace: string,
-  relativeDirectory: string,
-  hash: ReturnType<typeof createHash>
-): Promise<void> {
-  const directory = relativeDirectory ? join(workspace, relativeDirectory) : workspace
-  const entries = await readdir(directory, { withFileTypes: true })
-  entries.sort((left, right) => left.name.localeCompare(right.name))
-
-  for (const entry of entries) {
-    if (!relativeDirectory && WORKSPACE_FINGERPRINT_EXCLUDED_ENTRIES.has(entry.name)) continue
-    const relativePath = relativeDirectory ? join(relativeDirectory, entry.name) : entry.name
-    const path = join(workspace, relativePath)
-    const info = await lstat(path, { bigint: true })
-    hash.update(relativePath.replaceAll("\\", "/"))
-    hash.update("\0")
-    hash.update(entry.isDirectory() ? "directory" : entry.isSymbolicLink() ? "symlink" : "file")
-    hash.update("\0")
-    hash.update(info.size.toString())
-    hash.update("\0")
-    hash.update(info.mtimeNs.toString())
-    hash.update("\0")
-    if (entry.isSymbolicLink()) {
-      const target = await stat(path, { bigint: true }).catch(() => undefined)
-      if (target) {
-        hash.update(target.size.toString())
-        hash.update("\0")
-        hash.update(target.mtimeNs.toString())
-        hash.update("\0")
-      }
-    }
-    if (entry.isDirectory()) {
-      await fingerprintDirectory(workspace, relativePath, hash)
-    }
-  }
-}
-
-async function fingerprintOrRenderFailed(workspace: string): Promise<string> {
+async function fingerprintOrRenderFailed(
+  fingerprinter: WorkspaceFingerprinter,
+  sessionId: string,
+  workspace: string
+): Promise<string> {
   try {
-    return await workspaceFingerprint(workspace)
+    return await fingerprinter.fingerprint(sessionId, workspace)
   } catch (error) {
     throw renderFailed("Show Page workspace could not be read.", error)
   }

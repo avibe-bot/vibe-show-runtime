@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
+import { lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -17,6 +17,7 @@ import {
   type MarkdownRenderRequest
 } from "./markdown-renderer.js"
 import { startShowRuntimeServer } from "./server.js"
+import { createWorkspaceFingerprinter } from "./workspace-fingerprint.js"
 
 const temporaryDirectories: string[] = []
 
@@ -111,6 +112,77 @@ describe("rendered DOM conversion", () => {
 })
 
 describe("workspace render cache", () => {
+  it("memoizes file content hashes until metadata changes or the session is cleared", async () => {
+    const workspace = await temporaryDirectory("fingerprint-memo")
+    const firstPath = join(workspace, "first.txt")
+    const secondPath = join(workspace, "second.txt")
+    await writeFile(firstPath, "first version\n")
+    await writeFile(secondPath, "second version\n")
+    const reads: string[] = []
+    const fingerprinter = createWorkspaceFingerprinter({
+      readFile: async (path) => {
+        reads.push(path)
+        return await readFile(path)
+      }
+    })
+
+    const initial = await fingerprinter.fingerprint("session", workspace)
+    expect(reads).toEqual([firstPath, secondPath])
+
+    expect(await fingerprinter.fingerprint("session", workspace)).toBe(initial)
+    expect(reads).toEqual([firstPath, secondPath])
+
+    await writeFile(firstPath, "first version with changed metadata\n")
+    expect(await fingerprinter.fingerprint("session", workspace)).not.toBe(initial)
+    expect(reads).toEqual([firstPath, secondPath, firstPath])
+
+    fingerprinter.invalidateSession("session")
+    await fingerprinter.fingerprint("session", workspace)
+    expect(reads.slice(-2)).toEqual([firstPath, secondPath])
+
+    fingerprinter.clear()
+    await fingerprinter.fingerprint("session", workspace)
+    expect(reads.slice(-2)).toEqual([firstPath, secondPath])
+  })
+
+  it("bounds content-hash memo entries per session and globally", async () => {
+    const firstWorkspace = await temporaryDirectory("fingerprint-memo-first")
+    const secondWorkspace = await temporaryDirectory("fingerprint-memo-second")
+    const firstPath = join(firstWorkspace, "first.txt")
+    const secondPath = join(firstWorkspace, "second.txt")
+    const otherPath = join(secondWorkspace, "other.txt")
+    await writeFile(firstPath, "first\n")
+    await writeFile(secondPath, "second\n")
+    await writeFile(otherPath, "other\n")
+
+    const perSessionReads: string[] = []
+    const perSession = createWorkspaceFingerprinter({
+      entriesPerSession: 1,
+      entriesGlobal: 8,
+      readFile: async (path) => {
+        perSessionReads.push(path)
+        return await readFile(path)
+      }
+    })
+    await perSession.fingerprint("session", firstWorkspace)
+    await perSession.fingerprint("session", firstWorkspace)
+    expect(perSessionReads).toEqual([firstPath, secondPath, firstPath, secondPath])
+
+    const globalReads: string[] = []
+    const global = createWorkspaceFingerprinter({
+      entriesPerSession: 8,
+      entriesGlobal: 1,
+      readFile: async (path) => {
+        globalReads.push(path)
+        return await readFile(path)
+      }
+    })
+    await global.fingerprint("first-session", firstWorkspace)
+    await global.fingerprint("second-session", secondWorkspace)
+    await global.fingerprint("first-session", firstWorkspace)
+    expect(globalReads).toEqual([firstPath, secondPath, otherPath, firstPath, secondPath])
+  })
+
   it("includes meaningful dotfiles while excluding dependencies, Git metadata, and build output", async () => {
     const workspace = await temporaryDirectory("fingerprint")
     await mkdir(join(workspace, "src"), { recursive: true })
@@ -1086,6 +1158,57 @@ document.getElementById("root")!.textContent = leaked
     }
   }, 30_000)
 
+  it("rebuilds when file bytes change without changing size or mtime", async () => {
+    const workspaceRoot = await temporaryDirectory("snapshot-content-invalidation")
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    const pagePath = join(workspace, "index.html")
+    const writePage = (label: string) => writeFile(pagePath, `<!doctype html>
+<html><body><main id="root"><h1>${label}</h1></main><script type="module" src="/src/main.tsx"></script></body></html>\n`)
+    const preservedTime = new Date("2026-01-02T03:04:05.000Z")
+    await writePage("Snapshot version one")
+    await utimes(pagePath, preservedTime, preservedTime)
+    const originalMetadata = await lstat(pagePath, { bigint: true })
+    const browser = new FakeBrowser(() => ({
+      html: "",
+      mode: "success",
+      expectedNavigationBody: "/sessions/page/render-app/assets/",
+      useNavigationBody: true
+    }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+    const buildSnapshot = vi.spyOn(runtime.runtime, "buildSessionSnapshot")
+
+    try {
+      const first = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      expect(first.headers.get("x-avibe-render-cache")).toBe("miss")
+      expect(await first.text()).toContain("# Snapshot version one")
+
+      await writePage("Snapshot version two")
+      await utimes(pagePath, preservedTime, preservedTime)
+      const changedMetadata = await lstat(pagePath, { bigint: true })
+      expect(changedMetadata.size).toBe(originalMetadata.size)
+      expect(changedMetadata.mtimeNs).toBe(originalMetadata.mtimeNs)
+
+      const changed = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      expect(changed.headers.get("x-avibe-render-cache")).toBe("miss")
+      expect(await changed.text()).toContain("# Snapshot version two")
+      expect(buildSnapshot).toHaveBeenCalledTimes(2)
+      expect(browser.contextCount).toBe(2)
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
   it("retries a snapshot when the workspace changes before the build is committed", async () => {
     const workspaceRoot = await temporaryDirectory("snapshot-build-race")
     const workspace = await fixtureWorkspace("page", workspaceRoot)
@@ -1371,7 +1494,14 @@ document.getElementById("root")!.textContent = leaked
 
   it("releases the snapshot and cache when a session is suspended, then rebuilds cleanly", async () => {
     const workspaceRoot = await temporaryDirectory("suspend-render")
-    await fixtureWorkspace("page", workspaceRoot)
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    const fingerprintReads: string[] = []
+    const workspaceFingerprinter = createWorkspaceFingerprinter({
+      readFile: async (path) => {
+        fingerprintReads.push(path)
+        return await readFile(path)
+      }
+    })
     const browser = new FakeBrowser(() => ({
       html: "<h1>Suspend fixture</h1>",
       mode: "success",
@@ -1387,7 +1517,8 @@ document.getElementById("root")!.textContent = leaked
         return browser
       },
       browserProvisioningDisabled: true,
-      renderQuietPeriodMs: 0
+      renderQuietPeriodMs: 0,
+      workspaceFingerprinter
     })
     const headers = {
       "X-Avibe-Show-Protocol": "1",
@@ -1403,10 +1534,13 @@ document.getElementById("root")!.textContent = leaked
       const initialSnapshot = runtime.renderSnapshots.get("page")
       expect(initialSnapshot).toBeDefined()
       expect(buildSnapshot).toHaveBeenCalledTimes(1)
+      const initialFingerprintReads = fingerprintReads.filter((path) => path.startsWith(workspace)).length
+      expect(initialFingerprintReads).toBeGreaterThan(0)
 
       const cached = await fetch(`${runtime.url}/sessions/page/render-markdown`, { headers })
       expect(cached.headers.get("x-avibe-render-cache")).toBe("hit")
       await cached.text()
+      expect(fingerprintReads.filter((path) => path.startsWith(workspace))).toHaveLength(initialFingerprintReads)
 
       const suspended = await fetch(`${runtime.url}/sessions/page/suspend`, { method: "POST" })
       expect(suspended.status).toBe(200)
@@ -1421,6 +1555,8 @@ document.getElementById("root")!.textContent = leaked
       expect(runtime.renderSnapshots.get("page")).toBeDefined()
       expect(runtime.runtime.getSession("page")?.state).toBe("active")
       expect(buildSnapshot).toHaveBeenCalledTimes(2)
+      expect(fingerprintReads.filter((path) => path.startsWith(workspace)))
+        .toHaveLength(initialFingerprintReads * 2)
     } finally {
       await runtime.close()
     }
@@ -1432,6 +1568,13 @@ document.getElementById("root")!.textContent = leaked
     const activeWorkspace = await fixtureWorkspace("active-page", workspaceRoot)
     await writeFile(join(idleWorkspace, "index.html"), "<main id=\"root\"><h1>Idle snapshot</h1></main>\n")
     await writeFile(join(activeWorkspace, "index.html"), "<main id=\"root\"><h1>Active snapshot</h1></main>\n")
+    const fingerprintReads: string[] = []
+    const workspaceFingerprinter = createWorkspaceFingerprinter({
+      readFile: async (path) => {
+        fingerprintReads.push(path)
+        return await readFile(path)
+      }
+    })
     const browser = new FakeBrowser(() => ({ html: "", mode: "success", useNavigationBody: true }))
     const runtime = await startShowRuntimeServer({
       workspaceRoot,
@@ -1445,7 +1588,8 @@ document.getElementById("root")!.textContent = leaked
         return browser
       },
       browserProvisioningDisabled: true,
-      renderQuietPeriodMs: 0
+      renderQuietPeriodMs: 0,
+      workspaceFingerprinter
     })
     const buildSnapshot = vi.spyOn(runtime.runtime, "buildSessionSnapshot")
 
@@ -1461,6 +1605,8 @@ document.getElementById("root")!.textContent = leaked
 
       const idleSnapshot = runtime.renderSnapshots.get("idle-page")
       const activeSnapshot = runtime.renderSnapshots.get("active-page")
+      const idleReadsBeforePrune = fingerprintReads.filter((path) => path.startsWith(idleWorkspace)).length
+      const activeReadsBeforePrune = fingerprintReads.filter((path) => path.startsWith(activeWorkspace)).length
       expect(idleSnapshot).toBeDefined()
       expect(activeSnapshot).toBeDefined()
       runtime.runtime.getSession("idle-page")!.lastAccessedAt = new Date(Date.now() - 1_000)
@@ -1477,9 +1623,13 @@ document.getElementById("root")!.textContent = leaked
       const active = await fetch(`${runtime.url}/sessions/active-page/render-markdown`)
       expect(active.headers.get("x-avibe-render-cache")).toBe("hit")
       await active.text()
+      expect(fingerprintReads.filter((path) => path.startsWith(activeWorkspace)))
+        .toHaveLength(activeReadsBeforePrune)
       const idle = await fetch(`${runtime.url}/sessions/idle-page/render-markdown`)
       expect(idle.headers.get("x-avibe-render-cache")).toBe("miss")
       await idle.text()
+      expect(fingerprintReads.filter((path) => path.startsWith(idleWorkspace)))
+        .toHaveLength(idleReadsBeforePrune * 2)
       expect(buildSnapshot).toHaveBeenCalledTimes(3)
     } finally {
       await runtime.close()

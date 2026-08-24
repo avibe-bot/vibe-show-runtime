@@ -2,8 +2,12 @@ import { createHash } from "node:crypto"
 import { mkdtemp, realpath, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { MarkdownRenderError, workspaceFingerprint } from "./markdown-renderer.js"
+import { MarkdownRenderError } from "./markdown-renderer.js"
 import type { ShowRuntime } from "./types.js"
+import {
+  createWorkspaceFingerprinter,
+  type WorkspaceFingerprinter
+} from "./workspace-fingerprint.js"
 
 const MAX_SNAPSHOT_BUILD_ATTEMPTS = 3
 
@@ -20,7 +24,10 @@ export type RenderSnapshotManager = {
   close(): Promise<void>
 }
 
-export function createRenderSnapshotManager(runtime: ShowRuntime): RenderSnapshotManager {
+export function createRenderSnapshotManager(
+  runtime: ShowRuntime,
+  workspaceFingerprinter: WorkspaceFingerprinter = createWorkspaceFingerprinter()
+): RenderSnapshotManager {
   const snapshots = new Map<string, RenderSnapshot>()
   const preparations = new Map<string, Promise<RenderSnapshot>>()
   const generations = new Map<string, number>()
@@ -44,7 +51,7 @@ export function createRenderSnapshotManager(runtime: ShowRuntime): RenderSnapsho
       // It awaits the session's existing warm state and never creates a parallel runtime.
       await runtime.prepareSessionSnapshot(sessionId)
       for (let attempt = 0; attempt < MAX_SNAPSHOT_BUILD_ATTEMPTS; attempt += 1) {
-        const fingerprint = await workspaceFingerprint(workspace)
+        const fingerprint = await workspaceFingerprinter.fingerprint(sessionId, workspace)
         const existing = snapshots.get(sessionId)
         if (existing?.fingerprint === fingerprint && await snapshotExists(existing)) {
           return existing
@@ -69,7 +76,7 @@ export function createRenderSnapshotManager(runtime: ShowRuntime): RenderSnapsho
 
         // Never publish build bytes under a fingerprint captured before those
         // bytes were produced. A stable retry gives one-off edits fresh output.
-        if (await workspaceFingerprint(workspace) !== fingerprint) {
+        if (await workspaceFingerprinter.fingerprint(sessionId, workspace) !== fingerprint) {
           await rm(outDir, { force: true, recursive: true }).catch(() => undefined)
           if (attempt + 1 === MAX_SNAPSHOT_BUILD_ATTEMPTS) {
             throw snapshotBuildFailed(new Error("Workspace changed repeatedly during the snapshot build"))
@@ -112,6 +119,7 @@ export function createRenderSnapshotManager(runtime: ShowRuntime): RenderSnapsho
     async invalidateSession(sessionId) {
       generations.set(sessionId, (generations.get(sessionId) ?? 0) + 1)
       await preparations.get(sessionId)?.catch(() => undefined)
+      workspaceFingerprinter.invalidateSession(sessionId)
       const snapshot = snapshots.get(sessionId)
       snapshots.delete(sessionId)
       if (snapshot) {
@@ -127,6 +135,7 @@ export function createRenderSnapshotManager(runtime: ShowRuntime): RenderSnapsho
       await Promise.allSettled(preparations.values())
       preparations.clear()
       snapshots.clear()
+      workspaceFingerprinter.clear()
       if (rootPromise) {
         await rm(await rootPromise, { force: true, recursive: true }).catch(() => undefined)
       }
