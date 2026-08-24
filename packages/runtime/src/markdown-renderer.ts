@@ -20,6 +20,7 @@ export const DEFAULT_BROWSER_IDLE_MS = 60_000
 export const DEFAULT_BROWSER_PROVISION_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_MARKDOWN_CACHE_MAINTENANCE_INTERVAL_MS = 5_000
 const DEFAULT_RENDER_QUIET_PERIOD_MS = 150
+const DEFAULT_RENDER_AMBIGUITY_BUDGET_MS = 5_000
 const SYSTEM_BROWSER_CHANNELS = ["chrome", "msedge"] as const
 const MANAGED_BROWSER_TARGET = "managed" as const
 const PLAYWRIGHT_CLI_PATH = join(
@@ -134,6 +135,7 @@ export type MarkdownRendererOptions = {
   maxOutputBytes?: number
   browserIdleMs?: number
   quietPeriodMs?: number
+  ambiguityBudgetMs?: number
   browserDiscoveryDisabled?: boolean
   browserProvisioningDisabled?: boolean
   browserProvisionTimeoutMs?: number
@@ -192,6 +194,10 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
     DEFAULT_BROWSER_IDLE_MS
   )
   const quietPeriodMs = nonNegativeInteger(options.quietPeriodMs, DEFAULT_RENDER_QUIET_PERIOD_MS)
+  const ambiguityBudgetMs = nonNegativeInteger(
+    options.ambiguityBudgetMs ?? envInteger("VIBE_SHOW_RENDER_AMBIGUITY_BUDGET_MS"),
+    DEFAULT_RENDER_AMBIGUITY_BUDGET_MS
+  )
   const browserProvisionTimeoutMs = positiveInteger(
     options.browserProvisionTimeoutMs,
     positiveInteger(
@@ -266,6 +272,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
             deadline,
             timeoutMs,
             quietPeriodMs,
+            ambiguityBudgetMs,
             maxOutputBytes
           })
 
@@ -304,9 +311,18 @@ async function renderPageToMarkdown(options: {
   deadline: RenderDeadline
   timeoutMs: number
   quietPeriodMs: number
+  ambiguityBudgetMs: number
   maxOutputBytes: number
 }): Promise<string> {
-  const { request, browserPool, deadline, timeoutMs, quietPeriodMs, maxOutputBytes } = options
+  const {
+    request,
+    browserPool,
+    deadline,
+    timeoutMs,
+    quietPeriodMs,
+    ambiguityBudgetMs,
+    maxOutputBytes
+  } = options
   let browser: MarkdownBrowser | undefined
   let context: MarkdownBrowserContext | undefined
   let network: RenderNetworkTracker | undefined
@@ -317,7 +333,7 @@ async function renderPageToMarkdown(options: {
     // A fresh context has no cookies, storage, credentials, or caller headers.
     context = await deadline.wait(browser.newContext())
     const page = await deadline.wait(context.newPage())
-    network = trackRenderNetwork(page, quietPeriodMs)
+    network = trackRenderNetwork(page, quietPeriodMs, ambiguityBudgetMs)
     const navigation = await deadline.wait(page.goto(request.renderUrl, {
       waitUntil: "domcontentloaded",
       timeout: deadline.remaining()
@@ -395,14 +411,14 @@ type RenderNetworkTracker = {
 
 function trackRenderNetwork(
   page: MarkdownPage,
-  quietPeriodMs: number
+  quietPeriodMs: number,
+  ambiguityBudgetMs: number
 ): RenderNetworkTracker {
   const pending = new Map<MarkdownNetworkRequest, {
     key: string
-    responseAt?: number
+    ambiguousSince?: number
   }>()
   const completedPolls = new Set<string>()
-  const responseGracePeriodMs = quietPeriodMs * 2
   let activityVersion = 0
   let disposed = false
 
@@ -431,8 +447,12 @@ function trackRenderNetwork(
     const request = response.request()
     const tracked = pending.get(request)
     if (tracked === undefined) return
-    tracked.responseAt = Date.now()
-    if (isStreamingContentType(response.headers())) requestSettled(request)
+    const headers = response.headers()
+    if (isStreamingContentType(headers)) {
+      requestSettled(request)
+    } else if (responseHeader(headers, "content-length") === undefined) {
+      tracked.ambiguousSince = Date.now()
+    }
   }
 
   page.on("request", requestStarted)
@@ -448,8 +468,8 @@ function trackRenderNetwork(
         const now = Date.now()
         for (const [request, tracked] of pending) {
           if (
-            tracked.responseAt !== undefined &&
-            now - tracked.responseAt >= responseGracePeriodMs
+            tracked.ambiguousSince !== undefined &&
+            now - tracked.ambiguousSince >= ambiguityBudgetMs
           ) {
             requestSettled(request)
           }
@@ -480,11 +500,18 @@ function trackRenderNetwork(
 }
 
 function isStreamingContentType(headers: Record<string, string>): boolean {
-  const contentType = Object.entries(headers).find(
-    ([name]) => name.toLowerCase() === "content-type"
-  )?.[1]
+  const contentType = responseHeader(headers, "content-type")
   const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase()
   return mediaType === "text/event-stream" || mediaType === "application/x-ndjson"
+}
+
+function responseHeader(
+  headers: Record<string, string>,
+  expectedName: string
+): string | undefined {
+  return Object.entries(headers).find(
+    ([name]) => name.toLowerCase() === expectedName
+  )?.[1]
 }
 
 /**

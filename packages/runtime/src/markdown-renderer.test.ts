@@ -866,13 +866,14 @@ describe("browser resolution ladder", () => {
     }
   })
 
-  it("reclassifies an unlabeled response that remains open past the grace period", async () => {
+  it("reclassifies an unlabeled open response after the ambiguity budget", async () => {
     const workspace = await fixtureWorkspace("fetch-long-poll")
     const browser = new FakeBrowser(() => ({
       html: "<h1>Long poll ready</h1>",
-      mode: "fetch-stream",
-      responseContentType: "application/octet-stream"
+      mode: "fetch-stream"
     }))
+    const oldAmbiguityBudget = process.env.VIBE_SHOW_RENDER_AMBIGUITY_BUDGET_MS
+    process.env.VIBE_SHOW_RENDER_AMBIGUITY_BUDGET_MS = "120"
     const renderer = createMarkdownRenderer({
       timeoutMs: 600,
       browserProvisioningDisabled: true,
@@ -880,14 +881,17 @@ describe("browser resolution ladder", () => {
         if (target !== "chrome") throw new Error("not found")
         return browser
       },
-      quietPeriodMs: 40
+      quietPeriodMs: 10
     })
+    restoreEnvironment("VIBE_SHOW_RENDER_AMBIGUITY_BUDGET_MS", oldAmbiguityBudget)
 
     try {
+      const startedAt = Date.now()
       await expect(renderer.render(renderRequest(workspace))).resolves.toEqual({
         markdown: "# Long poll ready\n",
         cache: "miss"
       })
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(110)
     } finally {
       await renderer.close()
     }
@@ -898,18 +902,20 @@ describe("browser resolution ladder", () => {
     const browser = new FakeBrowser(() => ({
       html: "<h1>Loading report</h1>",
       completedHtml: "<h1>Loaded report</h1>",
-      initialDataDelayMs: 150,
+      initialDataDelayMs: 1_000,
       mode: "slow-initial-data",
-      responseContentType: "application/json; charset=utf-8"
+      responseContentType: "application/json; charset=utf-8",
+      responseContentLength: "4096"
     }))
     const renderer = createMarkdownRenderer({
-      timeoutMs: 800,
+      timeoutMs: 3_000,
       browserProvisioningDisabled: true,
       launchBrowser: async (target) => {
         if (target !== "chrome") throw new Error("not found")
         return browser
       },
-      quietPeriodMs: 100
+      quietPeriodMs: 100,
+      ambiguityBudgetMs: 100
     })
 
     try {
@@ -2185,6 +2191,7 @@ type FakePageState = {
   completedHtml?: string
   initialDataDelayMs?: number
   responseContentType?: string
+  responseContentLength?: string
 }
 
 class FakeBrowser implements MarkdownBrowser {
@@ -2266,9 +2273,12 @@ class FakePage implements MarkdownPage {
     if (mode === "fetch-stream") {
       const stream = new FakeNetworkRequest("GET", "fetch", `${url}api/stream`)
       this.emit("request", stream)
-      this.emit("response", new FakeNetworkResponse(stream, {
-        "Content-Type": this.state.responseContentType ?? "application/octet-stream"
-      }))
+      const headers: Record<string, string> = {}
+      if (this.state.responseContentType) headers["Content-Type"] = this.state.responseContentType
+      if (this.state.responseContentLength) {
+        headers["content-length"] = this.state.responseContentLength
+      }
+      this.emit("response", new FakeNetworkResponse(stream, headers))
     }
     if (mode === "never-settling-request") {
       this.emit("request", new FakeNetworkRequest("GET", "fetch", `${url}api/never-settles`))
@@ -2276,10 +2286,13 @@ class FakePage implements MarkdownPage {
     if (mode === "slow-initial-data") {
       const initialData = new FakeNetworkRequest("GET", "fetch", `${url}api/initial-data`)
       this.emit("request", initialData)
-      if (this.state.responseContentType) {
-        this.emit("response", new FakeNetworkResponse(initialData, {
-          "content-type": this.state.responseContentType
-        }))
+      if (this.state.responseContentType || this.state.responseContentLength) {
+        const headers: Record<string, string> = {}
+        if (this.state.responseContentType) headers["content-type"] = this.state.responseContentType
+        if (this.state.responseContentLength) {
+          headers["Content-Length"] = this.state.responseContentLength
+        }
+        this.emit("response", new FakeNetworkResponse(initialData, headers))
       }
       setTimeout(() => {
         this.renderedHtml = this.state.completedHtml ?? this.state.html
