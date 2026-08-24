@@ -49,7 +49,15 @@ export async function startShowRuntimeServer(
 
   const server = createServer(async (request, response) => {
     try {
-      await routeRequest(runtime, request, response, eventStreams, markdownRenderer, options.workspaceRoot)
+      await routeRequest(
+        runtime,
+        renderRuntime,
+        request,
+        response,
+        eventStreams,
+        markdownRenderer,
+        options.workspaceRoot
+      )
     } catch (error) {
       response.statusCode = 500
       response.setHeader("content-type", "application/json")
@@ -57,6 +65,7 @@ export async function startShowRuntimeServer(
     }
   })
   const runtime = createShowRuntime({ ...options, server })
+  const renderRuntime = createShowRuntime({ ...options, server }, { hmr: false })
   const eventStreams = new ShowEventStreamBroker()
 
   await new Promise<void>((resolve) => server.listen(port, host, resolve))
@@ -68,6 +77,7 @@ export async function startShowRuntimeServer(
     async close() {
       eventStreams.close()
       await markdownRenderer.close()
+      await renderRuntime.close()
       await runtime.close()
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
     }
@@ -76,6 +86,7 @@ export async function startShowRuntimeServer(
 
 async function routeRequest(
   runtime: ReturnType<typeof createShowRuntime>,
+  renderRuntime: ReturnType<typeof createShowRuntime>,
   request: IncomingMessage,
   response: ServerResponse,
   eventStreams: ShowEventStreamBroker,
@@ -100,7 +111,7 @@ async function routeRequest(
   // through any session's Vite). The browser only requests these after a Show Page
   // HTML — which warms the bundle — so it's available; guard defensively anyway.
   if (isVendorAssetPath(pathname)) {
-    const bundle = runtime.getVendorBundle()
+    const bundle = runtime.getVendorBundle() ?? renderRuntime.getVendorBundle()
     if (!bundle) {
       sendJson(response, 503, { error: "Vendor bundle not ready" })
       return
@@ -112,7 +123,7 @@ async function routeRequest(
   const renderMarkdownMatch = pathname.match(/^\/sessions\/([^/]+)\/render-markdown$/)
   if (request.method === "GET" && renderMarkdownMatch) {
     await handleRenderMarkdown({
-      runtime,
+      renderRuntime,
       request,
       response,
       renderer: markdownRenderer,
@@ -172,10 +183,12 @@ async function routeRequest(
     return
   }
 
-  const appMatch = pathname.match(/^\/sessions\/([^/]+)\/app\/?(.*)$/)
+  const renderAppMatch = pathname.match(/^\/sessions\/([^/]+)\/render-app\/?(.*)$/)
+  const appMatch = renderAppMatch ?? pathname.match(/^\/sessions\/([^/]+)\/app\/?(.*)$/)
   if (appMatch) {
     const sessionId = appMatch[1]
     const appPath = `/${appMatch[2] || ""}`
+    const servingRuntime = renderAppMatch ? renderRuntime : runtime
 
     // The annotation overlay bootstrap is session-independent JS shared by every workspace
     // (contract §7). Serve it straight off disk WITHOUT warming the session — the page requests it
@@ -189,17 +202,12 @@ async function routeRequest(
     }
 
     const requestStarted = performance.now()
-    // Anonymous loopback renders intentionally carry no caller headers. Preserve
-    // the base selected by their prepare step instead of restarting Vite at the
-    // default public base when the document and its modules arrive.
-    const requestedBasePath = publicBasePath(request)
-    const loopbackBasePath = `/sessions/${sessionId}/app/`
-    const activeBasePath = runtime.getSession(sessionId)?.basePath === loopbackBasePath
-      ? loopbackBasePath
-      : undefined
-    const status = await runtime.ensureSession(sessionId, requestedBasePath ?? activeBasePath)
+    const requestedBasePath = renderAppMatch
+      ? `/sessions/${sessionId}/render-app/`
+      : publicBasePath(request)
+    const status = await servingRuntime.ensureSession(sessionId, requestedBasePath)
     logRequestTiming("ensureSessionForAppRequest", sessionId, appPath, requestStarted, { state: status.state })
-    const session = runtime.getSession(sessionId)
+    const session = servingRuntime.getSession(sessionId)
     if (!session) {
       sendJson(response, 503, { error: "Session not ready", status })
       return
@@ -318,14 +326,14 @@ async function routeRequest(
 }
 
 async function handleRenderMarkdown(options: {
-  runtime: ReturnType<typeof createShowRuntime>
+  renderRuntime: ReturnType<typeof createShowRuntime>
   request: IncomingMessage
   response: ServerResponse
   renderer: MarkdownRenderer
   workspaceRoot: string
   sessionId: string
 }) {
-  const { runtime, request, response, renderer, workspaceRoot, sessionId } = options
+  const { renderRuntime, request, response, renderer, workspaceRoot, sessionId } = options
   try {
     const target = markdownRenderTarget(request)
     const workspace = sessionWorkspace(workspaceRoot, sessionId)
@@ -337,7 +345,7 @@ async function handleRenderMarkdown(options: {
       )
     }
 
-    const internalBasePath = `/sessions/${sessionId}/app/`
+    const internalBasePath = `/sessions/${sessionId}/render-app/`
     const basePath = markdownBasePath(request, sessionId)
     const result = await renderer.render({
       sessionId,
@@ -348,7 +356,7 @@ async function handleRenderMarkdown(options: {
       renderUrl: markdownRenderUrl(request, internalBasePath, target),
       workspace,
       async prepare() {
-        await runtime.ensureSession(sessionId, internalBasePath)
+        await renderRuntime.ensureSession(sessionId, internalBasePath)
       }
     })
     response.statusCode = 200

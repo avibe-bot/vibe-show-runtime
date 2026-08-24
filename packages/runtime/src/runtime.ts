@@ -237,7 +237,10 @@ function isSensitiveFileName(segment: string): boolean {
     lower.endsWith(".key")
 }
 
-export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
+export function createShowRuntime(
+  options: ShowRuntimeOptions,
+  dependencies: { hmr?: boolean } = {}
+): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
   // The most recently warmed shared vendor bundle. The server serves its assets at a
   // session-independent path; it's set the first time any session warms (the build is
@@ -480,10 +483,12 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       cacheDir,
       server: {
         middlewareMode: options.server ? { server: options.server } : true,
-        hmr: {
-          server: options.server,
-          path: `__vite_hmr`
-        },
+        hmr: dependencies.hmr === false
+          ? false
+          : {
+              server: options.server,
+              path: `__vite_hmr`
+            },
         fs: {
           strict: true,
           allow: fsAllow,

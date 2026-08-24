@@ -13,6 +13,7 @@ export const DEFAULT_MARKDOWN_MAX_BYTES = 512 * 1024
 export const DEFAULT_BROWSER_IDLE_MS = 60_000
 export const DEFAULT_BROWSER_PROVISION_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_RENDER_QUIET_PERIOD_MS = 150
+const MAX_RENDER_NETWORK_SETTLE_MS = 5_000
 const SYSTEM_BROWSER_CHANNELS = ["chrome", "msedge"] as const
 const MANAGED_BROWSER_TARGET = "managed" as const
 const PLAYWRIGHT_CLI_PATH = join(
@@ -62,12 +63,21 @@ export type MarkdownNavigationResponse = {
   status(): number
 }
 
+export type MarkdownNetworkRequest = {
+  method(): string
+  resourceType(): string
+  url(): string
+}
+
+type MarkdownNetworkEvent = "request" | "requestfinished" | "requestfailed"
+
 export type MarkdownPage = {
   goto(
     url: string,
     options: { waitUntil: "domcontentloaded"; timeout: number }
   ): Promise<MarkdownNavigationResponse | null>
-  waitForLoadState(state: "networkidle", options: { timeout: number }): Promise<void>
+  on(event: MarkdownNetworkEvent, listener: (request: MarkdownNetworkRequest) => void): void
+  off(event: MarkdownNetworkEvent, listener: (request: MarkdownNetworkRequest) => void): void
   evaluate<Result>(pageFunction: () => Result | Promise<Result>): Promise<Result>
   evaluate<Result, Argument>(
     pageFunction: (argument: Argument) => Result | Promise<Result>,
@@ -245,6 +255,7 @@ async function renderPageToMarkdown(options: {
   const { request, browserPool, deadline, timeoutMs, quietPeriodMs, maxOutputBytes } = options
   let browser: MarkdownBrowser | undefined
   let context: MarkdownBrowserContext | undefined
+  let network: RenderNetworkTracker | undefined
   let timedOut = false
 
   try {
@@ -252,6 +263,11 @@ async function renderPageToMarkdown(options: {
     // A fresh context has no cookies, storage, credentials, or caller headers.
     context = await deadline.wait(browser.newContext())
     const page = await deadline.wait(context.newPage())
+    network = trackRenderNetwork(
+      page,
+      quietPeriodMs,
+      Math.min(MAX_RENDER_NETWORK_SETTLE_MS, Math.max(quietPeriodMs, Math.floor(deadline.remaining() / 4)))
+    )
     const navigation = await deadline.wait(page.goto(request.renderUrl, {
       waitUntil: "domcontentloaded",
       timeout: deadline.remaining()
@@ -259,8 +275,12 @@ async function renderPageToMarkdown(options: {
     if (!navigation?.ok()) {
       throw new Error(`Navigation returned HTTP ${navigation?.status() ?? "unknown"}`)
     }
-    await deadline.wait(page.waitForLoadState("networkidle", { timeout: deadline.remaining() }))
+    await deadline.wait(network.waitForIdle())
     await deadline.wait(page.evaluate(settleRenderedPage, quietPeriodMs))
+    // A mount effect can start data loading after the first idle window. Observe
+    // one more idle edge before extraction, then let the page flush its result.
+    await deadline.wait(network.waitForIdle())
+    await deadline.wait(page.evaluate(settleRenderedPage, 0))
     const cleaned = await deadline.wait(page.evaluate(cleanupRenderedDocument, {
       basePath: request.basePath,
       internalBasePath: request.internalBasePath
@@ -297,6 +317,7 @@ async function renderPageToMarkdown(options: {
     }
     throw renderFailed("Show Page rendering failed.", error)
   } finally {
+    network?.dispose()
     try {
       if (context) {
         const closing = context.close().catch(() => undefined)
@@ -315,6 +336,86 @@ async function renderPageToMarkdown(options: {
         void browser.close().catch(() => undefined)
       }
       browserPool.release()
+    }
+  }
+}
+
+type RenderNetworkTracker = {
+  waitForIdle(): Promise<void>
+  dispose(): void
+}
+
+function trackRenderNetwork(
+  page: MarkdownPage,
+  quietPeriodMs: number,
+  maxSettleMs: number
+): RenderNetworkTracker {
+  const pending = new Map<MarkdownNetworkRequest, string>()
+  const completedPolls = new Set<string>()
+  let activityVersion = 0
+  let disposed = false
+
+  const requestKey = (request: MarkdownNetworkRequest) =>
+    `${request.method()}\0${request.resourceType()}\0${request.url()}`
+
+  const requestStarted = (request: MarkdownNetworkRequest) => {
+    const resourceType = request.resourceType().toLowerCase()
+    if (resourceType === "eventsource" || resourceType === "websocket") return
+    const key = requestKey(request)
+    // The first XHR/fetch populates the page; identical later requests are a
+    // polling loop and must not make a snapshot impossible.
+    if ((resourceType === "fetch" || resourceType === "xhr") && completedPolls.has(key)) return
+    pending.set(request, key)
+    activityVersion += 1
+  }
+  const requestSettled = (request: MarkdownNetworkRequest) => {
+    const key = pending.get(request)
+    if (key === undefined) return
+    pending.delete(request)
+    const resourceType = request.resourceType().toLowerCase()
+    if (resourceType === "fetch" || resourceType === "xhr") completedPolls.add(key)
+    activityVersion += 1
+  }
+
+  page.on("request", requestStarted)
+  page.on("requestfinished", requestSettled)
+  page.on("requestfailed", requestSettled)
+
+  return {
+    async waitForIdle() {
+      const startedAt = Date.now()
+      let idleSince: number | undefined
+      let idleVersion = -1
+      while (!disposed) {
+        const now = Date.now()
+        if (pending.size === 0) {
+          if (idleSince === undefined || idleVersion !== activityVersion) {
+            idleSince = now
+            idleVersion = activityVersion
+          }
+          if (now - idleSince >= quietPeriodMs) return
+        } else {
+          idleSince = undefined
+          idleVersion = activityVersion
+        }
+        // Unknown long-lived transports and query-varying pollers eventually
+        // become non-blocking, while the outer render deadline remains hard.
+        if (now - startedAt >= maxSettleMs) {
+          for (const key of pending.values()) completedPolls.add(key)
+          pending.clear()
+          activityVersion += 1
+          return
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+    },
+    dispose() {
+      if (disposed) return
+      disposed = true
+      pending.clear()
+      page.off("request", requestStarted)
+      page.off("requestfinished", requestSettled)
+      page.off("requestfailed", requestSettled)
     }
   }
 }

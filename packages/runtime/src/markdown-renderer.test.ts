@@ -11,6 +11,7 @@ import {
   type BrowserTarget,
   type MarkdownBrowser,
   type MarkdownBrowserContext,
+  type MarkdownNetworkRequest,
   type MarkdownPage,
   type MarkdownRenderRequest
 } from "./markdown-renderer.js"
@@ -221,6 +222,29 @@ describe("browser resolution ladder", () => {
     }
   })
 
+  it("settles after initial data while persistent streams and repeated polling stay open", async () => {
+    const workspace = await fixtureWorkspace("persistent-network")
+    const browser = new FakeBrowser(() => ({ html: "<h1>Stream-ready</h1>", mode: "persistent-network" }))
+    const renderer = createMarkdownRenderer({
+      timeoutMs: 500,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0
+    })
+
+    try {
+      await expect(renderer.render(renderRequest(workspace))).resolves.toMatchObject({
+        markdown: "# Stream-ready\n",
+        cache: "miss"
+      })
+    } finally {
+      await renderer.close()
+    }
+  })
+
   it("provisions the managed shell once, then reuses its cached installation after a crash", async () => {
     const workspace = await fixtureWorkspace("managed-browser")
     let installed = false
@@ -390,7 +414,7 @@ describe("render-markdown HTTP contract", () => {
     const pageState = () => ({
       html: mode === "large" ? `<p>${"x".repeat(2048)}</p>` : fixtureHtml,
       mode,
-      expectedNavigationBody: "/sessions/page/app/src/main.tsx"
+      expectedNavigationBody: "/sessions/page/render-app/src/main.tsx"
     })
     let browser = new FakeBrowser(pageState)
     const runtime = await startShowRuntimeServer({
@@ -424,7 +448,21 @@ describe("render-markdown HTTP contract", () => {
         authorization: "Bearer must-not-forward",
         cookie: "visitor=must-not-forward"
       }
-      const first = await fetch(`${runtime.url}/sessions/page/render-markdown`, { headers })
+      const liveBefore = await fetch(`${runtime.url}/sessions/page/app/`, {
+        headers: { "x-vibe-show-base": "/p/live-view/" }
+      })
+      expect(await liveBefore.text()).toContain("/p/live-view/src/main.tsx")
+      const liveSession = runtime.runtime.getSession("page")
+      const liveVite = liveSession?.vite
+      expect(liveSession?.basePath).toBe("/p/live-view/")
+
+      const [first, concurrentViewer] = await Promise.all([
+        fetch(`${runtime.url}/sessions/page/render-markdown`, { headers }),
+        fetch(`${runtime.url}/sessions/page/app/dashboard?view=week`, {
+          headers: { "x-vibe-show-base": "/p/live-view/" }
+        })
+      ])
+      expect(await concurrentViewer.text()).toContain("/p/live-view/src/main.tsx")
       expect(first.status).toBe(200)
       expect(first.headers.get("content-type")).toBe("text/markdown; charset=utf-8")
       expect(first.headers.get("x-avibe-render-cache")).toBe("miss")
@@ -434,7 +472,9 @@ describe("render-markdown HTTP contract", () => {
       expect(firstMarkdown).toContain("[Details](/p/public-share/details)")
       expect(firstMarkdown).toContain("> agent-note: Publish assets before repointing")
       expect(browser.newContextArguments).toEqual([[]])
-      expect(browser.visitedUrls[0]).toMatch(/^http:\/\/(?:127\.0\.0\.1|\[::1\]):\d+\/sessions\/page\/app\/dashboard\?view=week$/)
+      expect(browser.visitedUrls[0]).toMatch(/^http:\/\/(?:127\.0\.0\.1|\[::1\]):\d+\/sessions\/page\/render-app\/dashboard\?view=week$/)
+      expect(runtime.runtime.getSession("page")?.basePath).toBe("/p/live-view/")
+      expect(runtime.runtime.getSession("page")?.vite).toBe(liveVite)
 
       const cached = await fetch(`${runtime.url}/sessions/page/render-markdown`, { headers })
       expect(cached.headers.get("x-avibe-render-cache")).toBe("hit")
@@ -446,7 +486,7 @@ describe("render-markdown HTTP contract", () => {
       const root = await fetch(`${runtime.url}/sessions/page/render-markdown`, { headers: rootHeaders })
       expect(root.headers.get("x-avibe-render-cache")).toBe("miss")
       expect(browser.contextCount).toBe(2)
-      expect(browser.visitedUrls[1]).toMatch(/^http:\/\/(?:127\.0\.0\.1|\[::1\]):\d+\/sessions\/page\/app\/$/)
+      expect(browser.visitedUrls[1]).toMatch(/^http:\/\/(?:127\.0\.0\.1|\[::1\]):\d+\/sessions\/page\/render-app\/$/)
       await root.text()
 
       for (const target of [
@@ -527,7 +567,7 @@ describe("render-markdown HTTP contract", () => {
   }, 30_000)
 })
 
-type FakePageMode = "success" | "timeout" | "stalled" | "failed" | "large"
+type FakePageMode = "success" | "timeout" | "stalled" | "failed" | "large" | "persistent-network"
 type FakePageState = {
   html: string
   mode: FakePageMode
@@ -574,6 +614,8 @@ class FakeBrowser implements MarkdownBrowser {
 }
 
 class FakePage implements MarkdownPage {
+  private readonly listeners = new Map<string, Set<(request: MarkdownNetworkRequest) => void>>()
+
   constructor(
     private readonly pageState: () => FakePageState,
     private readonly visitedUrls: string[]
@@ -594,6 +636,15 @@ class FakePage implements MarkdownPage {
     if (mode === "failed") {
       throw new Error("fixture navigation failed")
     }
+    if (mode === "persistent-network") {
+      this.emit("request", new FakeNetworkRequest("GET", "eventsource", `${url}__show/events?stream=1`))
+      const firstPoll = new FakeNetworkRequest("GET", "fetch", `${url}api/status`)
+      this.emit("request", firstPoll)
+      setTimeout(() => {
+        this.emit("requestfinished", firstPoll)
+        this.emit("request", new FakeNetworkRequest("GET", "fetch", `${url}api/status`))
+      }, 20)
+    }
     if (state.expectedNavigationBody) {
       const response = await fetch(url)
       const body = await response.text()
@@ -605,7 +656,15 @@ class FakePage implements MarkdownPage {
     return { ok: () => true, status: () => 200 }
   }
 
-  async waitForLoadState(): Promise<void> {}
+  on(event: string, listener: (request: MarkdownNetworkRequest) => void): void {
+    const listeners = this.listeners.get(event) ?? new Set()
+    listeners.add(listener)
+    this.listeners.set(event, listeners)
+  }
+
+  off(event: string, listener: (request: MarkdownNetworkRequest) => void): void {
+    this.listeners.get(event)?.delete(listener)
+  }
 
   async evaluate<Result>(pageFunction: () => Result | Promise<Result>): Promise<Result>
   async evaluate<Result, Argument>(
@@ -621,6 +680,30 @@ class FakePage implements MarkdownPage {
       return { html: this.pageState().html, mountEmpty: false } as Result
     }
     return await (pageFunction as (argument?: Argument) => Result | Promise<Result>)(argument)
+  }
+
+  private emit(event: string, request: MarkdownNetworkRequest): void {
+    for (const listener of this.listeners.get(event) ?? []) listener(request)
+  }
+}
+
+class FakeNetworkRequest implements MarkdownNetworkRequest {
+  constructor(
+    private readonly requestMethod: string,
+    private readonly requestResourceType: string,
+    private readonly requestUrl: string
+  ) {}
+
+  method(): string {
+    return this.requestMethod
+  }
+
+  resourceType(): string {
+    return this.requestResourceType
+  }
+
+  url(): string {
+    return this.requestUrl
   }
 }
 
