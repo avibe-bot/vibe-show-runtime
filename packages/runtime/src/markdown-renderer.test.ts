@@ -110,22 +110,30 @@ describe("rendered DOM conversion", () => {
 })
 
 describe("workspace render cache", () => {
-  it("ignores dotfiles and node_modules but changes for every workspace-owned file change", async () => {
+  it("includes meaningful dotfiles while excluding dependencies, Git metadata, and build output", async () => {
     const workspace = await temporaryDirectory("fingerprint")
     await mkdir(join(workspace, "src"), { recursive: true })
     await mkdir(join(workspace, ".git"), { recursive: true })
     await mkdir(join(workspace, "node_modules", "fixture"), { recursive: true })
+    await mkdir(join(workspace, "dist"), { recursive: true })
     await writeFile(join(workspace, "src", "App.tsx"), "export default 'one'\n")
+    await writeFile(join(workspace, ".env"), "VITE_LABEL=one\n")
     await writeFile(join(workspace, ".git", "HEAD"), "private-one\n")
     await writeFile(join(workspace, "node_modules", "fixture", "index.js"), "ignored-one\n")
+    await writeFile(join(workspace, "dist", "index.js"), "built-one\n")
     const initial = await workspaceFingerprint(workspace)
 
     await writeFile(join(workspace, ".git", "HEAD"), "private-two-with-a-different-size\n")
     await writeFile(join(workspace, "node_modules", "fixture", "index.js"), "ignored-two-with-a-different-size\n")
+    await writeFile(join(workspace, "dist", "index.js"), "built-two-with-a-different-size\n")
     expect(await workspaceFingerprint(workspace)).toBe(initial)
 
+    await writeFile(join(workspace, ".env"), "VITE_LABEL=changed\n")
+    const dotfileFingerprint = await workspaceFingerprint(workspace)
+    expect(dotfileFingerprint).not.toBe(initial)
+
     await writeFile(join(workspace, "src", "App.tsx"), "export default 'two-with-a-different-size'\n")
-    expect(await workspaceFingerprint(workspace)).not.toBe(initial)
+    expect(await workspaceFingerprint(workspace)).not.toBe(dotfileFingerprint)
   })
 
   it("serializes concurrent misses and lets the second request use the first result", async () => {
@@ -158,7 +166,7 @@ describe("workspace render cache", () => {
     }
   })
 
-  it("keys entries by rendering context and expires dynamic data at the TTL backstop", async () => {
+  it("keys entries by target and caller base and expires dynamic data at the TTL backstop", async () => {
     const workspace = await fixtureWorkspace("cache-context")
     const browser = new FakeBrowser(() => ({ html: "<h1>Context cache</h1>", mode: "success" }))
     let now = 10_000
@@ -179,17 +187,88 @@ describe("workspace render cache", () => {
       target: "/dashboard?view=week",
       renderUrl: "http://127.0.0.1:4177/sessions/fixture/app/dashboard?view=week"
     }
+    const alternateBaseRequest = { ...shared, basePath: "/p/alternate-share/" }
 
     try {
       await expect(renderer.render(shared)).resolves.toMatchObject({ cache: "miss" })
       await expect(renderer.render(shared)).resolves.toMatchObject({ cache: "hit" })
-      await expect(renderer.render(privateRequest)).resolves.toMatchObject({ cache: "miss" })
+      await expect(renderer.render(privateRequest)).resolves.toMatchObject({ cache: "hit" })
       await expect(renderer.render(nestedRequest)).resolves.toMatchObject({ cache: "miss" })
+      await expect(renderer.render(alternateBaseRequest)).resolves.toMatchObject({ cache: "miss" })
+      await expect(renderer.render(nestedRequest)).resolves.toMatchObject({ cache: "hit" })
+      await expect(renderer.render(alternateBaseRequest)).resolves.toMatchObject({ cache: "hit" })
       expect(browser.contextCount).toBe(3)
 
       now += 30_000
       await expect(renderer.render(shared)).resolves.toMatchObject({ cache: "miss" })
       expect(browser.contextCount).toBe(4)
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("never cross-serves target or caller-base variants", async () => {
+    const workspace = await fixtureWorkspace("cache-variants")
+    const rendered = ["Target A", "Target B", "Alternate base"]
+    let renderIndex = 0
+    const browser = new FakeBrowser(() => ({
+      html: `<h1>${rendered[renderIndex++]}</h1>`,
+      mode: "success"
+    }))
+    const renderer = createMarkdownRenderer({
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0
+    })
+    const targetA = renderRequest(workspace)
+    const targetB = {
+      ...targetA,
+      target: "/dashboard?view=week",
+      renderUrl: "http://127.0.0.1:4177/sessions/fixture/app/dashboard?view=week"
+    }
+    const alternateBase = { ...targetB, basePath: "/p/alternate-share/" }
+
+    try {
+      await expect(renderer.render(targetA)).resolves.toEqual({ markdown: "# Target A\n", cache: "miss" })
+      await expect(renderer.render(targetB)).resolves.toEqual({ markdown: "# Target B\n", cache: "miss" })
+      await expect(renderer.render(alternateBase)).resolves.toEqual({ markdown: "# Alternate base\n", cache: "miss" })
+      await expect(renderer.render(targetA)).resolves.toEqual({ markdown: "# Target A\n", cache: "hit" })
+      await expect(renderer.render(targetB)).resolves.toEqual({ markdown: "# Target B\n", cache: "hit" })
+      await expect(renderer.render(alternateBase)).resolves.toEqual({ markdown: "# Alternate base\n", cache: "hit" })
+      expect(browser.contextCount).toBe(3)
+      expect(renderIndex).toBe(3)
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("invalidates cached Markdown when a workspace dotfile changes", async () => {
+    const workspace = await fixtureWorkspace("cache-dotfile")
+    await writeFile(join(workspace, ".env"), "VITE_LABEL=one\n")
+    let label = "one"
+    const browser = new FakeBrowser(() => ({ html: `<h1>Environment ${label}</h1>`, mode: "success" }))
+    const renderer = createMarkdownRenderer({
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0
+    })
+    const request = renderRequest(workspace)
+
+    try {
+      await expect(renderer.render(request)).resolves.toEqual({ markdown: "# Environment one\n", cache: "miss" })
+      await expect(renderer.render(request)).resolves.toMatchObject({ cache: "hit" })
+
+      await writeFile(join(workspace, ".env"), "VITE_LABEL=changed\n")
+      label = "changed"
+      await expect(renderer.render(request)).resolves.toEqual({ markdown: "# Environment changed\n", cache: "miss" })
+      await expect(renderer.render(request)).resolves.toEqual({ markdown: "# Environment changed\n", cache: "hit" })
+      expect(browser.contextCount).toBe(2)
     } finally {
       await renderer.close()
     }
@@ -238,6 +317,34 @@ describe("browser resolution ladder", () => {
     try {
       await expect(renderer.render(renderRequest(workspace))).resolves.toMatchObject({
         markdown: "# Stream-ready\n",
+        cache: "miss"
+      })
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("waits for a slow finite initial request before extracting the page", async () => {
+    const workspace = await fixtureWorkspace("slow-initial-data")
+    const browser = new FakeBrowser(() => ({
+      html: "<h1>Loading report</h1>",
+      completedHtml: "<h1>Loaded report</h1>",
+      initialDataDelayMs: 300,
+      mode: "slow-initial-data"
+    }))
+    const renderer = createMarkdownRenderer({
+      timeoutMs: 800,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0
+    })
+
+    try {
+      await expect(renderer.render(renderRequest(workspace))).resolves.toEqual({
+        markdown: "# Loaded report\n",
         cache: "miss"
       })
     } finally {
@@ -465,6 +572,7 @@ describe("render-markdown HTTP contract", () => {
       expect(await concurrentViewer.text()).toContain("/p/live-view/src/main.tsx")
       expect(first.status).toBe(200)
       expect(first.headers.get("content-type")).toBe("text/markdown; charset=utf-8")
+      expect(first.headers.get("cache-control")).toBe("no-store")
       expect(first.headers.get("x-avibe-render-cache")).toBe("miss")
       const firstMarkdown = await first.text()
       expect(firstMarkdown).toContain("# Fixture release")
@@ -525,6 +633,61 @@ describe("render-markdown HTTP contract", () => {
         headers: { ...headers, "x-vibe-show-base": "/p/large/" }
       })
       await expectRenderError(large, 502, "output_too_large")
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
+  it("releases the render runtime and cache when a session is suspended", async () => {
+    const workspaceRoot = await temporaryDirectory("suspend-render")
+    await fixtureWorkspace("page", workspaceRoot)
+    const browser = new FakeBrowser(() => ({
+      html: "<h1>Suspend fixture</h1>",
+      mode: "success",
+      expectedNavigationBody: "/sessions/page/render-app/src/main.tsx"
+    }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+    const headers = {
+      "X-Avibe-Show-Protocol": "1",
+      "X-Avibe-Show-Context": "private",
+      "x-vibe-show-base": "/show/page/"
+    }
+
+    try {
+      const first = await fetch(`${runtime.url}/sessions/page/render-markdown`, { headers })
+      expect(first.headers.get("x-avibe-render-cache")).toBe("miss")
+      await first.text()
+      const initialRenderSession = runtime.renderRuntime.getSession("page")
+      const initialRenderVite = initialRenderSession?.vite
+      expect(initialRenderSession?.state).toBe("active")
+      expect(initialRenderVite).toBeDefined()
+
+      const cached = await fetch(`${runtime.url}/sessions/page/render-markdown`, { headers })
+      expect(cached.headers.get("x-avibe-render-cache")).toBe("hit")
+      await cached.text()
+
+      const suspended = await fetch(`${runtime.url}/sessions/page/suspend`, { method: "POST" })
+      expect(suspended.status).toBe(200)
+      expect(await suspended.json()).toMatchObject({ sessionId: "page", state: "suspended" })
+      expect(runtime.renderRuntime.getSession("page")).toMatchObject({ state: "suspended", vite: undefined })
+
+      const relaunched = await fetch(`${runtime.url}/sessions/page/render-markdown`, { headers })
+      expect(relaunched.headers.get("x-avibe-render-cache")).toBe("miss")
+      await relaunched.text()
+      expect(browser.contextCount).toBe(2)
+      expect(runtime.renderRuntime.getSession("page")?.state).toBe("active")
+      expect(runtime.renderRuntime.getSession("page")?.vite).not.toBe(initialRenderVite)
     } finally {
       await runtime.close()
     }
@@ -629,11 +792,20 @@ describe("render-markdown HTTP contract", () => {
   }, 30_000)
 })
 
-type FakePageMode = "success" | "timeout" | "stalled" | "failed" | "large" | "persistent-network"
+type FakePageMode =
+  | "success"
+  | "timeout"
+  | "stalled"
+  | "failed"
+  | "large"
+  | "persistent-network"
+  | "slow-initial-data"
 type FakePageState = {
   html: string
   mode: FakePageMode
   expectedNavigationBody?: string
+  completedHtml?: string
+  initialDataDelayMs?: number
 }
 
 class FakeBrowser implements MarkdownBrowser {
@@ -654,7 +826,7 @@ class FakeBrowser implements MarkdownBrowser {
     this.newContextArguments.push(args)
     this.contextCount += 1
     return {
-      newPage: async () => new FakePage(this.pageState, this.visitedUrls),
+      newPage: async () => new FakePage(this.pageState(), this.visitedUrls),
       close: async () => undefined
     }
   }
@@ -677,16 +849,18 @@ class FakeBrowser implements MarkdownBrowser {
 
 class FakePage implements MarkdownPage {
   private readonly listeners = new Map<string, Set<(request: MarkdownNetworkRequest) => void>>()
+  private renderedHtml: string
 
   constructor(
-    private readonly pageState: () => FakePageState,
+    private readonly state: FakePageState,
     private readonly visitedUrls: string[]
-  ) {}
+  ) {
+    this.renderedHtml = state.html
+  }
 
   async goto(url: string): Promise<{ ok(): boolean; status(): number } | null> {
     this.visitedUrls.push(url)
-    const state = this.pageState()
-    const mode = state.mode
+    const mode = this.state.mode
     if (mode === "timeout") {
       const error = new Error("fixture navigation timed out")
       error.name = "TimeoutError"
@@ -707,10 +881,18 @@ class FakePage implements MarkdownPage {
         this.emit("request", new FakeNetworkRequest("GET", "fetch", `${url}api/status`))
       }, 20)
     }
-    if (state.expectedNavigationBody) {
+    if (mode === "slow-initial-data") {
+      const initialData = new FakeNetworkRequest("GET", "fetch", `${url}api/initial-data`)
+      this.emit("request", initialData)
+      setTimeout(() => {
+        this.renderedHtml = this.state.completedHtml ?? this.state.html
+        this.emit("requestfinished", initialData)
+      }, this.state.initialDataDelayMs ?? 0)
+    }
+    if (this.state.expectedNavigationBody) {
       const response = await fetch(url)
       const body = await response.text()
-      if (!body.includes(state.expectedNavigationBody)) {
+      if (!body.includes(this.state.expectedNavigationBody)) {
         throw new Error(`anonymous navigation did not preserve loopback base: ${body}`)
       }
       return { ok: () => response.ok, status: () => response.status }
@@ -739,7 +921,7 @@ class FakePage implements MarkdownPage {
   ): Promise<Result> {
     if (pageFunction === settleRenderedPage) return undefined as Result
     if (pageFunction === cleanupRenderedDocument) {
-      return { html: this.pageState().html, mountEmpty: false } as Result
+      return { html: this.renderedHtml, mountEmpty: false } as Result
     }
     return await (pageFunction as (argument?: Argument) => Result | Promise<Result>)(argument)
   }
@@ -866,6 +1048,7 @@ async function expectRenderError(
 ): Promise<{ error: { code: string; message: string } }> {
   expect(response.status).toBe(status)
   expect(response.headers.get("content-type")).toContain("application/json")
+  expect(response.headers.get("cache-control")).toBe("no-store")
   const body = await response.json() as { error: { code: string; message: string } }
   expect(body).toEqual({
     error: {

@@ -13,9 +13,9 @@ export const DEFAULT_MARKDOWN_MAX_BYTES = 512 * 1024
 export const DEFAULT_BROWSER_IDLE_MS = 60_000
 export const DEFAULT_BROWSER_PROVISION_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_RENDER_QUIET_PERIOD_MS = 150
-const MAX_RENDER_NETWORK_SETTLE_MS = 5_000
 const SYSTEM_BROWSER_CHANNELS = ["chrome", "msedge"] as const
 const MANAGED_BROWSER_TARGET = "managed" as const
+const WORKSPACE_FINGERPRINT_EXCLUDED_ENTRIES = new Set(["node_modules", ".git", "dist", "build"])
 const PLAYWRIGHT_CLI_PATH = join(
   dirname(createRequire(import.meta.url).resolve("playwright-core/package.json")),
   "cli.js"
@@ -128,10 +128,12 @@ export type MarkdownRendererOptions = {
 
 export type MarkdownRenderer = {
   render(request: MarkdownRenderRequest): Promise<MarkdownRenderResult>
+  invalidateSession(sessionId: string): Promise<void>
   close(): Promise<void>
 }
 
 type CacheEntry = {
+  sessionId: string
   markdown: string
   fingerprint: string
   createdAt: number
@@ -223,6 +225,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
           const completedFingerprint = await deadline.wait(fingerprintOrRenderFailed(request.workspace))
           if (completedFingerprint === renderFingerprint) {
             cache.set(cacheKey, {
+              sessionId: request.sessionId,
               markdown,
               fingerprint: renderFingerprint,
               createdAt: now()
@@ -235,6 +238,14 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
       } catch (error) {
         throw normalizeRenderError(error, timeoutMs, deadline)
       }
+    },
+    async invalidateSession(sessionId) {
+      if (closed) return
+      await mutex.runExclusive(async () => {
+        for (const [key, entry] of cache) {
+          if (entry.sessionId === sessionId) cache.delete(key)
+        }
+      })
     },
     async close() {
       closed = true
@@ -263,11 +274,7 @@ async function renderPageToMarkdown(options: {
     // A fresh context has no cookies, storage, credentials, or caller headers.
     context = await deadline.wait(browser.newContext())
     const page = await deadline.wait(context.newPage())
-    network = trackRenderNetwork(
-      page,
-      quietPeriodMs,
-      Math.min(MAX_RENDER_NETWORK_SETTLE_MS, Math.max(quietPeriodMs, Math.floor(deadline.remaining() / 4)))
-    )
+    network = trackRenderNetwork(page, quietPeriodMs)
     const navigation = await deadline.wait(page.goto(request.renderUrl, {
       waitUntil: "domcontentloaded",
       timeout: deadline.remaining()
@@ -347,8 +354,7 @@ type RenderNetworkTracker = {
 
 function trackRenderNetwork(
   page: MarkdownPage,
-  quietPeriodMs: number,
-  maxSettleMs: number
+  quietPeriodMs: number
 ): RenderNetworkTracker {
   const pending = new Map<MarkdownNetworkRequest, string>()
   const completedPolls = new Set<string>()
@@ -383,7 +389,6 @@ function trackRenderNetwork(
 
   return {
     async waitForIdle() {
-      const startedAt = Date.now()
       let idleSince: number | undefined
       let idleVersion = -1
       while (!disposed) {
@@ -397,14 +402,6 @@ function trackRenderNetwork(
         } else {
           idleSince = undefined
           idleVersion = activityVersion
-        }
-        // Unknown long-lived transports and query-varying pollers eventually
-        // become non-blocking, while the outer render deadline remains hard.
-        if (now - startedAt >= maxSettleMs) {
-          for (const key of pending.values()) completedPolls.add(key)
-          pending.clear()
-          activityVersion += 1
-          return
         }
         await new Promise((resolve) => setTimeout(resolve, 25))
       }
@@ -567,7 +564,7 @@ async function fingerprintDirectory(
   entries.sort((left, right) => left.name.localeCompare(right.name))
 
   for (const entry of entries) {
-    if (entry.name === "node_modules" || entry.name.startsWith(".")) continue
+    if (WORKSPACE_FINGERPRINT_EXCLUDED_ENTRIES.has(entry.name)) continue
     const relativePath = relativeDirectory ? join(relativeDirectory, entry.name) : entry.name
     const path = join(workspace, relativePath)
     const info = await lstat(path, { bigint: true })
@@ -603,7 +600,7 @@ async function fingerprintOrRenderFailed(workspace: string): Promise<string> {
 }
 
 function renderCacheKey(request: MarkdownRenderRequest): string {
-  return JSON.stringify([request.sessionId, request.context, request.basePath, request.target])
+  return JSON.stringify([request.sessionId, request.target, request.basePath])
 }
 
 function cacheHit(

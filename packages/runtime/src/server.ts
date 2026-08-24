@@ -72,6 +72,7 @@ export async function startShowRuntimeServer(
 
   return {
     runtime,
+    renderRuntime,
     server,
     url: `http://${host}:${(server.address() as AddressInfo).port}`,
     async close() {
@@ -179,7 +180,13 @@ async function routeRequest(
 
   const suspendMatch = pathname.match(/^\/sessions\/([^/]+)\/suspend$/)
   if (request.method === "POST" && suspendMatch) {
-    sendJson(response, 200, await runtime.suspendSession(suspendMatch[1]))
+    const sessionId = suspendMatch[1]
+    await markdownRenderer.invalidateSession(sessionId)
+    const [status] = await Promise.all([
+      runtime.suspendSession(sessionId),
+      renderRuntime.suspendSession(sessionId)
+    ])
+    sendJson(response, 200, status)
     return
   }
 
@@ -334,6 +341,7 @@ async function handleRenderMarkdown(options: {
   sessionId: string
 }) {
   const { renderRuntime, request, response, renderer, workspaceRoot, sessionId } = options
+  response.setHeader("cache-control", "no-store")
   try {
     const target = markdownRenderTarget(request)
     const workspace = sessionWorkspace(workspaceRoot, sessionId)
