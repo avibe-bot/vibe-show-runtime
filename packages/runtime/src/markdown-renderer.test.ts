@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises"
+import { lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -976,6 +976,69 @@ describe("render-markdown HTTP contract", () => {
     }
   }, 30_000)
 
+  it("blocks snapshot inputs that resolve outside the workspace boundary", async () => {
+    const workspaceRoot = await temporaryDirectory("snapshot-file-boundary")
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    await writeFile(join(workspaceRoot, "secret.pem"), "PRIVATE SNAPSHOT FIXTURE\n")
+    await writeFile(join(workspace, "src", "main.tsx"), `import leaked from "../../secret.pem?raw"
+document.getElementById("root")!.textContent = leaked
+`)
+    const launchBrowser = vi.fn(async () => new FakeBrowser(() => ({
+      html: "<h1>Never reached</h1>",
+      mode: "success"
+    })))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser,
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+
+    try {
+      const traversal = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      const traversalError = await expectRenderError(traversal, 502, "render_failed")
+      expect(traversalError.error.message).toMatch(/workspace boundary/i)
+
+      const outsideSource = join(workspaceRoot, "outside-source")
+      await mkdir(outsideSource)
+      await writeFile(join(outsideSource, "index.ts"), 'export const leaked = "outside"\n')
+      await symlink(
+        outsideSource,
+        join(workspace, "src", "linked-source"),
+        process.platform === "win32" ? "junction" : "dir"
+      )
+      await writeFile(join(workspace, "src", "main.tsx"), `import { leaked } from "./linked-source/index.ts"
+document.getElementById("root")!.textContent = leaked
+`)
+
+      const linked = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      const linkedError = await expectRenderError(linked, 502, "render_failed")
+      expect(linkedError.error.message).toMatch(/workspace boundary/i)
+
+      const outsidePublic = join(workspaceRoot, "outside-public")
+      await mkdir(outsidePublic)
+      await writeFile(join(outsidePublic, "leaked.txt"), "outside public asset\n")
+      await mkdir(join(workspace, "public"))
+      await symlink(
+        outsidePublic,
+        join(workspace, "public", "linked-assets"),
+        process.platform === "win32" ? "junction" : "dir"
+      )
+      await writeFile(join(workspace, "src", "main.tsx"), 'document.getElementById("root")!.textContent = "safe"\n')
+
+      const publicLink = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      const publicError = await expectRenderError(publicLink, 502, "render_failed")
+      expect(publicError.error.message).toMatch(/workspace boundary/i)
+      expect(runtime.renderSnapshots.get("page")).toBeUndefined()
+      expect(launchBrowser).not.toHaveBeenCalled()
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
   it("rebuilds the snapshot after a workspace file change and renders the new bytes", async () => {
     const workspaceRoot = await temporaryDirectory("snapshot-invalidation")
     const workspace = await fixtureWorkspace("page", workspaceRoot)
@@ -1017,6 +1080,55 @@ describe("render-markdown HTTP contract", () => {
       expect(await changed.text()).toContain("# Snapshot version two changed")
       expect(buildSnapshot).toHaveBeenCalledTimes(2)
       expect(browser.contextCount).toBe(2)
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
+  it("retries a snapshot when the workspace changes before the build is committed", async () => {
+    const workspaceRoot = await temporaryDirectory("snapshot-build-race")
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    const writePage = (label: string) => writeFile(join(workspace, "index.html"), `<!doctype html>
+<html><body><main id="root"><h1>${label}</h1></main><script type="module" src="/src/main.tsx"></script></body></html>\n`)
+    await writePage("Snapshot before build race")
+    const browser = new FakeBrowser(() => ({
+      html: "",
+      mode: "success",
+      expectedNavigationBody: "/sessions/page/render-app/assets/",
+      useNavigationBody: true
+    }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+    const originalBuild = runtime.runtime.buildSessionSnapshot.bind(runtime.runtime)
+    const buildSnapshot = vi.spyOn(runtime.runtime, "buildSessionSnapshot")
+      .mockImplementationOnce(async (sessionId, snapshot) => {
+        await originalBuild(sessionId, snapshot)
+        await writePage("Snapshot after build race")
+      })
+
+    try {
+      const response = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      expect(response.status).toBe(200)
+      expect(response.headers.get("x-avibe-render-cache")).toBe("miss")
+      expect(await response.text()).toContain("# Snapshot after build race")
+      expect(buildSnapshot).toHaveBeenCalledTimes(2)
+      expect(browser.contextCount).toBe(1)
+      expect(runtime.renderSnapshots.get("page")?.fingerprint)
+        .toBe(await workspaceFingerprint(workspace))
+
+      const cached = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      expect(cached.headers.get("x-avibe-render-cache")).toBe("hit")
+      expect(await cached.text()).toContain("# Snapshot after build race")
     } finally {
       await runtime.close()
     }

@@ -79,6 +79,8 @@ type WorkspaceFileBoundary = {
   allowedRoots: string[]
 }
 
+const WORKSPACE_BUILD_BOUNDARY_ERROR = "Show Page build blocked a file outside the allowed workspace boundary."
+
 async function fileBoundaryRoots(paths: string[]): Promise<string[]> {
   const roots = await Promise.all(paths.map(async (path) => {
     const resolved = resolve(path)
@@ -104,7 +106,32 @@ function escapeViteGlobPath(path: string): string {
   return path.replace(/([\\*?[\]{}()!+@])/g, "\\$1")
 }
 
-function workspaceFileBoundaryPlugin(boundary: WorkspaceFileBoundary): Plugin {
+function workspaceFileBoundaryPlugin(
+  boundary: WorkspaceFileBoundary,
+  mode: "serve" | "build" = "serve"
+): Plugin {
+  if (mode === "build") {
+    return {
+      name: "avibe-show-workspace-file-boundary",
+      apply: "build",
+      enforce: "pre",
+      async buildStart() {
+        if (await hasDeniedBuildPublicEntry(boundary)) {
+          this.error(WORKSPACE_BUILD_BOUNDARY_ERROR)
+        }
+      },
+      async resolveId(source, importer, options) {
+        const resolvedId = await this.resolve(source, importer, { ...options, skipSelf: true })
+        if (!resolvedId || resolvedId.external) return resolvedId
+        const target = await buildResolvedFileTarget(resolvedId.id)
+        if (target && isDeniedResolvedTarget(target, boundary)) {
+          this.error(WORKSPACE_BUILD_BOUNDARY_ERROR)
+        }
+        return resolvedId
+      }
+    }
+  }
+
   return {
     name: "avibe-show-workspace-file-boundary",
     apply: "serve",
@@ -125,6 +152,58 @@ function workspaceFileBoundaryPlugin(boundary: WorkspaceFileBoundary): Plugin {
       })
     }
   }
+}
+
+async function buildResolvedFileTarget(id: string): Promise<string | undefined> {
+  const cleanId = id.replace(/[?#].*$/, "")
+  if (!cleanId || cleanId.startsWith("\0")) return undefined
+  let filePath: string
+  try {
+    filePath = cleanId.startsWith("file:")
+      ? fileURLToPath(cleanId)
+      : cleanId.startsWith("/@fs/")
+        ? viteFsRequestPath(cleanId)
+        : cleanId
+  } catch {
+    return undefined
+  }
+  if (!isAbsolute(filePath)) return undefined
+  return await realpath(filePath).catch(() => undefined)
+}
+
+async function hasDeniedBuildPublicEntry(boundary: WorkspaceFileBoundary): Promise<boolean> {
+  const publicDirectory = join(boundary.workspace, "public")
+  try {
+    await access(publicDirectory)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false
+    throw error
+  }
+  return await hasDeniedBuildDirectoryEntry(publicDirectory, boundary, new Set())
+}
+
+async function hasDeniedBuildDirectoryEntry(
+  directory: string,
+  boundary: WorkspaceFileBoundary,
+  visited: Set<string>
+): Promise<boolean> {
+  const canonicalDirectory = await realpath(directory).catch(() => undefined)
+  if (!canonicalDirectory || isDeniedResolvedTarget(canonicalDirectory, boundary)) return true
+  if (visited.has(canonicalDirectory)) return false
+  visited.add(canonicalDirectory)
+
+  const entries = await readdir(directory, { withFileTypes: true })
+  for (const entry of entries) {
+    const entryPath = join(directory, entry.name)
+    const logicalPath = normalizePath(relative(boundary.workspace, entryPath))
+    if (hasDeniedWorkspaceSegment(logicalPath)) return true
+    const target = await realpath(entryPath).catch(() => undefined)
+    if (!target || isDeniedResolvedTarget(target, boundary)) return true
+    if ((await stat(target)).isDirectory() && await hasDeniedBuildDirectoryEntry(entryPath, boundary, visited)) {
+      return true
+    }
+  }
+  return false
 }
 
 async function isDeniedWorkspaceRequest(rawUrl: string | undefined, boundary: WorkspaceFileBoundary): Promise<boolean> {
@@ -358,6 +437,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
           emptyOutDir: true
         },
         plugins: [
+          workspaceFileBoundaryPlugin(prepared.fileBoundary, "build"),
           snapshotRuntimeConfigPlugin(sessionId, snapshot.basePath),
           ...(prepared.sharedDependencies.nodeModules === prepared.sharedDependencies.sharedNodeModules
             ? []
@@ -517,11 +597,6 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       packageRoots,
       uiPackageName
     )
-    snapshotBuildContexts.set(session.id, {
-      providedSpecifiers,
-      sharedDependencies,
-      uiPackageName
-    })
     logTiming("warmSession.dependencyLink", session.id, linkStarted, { nodeModules: sharedDependencies.nodeModules, extrasSignature: sharedDependencies.extrasSignature })
     const cacheStarted = performance.now()
     const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot, sourceDependencies.signature, bundle.result.manifest.hash)
@@ -546,6 +621,12 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
       workspaceRoots,
       allowedRoots: fsAllow
     }
+    snapshotBuildContexts.set(session.id, {
+      fileBoundary,
+      providedSpecifiers,
+      sharedDependencies,
+      uiPackageName
+    })
     const viteConfig = {
       // The outer runtime owns the Show Page SPA fallback. Vite's default `spa`
       // middleware also rewrites missing assets and reserved paths to index.html,
@@ -733,6 +814,7 @@ type SharedDependencies = {
 }
 
 type SnapshotBuildContext = {
+  fileBoundary: WorkspaceFileBoundary
   providedSpecifiers: string[]
   sharedDependencies: SharedDependencies
   uiPackageName: string
@@ -804,10 +886,11 @@ async function ensureSessionDependencies(
   // sessions can resolve the theme + its `@source`d components. (JS imports of the package
   // stay externalized to the shared vendor bundle; this symlink only serves CSS resolution.)
   await ensureSharedPackageLink(extrasDir, sharedNodeModules, uiPackageName)
+  const declaredPackageRoots = await resolveAllowedPackageRoots(extrasDir, declaredExtras.packageNames)
   return {
     nodeModules: extrasDir,
     sharedNodeModules,
-    packageRoots: [...packageRoots, extrasDir, sharedNodeModules],
+    packageRoots: [...packageRoots, extrasDir, sharedNodeModules, ...declaredPackageRoots],
     extrasSignature: declaredExtras.signature
   }
 }
@@ -982,6 +1065,8 @@ const SESSION_EXTRAS_LOCKFILE = ".show-extras.json"
 type DeclaredExtras = {
   /** Declared extra packages as `name@range`, sorted for a stable signature. */
   entries: string[]
+  /** Package names whose installed roots are authorized build inputs. */
+  packageNames: string[]
   /** Stable digest of the declared extras (`"none"` when nothing is declared). */
   signature: string
 }
@@ -1005,18 +1090,20 @@ async function readDeclaredExtras(workspace: string, uiPackageName: string): Pro
   try {
     manifest = JSON.parse(await readFile(join(workspace, "package.json"), "utf8"))
   } catch {
-    return { entries: [], signature: "none" }
+    return { entries: [], packageNames: [], signature: "none" }
   }
   const dependencies = manifest.dependencies
   if (!dependencies || typeof dependencies !== "object") {
-    return { entries: [], signature: "none" }
+    return { entries: [], packageNames: [], signature: "none" }
   }
-  const entries = Object.entries(dependencies)
+  const extras = Object.entries(dependencies)
     .filter(([name]) => !isRuntimeOwnedDependency(name, uiPackageName))
+    .sort(([left], [right]) => left.localeCompare(right))
+  const entries = extras
     .map(([name, range]) => `${name}@${anchorLocalRange(range, workspace)}`)
-    .sort()
   return {
     entries,
+    packageNames: extras.map(([name]) => name),
     signature: entries.length ? createHash("sha256").update(entries.join("\n")).digest("hex").slice(0, 16) : "none"
   }
 }

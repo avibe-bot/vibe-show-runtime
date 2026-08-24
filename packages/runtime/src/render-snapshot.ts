@@ -5,6 +5,8 @@ import { join } from "node:path"
 import { MarkdownRenderError, workspaceFingerprint } from "./markdown-renderer.js"
 import type { ShowRuntime } from "./types.js"
 
+const MAX_SNAPSHOT_BUILD_ATTEMPTS = 3
+
 export type RenderSnapshot = {
   sessionId: string
   fingerprint: string
@@ -41,34 +43,48 @@ export function createRenderSnapshotManager(runtime: ShowRuntime): RenderSnapsho
       // This is the single dependency-preparation owner shared with live serving.
       // It awaits the session's existing warm state and never creates a parallel runtime.
       await runtime.prepareSessionSnapshot(sessionId)
-      const fingerprint = await workspaceFingerprint(workspace)
-      const existing = snapshots.get(sessionId)
-      if (existing?.fingerprint === fingerprint && await snapshotExists(existing)) {
-        return existing
-      }
+      for (let attempt = 0; attempt < MAX_SNAPSHOT_BUILD_ATTEMPTS; attempt += 1) {
+        const fingerprint = await workspaceFingerprint(workspace)
+        const existing = snapshots.get(sessionId)
+        if (existing?.fingerprint === fingerprint && await snapshotExists(existing)) {
+          return existing
+        }
 
-      const digest = createHash("sha256")
-        .update(`${sessionId}\0${fingerprint}`)
-        .digest("hex")
-        .slice(0, 24)
-      const outDir = join(await snapshotRoot(), digest)
-      try {
-        await runtime.buildSessionSnapshot(sessionId, { basePath, outDir })
-      } catch (error) {
-        await rm(outDir, { force: true, recursive: true }).catch(() => undefined)
-        throw snapshotBuildFailed(error)
-      }
+        const digest = createHash("sha256")
+          .update(`${sessionId}\0${fingerprint}`)
+          .digest("hex")
+          .slice(0, 24)
+        const outDir = join(await snapshotRoot(), digest)
+        try {
+          await runtime.buildSessionSnapshot(sessionId, { basePath, outDir })
+        } catch (error) {
+          await rm(outDir, { force: true, recursive: true }).catch(() => undefined)
+          throw snapshotBuildFailed(error)
+        }
 
-      if (closed || (generations.get(sessionId) ?? 0) !== generation) {
-        await rm(outDir, { force: true, recursive: true }).catch(() => undefined)
-        throw snapshotBuildFailed(new Error("Snapshot build was invalidated"))
+        if (closed || (generations.get(sessionId) ?? 0) !== generation) {
+          await rm(outDir, { force: true, recursive: true }).catch(() => undefined)
+          throw snapshotBuildFailed(new Error("Snapshot build was invalidated"))
+        }
+
+        // Never publish build bytes under a fingerprint captured before those
+        // bytes were produced. A stable retry gives one-off edits fresh output.
+        if (await workspaceFingerprint(workspace) !== fingerprint) {
+          await rm(outDir, { force: true, recursive: true }).catch(() => undefined)
+          if (attempt + 1 === MAX_SNAPSHOT_BUILD_ATTEMPTS) {
+            throw snapshotBuildFailed(new Error("Workspace changed repeatedly during the snapshot build"))
+          }
+          continue
+        }
+
+        const snapshot = { sessionId, fingerprint, outDir }
+        snapshots.set(sessionId, snapshot)
+        if (existing && existing.outDir !== outDir) {
+          await rm(existing.outDir, { force: true, recursive: true }).catch(() => undefined)
+        }
+        return snapshot
       }
-      const snapshot = { sessionId, fingerprint, outDir }
-      snapshots.set(sessionId, snapshot)
-      if (existing && existing.outDir !== outDir) {
-        await rm(existing.outDir, { force: true, recursive: true }).catch(() => undefined)
-      }
-      return snapshot
+      throw snapshotBuildFailed(new Error("Snapshot build did not stabilize"))
     } catch (error) {
       if (error instanceof MarkdownRenderError) throw error
       throw snapshotBuildFailed(error)
