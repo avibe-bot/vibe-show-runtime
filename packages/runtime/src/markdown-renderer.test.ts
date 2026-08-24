@@ -166,6 +166,90 @@ describe("workspace render cache", () => {
     }
   })
 
+  it("restores the render budget spent waiting behind an unrelated miss", async () => {
+    const workspace = await fixtureWorkspace("serialized-budget")
+    let pageIndex = 0
+    const browser = new FakeBrowser(() => pageIndex++ === 0
+      ? { html: "<h1>Slow first</h1>", mode: "success" }
+      : {
+          html: "<h1>Loading second</h1>",
+          completedHtml: "<h1>Fast second</h1>",
+          initialDataDelayMs: 120,
+          mode: "slow-initial-data"
+        })
+    let firstPrepareStarted!: () => void
+    const firstPreparing = new Promise<void>((resolve) => {
+      firstPrepareStarted = resolve
+    })
+    const renderer = createMarkdownRenderer({
+      timeoutMs: 250,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0
+    })
+    const firstRequest = renderRequest(workspace, async () => {
+      firstPrepareStarted()
+      await new Promise((resolve) => setTimeout(resolve, 170))
+    })
+    const secondRequest = renderRequest(workspace, undefined, "/p/second/")
+
+    try {
+      const first = renderer.render(firstRequest)
+      await firstPreparing
+      const second = renderer.render(secondRequest)
+
+      await expect(first).resolves.toEqual({ markdown: "# Slow first\n", cache: "miss" })
+      await expect(second).resolves.toEqual({ markdown: "# Fast second\n", cache: "miss" })
+      expect(browser.contextCount).toBe(2)
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("still times out a stalled render after compensating its queue wait", async () => {
+    const workspace = await fixtureWorkspace("serialized-real-timeout")
+    let pageIndex = 0
+    const browser = new FakeBrowser(() => pageIndex++ === 0
+      ? { html: "<h1>Slow first</h1>", mode: "success" }
+      : { html: "<h1>Never completes</h1>", mode: "stalled" })
+    let firstPrepareStarted!: () => void
+    const firstPreparing = new Promise<void>((resolve) => {
+      firstPrepareStarted = resolve
+    })
+    const renderer = createMarkdownRenderer({
+      timeoutMs: 180,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0
+    })
+    const firstRequest = renderRequest(workspace, async () => {
+      firstPrepareStarted()
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    })
+    const secondRequest = renderRequest(workspace, undefined, "/p/stalled/")
+
+    try {
+      const first = renderer.render(firstRequest)
+      await firstPreparing
+      const secondStartedAt = Date.now()
+      const second = renderer.render(secondRequest)
+
+      await expect(first).resolves.toEqual({ markdown: "# Slow first\n", cache: "miss" })
+      await expect(second).rejects.toMatchObject({ code: "render_timeout", status: 504 })
+      expect(Date.now() - secondStartedAt).toBeGreaterThanOrEqual(220)
+      expect(browser.contextCount).toBe(2)
+      expect(browser.closeCount).toBe(1)
+    } finally {
+      await renderer.close()
+    }
+  })
+
   it("keys entries by target and caller base and expires dynamic data at the TTL backstop", async () => {
     const workspace = await fixtureWorkspace("cache-context")
     const browser = new FakeBrowser(() => ({ html: "<h1>Context cache</h1>", mode: "success" }))

@@ -224,7 +224,9 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
           return { markdown: initialHit.markdown, cache: "hit" }
         }
 
+        const waitStart = Date.now()
         return await mutex.runExclusive(async () => {
+          deadline.extendBy(Date.now() - waitStart)
           const lockedFingerprint = await deadline.wait(fingerprintOrRenderFailed(request.workspace))
           const lockedHit = cache.get(cacheKey, lockedFingerprint)
           if (lockedHit) {
