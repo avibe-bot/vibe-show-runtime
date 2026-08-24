@@ -245,6 +245,171 @@ describe("workspace render cache", () => {
     }
   })
 
+  it("evicts the least-recently-served entry at the per-session cap", async () => {
+    const workspace = await fixtureWorkspace("cache-session-lru")
+    const browser = new FakeBrowser(() => ({ html: "<h1>Session LRU</h1>", mode: "success" }))
+    const renderer = createMarkdownRenderer({
+      cacheEntriesPerSession: 2,
+      cacheEntriesGlobal: 10,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0
+    })
+    const first = cacheVariantRequest(workspace, "session-one", "first")
+    const second = cacheVariantRequest(workspace, "session-one", "second")
+    const third = cacheVariantRequest(workspace, "session-one", "third")
+
+    try {
+      await expect(renderer.render(first)).resolves.toMatchObject({ cache: "miss" })
+      await expect(renderer.render(second)).resolves.toMatchObject({ cache: "miss" })
+      await expect(renderer.render(first)).resolves.toMatchObject({ cache: "hit" })
+      await expect(renderer.render(third)).resolves.toMatchObject({ cache: "miss" })
+
+      await expect(renderer.render(first)).resolves.toMatchObject({ cache: "hit" })
+      await expect(renderer.render(second)).resolves.toMatchObject({ cache: "miss" })
+      expect(browser.contextCount).toBe(4)
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("evicts the global LRU across sessions", async () => {
+    const workspace = await fixtureWorkspace("cache-global-lru")
+    const browser = new FakeBrowser(() => ({ html: "<h1>Global LRU</h1>", mode: "success" }))
+    const renderer = createMarkdownRenderer({
+      cacheEntriesPerSession: 10,
+      cacheEntriesGlobal: 3,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0
+    })
+    const first = cacheVariantRequest(workspace, "session-one", "first")
+    const second = cacheVariantRequest(workspace, "session-two", "second")
+    const third = cacheVariantRequest(workspace, "session-one", "third")
+    const fourth = cacheVariantRequest(workspace, "session-two", "fourth")
+
+    try {
+      await expect(renderer.render(first)).resolves.toMatchObject({ cache: "miss" })
+      await expect(renderer.render(second)).resolves.toMatchObject({ cache: "miss" })
+      await expect(renderer.render(third)).resolves.toMatchObject({ cache: "miss" })
+      await expect(renderer.render(first)).resolves.toMatchObject({ cache: "hit" })
+      await expect(renderer.render(fourth)).resolves.toMatchObject({ cache: "miss" })
+
+      await expect(renderer.render(first)).resolves.toMatchObject({ cache: "hit" })
+      await expect(renderer.render(second)).resolves.toMatchObject({ cache: "miss" })
+      expect(browser.contextCount).toBe(5)
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("deletes expired entries before enforcing capacity on write", async () => {
+    const workspace = await fixtureWorkspace("cache-expired-write")
+    const browser = new FakeBrowser(() => ({ html: "<h1>Expiry</h1>", mode: "success" }))
+    let now = 0
+    const renderer = createMarkdownRenderer({
+      cacheTtlMs: 100,
+      cacheEntriesPerSession: 10,
+      cacheEntriesGlobal: 3,
+      cacheMaintenanceIntervalMs: 60_000,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0,
+      now: () => now
+    })
+    const first = cacheVariantRequest(workspace, "session-one", "first")
+    const second = cacheVariantRequest(workspace, "session-one", "second")
+    const third = cacheVariantRequest(workspace, "session-one", "third")
+    const fourth = cacheVariantRequest(workspace, "session-one", "fourth")
+
+    try {
+      await expect(renderer.render(first)).resolves.toMatchObject({ cache: "miss" })
+      now = 10
+      await expect(renderer.render(second)).resolves.toMatchObject({ cache: "miss" })
+      now = 20
+      await expect(renderer.render(first)).resolves.toMatchObject({ cache: "hit" })
+      await expect(renderer.render(third)).resolves.toMatchObject({ cache: "miss" })
+
+      // The hot first entry expires while the older LRU entry remains fresh.
+      // Pruning before the fourth write prevents capacity eviction of second.
+      now = 100
+      await expect(renderer.render(fourth)).resolves.toMatchObject({ cache: "miss" })
+      await expect(renderer.render(second)).resolves.toMatchObject({ cache: "hit" })
+      expect(browser.contextCount).toBe(4)
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("physically deletes expired entries during idle maintenance", async () => {
+    const workspace = await fixtureWorkspace("cache-expired-idle")
+    const browser = new FakeBrowser(() => ({ html: "<h1>Idle expiry</h1>", mode: "success" }))
+    let now = 0
+    const deleted = vi.spyOn(Map.prototype, "delete")
+    const renderer = createMarkdownRenderer({
+      cacheTtlMs: 10,
+      cacheMaintenanceIntervalMs: 5,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0,
+      now: () => now
+    })
+    const request = cacheVariantRequest(workspace, "session-one", "idle")
+    const cacheKey = JSON.stringify([request.sessionId, request.target, request.basePath])
+
+    try {
+      await expect(renderer.render(request)).resolves.toMatchObject({ cache: "miss" })
+      deleted.mockClear()
+      now = 10
+
+      await vi.waitFor(() => {
+        expect(deleted).toHaveBeenCalledWith(cacheKey)
+      }, { timeout: 500, interval: 5 })
+      expect(browser.contextCount).toBe(1)
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("invalidates only the requested session's cached entries", async () => {
+    const workspace = await fixtureWorkspace("cache-session-invalidation")
+    const browser = new FakeBrowser(() => ({ html: "<h1>Invalidation</h1>", mode: "success" }))
+    const renderer = createMarkdownRenderer({
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0
+    })
+    const firstSession = cacheVariantRequest(workspace, "session-one", "first")
+    const secondSession = cacheVariantRequest(workspace, "session-two", "second")
+
+    try {
+      await expect(renderer.render(firstSession)).resolves.toMatchObject({ cache: "miss" })
+      await expect(renderer.render(secondSession)).resolves.toMatchObject({ cache: "miss" })
+      await renderer.invalidateSession("session-one")
+
+      await expect(renderer.render(firstSession)).resolves.toMatchObject({ cache: "miss" })
+      await expect(renderer.render(secondSession)).resolves.toMatchObject({ cache: "hit" })
+      expect(browser.contextCount).toBe(3)
+    } finally {
+      await renderer.close()
+    }
+  })
+
   it("invalidates cached Markdown when a workspace dotfile changes", async () => {
     const workspace = await fixtureWorkspace("cache-dotfile")
     await writeFile(join(workspace, ".env"), "VITE_LABEL=one\n")
@@ -1038,6 +1203,22 @@ function renderRequest(
     renderUrl: "http://127.0.0.1:4177/sessions/fixture/app/",
     workspace,
     prepare: prepare ?? (async () => undefined)
+  }
+}
+
+function cacheVariantRequest(
+  workspace: string,
+  sessionId: string,
+  variant: string
+): MarkdownRenderRequest {
+  const target = `/${variant}`
+  const internalBasePath = `/sessions/${sessionId}/app/`
+  return {
+    ...renderRequest(workspace, undefined, `/p/${variant}/`),
+    sessionId,
+    target,
+    internalBasePath,
+    renderUrl: `http://127.0.0.1:4177${internalBasePath}${variant}`
   }
 }
 

@@ -9,9 +9,12 @@ import { gfm } from "turndown-plugin-gfm"
 
 export const DEFAULT_MARKDOWN_RENDER_TIMEOUT_MS = 30_000
 export const DEFAULT_MARKDOWN_CACHE_TTL_MS = 30_000
+export const DEFAULT_MARKDOWN_CACHE_ENTRIES_PER_SESSION = 64
+export const DEFAULT_MARKDOWN_CACHE_ENTRIES_GLOBAL = 256
 export const DEFAULT_MARKDOWN_MAX_BYTES = 512 * 1024
 export const DEFAULT_BROWSER_IDLE_MS = 60_000
 export const DEFAULT_BROWSER_PROVISION_TIMEOUT_MS = 5 * 60_000
+const DEFAULT_MARKDOWN_CACHE_MAINTENANCE_INTERVAL_MS = 5_000
 const DEFAULT_RENDER_QUIET_PERIOD_MS = 150
 const SYSTEM_BROWSER_CHANNELS = ["chrome", "msedge"] as const
 const MANAGED_BROWSER_TARGET = "managed" as const
@@ -115,6 +118,9 @@ export type BrowserProvisioner = (timeoutMs: number) => Promise<BrowserProvision
 export type MarkdownRendererOptions = {
   timeoutMs?: number
   cacheTtlMs?: number
+  cacheEntriesPerSession?: number
+  cacheEntriesGlobal?: number
+  cacheMaintenanceIntervalMs?: number
   maxOutputBytes?: number
   browserIdleMs?: number
   quietPeriodMs?: number
@@ -153,6 +159,18 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
     options.cacheTtlMs ?? envInteger("VIBE_SHOW_RENDER_CACHE_TTL_MS"),
     DEFAULT_MARKDOWN_CACHE_TTL_MS
   )
+  const cacheEntriesPerSession = positiveInteger(
+    options.cacheEntriesPerSession,
+    DEFAULT_MARKDOWN_CACHE_ENTRIES_PER_SESSION
+  )
+  const cacheEntriesGlobal = positiveInteger(
+    options.cacheEntriesGlobal,
+    DEFAULT_MARKDOWN_CACHE_ENTRIES_GLOBAL
+  )
+  const cacheMaintenanceIntervalMs = positiveInteger(
+    options.cacheMaintenanceIntervalMs,
+    DEFAULT_MARKDOWN_CACHE_MAINTENANCE_INTERVAL_MS
+  )
   const maxOutputBytes = positiveInteger(
     options.maxOutputBytes ?? envInteger("VIBE_SHOW_RENDER_MAX_BYTES"),
     DEFAULT_MARKDOWN_MAX_BYTES
@@ -179,7 +197,16 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
     provisionBrowser: options.provisionBrowser ?? provisionManagedBrowser
   })
   const mutex = new AsyncMutex()
-  const cache = new Map<string, CacheEntry>()
+  const cache = new MarkdownRenderCache({
+    ttlMs: cacheTtlMs,
+    entriesPerSession: cacheEntriesPerSession,
+    entriesGlobal: cacheEntriesGlobal,
+    now
+  })
+  const cacheMaintenanceTimer = cacheTtlMs > 0
+    ? setInterval(() => cache.deleteExpired(), cacheMaintenanceIntervalMs)
+    : undefined
+  cacheMaintenanceTimer?.unref?.()
   let closed = false
 
   return {
@@ -192,21 +219,21 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
       try {
         const cacheKey = renderCacheKey(request)
         const initialFingerprint = await deadline.wait(fingerprintOrRenderFailed(request.workspace))
-        const initialHit = cacheHit(cache.get(cacheKey), initialFingerprint, cacheTtlMs, now())
+        const initialHit = cache.get(cacheKey, initialFingerprint)
         if (initialHit) {
           return { markdown: initialHit.markdown, cache: "hit" }
         }
 
         return await mutex.runExclusive(async () => {
           const lockedFingerprint = await deadline.wait(fingerprintOrRenderFailed(request.workspace))
-          const lockedHit = cacheHit(cache.get(cacheKey), lockedFingerprint, cacheTtlMs, now())
+          const lockedHit = cache.get(cacheKey, lockedFingerprint)
           if (lockedHit) {
             return { markdown: lockedHit.markdown, cache: "hit" }
           }
 
           await deadline.wait(request.prepare())
           const renderFingerprint = await deadline.wait(fingerprintOrRenderFailed(request.workspace))
-          const preparedHit = cacheHit(cache.get(cacheKey), renderFingerprint, cacheTtlMs, now())
+          const preparedHit = cache.get(cacheKey, renderFingerprint)
           if (preparedHit) {
             return { markdown: preparedHit.markdown, cache: "hit" }
           }
@@ -227,8 +254,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
             cache.set(cacheKey, {
               sessionId: request.sessionId,
               markdown,
-              fingerprint: renderFingerprint,
-              createdAt: now()
+              fingerprint: renderFingerprint
             })
           } else {
             cache.delete(cacheKey)
@@ -242,13 +268,12 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
     async invalidateSession(sessionId) {
       if (closed) return
       await mutex.runExclusive(async () => {
-        for (const [key, entry] of cache) {
-          if (entry.sessionId === sessionId) cache.delete(key)
-        }
+        cache.invalidateSession(sessionId)
       })
     },
     async close() {
       closed = true
+      if (cacheMaintenanceTimer) clearInterval(cacheMaintenanceTimer)
       cache.clear()
       await mutex.runExclusive(() => browserPool.close())
     }
@@ -603,14 +628,88 @@ function renderCacheKey(request: MarkdownRenderRequest): string {
   return JSON.stringify([request.sessionId, request.target, request.basePath])
 }
 
-function cacheHit(
-  entry: CacheEntry | undefined,
-  fingerprint: string,
-  ttlMs: number,
-  now: number
-): CacheEntry | undefined {
-  if (!entry || entry.fingerprint !== fingerprint) return undefined
-  return now - entry.createdAt < ttlMs ? entry : undefined
+class MarkdownRenderCache {
+  private readonly entries = new Map<string, CacheEntry>()
+
+  constructor(private readonly options: {
+    ttlMs: number
+    entriesPerSession: number
+    entriesGlobal: number
+    now: () => number
+  }) {}
+
+  get(key: string, fingerprint: string): CacheEntry | undefined {
+    const entry = this.entries.get(key)
+    if (!entry) return undefined
+    if (entry.fingerprint !== fingerprint || this.isExpired(entry, this.options.now())) {
+      this.entries.delete(key)
+      return undefined
+    }
+
+    // Map insertion order is the global LRU order. A successful serve makes
+    // this entry the most recently served without extending its TTL.
+    this.entries.delete(key)
+    this.entries.set(key, entry)
+    return entry
+  }
+
+  set(key: string, entry: Omit<CacheEntry, "createdAt">): void {
+    const createdAt = this.options.now()
+    this.deleteExpired(createdAt)
+    this.entries.delete(key)
+    if (this.options.ttlMs === 0) return
+
+    this.entries.set(key, { ...entry, createdAt })
+    this.enforceSessionLimit(entry.sessionId)
+    this.enforceGlobalLimit()
+  }
+
+  delete(key: string): void {
+    this.entries.delete(key)
+  }
+
+  deleteExpired(at = this.options.now()): void {
+    for (const [key, entry] of this.entries) {
+      if (this.isExpired(entry, at)) this.entries.delete(key)
+    }
+  }
+
+  invalidateSession(sessionId: string): void {
+    for (const [key, entry] of this.entries) {
+      if (entry.sessionId === sessionId) this.entries.delete(key)
+    }
+  }
+
+  clear(): void {
+    this.entries.clear()
+  }
+
+  private isExpired(entry: CacheEntry, at: number): boolean {
+    return at - entry.createdAt >= this.options.ttlMs
+  }
+
+  private enforceSessionLimit(sessionId: string): void {
+    let overflow = 0
+    for (const entry of this.entries.values()) {
+      if (entry.sessionId === sessionId) overflow += 1
+    }
+    overflow -= this.options.entriesPerSession
+
+    for (const [key, entry] of this.entries) {
+      if (overflow <= 0) return
+      if (entry.sessionId !== sessionId) continue
+      this.entries.delete(key)
+      overflow -= 1
+    }
+  }
+
+  private enforceGlobalLimit(): void {
+    while (this.entries.size > this.options.entriesGlobal) {
+      const oldest = this.entries.keys().next()
+      if (oldest.done) return
+      this.entries.delete(oldest.value)
+    }
+  }
 }
 
 class BrowserPool {
