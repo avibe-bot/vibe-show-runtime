@@ -152,6 +152,7 @@ type CacheEntry = {
 type CleanedDocument = {
   html: string
   mountEmpty: boolean
+  outputTooLarge: boolean
 }
 
 export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): MarkdownRenderer {
@@ -325,8 +326,10 @@ async function renderPageToMarkdown(options: {
     await deadline.wait(page.evaluate(settleRenderedPage, 0))
     const cleaned = await deadline.wait(page.evaluate(cleanupRenderedDocument, {
       basePath: request.basePath,
-      internalBasePath: request.internalBasePath
+      internalBasePath: request.internalBasePath,
+      maxOutputBytes
     }))
+    if (cleaned.outputTooLarge) throw outputTooLarge(maxOutputBytes)
     if (cleaned.mountEmpty) {
       throw new Error("The Show Page mount is empty")
     }
@@ -336,11 +339,7 @@ async function renderPageToMarkdown(options: {
       throw new Error("The rendered page has no Markdown content")
     }
     if (Buffer.byteLength(markdown, "utf8") > maxOutputBytes) {
-      throw new MarkdownRenderError(
-        "output_too_large",
-        502,
-        `Rendered Markdown exceeds the ${formatByteLimit(maxOutputBytes)} output limit.`
-      )
+      throw outputTooLarge(maxOutputBytes)
     }
     return markdown
   } catch (error) {
@@ -473,7 +472,13 @@ export function settleRenderedPage(quietPeriodMs: number): Promise<void> {
 export function cleanupRenderedDocument(options: {
   basePath: string
   internalBasePath: string
+  maxOutputBytes: number
 }): CleanedDocument {
+  const initialBody = document.body
+  if (initialBody && !serializedBodyWithinLimit(initialBody, options.maxOutputBytes)) {
+    return { html: "", mountEmpty: false, outputTooLarge: true }
+  }
+
   const cleanupSelector = [
     "script",
     "style",
@@ -564,9 +569,99 @@ export function cleanupRenderedDocument(options: {
     !mount.textContent?.trim() &&
     !mount.querySelector("img, picture, video, audio, input, button, table, ul, ol, dl")
   )
+  const body = document.body
+  const withinLimit = !body || serializedBodyWithinLimit(body, options.maxOutputBytes)
   return {
-    html: document.body?.innerHTML.trim() ?? "",
-    mountEmpty
+    html: withinLimit ? body?.innerHTML.trim() ?? "" : "",
+    mountEmpty,
+    outputTooLarge: !withinLimit
+  }
+
+  function serializedBodyWithinLimit(body: HTMLElement, rawLimit: number): boolean {
+    // Compute a conservative UTF-8 serialization bound without materializing
+    // subtree HTML. The parallel node budget also caps work for empty-node trees.
+    const limit = Math.max(0, Math.floor(rawLimit))
+    const voidElements = new Set([
+      "area", "base", "br", "col", "embed", "hr", "img", "input",
+      "link", "meta", "param", "source", "track", "wbr"
+    ])
+    let bytes = 0
+    let nodes = 0
+
+    function addBytes(count: number): boolean {
+      bytes += count
+      return bytes <= limit
+    }
+
+    function addString(value: string, context: "raw" | "text" | "attribute"): boolean {
+      for (let index = 0; index < value.length;) {
+        const codePoint = value.codePointAt(index) ?? 0xfffd
+        index += codePoint > 0xffff ? 2 : 1
+        let encodedBytes: number
+        if (context !== "raw" && codePoint === 0x26) encodedBytes = 5
+        else if (context !== "raw" && (codePoint === 0x3c || codePoint === 0x3e)) encodedBytes = 4
+        else if (context === "attribute" && codePoint === 0x22) encodedBytes = 6
+        else if (context === "attribute" && codePoint < 0x20 && codePoint !== 0x20) encodedBytes = 6
+        else if (context !== "raw" && codePoint === 0xa0) encodedBytes = 6
+        else if (codePoint <= 0x7f) encodedBytes = 1
+        else if (codePoint <= 0x7ff) encodedBytes = 2
+        else if (codePoint <= 0xffff) encodedBytes = 3
+        else encodedBytes = 4
+        if (!addBytes(encodedBytes)) return false
+      }
+      return true
+    }
+
+    const pendingSiblings: Array<Node | null> = []
+    let node: Node | null = body.firstChild
+    while (node) {
+      nodes += 1
+      if (nodes > limit) return false
+
+      if (node.nodeType === 1) {
+        const element = node as Element
+        const tagName = element.localName || element.tagName.toLowerCase()
+        if (!addBytes(2) || !addString(tagName, "raw")) return false
+        for (let index = 0; index < element.attributes.length; index += 1) {
+          const attribute = element.attributes[index]
+          if (
+            !addBytes(4) ||
+            !addString(attribute.name, "raw") ||
+            !addString(attribute.value, "attribute")
+          ) {
+            return false
+          }
+        }
+        const isHtmlVoidElement = element.namespaceURI === "http://www.w3.org/1999/xhtml" &&
+          voidElements.has(tagName)
+        if (!isHtmlVoidElement && (!addBytes(3) || !addString(tagName, "raw"))) {
+          return false
+        }
+      } else if (node.nodeType === 3) {
+        if (!addString(node.nodeValue ?? "", "text")) return false
+      } else if (node.nodeType === 8) {
+        if (!addBytes(7) || !addString(node.nodeValue ?? "", "raw")) return false
+      } else if (!addBytes(16) || !addString(node.textContent ?? "", "text")) {
+        return false
+      }
+
+      const element = node.nodeType === 1 ? node as Element : undefined
+      const firstChild = element?.localName === "template" && "content" in element
+        ? (element as HTMLTemplateElement).content.firstChild
+        : node.firstChild
+      if (firstChild) {
+        pendingSiblings.push(node.nextSibling)
+        if (pendingSiblings.length > limit) return false
+        node = firstChild
+        continue
+      }
+
+      node = node.nextSibling
+      while (!node && pendingSiblings.length > 0) {
+        node = pendingSiblings.pop() ?? null
+      }
+    }
+    return true
   }
 }
 
@@ -581,6 +676,14 @@ export function convertRenderedHtmlToMarkdown(html: string): string {
   turndown.use(gfm)
   const markdown = turndown.turndown(html).trim()
   return markdown ? `${markdown}\n` : ""
+}
+
+function outputTooLarge(maxOutputBytes: number): MarkdownRenderError {
+  return new MarkdownRenderError(
+    "output_too_large",
+    502,
+    `Rendered Markdown exceeds the ${formatByteLimit(maxOutputBytes)} output limit.`
+  )
 }
 
 async function fingerprintOrRenderFailed(

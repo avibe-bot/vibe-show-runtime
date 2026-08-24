@@ -19,9 +19,31 @@ import {
 import { startShowRuntimeServer } from "./server.js"
 import { createWorkspaceFingerprinter } from "./workspace-fingerprint.js"
 
+const viteTestControl = vi.hoisted(() => ({
+  beforeBuild: undefined as (() => Promise<void>) | undefined,
+  beforeCreateServer: undefined as (() => Promise<void>) | undefined
+}))
+
+vi.mock("vite", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("vite")>()
+  return {
+    ...actual,
+    async build(config?: Parameters<typeof actual.build>[0]) {
+      await viteTestControl.beforeBuild?.()
+      return await actual.build(config)
+    },
+    async createServer(config?: Parameters<typeof actual.createServer>[0]) {
+      await viteTestControl.beforeCreateServer?.()
+      return await actual.createServer(config)
+    }
+  }
+})
+
 const temporaryDirectories: string[] = []
 
 afterEach(async () => {
+  viteTestControl.beforeBuild = undefined
+  viteTestControl.beforeCreateServer = undefined
   vi.restoreAllMocks()
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
     force: true,
@@ -59,7 +81,8 @@ describe("rendered DOM conversion", () => {
 
     const result = withDocument(fakeDocument as unknown as Document, () => cleanupRenderedDocument({
       basePath: "/p/public-share/",
-      internalBasePath: "/sessions/demo/app/"
+      internalBasePath: "/sessions/demo/app/",
+      maxOutputBytes: 1024
     }))
 
     expect(removed.every((element) => element.removed)).toBe(true)
@@ -86,7 +109,86 @@ describe("rendered DOM conversion", () => {
     expect(currentLink.getAttribute("href")).toBe("/p/public-share/overview?view=week#details")
     expect(internalLink.getAttribute("href")).toBe("/p/public-share/settings")
     expect(image.getAttribute("src")).toBe("/p/public-share/images/chart.png")
-    expect(result).toEqual({ html: "<main>Visible page content</main>", mountEmpty: false })
+    expect(result).toEqual({
+      html: "<main>Visible page content</main>",
+      mountEmpty: false,
+      outputTooLarge: false
+    })
+  })
+
+  it("stops oversized DOM extraction before full HTML serialization", () => {
+    let innerHtmlRead = false
+    const body = {
+      firstChild: undefined as unknown,
+      get innerHTML() {
+        innerHtmlRead = true
+        throw new Error("full body serialization must not run")
+      }
+    }
+    const text = {
+      nodeType: 3,
+      nodeValue: "x".repeat(256),
+      firstChild: null,
+      nextSibling: null,
+      parentNode: body
+    }
+    body.firstChild = text
+    const mount = {
+      textContent: "visible",
+      querySelector: () => null
+    }
+    let selectorQueries = 0
+    const fakeDocument = {
+      URL: "http://127.0.0.1:4177/sessions/demo/app/",
+      baseURI: "http://127.0.0.1:4177/sessions/demo/app/",
+      body,
+      querySelector: () => mount,
+      querySelectorAll: () => {
+        selectorQueries += 1
+        return []
+      }
+    }
+
+    const result = withDocument(fakeDocument as unknown as Document, () => cleanupRenderedDocument({
+      basePath: "/show/demo/",
+      internalBasePath: "/sessions/demo/app/",
+      maxOutputBytes: 64
+    }))
+
+    expect(result).toEqual({ html: "", mountEmpty: false, outputTooLarge: true })
+    expect(innerHtmlRead).toBe(false)
+    expect(selectorQueries).toBe(0)
+  })
+
+  it("serializes a DOM just below the browser-side byte limit", () => {
+    const html = "x".repeat(63)
+    const body = {
+      firstChild: undefined as unknown,
+      innerHTML: html
+    }
+    const text = {
+      nodeType: 3,
+      nodeValue: html,
+      firstChild: null,
+      nextSibling: null,
+      parentNode: body
+    }
+    body.firstChild = text
+    const fakeDocument = {
+      URL: "http://127.0.0.1:4177/sessions/demo/app/",
+      baseURI: "http://127.0.0.1:4177/sessions/demo/app/",
+      body,
+      querySelector: () => ({ textContent: "visible", querySelector: () => null }),
+      querySelectorAll: () => []
+    }
+
+    const result = withDocument(fakeDocument as unknown as Document, () => cleanupRenderedDocument({
+      basePath: "/show/demo/",
+      internalBasePath: "/sessions/demo/app/",
+      maxOutputBytes: 64
+    }))
+
+    expect(result).toEqual({ html, mountEmpty: false, outputTooLarge: false })
   })
 
   it("converts semantic HTML with the GFM table and strikethrough extensions", () => {
@@ -888,6 +990,29 @@ describe("browser resolution ladder", () => {
       await renderer.close()
     }
   })
+
+  it("renders a page just below the serialization limit", async () => {
+    const workspace = await fixtureWorkspace("serialization-limit")
+    const html = `<p>${"x".repeat(120)}</p>`
+    const renderer = createMarkdownRenderer({
+      maxOutputBytes: 128,
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return new FakeBrowser(() => ({ html, mode: "success" }))
+      },
+      quietPeriodMs: 0
+    })
+
+    try {
+      await expect(renderer.render(renderRequest(workspace))).resolves.toEqual({
+        markdown: `${"x".repeat(120)}\n`,
+        cache: "miss"
+      })
+    } finally {
+      await renderer.close()
+    }
+  })
 })
 
 describe("session dependency preparation", () => {
@@ -947,6 +1072,50 @@ document.getElementById("root")!.textContent = React.version + String(fixtureExt
       await runtime.close()
     }
   }, 60_000)
+
+  it("waits for an in-flight warm before suspending the session", async () => {
+    const workspaceRoot = await temporaryDirectory("warm-suspend-serialization")
+    await fixtureWorkspace("page", workspaceRoot)
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache")
+    })
+    let signalWarmStarted!: () => void
+    const warmStarted = new Promise<void>((resolveStarted) => {
+      signalWarmStarted = resolveStarted
+    })
+    let releaseWarm!: () => void
+    const warmGate = new Promise<void>((resolveWarm) => {
+      releaseWarm = resolveWarm
+    })
+    viteTestControl.beforeCreateServer = async () => {
+      signalWarmStarted()
+      await warmGate
+    }
+
+    try {
+      const warming = runtime.runtime.ensureSession("page", "/show/page/")
+      await warmStarted
+      let suspendSettled = false
+      const suspend = runtime.runtime.suspendSession("page").then((status) => {
+        suspendSettled = true
+        return status
+      })
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 0))
+      expect(suspendSettled).toBe(false)
+      expect(runtime.runtime.getSession("page")?.state).toBe("warming")
+
+      releaseWarm()
+      viteTestControl.beforeCreateServer = undefined
+      await expect(warming).resolves.toMatchObject({ state: "active" })
+      await expect(suspend).resolves.toMatchObject({ state: "suspended" })
+      expect(runtime.runtime.getSession("page")?.warming).toBeUndefined()
+    } finally {
+      releaseWarm()
+      viteTestControl.beforeCreateServer = undefined
+      await runtime.close()
+    }
+  })
 })
 
 describe("render-markdown HTTP contract", () => {
@@ -1014,6 +1183,89 @@ describe("render-markdown HTTP contract", () => {
       expect(asset.status).toBe(200)
       expect(asset.headers.get("cache-control")).toBe("no-store")
     } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
+  it("keeps active live HTML, assets, and API responsive during a snapshot build", async () => {
+    const workspaceRoot = await temporaryDirectory("snapshot-live-fast-path")
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    await mkdir(join(workspace, "api"), { recursive: true })
+    await writeFile(join(workspace, "api", "status.ts"), `export function GET() {
+  return Response.json({ status: "ready" })
+}\n`)
+    const browser = new FakeBrowser(() => ({
+      html: "<main id=\"root\"><h1>Snapshot complete</h1></main>",
+      mode: "success",
+      expectedNavigationBody: "/sessions/page/render-app/assets/"
+    }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+    const liveHeaders = { "x-vibe-show-base": "/show/page/" }
+    let signalBuildStarted!: () => void
+    const buildStarted = new Promise<void>((resolveStarted) => {
+      signalBuildStarted = resolveStarted
+    })
+    let releaseBuild!: () => void
+    const buildGate = new Promise<void>((resolveBuild) => {
+      releaseBuild = resolveBuild
+    })
+
+    try {
+      const warmDocument = await fetch(`${runtime.url}/sessions/page/app/`, { headers: liveHeaders })
+      expect(warmDocument.status).toBe(200)
+      await warmDocument.text()
+      const warmAsset = await fetch(`${runtime.url}/sessions/page/app/src/main.tsx`, { headers: liveHeaders })
+      expect(warmAsset.status).toBe(200)
+      await warmAsset.text()
+      const warmApi = await fetch(`${runtime.url}/sessions/page/app/api/status`, { headers: liveHeaders })
+      expect(await warmApi.json()).toEqual({ status: "ready" })
+
+      viteTestControl.beforeBuild = async () => {
+        signalBuildStarted()
+        await buildGate
+      }
+      const render = fetch(`${runtime.url}/sessions/page/render-markdown`)
+      await buildStarted
+
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      const liveResponses = await Promise.race([
+        Promise.all([
+          fetch(`${runtime.url}/sessions/page/app/dashboard`, { headers: liveHeaders }),
+          fetch(`${runtime.url}/sessions/page/app/src/main.tsx`, { headers: liveHeaders }),
+          fetch(`${runtime.url}/sessions/page/app/api/status`, { headers: liveHeaders })
+        ]),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("active live requests stalled behind snapshot build")), 1_000)
+        })
+      ]).finally(() => {
+        if (timeout) clearTimeout(timeout)
+      })
+      const [documentResponse, assetResponse, apiResponse] = liveResponses
+      expect(documentResponse.status).toBe(200)
+      expect(await documentResponse.text()).toContain("/show/page/src/main.tsx")
+      expect(assetResponse.status).toBe(200)
+      expect(await assetResponse.text()).toContain("document.getElementById")
+      expect(await apiResponse.json()).toEqual({ status: "ready" })
+
+      releaseBuild()
+      viteTestControl.beforeBuild = undefined
+      const renderResponse = await render
+      expect(renderResponse.status).toBe(200)
+      expect(await renderResponse.text()).toContain("# Snapshot complete")
+    } finally {
+      releaseBuild()
+      viteTestControl.beforeBuild = undefined
       await runtime.close()
     }
   }, 30_000)
@@ -1947,7 +2199,13 @@ class FakePage implements MarkdownPage {
   ): Promise<Result> {
     if (pageFunction === settleRenderedPage) return undefined as Result
     if (pageFunction === cleanupRenderedDocument) {
-      return { html: this.renderedHtml, mountEmpty: false } as Result
+      const maxOutputBytes = (argument as { maxOutputBytes: number }).maxOutputBytes
+      const outputTooLarge = Buffer.byteLength(this.renderedHtml, "utf8") > maxOutputBytes
+      return {
+        html: outputTooLarge ? "" : this.renderedHtml,
+        mountEmpty: false,
+        outputTooLarge
+      } as Result
     }
     return await (pageFunction as (argument?: Argument) => Result | Promise<Result>)(argument)
   }

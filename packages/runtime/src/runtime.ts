@@ -362,20 +362,28 @@ export function createShowRuntime(
   async function ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus> {
     const started = performance.now()
     const existing = getOrCreateSession(sessionId)
+    const normalizedBasePath = normalizeBasePath(basePath, sessionId)
+    // Snapshot builds only read prepared dependencies; an exact active match can
+    // keep serving from the existing Vite instance while the build is in flight.
+    if (await canReuseActiveSession(existing, normalizedBasePath)) {
+      existing.lastAccessedAt = new Date()
+      existing.updatedAt = new Date()
+      logTiming("ensureSession", sessionId, started, { state: "active", reused: true })
+      return toStatus(existing)
+    }
+
     await snapshotBuilds.get(sessionId)?.catch(() => undefined)
     existing.lastAccessedAt = new Date()
     if (existing.closing) {
       await existing.closing
       existing.lastAccessedAt = new Date()
     }
-    const normalizedBasePath = normalizeBasePath(basePath, sessionId)
-    const dependencySignature = existing.state === "active" ? await sourceDependencySignature(existing.workspace, options.uiPackageName ?? "@avibe/show-ui") : undefined
-    if (existing.state === "active" && existing.basePath === normalizedBasePath && existing.dependencySignature === dependencySignature) {
+    if (await canReuseActiveSession(existing, normalizedBasePath)) {
       existing.updatedAt = new Date()
       logTiming("ensureSession", sessionId, started, { state: "active", reused: true })
       return toStatus(existing)
     }
-    if (existing.state === "active" && (existing.basePath !== normalizedBasePath || existing.dependencySignature !== dependencySignature)) {
+    if (existing.state === "active") {
       const closeStarted = performance.now()
       await closeSession(existing)
       logTiming("closeSessionForWarmChange", sessionId, closeStarted, { from: existing.basePath, to: normalizedBasePath })
@@ -398,6 +406,30 @@ export function createShowRuntime(
     warmed.lastAccessedAt = new Date()
     logTiming("ensureSession", sessionId, started, { state: warmed.state, reused: false, basePath: warmed.basePath })
     return toStatus(warmed)
+  }
+
+  async function canReuseActiveSession(session: ShowSession, basePath: string): Promise<boolean> {
+    const vite = session.vite
+    if (
+      session.state !== "active" ||
+      !vite ||
+      session.closing ||
+      session.warming ||
+      session.basePath !== basePath
+    ) {
+      return false
+    }
+
+    const dependencySignature = await sourceDependencySignature(
+      session.workspace,
+      options.uiPackageName ?? "@avibe/show-ui"
+    )
+    return session.state === "active" &&
+      session.vite === vite &&
+      !session.closing &&
+      !session.warming &&
+      session.basePath === basePath &&
+      session.dependencySignature === dependencySignature
   }
 
   async function getSessionStatus(sessionId: string): Promise<ShowSessionStatus> {
