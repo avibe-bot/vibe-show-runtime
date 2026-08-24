@@ -7,7 +7,7 @@ import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import react from "@vitejs/plugin-react"
 import tailwindcss from "@tailwindcss/vite"
-import { createServer as createViteServer } from "vite"
+import { build as buildVite, createServer as createViteServer } from "vite"
 import type { InlineConfig, Plugin, ViteDevServer } from "vite"
 import {
   formatShowEventMessage,
@@ -48,7 +48,6 @@ const SENSITIVE_FS_DENY_PATTERNS = [
   "**/*.key"
 ]
 const viteCacheWarmLocks = new Map<string, Promise<void>>()
-const defaultWorkspaceWarmCoordinator = createWorkspaceWarmCoordinator()
 // One shared-install resolver per `node_modules` dir, built lazily on the first extras
 // session that needs the fallback and reused across sessions. Anchored at the shared
 // install so it resolves `import`-only packages (e.g. `@avibe/show-sdk/*`) that CJS
@@ -238,14 +237,10 @@ function isSensitiveFileName(segment: string): boolean {
     lower.endsWith(".key")
 }
 
-export function createShowRuntime(
-  options: ShowRuntimeOptions,
-  dependencies: {
-    hmr?: boolean
-    workspaceWarmCoordinator?: WorkspaceWarmCoordinator
-  } = {}
-): ShowRuntime {
+export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
+  const snapshotBuildContexts = new Map<string, SnapshotBuildContext>()
+  const snapshotBuilds = new Map<string, Promise<void>>()
   // The most recently warmed shared vendor bundle. The server serves its assets at a
   // session-independent path; it's set the first time any session warms (the build is
   // cached per dependency root in `ensureVendorBundle`).
@@ -256,7 +251,6 @@ export function createShowRuntime(
   const viteCacheRoots = new Set<string>()
   const idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS
   const idlePruneIntervalMs = options.idlePruneIntervalMs ?? DEFAULT_IDLE_PRUNE_INTERVAL_MS
-  const workspaceWarmCoordinator = dependencies.workspaceWarmCoordinator ?? defaultWorkspaceWarmCoordinator
   // Maintenance heartbeat: keep the cache dirs this process owns fresh for the cross-process age GC
   // (#31) — the vendor bundle is memoized for the process lifetime (and non-self-healing if swept),
   // and an active session may go a while between browser fetches. Crucially this runs EVEN when idle
@@ -282,6 +276,7 @@ export function createShowRuntime(
   async function ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus> {
     const started = performance.now()
     const existing = getOrCreateSession(sessionId)
+    await snapshotBuilds.get(sessionId)?.catch(() => undefined)
     existing.lastAccessedAt = new Date()
     if (existing.closing) {
       await existing.closing
@@ -308,6 +303,7 @@ export function createShowRuntime(
       existing.state = "warming"
       existing.updatedAt = new Date()
       existing.warming = warmSession(existing, normalizedBasePath).catch(async (error) => {
+        snapshotBuildContexts.delete(existing.id)
         await closeSession(existing)
         throw error
       })
@@ -326,13 +322,73 @@ export function createShowRuntime(
 
   async function suspendSession(sessionId: string): Promise<ShowSessionStatus> {
     const session = getOrCreateSession(sessionId)
+    await session.warming?.catch(() => undefined)
+    await snapshotBuilds.get(sessionId)?.catch(() => undefined)
     await closeSession(session)
     return toStatus(session)
   }
 
+  async function prepareSessionSnapshot(sessionId: string): Promise<void> {
+    const session = getOrCreateSession(sessionId)
+    await ensureSession(sessionId, session.basePath)
+  }
+
+  async function buildSessionSnapshot(
+    sessionId: string,
+    snapshot: { basePath: string; outDir: string }
+  ): Promise<void> {
+    const session = getOrCreateSession(sessionId)
+    // Reuse an in-flight or active live-session warm without changing its caller-facing
+    // base. The production build consumes the dependency state that warm prepared; it
+    // never creates a second runtime or serves through the live Vite middleware.
+    await prepareSessionSnapshot(sessionId)
+    const prepared = snapshotBuildContexts.get(sessionId)
+    if (!prepared) {
+      throw new Error("Session dependency preparation did not produce build state")
+    }
+    const building = (async () => {
+      const buildRoot = await realpath(session.workspace)
+      await buildVite({
+        configFile: false,
+        root: buildRoot,
+        base: snapshot.basePath,
+        logLevel: "silent",
+        build: {
+          outDir: snapshot.outDir,
+          emptyOutDir: true
+        },
+        plugins: [
+          snapshotRuntimeConfigPlugin(sessionId, snapshot.basePath),
+          ...(prepared.sharedDependencies.nodeModules === prepared.sharedDependencies.sharedNodeModules
+            ? []
+            : [sharedResolveFallbackPlugin(
+                prepared.sharedDependencies.sharedNodeModules,
+                prepared.providedSpecifiers,
+                "build"
+              )]),
+          tailwindcss(),
+          react()
+        ] as InlineConfig["plugins"],
+        resolve: {
+          alias: createShadcnAlias(prepared.uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never,
+          dedupe: ["react", "react-dom"]
+        }
+      })
+    })()
+    snapshotBuilds.set(sessionId, building)
+    try {
+      await building
+    } finally {
+      if (snapshotBuilds.get(sessionId) === building) snapshotBuilds.delete(sessionId)
+    }
+  }
+
   async function close() {
     clearInterval(maintenanceTimer)
+    await Promise.allSettled(snapshotBuilds.values())
+    snapshotBuilds.clear()
     await Promise.all([...sessions.values()].map((session) => closeSession(session)))
+    snapshotBuildContexts.clear()
     await disposeSharedInstallResolvers()
   }
 
@@ -454,16 +510,18 @@ export function createShowRuntime(
     await access(sharedNodeModules)
     const packageRoots = await resolveAllowedPackageRoots(sharedNodeModules, [uiPackageName, "@avibe/show-sdk"])
     const linkStarted = performance.now()
-    const sharedDependencies = await workspaceWarmCoordinator.runExclusive(
+    const sharedDependencies = await ensureSessionDependencies(
       session.workspace,
-      () => ensureSessionDependencies(
-        session.workspace,
-        sourceDependencies.declaredExtras,
-        sharedNodeModules,
-        packageRoots,
-        uiPackageName
-      )
+      sourceDependencies.declaredExtras,
+      sharedNodeModules,
+      packageRoots,
+      uiPackageName
     )
+    snapshotBuildContexts.set(session.id, {
+      providedSpecifiers,
+      sharedDependencies,
+      uiPackageName
+    })
     logTiming("warmSession.dependencyLink", session.id, linkStarted, { nodeModules: sharedDependencies.nodeModules, extrasSignature: sharedDependencies.extrasSignature })
     const cacheStarted = performance.now()
     const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot, sourceDependencies.signature, bundle.result.manifest.hash)
@@ -500,12 +558,10 @@ export function createShowRuntime(
       cacheDir,
       server: {
         middlewareMode: options.server ? { server: options.server } : true,
-        hmr: dependencies.hmr === false
-          ? false
-          : {
-              server: options.server,
-              path: `__vite_hmr`
-            },
+        hmr: {
+          server: options.server,
+          path: `__vite_hmr`
+        },
         fs: {
           strict: true,
           allow: fsAllow,
@@ -617,6 +673,8 @@ export function createShowRuntime(
     pruneIdleSessions,
     getSession: (sessionId: string) => sessions.get(sessionId),
     getVendorBundle: () => vendorBundle,
+    prepareSessionSnapshot,
+    buildSessionSnapshot,
     suspendSession,
     recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor) {
       return recordShowEvent(sessionId, { type: "assistant.mark.created", mark, anchor })
@@ -672,6 +730,32 @@ type SharedDependencies = {
   packageRoots: string[]
   /** Signature of the declared extras the workspace was installed against. */
   extrasSignature: string
+}
+
+type SnapshotBuildContext = {
+  providedSpecifiers: string[]
+  sharedDependencies: SharedDependencies
+  uiPackageName: string
+}
+
+function snapshotRuntimeConfigPlugin(sessionId: string, basePath: string): Plugin {
+  const config = JSON.stringify({
+    sessionId,
+    basePath,
+    eventsPath: "__show/events",
+    streamPath: "__show/events?stream=1"
+  }).replaceAll("<", "\\u003c")
+  return {
+    name: "avibe-show-snapshot-runtime-config",
+    apply: "build",
+    transformIndexHtml() {
+      return [{
+        tag: "script",
+        children: `globalThis.__AVIBE_SHOW__ = { ...(globalThis.__AVIBE_SHOW__ || {}), ...${config} }`,
+        injectTo: "head-prepend"
+      }]
+    }
+  }
 }
 
 /**
@@ -781,7 +865,8 @@ async function ensureSharedSymlink(linkPath: string, sharedNodeModules: string) 
   try {
     const stats = await lstat(linkPath)
     if (stats.isSymbolicLink()) {
-      if (await isExpectedSymlink(linkPath, sharedNodeModules)) return
+      const currentTarget = resolve(dirname(linkPath), await readlink(linkPath))
+      if (currentTarget === sharedNodeModules) return
       await rm(linkPath)
     } else {
       // A previous extras warm left this session's real node_modules here; clear it
@@ -791,55 +876,7 @@ async function ensureSharedSymlink(linkPath: string, sharedNodeModules: string) 
   } catch {
     // Nothing to replace; create the link below.
   }
-  try {
-    await symlink(sharedNodeModules, linkPath, "junction")
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST" && await isExpectedSymlink(linkPath, sharedNodeModules)) {
-      return
-    }
-    throw error
-  }
-}
-
-async function isExpectedSymlink(linkPath: string, expectedTarget: string): Promise<boolean> {
-  try {
-    const stats = await lstat(linkPath)
-    if (!stats.isSymbolicLink()) return false
-    const [actual, expected] = await Promise.all([
-      realpath(linkPath),
-      realpath(expectedTarget)
-    ])
-    return actual === expected
-  } catch {
-    return false
-  }
-}
-
-export type WorkspaceWarmCoordinator = {
-  runExclusive<T>(workspace: string, operation: () => Promise<T>): Promise<T>
-}
-
-export function createWorkspaceWarmCoordinator(): WorkspaceWarmCoordinator {
-  const tails = new Map<string, Promise<void>>()
-  return {
-    async runExclusive<T>(workspace: string, operation: () => Promise<T>): Promise<T> {
-      const key = resolve(workspace)
-      const previous = tails.get(key) ?? Promise.resolve()
-      let release!: () => void
-      const current = new Promise<void>((resolveCurrent) => {
-        release = resolveCurrent
-      })
-      const tail = previous.catch(() => undefined).then(() => current)
-      tails.set(key, tail)
-      await previous.catch(() => undefined)
-      try {
-        return await operation()
-      } finally {
-        release()
-        if (tails.get(key) === tail) tails.delete(key)
-      }
-    }
-  }
+  await symlink(sharedNodeModules, linkPath, "junction")
 }
 
 /**
@@ -867,13 +904,17 @@ export function createWorkspaceWarmCoordinator(): WorkspaceWarmCoordinator {
  * install (not CJS `createRequire`, which throws `ERR_PACKAGE_PATH_NOT_EXPORTED` on the
  * `import`-only `@avibe/show-sdk/*` subpaths).
  */
-function sharedResolveFallbackPlugin(sharedNodeModules: string, providedSpecifiers: string[]): Plugin {
+function sharedResolveFallbackPlugin(
+  sharedNodeModules: string,
+  providedSpecifiers: string[],
+  mode: "serve" | "build" = "serve"
+): Plugin {
   return {
     name: "avibe-show-shared-resolve-fallback",
     enforce: "post",
-    apply: "serve",
+    apply: mode,
     async resolveId(source, importer, options) {
-      if (!isBareImport(source) || isExternalizedImport(source, providedSpecifiers)) {
+      if (!isBareImport(source) || (mode === "serve" && isExternalizedImport(source, providedSpecifiers))) {
         return null
       }
       // Only act as a fallback: defer to the session's own resolution first.
@@ -1080,7 +1121,9 @@ async function installExtrasToStagingDir(workspace: string, declaredExtras: Decl
     `${JSON.stringify({ name: "avibe-show-session-extras", private: true }, null, 2)}\n`,
     "utf8"
   )
-  await execFileAsync(npmExecutable(), [
+  const npm = await npmInvocation()
+  await execFileAsync(npm.executable, [
+    ...npm.args,
     "install",
     ...declaredExtras.entries,
     "--no-save",
@@ -1116,8 +1159,27 @@ async function readInstalledExtrasSignature(lockfile: string): Promise<string | 
   }
 }
 
-function npmExecutable() {
-  return process.platform === "win32" ? "npm.cmd" : "npm"
+async function npmInvocation(): Promise<{ executable: string; args: string[] }> {
+  if (process.platform !== "win32") {
+    return { executable: "npm", args: [] }
+  }
+
+  // Node 22 rejects direct execFile() launches of .cmd shims on Windows. Invoke
+  // npm's JavaScript entry with the current Node executable instead, keeping every
+  // package specifier as a distinct argv value (no shell interpolation).
+  const candidates = [
+    process.env.npm_execpath,
+    join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")
+  ].filter((candidate): candidate is string => Boolean(candidate))
+  for (const candidate of candidates) {
+    try {
+      await access(candidate)
+      return { executable: process.execPath, args: [candidate] }
+    } catch {
+      // Try the next standard npm CLI location.
+    }
+  }
+  throw new Error("npm CLI could not be located for the session extras install")
 }
 
 type SourceDependencies = {

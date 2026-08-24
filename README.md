@@ -187,11 +187,14 @@ POST /sessions/:sessionId/suspend
 ANY  /sessions/:sessionId/app/*
 ```
 
-`render-markdown` loads the session app in an anonymous Playwright browser
-context, removes non-semantic and annotation-overlay DOM, and returns GFM
-Markdown. `x-vibe-show-target` selects a root-relative SPA path and query; it
-defaults to the app root and rejects traversal or absolute targets. The runtime
-discovers system Chrome and Edge first. When neither is usable,
+`render-markdown` creates a fingerprinted production build of the session app,
+serves that snapshot on a static loopback route, and loads it in an anonymous
+Playwright browser context. Snapshot `api/*` requests still use the session's
+existing handler runtime; no second live Vite runtime is created. The renderer
+removes non-semantic and annotation-overlay DOM and returns GFM Markdown.
+`x-vibe-show-target` selects a root-relative SPA path and query; it defaults to
+the app root and rejects traversal or absolute targets. The runtime discovers
+system Chrome and Edge first. When neither is usable,
 the first render provisions Playwright's managed Chromium headless shell in the
 normal user cache. Set `AVIBE_SHOW_RENDER_NO_PROVISION=1` to disable downloads;
 in that mode a browserless host receives the deterministic

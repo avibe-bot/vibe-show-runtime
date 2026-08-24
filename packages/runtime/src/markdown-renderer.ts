@@ -134,7 +134,7 @@ export type MarkdownRendererOptions = {
 
 export type MarkdownRenderer = {
   render(request: MarkdownRenderRequest): Promise<MarkdownRenderResult>
-  invalidateSession(sessionId: string): Promise<void>
+  invalidateSession(sessionId: string, releaseResources?: () => Promise<void>): Promise<void>
   close(): Promise<void>
 }
 
@@ -267,10 +267,11 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
         throw normalizeRenderError(error, timeoutMs, deadline)
       }
     },
-    async invalidateSession(sessionId) {
+    async invalidateSession(sessionId, releaseResources) {
       if (closed) return
       await mutex.runExclusive(async () => {
         cache.invalidateSession(sessionId)
+        await releaseResources?.()
       })
     },
     async close() {

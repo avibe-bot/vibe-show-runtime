@@ -16,11 +16,6 @@ import {
   type MarkdownPage,
   type MarkdownRenderRequest
 } from "./markdown-renderer.js"
-import {
-  createShowRuntime,
-  createWorkspaceWarmCoordinator,
-  type WorkspaceWarmCoordinator
-} from "./runtime.js"
 import { startShowRuntimeServer } from "./server.js"
 
 const temporaryDirectories: string[] = []
@@ -822,37 +817,9 @@ describe("browser resolution ladder", () => {
   })
 })
 
-describe("cross-runtime workspace dependency preparation", () => {
-  it("warms the same shared-dependency session concurrently from both runtimes", async () => {
-    const workspaceRoot = await temporaryDirectory("concurrent-shared-warm")
-    const workspace = await fixtureWorkspace("page", workspaceRoot)
-    const dependencyRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
-    const runtime = await startShowRuntimeServer({
-      workspaceRoot,
-      dependencyRoot,
-      cacheRoot: join(workspaceRoot, ".cache")
-    })
-
-    try {
-      const outcomes = await Promise.allSettled([
-        runtime.runtime.ensureSession("page", "/show/page/"),
-        runtime.renderRuntime.ensureSession("page", "/sessions/page/render-app/")
-      ])
-
-      expect(outcomes).toEqual([
-        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) },
-        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) }
-      ])
-      const nodeModules = join(workspace, "node_modules")
-      expect((await lstat(nodeModules)).isSymbolicLink()).toBe(true)
-      expect(await realpath(nodeModules)).toBe(await realpath(join(dependencyRoot, "node_modules")))
-    } finally {
-      await runtime.close()
-    }
-  }, 30_000)
-
-  it("warms the same extras session concurrently without tearing node_modules", async () => {
-    const workspaceRoot = await temporaryDirectory("concurrent-extras-warm")
+describe("session dependency preparation", () => {
+  it("installs session extras through the platform-safe npm entry point", async () => {
+    const workspaceRoot = await temporaryDirectory("extras-warm")
     const workspace = await fixtureWorkspace("page", workspaceRoot)
     const dependencyRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
     const extraPackage = join(workspaceRoot, "fixture-extra")
@@ -860,6 +827,7 @@ describe("cross-runtime workspace dependency preparation", () => {
     await writeFile(join(extraPackage, "package.json"), JSON.stringify({
       name: "fixture-extra",
       version: "1.0.0",
+      type: "module",
       main: "index.js"
     }))
     await writeFile(join(extraPackage, "index.js"), "export const fixtureExtra = true\n")
@@ -869,6 +837,10 @@ describe("cross-runtime workspace dependency preparation", () => {
         "fixture-extra": "file:../fixture-extra"
       }
     }))
+    await writeFile(join(workspace, "src", "main.tsx"), `import React from "react"
+import { fixtureExtra } from "fixture-extra"
+document.getElementById("root")!.textContent = React.version + String(fixtureExtra)
+`)
     const runtime = await startShowRuntimeServer({
       workspaceRoot,
       dependencyRoot,
@@ -876,15 +848,8 @@ describe("cross-runtime workspace dependency preparation", () => {
     })
 
     try {
-      const outcomes = await Promise.allSettled([
-        runtime.runtime.ensureSession("page", "/show/page/"),
-        runtime.renderRuntime.ensureSession("page", "/sessions/page/render-app/")
-      ])
-
-      expect(outcomes).toEqual([
-        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) },
-        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) }
-      ])
+      await expect(runtime.runtime.ensureSession("page", "/show/page/"))
+        .resolves.toMatchObject({ state: "active" })
       const nodeModules = join(workspace, "node_modules")
       expect((await lstat(nodeModules)).isDirectory()).toBe(true)
       expect((await lstat(nodeModules)).isSymbolicLink()).toBe(false)
@@ -898,63 +863,217 @@ describe("cross-runtime workspace dependency preparation", () => {
       expect(installed.entries).toEqual([
         `fixture-extra@file:${extraPackage}`
       ])
+      const snapshotOut = join(workspaceRoot, "snapshot-output")
+      await expect(runtime.runtime.buildSessionSnapshot("page", {
+        basePath: "/sessions/page/render-app/",
+        outDir: snapshotOut
+      })).resolves.toBeUndefined()
+      expect(await readFile(join(snapshotOut, "index.html"), "utf8"))
+        .toContain("/sessions/page/render-app/assets/")
     } finally {
       await runtime.close()
     }
   }, 60_000)
-
-  it("does not serialize dependency preparation for different session workspaces", async () => {
-    const workspaceRoot = await temporaryDirectory("parallel-session-warms")
-    await fixtureWorkspace("first", workspaceRoot)
-    await fixtureWorkspace("second", workspaceRoot)
-    const dependencyRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
-    const keyedCoordinator = createWorkspaceWarmCoordinator()
-    const entered = new Set<string>()
-    let releasePreparation!: () => void
-    const preparationGate = new Promise<void>((resolveGate) => {
-      releasePreparation = resolveGate
-    })
-    let bothEntered!: () => void
-    const bothStarted = new Promise<void>((resolveStarted) => {
-      bothEntered = resolveStarted
-    })
-    const coordinator: WorkspaceWarmCoordinator = {
-      runExclusive<T>(workspace: string, operation: () => Promise<T>): Promise<T> {
-        return keyedCoordinator.runExclusive(workspace, async () => {
-          entered.add(resolve(workspace))
-          if (entered.size === 2) bothEntered()
-          await preparationGate
-          return operation()
-        })
-      }
-    }
-    const runtime = createShowRuntime({
-      workspaceRoot,
-      dependencyRoot,
-      cacheRoot: join(workspaceRoot, ".cache")
-    }, { hmr: false, workspaceWarmCoordinator: coordinator })
-    const outcomes = Promise.allSettled([
-      runtime.ensureSession("first", "/show/first/"),
-      runtime.ensureSession("second", "/show/second/")
-    ])
-
-    try {
-      await expect(Promise.race([
-        bothStarted.then(() => true),
-        new Promise<boolean>((resolveTimeout) => setTimeout(() => resolveTimeout(false), 5_000))
-      ])).resolves.toBe(true)
-    } finally {
-      releasePreparation()
-      expect(await outcomes).toEqual([
-        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) },
-        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) }
-      ])
-      await runtime.close()
-    }
-  }, 15_000)
 })
 
 describe("render-markdown HTTP contract", () => {
+  it("renders Markdown through a production build snapshot and plain static route", async () => {
+    const workspaceRoot = await temporaryDirectory("snapshot-e2e")
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    await writeFile(join(workspace, "index.html"), `<!doctype html>
+<html><head><title>Snapshot fixture</title></head><body>
+  <main id="root"><h1>Built snapshot</h1><p>Production HTML reached Markdown.</p></main>
+  <script type="module" src="/src/main.tsx"></script>
+</body></html>\n`)
+    await writeFile(join(workspace, "src", "main.tsx"), "document.body.dataset.snapshot = 'ready'\n")
+    const browser = new FakeBrowser(() => ({
+      html: "",
+      mode: "success",
+      expectedNavigationBody: "/sessions/page/render-app/assets/",
+      useNavigationBody: true
+    }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+    const buildSnapshot = vi.spyOn(runtime.runtime, "buildSessionSnapshot")
+
+    try {
+      const response = await fetch(`${runtime.url}/sessions/page/render-markdown`, {
+        headers: {
+          "x-vibe-show-base": "/p/snapshot-share/",
+          "x-vibe-show-target": "/dashboard?view=week"
+        }
+      })
+      expect(response.status).toBe(200)
+      expect(response.headers.get("x-avibe-render-cache")).toBe("miss")
+      const markdown = await response.text()
+      expect(markdown).toContain("# Built snapshot")
+      expect(markdown).toContain("Production HTML reached Markdown.")
+
+      const secondTarget = await fetch(`${runtime.url}/sessions/page/render-markdown`, {
+        headers: {
+          "x-vibe-show-base": "/p/snapshot-share/",
+          "x-vibe-show-target": "/reports?view=month"
+        }
+      })
+      expect(secondTarget.headers.get("x-avibe-render-cache")).toBe("miss")
+      expect(await secondTarget.text()).toContain("# Built snapshot")
+      expect(buildSnapshot).toHaveBeenCalledTimes(1)
+
+      const snapshot = runtime.renderSnapshots.get("page")
+      expect(snapshot).toBeDefined()
+      const builtHtml = await readFile(join(snapshot!.outDir, "index.html"), "utf8")
+      expect(builtHtml).toContain("globalThis.__AVIBE_SHOW__")
+      expect(builtHtml).toContain('"sessionId":"page"')
+      expect(builtHtml).toContain('"basePath":"/sessions/page/render-app/"')
+      const assetPath = builtHtml.match(/(?:src|href)="([^"]*\/assets\/[^"]+)"/)?.[1]
+      expect(assetPath).toBeDefined()
+      const asset = await fetch(new URL(assetPath!, runtime.url))
+      expect(asset.status).toBe(200)
+      expect(asset.headers.get("cache-control")).toBe("no-store")
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
+  it("returns render_failed with a concise production build error", async () => {
+    const workspaceRoot = await temporaryDirectory("snapshot-build-failure")
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    await writeFile(join(workspace, "src", "main.tsx"), 'import "./does-not-exist"\n')
+    const launchBrowser = vi.fn(async () => new FakeBrowser(() => ({
+      html: "<h1>Never reached</h1>",
+      mode: "success"
+    })))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser,
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+
+    try {
+      const response = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      const body = await expectRenderError(response, 502, "render_failed")
+      expect(body.error.message).toContain("Show Page build failed:")
+      expect(body.error.message).toMatch(/does-not-exist|resolve/i)
+      expect(body.error.message.length).toBeLessThanOrEqual(324)
+      expect(runtime.renderSnapshots.get("page")).toBeUndefined()
+      expect(launchBrowser).not.toHaveBeenCalled()
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
+  it("rebuilds the snapshot after a workspace file change and renders the new bytes", async () => {
+    const workspaceRoot = await temporaryDirectory("snapshot-invalidation")
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    const writePage = (label: string) => writeFile(join(workspace, "index.html"), `<!doctype html>
+<html><body><main id="root"><h1>${label}</h1></main><script type="module" src="/src/main.tsx"></script></body></html>\n`)
+    await writePage("Snapshot version one")
+    const browser = new FakeBrowser(() => ({
+      html: "",
+      mode: "success",
+      expectedNavigationBody: "/sessions/page/render-app/assets/",
+      useNavigationBody: true
+    }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+    const buildSnapshot = vi.spyOn(runtime.runtime, "buildSessionSnapshot")
+
+    try {
+      const first = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      expect(first.headers.get("x-avibe-render-cache")).toBe("miss")
+      expect(await first.text()).toContain("# Snapshot version one")
+      const cached = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      expect(cached.headers.get("x-avibe-render-cache")).toBe("hit")
+      await cached.text()
+      expect(buildSnapshot).toHaveBeenCalledTimes(1)
+
+      await writePage("Snapshot version two changed")
+      const changed = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      expect(changed.headers.get("x-avibe-render-cache")).toBe("miss")
+      expect(await changed.text()).toContain("# Snapshot version two changed")
+      expect(buildSnapshot).toHaveBeenCalledTimes(2)
+      expect(browser.contextCount).toBe(2)
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
+  it("routes snapshot API requests through the live handler without caller identity", async () => {
+    const workspaceRoot = await temporaryDirectory("snapshot-api")
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    await mkdir(join(workspace, "api"), { recursive: true })
+    await writeFile(join(workspace, "api", "data.ts"), `export function GET(request: Request) {
+  return Response.json({
+    label: "Anonymous API data",
+    authorization: request.headers.get("authorization"),
+    cookie: request.headers.get("cookie")
+  })
+}\n`)
+    const browser = new FakeBrowser(() => ({
+      html: "",
+      mode: "success",
+      expectedNavigationBody: "/sessions/page/render-app/assets/",
+      apiPath: "api/data",
+      renderApiBody(body) {
+        const data = JSON.parse(body) as { label: string; authorization: string | null; cookie: string | null }
+        return `<main id="root"><h1>${data.label}</h1><p>authorization: ${data.authorization}</p><p>cookie: ${data.cookie}</p></main>`
+      }
+    }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+
+    try {
+      const response = await fetch(`${runtime.url}/sessions/page/render-markdown`, {
+        headers: {
+          authorization: "Bearer caller-must-not-forward",
+          cookie: "visitor=caller-must-not-forward"
+        }
+      })
+      expect(response.status).toBe(200)
+      const markdown = await response.text()
+      expect(markdown).toContain("# Anonymous API data")
+      expect(markdown).toContain("authorization: null")
+      expect(markdown).toContain("cookie: null")
+      expect(browser.newContextArguments).toEqual([[]])
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
   it("serves capabilities, Markdown, cache invalidation, and every deterministic error shape", async () => {
     const workspaceRoot = await temporaryDirectory("server")
     const workspace = await fixtureWorkspace("page", workspaceRoot)
@@ -970,7 +1089,7 @@ describe("render-markdown HTTP contract", () => {
     const pageState = () => ({
       html: mode === "large" ? `<p>${"x".repeat(2048)}</p>` : fixtureHtml,
       mode,
-      expectedNavigationBody: "/sessions/page/render-app/src/main.tsx"
+      expectedNavigationBody: "/sessions/page/render-app/assets/"
     })
     let browser = new FakeBrowser(pageState)
     const runtime = await startShowRuntimeServer({
@@ -1087,13 +1206,13 @@ describe("render-markdown HTTP contract", () => {
     }
   }, 30_000)
 
-  it("releases the render runtime and cache when a session is suspended", async () => {
+  it("releases the snapshot and cache when a session is suspended, then rebuilds cleanly", async () => {
     const workspaceRoot = await temporaryDirectory("suspend-render")
     await fixtureWorkspace("page", workspaceRoot)
     const browser = new FakeBrowser(() => ({
       html: "<h1>Suspend fixture</h1>",
       mode: "success",
-      expectedNavigationBody: "/sessions/page/render-app/src/main.tsx"
+      expectedNavigationBody: "/sessions/page/render-app/assets/"
     }))
     const runtime = await startShowRuntimeServer({
       workspaceRoot,
@@ -1112,15 +1231,15 @@ describe("render-markdown HTTP contract", () => {
       "X-Avibe-Show-Context": "private",
       "x-vibe-show-base": "/show/page/"
     }
+    const buildSnapshot = vi.spyOn(runtime.runtime, "buildSessionSnapshot")
 
     try {
       const first = await fetch(`${runtime.url}/sessions/page/render-markdown`, { headers })
       expect(first.headers.get("x-avibe-render-cache")).toBe("miss")
       await first.text()
-      const initialRenderSession = runtime.renderRuntime.getSession("page")
-      const initialRenderVite = initialRenderSession?.vite
-      expect(initialRenderSession?.state).toBe("active")
-      expect(initialRenderVite).toBeDefined()
+      const initialSnapshot = runtime.renderSnapshots.get("page")
+      expect(initialSnapshot).toBeDefined()
+      expect(buildSnapshot).toHaveBeenCalledTimes(1)
 
       const cached = await fetch(`${runtime.url}/sessions/page/render-markdown`, { headers })
       expect(cached.headers.get("x-avibe-render-cache")).toBe("hit")
@@ -1129,15 +1248,86 @@ describe("render-markdown HTTP contract", () => {
       const suspended = await fetch(`${runtime.url}/sessions/page/suspend`, { method: "POST" })
       expect(suspended.status).toBe(200)
       expect(await suspended.json()).toMatchObject({ sessionId: "page", state: "suspended" })
-      expect(runtime.renderRuntime.getSession("page")).toMatchObject({ state: "suspended", vite: undefined })
+      expect(runtime.renderSnapshots.get("page")).toBeUndefined()
+      expect(runtime.runtime.getSession("page")).toMatchObject({ state: "suspended", vite: undefined })
 
       const relaunched = await fetch(`${runtime.url}/sessions/page/render-markdown`, { headers })
       expect(relaunched.headers.get("x-avibe-render-cache")).toBe("miss")
       await relaunched.text()
       expect(browser.contextCount).toBe(2)
-      expect(runtime.renderRuntime.getSession("page")?.state).toBe("active")
-      expect(runtime.renderRuntime.getSession("page")?.vite).not.toBe(initialRenderVite)
+      expect(runtime.renderSnapshots.get("page")).toBeDefined()
+      expect(runtime.runtime.getSession("page")?.state).toBe("active")
+      expect(buildSnapshot).toHaveBeenCalledTimes(2)
     } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
+  it("fences suspension ahead of a render queued behind an active snapshot build", async () => {
+    const workspaceRoot = await temporaryDirectory("suspend-queued-render")
+    await fixtureWorkspace("page", workspaceRoot)
+    const browser = new FakeBrowser(() => ({
+      html: "<main id=\"root\"><h1>Queued render</h1></main>",
+      mode: "success",
+      expectedNavigationBody: "/sessions/page/render-app/assets/"
+    }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+    const originalBuild = runtime.runtime.buildSessionSnapshot.bind(runtime.runtime)
+    let firstBuildStarted!: () => void
+    const buildStarted = new Promise<void>((resolveStarted) => {
+      firstBuildStarted = resolveStarted
+    })
+    let releaseFirstBuild!: () => void
+    const buildGate = new Promise<void>((resolveGate) => {
+      releaseFirstBuild = resolveGate
+    })
+    let buildCount = 0
+    vi.spyOn(runtime.runtime, "buildSessionSnapshot").mockImplementation(async (...args) => {
+      buildCount += 1
+      if (buildCount === 1) {
+        firstBuildStarted()
+        await buildGate
+      }
+      await originalBuild(...args)
+    })
+
+    try {
+      const first = fetch(`${runtime.url}/sessions/page/render-markdown`, {
+        headers: { "x-vibe-show-base": "/p/first/" }
+      })
+      await buildStarted
+      const suspend = fetch(`${runtime.url}/sessions/page/suspend`, { method: "POST" })
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 20))
+      const queued = fetch(`${runtime.url}/sessions/page/render-markdown`, {
+        headers: { "x-vibe-show-base": "/p/queued/" }
+      })
+      releaseFirstBuild()
+
+      const firstResponse = await first
+      expect(firstResponse.status).toBe(200)
+      await firstResponse.text()
+      const suspendResponse = await suspend
+      expect(await suspendResponse.json()).toMatchObject({ state: "suspended" })
+      const queuedResponse = await queued
+      expect(queuedResponse.status).toBe(200)
+      expect(queuedResponse.headers.get("x-avibe-render-cache")).toBe("miss")
+      expect(await queuedResponse.text()).toContain("# Queued render")
+      expect(buildCount).toBe(2)
+      expect(runtime.runtime.getSession("page")?.state).toBe("active")
+      expect(runtime.renderSnapshots.get("page")).toBeDefined()
+    } finally {
+      releaseFirstBuild()
       await runtime.close()
     }
   }, 30_000)
@@ -1253,6 +1443,9 @@ type FakePageState = {
   html: string
   mode: FakePageMode
   expectedNavigationBody?: string
+  useNavigationBody?: boolean
+  apiPath?: string
+  renderApiBody?: (body: string) => string
   completedHtml?: string
   initialDataDelayMs?: number
 }
@@ -1338,11 +1531,22 @@ class FakePage implements MarkdownPage {
         this.emit("requestfinished", initialData)
       }, this.state.initialDataDelayMs ?? 0)
     }
-    if (this.state.expectedNavigationBody) {
+    if (this.state.expectedNavigationBody || this.state.useNavigationBody || this.state.apiPath) {
       const response = await fetch(url)
       const body = await response.text()
-      if (!body.includes(this.state.expectedNavigationBody)) {
+      if (this.state.expectedNavigationBody && !body.includes(this.state.expectedNavigationBody)) {
         throw new Error(`anonymous navigation did not preserve loopback base: ${body}`)
+      }
+      if (this.state.useNavigationBody) {
+        this.renderedHtml = /<body[^>]*>([\s\S]*?)<\/body>/i.exec(body)?.[1] ?? body
+      }
+      if (this.state.apiPath) {
+        const apiResponse = await fetch(new URL(this.state.apiPath, url))
+        const apiBody = await apiResponse.text()
+        if (!apiResponse.ok) {
+          throw new Error(`anonymous API request failed: ${apiResponse.status} ${apiBody}`)
+        }
+        this.renderedHtml = this.state.renderApiBody?.(apiBody) ?? apiBody
       }
       return { ok: () => response.ok, status: () => response.status }
     }
