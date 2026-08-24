@@ -14,6 +14,11 @@ export type ShowRuntimeOptions = {
   idlePruneIntervalMs?: number
   uiPackageName?: string
   fallbackDelaySeconds?: number
+  renderTimeoutMs?: number
+  renderCacheTtlMs?: number
+  renderMaxOutputBytes?: number
+  renderBrowserIdleMs?: number
+  renderBrowserProvisionTimeoutMs?: number
 }
 
 export type ShowSessionState = "created" | "warming" | "active" | "closing" | "idle" | "suspended"

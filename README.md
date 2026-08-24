@@ -176,14 +176,33 @@ Local API:
 
 ```text
 GET  /health
+GET  /capabilities
 POST /sessions/:sessionId/ensure
 GET  /sessions/:sessionId/status
+GET  /sessions/:sessionId/render-markdown
 GET  /sessions/:sessionId/events
 POST /sessions/:sessionId/events
 GET  /sessions/:sessionId/messages
 POST /sessions/:sessionId/suspend
 ANY  /sessions/:sessionId/app/*
 ```
+
+`render-markdown` loads the session app in an anonymous Playwright browser
+context, removes non-semantic and annotation-overlay DOM, and returns GFM
+Markdown. `x-vibe-show-target` selects a root-relative SPA path and query; it
+defaults to the app root and rejects traversal or absolute targets. The runtime
+discovers system Chrome and Edge first. When neither is usable,
+the first render provisions Playwright's managed Chromium headless shell in the
+normal user cache. Set `AVIBE_SHOW_RENDER_NO_PROVISION=1` to disable downloads;
+in that mode a browserless host receives the deterministic
+`renderer_unavailable` response.
+
+The render timeout, cache TTL, output limit, browser idle timeout, and browser
+provisioning timeout are configurable with `--render-timeout-ms`,
+`--render-cache-ttl-ms`, `--render-max-output-bytes`,
+`--render-browser-idle-ms`, and `--render-browser-provision-timeout-ms`.
+Defaults are 30 seconds, 30 seconds, 512 KiB, 60 seconds, and 5 minutes,
+respectively.
 
 `/sessions/:sessionId/app/api/*` dispatches to Web-standard handlers in the
 session workspace:

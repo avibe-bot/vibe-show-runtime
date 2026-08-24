@@ -39,13 +39,23 @@ async function runServer() {
   const port = Number(getArg("--port") ?? "0")
   const host = getArg("--host") ?? "127.0.0.1"
   const fallbackDelaySeconds = numberArg("--fallback-delay-seconds")
+  const renderTimeoutMs = positiveNumberArg("--render-timeout-ms")
+  const renderCacheTtlMs = numberArg("--render-cache-ttl-ms")
+  const renderMaxOutputBytes = positiveNumberArg("--render-max-output-bytes")
+  const renderBrowserIdleMs = numberArg("--render-browser-idle-ms")
+  const renderBrowserProvisionTimeoutMs = positiveNumberArg("--render-browser-provision-timeout-ms")
 
   const runtime = await startShowRuntimeServer({
     workspaceRoot,
     cacheRoot: cacheRoot ? resolve(cacheRoot) : undefined,
     host,
     port,
-    fallbackDelaySeconds
+    fallbackDelaySeconds,
+    renderTimeoutMs,
+    renderCacheTtlMs,
+    renderMaxOutputBytes,
+    renderBrowserIdleMs,
+    renderBrowserProvisionTimeoutMs
   })
 
   console.log(`Vibe Show Runtime listening at ${runtime.url}`)
@@ -122,4 +132,12 @@ function numberArg(name: string) {
     throw new Error(`${name} must be a non-negative number`)
   }
   return parsed
+}
+
+function positiveNumberArg(name: string) {
+  const value = numberArg(name)
+  if (value === 0) {
+    throw new Error(`${name} must be greater than zero`)
+  }
+  return value
 }

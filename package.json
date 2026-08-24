@@ -21,7 +21,7 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "check": "npm run build && npm run typecheck",
+    "check": "npm run build && npm run typecheck && npm run test",
     "bundle:vibe-remote": "node scripts/bundle-vibe-remote.mjs",
     "smoke": "node scripts/smoke-runtime.mjs"
   },

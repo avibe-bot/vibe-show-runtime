@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
-import { readFile } from "node:fs/promises"
-import { join } from "node:path"
+import { readFile, stat } from "node:fs/promises"
+import { isAbsolute, join, relative, resolve } from "node:path"
 import { parse } from "node:url"
 import type { AddressInfo } from "node:net"
 import { isAgentOnlyShowEventType, isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type ShowEventInput } from "@avibe/show-sdk"
@@ -9,16 +9,47 @@ import { createShowRuntime } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
 import { isVendorAssetPath, serveVendorAsset } from "./vendor-runtime.js"
 import { isAnnotationBootstrapPath, serveAnnotationBootstrap } from "./annotation-bootstrap.js"
+import {
+  createMarkdownRenderer,
+  MarkdownRenderError,
+  type BrowserLauncher,
+  type BrowserProvisioner,
+  type MarkdownRenderer,
+  type ShowRenderContext
+} from "./markdown-renderer.js"
 
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 
-export async function startShowRuntimeServer(options: ShowRuntimeOptions = { workspaceRoot: ".show" }) {
+export type ShowRuntimeServerDependencies = {
+  launchBrowser?: BrowserLauncher
+  renderQuietPeriodMs?: number
+  browserDiscoveryDisabled?: boolean
+  browserProvisioningDisabled?: boolean
+  provisionBrowser?: BrowserProvisioner
+}
+
+export async function startShowRuntimeServer(
+  options: ShowRuntimeOptions = { workspaceRoot: ".show" },
+  dependencies: ShowRuntimeServerDependencies = {}
+) {
   const host = options.host ?? "127.0.0.1"
   const port = options.port ?? 0
+  const markdownRenderer = createMarkdownRenderer({
+    timeoutMs: options.renderTimeoutMs,
+    cacheTtlMs: options.renderCacheTtlMs,
+    maxOutputBytes: options.renderMaxOutputBytes,
+    browserIdleMs: options.renderBrowserIdleMs,
+    quietPeriodMs: dependencies.renderQuietPeriodMs,
+    browserDiscoveryDisabled: dependencies.browserDiscoveryDisabled,
+    browserProvisioningDisabled: dependencies.browserProvisioningDisabled,
+    browserProvisionTimeoutMs: options.renderBrowserProvisionTimeoutMs,
+    launchBrowser: dependencies.launchBrowser,
+    provisionBrowser: dependencies.provisionBrowser
+  })
 
   const server = createServer(async (request, response) => {
     try {
-      await routeRequest(runtime, request, response, eventStreams)
+      await routeRequest(runtime, request, response, eventStreams, markdownRenderer, options.workspaceRoot)
     } catch (error) {
       response.statusCode = 500
       response.setHeader("content-type", "application/json")
@@ -36,6 +67,7 @@ export async function startShowRuntimeServer(options: ShowRuntimeOptions = { wor
     url: `http://${host}:${(server.address() as AddressInfo).port}`,
     async close() {
       eventStreams.close()
+      await markdownRenderer.close()
       await runtime.close()
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
     }
@@ -46,13 +78,20 @@ async function routeRequest(
   runtime: ReturnType<typeof createShowRuntime>,
   request: IncomingMessage,
   response: ServerResponse,
-  eventStreams: ShowEventStreamBroker
+  eventStreams: ShowEventStreamBroker,
+  markdownRenderer: MarkdownRenderer,
+  workspaceRoot: string
 ) {
   const parsed = parse(request.url ?? "/", true)
   const pathname = parsed.pathname ?? "/"
 
   if (request.method === "GET" && pathname === "/health") {
     sendJson(response, 200, { ok: true })
+    return
+  }
+
+  if (request.method === "GET" && pathname === "/capabilities") {
+    sendJson(response, 200, { render_markdown: true })
     return
   }
 
@@ -67,6 +106,19 @@ async function routeRequest(
       return
     }
     await serveVendorAsset(bundle, pathname, response)
+    return
+  }
+
+  const renderMarkdownMatch = pathname.match(/^\/sessions\/([^/]+)\/render-markdown$/)
+  if (request.method === "GET" && renderMarkdownMatch) {
+    await handleRenderMarkdown({
+      runtime,
+      request,
+      response,
+      renderer: markdownRenderer,
+      workspaceRoot,
+      sessionId: renderMarkdownMatch[1]
+    })
     return
   }
 
@@ -137,7 +189,15 @@ async function routeRequest(
     }
 
     const requestStarted = performance.now()
-    const status = await runtime.ensureSession(sessionId, publicBasePath(request))
+    // Anonymous loopback renders intentionally carry no caller headers. Preserve
+    // the base selected by their prepare step instead of restarting Vite at the
+    // default public base when the document and its modules arrive.
+    const requestedBasePath = publicBasePath(request)
+    const loopbackBasePath = `/sessions/${sessionId}/app/`
+    const activeBasePath = runtime.getSession(sessionId)?.basePath === loopbackBasePath
+      ? loopbackBasePath
+      : undefined
+    const status = await runtime.ensureSession(sessionId, requestedBasePath ?? activeBasePath)
     logRequestTiming("ensureSessionForAppRequest", sessionId, appPath, requestStarted, { state: status.state })
     const session = runtime.getSession(sessionId)
     if (!session) {
@@ -255,6 +315,145 @@ async function routeRequest(
   }
 
   sendJson(response, 404, { error: "Not found" })
+}
+
+async function handleRenderMarkdown(options: {
+  runtime: ReturnType<typeof createShowRuntime>
+  request: IncomingMessage
+  response: ServerResponse
+  renderer: MarkdownRenderer
+  workspaceRoot: string
+  sessionId: string
+}) {
+  const { runtime, request, response, renderer, workspaceRoot, sessionId } = options
+  try {
+    const target = markdownRenderTarget(request)
+    const workspace = sessionWorkspace(workspaceRoot, sessionId)
+    if (!workspace || !await isDirectory(workspace)) {
+      throw new MarkdownRenderError(
+        "session_unknown",
+        404,
+        "No Show Page workspace exists for this session."
+      )
+    }
+
+    const internalBasePath = `/sessions/${sessionId}/app/`
+    const basePath = markdownBasePath(request, sessionId)
+    const result = await renderer.render({
+      sessionId,
+      context: markdownRenderContext(request),
+      basePath,
+      target,
+      internalBasePath,
+      renderUrl: markdownRenderUrl(request, internalBasePath, target),
+      workspace,
+      async prepare() {
+        await runtime.ensureSession(sessionId, internalBasePath)
+      }
+    })
+    response.statusCode = 200
+    response.setHeader("content-type", "text/markdown; charset=utf-8")
+    response.setHeader("x-avibe-render-cache", result.cache)
+    response.end(result.markdown)
+  } catch (error) {
+    sendRenderError(
+      response,
+      error instanceof MarkdownRenderError
+        ? error
+        : new MarkdownRenderError("render_failed", 502, "Show Page rendering failed.", { cause: error })
+    )
+  }
+}
+
+function sendRenderError(response: ServerResponse, error: MarkdownRenderError) {
+  sendJson(response, error.status, {
+    error: {
+      code: error.code,
+      message: error.message
+    }
+  })
+}
+
+function sessionWorkspace(workspaceRoot: string, sessionId: string): string | undefined {
+  const root = resolve(workspaceRoot)
+  const workspace = resolve(root, sessionId)
+  const relativePath = relative(root, workspace)
+  if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(relativePath)) {
+    return undefined
+  }
+  return workspace
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function markdownRenderContext(request: IncomingMessage): ShowRenderContext {
+  return requestHeader(request, "x-avibe-show-context") === "shared" ? "shared" : "private"
+}
+
+function markdownBasePath(request: IncomingMessage, sessionId: string): string {
+  const raw = requestHeader(request, "x-vibe-show-base") ?? `/show/${sessionId}/`
+  let pathname: string
+  try {
+    pathname = new URL(raw, "http://show-runtime.local").pathname
+  } catch {
+    pathname = `/show/${sessionId}/`
+  }
+  const withLeadingSlash = pathname.startsWith("/") ? pathname : `/${pathname}`
+  return withLeadingSlash.endsWith("/") ? withLeadingSlash : `${withLeadingSlash}/`
+}
+
+function markdownRenderTarget(request: IncomingMessage): string {
+  const target = requestHeader(request, "x-vibe-show-target") ?? "/"
+  if (
+    !target.startsWith("/") ||
+    target.startsWith("//") ||
+    target.includes("..") ||
+    target.includes("://")
+  ) {
+    throw new MarkdownRenderError(
+      "invalid_target",
+      400,
+      "The x-vibe-show-target header must be a root-relative path and query without '..' or a scheme/authority."
+    )
+  }
+  return target
+}
+
+function markdownRenderUrl(
+  request: IncomingMessage,
+  internalBasePath: string,
+  target: string
+): string {
+  const origin = loopbackOrigin(request)
+  const internalBase = new URL(internalBasePath, origin)
+  const renderUrl = new URL(`${internalBasePath}${target.slice(1)}`, origin)
+  if (renderUrl.origin !== internalBase.origin || !renderUrl.pathname.startsWith(internalBase.pathname)) {
+    throw new MarkdownRenderError(
+      "invalid_target",
+      400,
+      "The x-vibe-show-target header must stay within the session app."
+    )
+  }
+  return renderUrl.href
+}
+
+function requestHeader(request: IncomingMessage, name: string): string | undefined {
+  const raw = request.headers[name]
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return typeof value === "string" && value.trim() ? value.trim() : undefined
+}
+
+function loopbackOrigin(request: IncomingMessage): string {
+  const port = request.socket.localPort
+  const address = request.socket.localAddress ?? "127.0.0.1"
+  const host = address.includes(":") ? `[${address}]` : address
+  return `http://${host}:${port}`
 }
 
 function isSpaRoutePath(appPath: string, request: IncomingMessage) {

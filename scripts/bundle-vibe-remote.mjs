@@ -98,6 +98,9 @@ function assertBundleDependencyRoot(root) {
   const required = [
     "react",
     "react-dom",
+    "playwright-core",
+    "turndown",
+    "turndown-plugin-gfm",
     "@avibe/show-runtime",
     "@avibe/show-ui",
     "@avibe/show-sdk"
