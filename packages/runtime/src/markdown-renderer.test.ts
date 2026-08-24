@@ -136,6 +136,20 @@ describe("workspace render cache", () => {
     expect(await workspaceFingerprint(workspace)).not.toBe(dotfileFingerprint)
   })
 
+  it("includes nested source directories named like build artifacts", async () => {
+    const workspace = await temporaryDirectory("fingerprint-nested-artifact-name")
+    await mkdir(join(workspace, "packages", "widget", "dist"), { recursive: true })
+    await writeFile(join(workspace, "packages", "widget", "dist", "index.ts"), "export const label = 'one'\n")
+    const initial = await workspaceFingerprint(workspace)
+
+    await writeFile(
+      join(workspace, "packages", "widget", "dist", "index.ts"),
+      "export const label = 'changed-source'\n"
+    )
+
+    expect(await workspaceFingerprint(workspace)).not.toBe(initial)
+  })
+
   it("serializes concurrent misses and lets the second request use the first result", async () => {
     const workspace = await fixtureWorkspace("serialized")
     const browser = new FakeBrowser(() => ({ html: "<h1>Serialized</h1>", mode: "success" }))
@@ -166,7 +180,7 @@ describe("workspace render cache", () => {
     }
   })
 
-  it("restores the render budget spent waiting behind an unrelated miss", async () => {
+  it("restores the full render budget after queueing longer than the timeout", async () => {
     const workspace = await fixtureWorkspace("serialized-budget")
     let pageIndex = 0
     const browser = new FakeBrowser(() => pageIndex++ === 0
@@ -174,37 +188,52 @@ describe("workspace render cache", () => {
       : {
           html: "<h1>Loading second</h1>",
           completedHtml: "<h1>Fast second</h1>",
-          initialDataDelayMs: 120,
+          initialDataDelayMs: 80,
           mode: "slow-initial-data"
         })
-    let firstPrepareStarted!: () => void
-    const firstPreparing = new Promise<void>((resolve) => {
-      firstPrepareStarted = resolve
+    let provisioningStarted!: () => void
+    const provisioning = new Promise<void>((resolve) => {
+      provisioningStarted = resolve
     })
+    let releaseProvisioning!: () => void
+    const provisioningGate = new Promise<void>((resolve) => {
+      releaseProvisioning = resolve
+    })
+    let installed = false
     const renderer = createMarkdownRenderer({
-      timeoutMs: 250,
-      browserProvisioningDisabled: true,
+      timeoutMs: 200,
       launchBrowser: async (target) => {
-        if (target !== "chrome") throw new Error("not found")
+        if (target !== "managed" || !installed) throw new Error("not found")
         return browser
+      },
+      provisionBrowser: async () => {
+        provisioningStarted()
+        await provisioningGate
+        installed = true
+        return { ok: true }
       },
       quietPeriodMs: 0
     })
-    const firstRequest = renderRequest(workspace, async () => {
-      firstPrepareStarted()
-      await new Promise((resolve) => setTimeout(resolve, 170))
-    })
+    const firstRequest = renderRequest(workspace)
     const secondRequest = renderRequest(workspace, undefined, "/p/second/")
 
     try {
       const first = renderer.render(firstRequest)
-      await firstPreparing
-      const second = renderer.render(secondRequest)
+      await provisioning
+      const second = renderer.render(secondRequest).then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error })
+      )
+      await new Promise((resolve) => setTimeout(resolve, 320))
+      releaseProvisioning()
 
       await expect(first).resolves.toEqual({ markdown: "# Slow first\n", cache: "miss" })
-      await expect(second).resolves.toEqual({ markdown: "# Fast second\n", cache: "miss" })
+      await expect(second).resolves.toEqual({
+        result: { markdown: "# Fast second\n", cache: "miss" }
+      })
       expect(browser.contextCount).toBe(2)
     } finally {
+      releaseProvisioning()
       await renderer.close()
     }
   })
@@ -517,6 +546,39 @@ describe("workspace render cache", () => {
       label = "changed"
       await expect(renderer.render(request)).resolves.toEqual({ markdown: "# Environment changed\n", cache: "miss" })
       await expect(renderer.render(request)).resolves.toEqual({ markdown: "# Environment changed\n", cache: "hit" })
+      expect(browser.contextCount).toBe(2)
+    } finally {
+      await renderer.close()
+    }
+  })
+
+  it("invalidates cached Markdown when a nested source directory named dist changes", async () => {
+    const workspace = await fixtureWorkspace("cache-nested-artifact-name")
+    const nestedSource = join(workspace, "packages", "widget", "dist", "index.ts")
+    await mkdir(join(workspace, "packages", "widget", "dist"), { recursive: true })
+    await writeFile(nestedSource, "export const label = 'one'\n")
+    let label = "one"
+    const browser = new FakeBrowser(() => ({ html: `<h1>Nested source ${label}</h1>`, mode: "success" }))
+    const renderer = createMarkdownRenderer({
+      browserProvisioningDisabled: true,
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      quietPeriodMs: 0
+    })
+    const request = renderRequest(workspace)
+
+    try {
+      await expect(renderer.render(request)).resolves.toEqual({ markdown: "# Nested source one\n", cache: "miss" })
+      await expect(renderer.render(request)).resolves.toMatchObject({ cache: "hit" })
+
+      await writeFile(nestedSource, "export const label = 'changed-source'\n")
+      label = "changed"
+      await expect(renderer.render(request)).resolves.toEqual({
+        markdown: "# Nested source changed\n",
+        cache: "miss"
+      })
       expect(browser.contextCount).toBe(2)
     } finally {
       await renderer.close()

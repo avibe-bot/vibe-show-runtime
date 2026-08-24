@@ -262,7 +262,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
             cache.delete(cacheKey)
           }
           return { markdown, cache: "miss" }
-        }, deadline)
+        })
       } catch (error) {
         throw normalizeRenderError(error, timeoutMs, deadline)
       }
@@ -591,7 +591,7 @@ async function fingerprintDirectory(
   entries.sort((left, right) => left.name.localeCompare(right.name))
 
   for (const entry of entries) {
-    if (WORKSPACE_FINGERPRINT_EXCLUDED_ENTRIES.has(entry.name)) continue
+    if (!relativeDirectory && WORKSPACE_FINGERPRINT_EXCLUDED_ENTRIES.has(entry.name)) continue
     const relativePath = relativeDirectory ? join(relativeDirectory, entry.name) : entry.name
     const path = join(workspace, relativePath)
     const info = await lstat(path, { bigint: true })
