@@ -418,19 +418,30 @@ function markdownBasePath(request: IncomingMessage, sessionId: string): string {
 
 function markdownRenderTarget(request: IncomingMessage): string {
   const target = requestHeader(request, "x-vibe-show-target") ?? "/"
+  const queryIndex = target.indexOf("?")
+  const pathname = queryIndex === -1 ? target : target.slice(0, queryIndex)
   if (
     !target.startsWith("/") ||
     target.startsWith("//") ||
-    target.includes("..") ||
-    target.includes("://")
+    pathnameHasParentSegment(pathname)
   ) {
-    throw new MarkdownRenderError(
-      "invalid_target",
-      400,
-      "The x-vibe-show-target header must be a root-relative path and query without '..' or a scheme/authority."
-    )
+    throw invalidMarkdownRenderTarget()
   }
   return target
+}
+
+function pathnameHasParentSegment(pathname: string): boolean {
+  let decoded = pathname
+  while (true) {
+    if (decoded.split(/[\\/]/).includes("..")) return true
+    try {
+      const next = decodeURIComponent(decoded)
+      if (next === decoded) return false
+      decoded = next
+    } catch {
+      return true
+    }
+  }
 }
 
 function markdownRenderUrl(
@@ -440,15 +451,24 @@ function markdownRenderUrl(
 ): string {
   const origin = loopbackOrigin(request)
   const internalBase = new URL(internalBasePath, origin)
-  const renderUrl = new URL(`${internalBasePath}${target.slice(1)}`, origin)
+  let renderUrl: URL
+  try {
+    renderUrl = new URL(target.slice(1), internalBase)
+  } catch {
+    throw invalidMarkdownRenderTarget()
+  }
   if (renderUrl.origin !== internalBase.origin || !renderUrl.pathname.startsWith(internalBase.pathname)) {
-    throw new MarkdownRenderError(
-      "invalid_target",
-      400,
-      "The x-vibe-show-target header must stay within the session app."
-    )
+    throw invalidMarkdownRenderTarget()
   }
   return renderUrl.href
+}
+
+function invalidMarkdownRenderTarget(): MarkdownRenderError {
+  return new MarkdownRenderError(
+    "invalid_target",
+    400,
+    "The x-vibe-show-target header must resolve to a path within the loopback session app."
+  )
 }
 
 function requestHeader(request: IncomingMessage, name: string): string | undefined {

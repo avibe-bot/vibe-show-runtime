@@ -565,6 +565,68 @@ describe("render-markdown HTTP contract", () => {
       await runtime.close()
     }
   }, 30_000)
+
+  it("keeps query bytes opaque while containing decoded target pathnames", async () => {
+    const workspaceRoot = await temporaryDirectory("render-targets")
+    await fixtureWorkspace("page", workspaceRoot)
+    const browser = new FakeBrowser(() => ({ html: "<h1>Target page</h1>", mode: "success" }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache")
+    }, {
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+    const headers = {
+      "X-Avibe-Show-Protocol": "1",
+      "X-Avibe-Show-Context": "private",
+      "x-vibe-show-base": "/show/page/"
+    }
+
+    try {
+      for (const target of [
+        "/search?q=version..2&next=../secret",
+        "/callback?return=https://example.com/path"
+      ]) {
+        const response = await fetch(`${runtime.url}/sessions/page/render-markdown`, {
+          headers: { ...headers, "x-vibe-show-target": target }
+        })
+        expect(response.status).toBe(200)
+        expect(response.headers.get("x-avibe-render-cache")).toBe("miss")
+        await response.text()
+      }
+
+      expect(browser.visitedUrls.map((url) => {
+        const rendered = new URL(url)
+        return `${rendered.pathname}${rendered.search}`
+      })).toEqual([
+        "/sessions/page/render-app/search?q=version..2&next=../secret",
+        "/sessions/page/render-app/callback?return=https://example.com/path"
+      ])
+
+      for (const target of [
+        "dashboard",
+        "https://evil.example/path",
+        "//evil.example/path",
+        "/reports/../secret",
+        "/%2e%2e/secret",
+        "/%252e%252e/secret",
+        "/https://evil.example/path"
+      ]) {
+        const invalid = await fetch(`${runtime.url}/sessions/page/render-markdown`, {
+          headers: { ...headers, "x-vibe-show-target": target }
+        })
+        await expectRenderError(invalid, 400, "invalid_target")
+      }
+      expect(browser.contextCount).toBe(2)
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
 })
 
 type FakePageMode = "success" | "timeout" | "stalled" | "failed" | "large" | "persistent-network"
