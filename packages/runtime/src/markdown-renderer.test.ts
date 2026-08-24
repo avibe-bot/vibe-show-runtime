@@ -1,6 +1,7 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
+import { lstat, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   cleanupRenderedDocument,
@@ -15,6 +16,11 @@ import {
   type MarkdownPage,
   type MarkdownRenderRequest
 } from "./markdown-renderer.js"
+import {
+  createShowRuntime,
+  createWorkspaceWarmCoordinator,
+  type WorkspaceWarmCoordinator
+} from "./runtime.js"
 import { startShowRuntimeServer } from "./server.js"
 
 const temporaryDirectories: string[] = []
@@ -814,6 +820,138 @@ describe("browser resolution ladder", () => {
       await renderer.close()
     }
   })
+})
+
+describe("cross-runtime workspace dependency preparation", () => {
+  it("warms the same shared-dependency session concurrently from both runtimes", async () => {
+    const workspaceRoot = await temporaryDirectory("concurrent-shared-warm")
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    const dependencyRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      dependencyRoot,
+      cacheRoot: join(workspaceRoot, ".cache")
+    })
+
+    try {
+      const outcomes = await Promise.allSettled([
+        runtime.runtime.ensureSession("page", "/show/page/"),
+        runtime.renderRuntime.ensureSession("page", "/sessions/page/render-app/")
+      ])
+
+      expect(outcomes).toEqual([
+        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) },
+        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) }
+      ])
+      const nodeModules = join(workspace, "node_modules")
+      expect((await lstat(nodeModules)).isSymbolicLink()).toBe(true)
+      expect(await realpath(nodeModules)).toBe(await realpath(join(dependencyRoot, "node_modules")))
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
+  it("warms the same extras session concurrently without tearing node_modules", async () => {
+    const workspaceRoot = await temporaryDirectory("concurrent-extras-warm")
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    const dependencyRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
+    const extraPackage = join(workspaceRoot, "fixture-extra")
+    await mkdir(extraPackage, { recursive: true })
+    await writeFile(join(extraPackage, "package.json"), JSON.stringify({
+      name: "fixture-extra",
+      version: "1.0.0",
+      main: "index.js"
+    }))
+    await writeFile(join(extraPackage, "index.js"), "export const fixtureExtra = true\n")
+    await writeFile(join(workspace, "package.json"), JSON.stringify({
+      private: true,
+      dependencies: {
+        "fixture-extra": "file:../fixture-extra"
+      }
+    }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      dependencyRoot,
+      cacheRoot: join(workspaceRoot, ".cache")
+    })
+
+    try {
+      const outcomes = await Promise.allSettled([
+        runtime.runtime.ensureSession("page", "/show/page/"),
+        runtime.renderRuntime.ensureSession("page", "/sessions/page/render-app/")
+      ])
+
+      expect(outcomes).toEqual([
+        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) },
+        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) }
+      ])
+      const nodeModules = join(workspace, "node_modules")
+      expect((await lstat(nodeModules)).isDirectory()).toBe(true)
+      expect((await lstat(nodeModules)).isSymbolicLink()).toBe(false)
+      expect(await readFile(join(nodeModules, "fixture-extra", "index.js"), "utf8"))
+        .toBe("export const fixtureExtra = true\n")
+      const installed = JSON.parse(await readFile(join(workspace, ".show-extras.json"), "utf8")) as {
+        signature?: string
+        entries?: string[]
+      }
+      expect(installed.signature).toMatch(/^[0-9a-f]{16}$/)
+      expect(installed.entries).toEqual([
+        `fixture-extra@file:${extraPackage}`
+      ])
+    } finally {
+      await runtime.close()
+    }
+  }, 60_000)
+
+  it("does not serialize dependency preparation for different session workspaces", async () => {
+    const workspaceRoot = await temporaryDirectory("parallel-session-warms")
+    await fixtureWorkspace("first", workspaceRoot)
+    await fixtureWorkspace("second", workspaceRoot)
+    const dependencyRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
+    const keyedCoordinator = createWorkspaceWarmCoordinator()
+    const entered = new Set<string>()
+    let releasePreparation!: () => void
+    const preparationGate = new Promise<void>((resolveGate) => {
+      releasePreparation = resolveGate
+    })
+    let bothEntered!: () => void
+    const bothStarted = new Promise<void>((resolveStarted) => {
+      bothEntered = resolveStarted
+    })
+    const coordinator: WorkspaceWarmCoordinator = {
+      runExclusive<T>(workspace: string, operation: () => Promise<T>): Promise<T> {
+        return keyedCoordinator.runExclusive(workspace, async () => {
+          entered.add(resolve(workspace))
+          if (entered.size === 2) bothEntered()
+          await preparationGate
+          return operation()
+        })
+      }
+    }
+    const runtime = createShowRuntime({
+      workspaceRoot,
+      dependencyRoot,
+      cacheRoot: join(workspaceRoot, ".cache")
+    }, { hmr: false, workspaceWarmCoordinator: coordinator })
+    const outcomes = Promise.allSettled([
+      runtime.ensureSession("first", "/show/first/"),
+      runtime.ensureSession("second", "/show/second/")
+    ])
+
+    try {
+      await expect(Promise.race([
+        bothStarted.then(() => true),
+        new Promise<boolean>((resolveTimeout) => setTimeout(() => resolveTimeout(false), 5_000))
+      ])).resolves.toBe(true)
+    } finally {
+      releasePreparation()
+      expect(await outcomes).toEqual([
+        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) },
+        { status: "fulfilled", value: expect.objectContaining({ state: "active" }) }
+      ])
+      await runtime.close()
+    }
+  }, 15_000)
 })
 
 describe("render-markdown HTTP contract", () => {

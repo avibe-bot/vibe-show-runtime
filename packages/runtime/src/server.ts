@@ -5,7 +5,7 @@ import { parse } from "node:url"
 import type { AddressInfo } from "node:net"
 import { isAgentOnlyShowEventType, isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type ShowEventInput } from "@avibe/show-sdk"
 import type { ShowRuntimeOptions } from "./types.js"
-import { createShowRuntime } from "./runtime.js"
+import { createShowRuntime, createWorkspaceWarmCoordinator } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
 import { isVendorAssetPath, serveVendorAsset } from "./vendor-runtime.js"
 import { isAnnotationBootstrapPath, serveAnnotationBootstrap } from "./annotation-bootstrap.js"
@@ -46,6 +46,7 @@ export async function startShowRuntimeServer(
     launchBrowser: dependencies.launchBrowser,
     provisionBrowser: dependencies.provisionBrowser
   })
+  const workspaceWarmCoordinator = createWorkspaceWarmCoordinator()
 
   const server = createServer(async (request, response) => {
     try {
@@ -64,8 +65,11 @@ export async function startShowRuntimeServer(
       response.end(JSON.stringify({ error: error instanceof Error ? error.message : "Runtime error" }))
     }
   })
-  const runtime = createShowRuntime({ ...options, server })
-  const renderRuntime = createShowRuntime({ ...options, server }, { hmr: false })
+  const runtime = createShowRuntime({ ...options, server }, { workspaceWarmCoordinator })
+  const renderRuntime = createShowRuntime({ ...options, server }, {
+    hmr: false,
+    workspaceWarmCoordinator
+  })
   const eventStreams = new ShowEventStreamBroker()
 
   await new Promise<void>((resolve) => server.listen(port, host, resolve))

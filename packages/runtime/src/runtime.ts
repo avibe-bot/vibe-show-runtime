@@ -48,6 +48,7 @@ const SENSITIVE_FS_DENY_PATTERNS = [
   "**/*.key"
 ]
 const viteCacheWarmLocks = new Map<string, Promise<void>>()
+const defaultWorkspaceWarmCoordinator = createWorkspaceWarmCoordinator()
 // One shared-install resolver per `node_modules` dir, built lazily on the first extras
 // session that needs the fallback and reused across sessions. Anchored at the shared
 // install so it resolves `import`-only packages (e.g. `@avibe/show-sdk/*`) that CJS
@@ -239,7 +240,10 @@ function isSensitiveFileName(segment: string): boolean {
 
 export function createShowRuntime(
   options: ShowRuntimeOptions,
-  dependencies: { hmr?: boolean } = {}
+  dependencies: {
+    hmr?: boolean
+    workspaceWarmCoordinator?: WorkspaceWarmCoordinator
+  } = {}
 ): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
   // The most recently warmed shared vendor bundle. The server serves its assets at a
@@ -252,6 +256,7 @@ export function createShowRuntime(
   const viteCacheRoots = new Set<string>()
   const idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS
   const idlePruneIntervalMs = options.idlePruneIntervalMs ?? DEFAULT_IDLE_PRUNE_INTERVAL_MS
+  const workspaceWarmCoordinator = dependencies.workspaceWarmCoordinator ?? defaultWorkspaceWarmCoordinator
   // Maintenance heartbeat: keep the cache dirs this process owns fresh for the cross-process age GC
   // (#31) — the vendor bundle is memoized for the process lifetime (and non-self-healing if swept),
   // and an active session may go a while between browser fetches. Crucially this runs EVEN when idle
@@ -445,8 +450,20 @@ export function createShowRuntime(
     const dependencyStarted = performance.now()
     const sourceDependencies = await sourceDependenciesForWorkspace(session.workspace, uiPackageName)
     logTiming("warmSession.sourceDependencies", session.id, dependencyStarted, { signature: sourceDependencies.signature, extraBareImports: sourceDependencies.extraBareImports.length, declaredExtras: sourceDependencies.declaredExtras.entries.length })
+    const sharedNodeModules = join(dependencyRoot, "node_modules")
+    await access(sharedNodeModules)
+    const packageRoots = await resolveAllowedPackageRoots(sharedNodeModules, [uiPackageName, "@avibe/show-sdk"])
     const linkStarted = performance.now()
-    const sharedDependencies = await ensureSessionDependencies(session.workspace, sourceDependencies.declaredExtras, dependencyRoot, uiPackageName)
+    const sharedDependencies = await workspaceWarmCoordinator.runExclusive(
+      session.workspace,
+      () => ensureSessionDependencies(
+        session.workspace,
+        sourceDependencies.declaredExtras,
+        sharedNodeModules,
+        packageRoots,
+        uiPackageName
+      )
+    )
     logTiming("warmSession.dependencyLink", session.id, linkStarted, { nodeModules: sharedDependencies.nodeModules, extrasSignature: sharedDependencies.extrasSignature })
     const cacheStarted = performance.now()
     const cacheDir = await viteCacheDir(sharedDependencies.nodeModules, options.cacheRoot, sourceDependencies.signature, bundle.result.manifest.hash)
@@ -677,14 +694,10 @@ type SharedDependencies = {
 async function ensureSessionDependencies(
   workspace: string,
   declaredExtras: DeclaredExtras,
-  dependencyRoot: string,
+  sharedNodeModules: string,
+  packageRoots: string[],
   uiPackageName = "@avibe/show-ui"
 ): Promise<SharedDependencies> {
-  const root = dependencyRoot
-  const sharedNodeModules = join(root, "node_modules")
-  await access(sharedNodeModules)
-  const packageRoots = await resolveAllowedPackageRoots(sharedNodeModules, [uiPackageName, "@avibe/show-sdk"])
-
   if (declaredExtras.entries.length === 0) {
     // Shared-only: workspace/node_modules -> shared install. Drop any stale extras
     // real dir from a previous warm so reverting to no-extras restores the symlink.
@@ -768,8 +781,7 @@ async function ensureSharedSymlink(linkPath: string, sharedNodeModules: string) 
   try {
     const stats = await lstat(linkPath)
     if (stats.isSymbolicLink()) {
-      const currentTarget = resolve(dirname(linkPath), await readlink(linkPath))
-      if (currentTarget === sharedNodeModules) return
+      if (await isExpectedSymlink(linkPath, sharedNodeModules)) return
       await rm(linkPath)
     } else {
       // A previous extras warm left this session's real node_modules here; clear it
@@ -779,7 +791,55 @@ async function ensureSharedSymlink(linkPath: string, sharedNodeModules: string) 
   } catch {
     // Nothing to replace; create the link below.
   }
-  await symlink(sharedNodeModules, linkPath, "junction")
+  try {
+    await symlink(sharedNodeModules, linkPath, "junction")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST" && await isExpectedSymlink(linkPath, sharedNodeModules)) {
+      return
+    }
+    throw error
+  }
+}
+
+async function isExpectedSymlink(linkPath: string, expectedTarget: string): Promise<boolean> {
+  try {
+    const stats = await lstat(linkPath)
+    if (!stats.isSymbolicLink()) return false
+    const [actual, expected] = await Promise.all([
+      realpath(linkPath),
+      realpath(expectedTarget)
+    ])
+    return actual === expected
+  } catch {
+    return false
+  }
+}
+
+export type WorkspaceWarmCoordinator = {
+  runExclusive<T>(workspace: string, operation: () => Promise<T>): Promise<T>
+}
+
+export function createWorkspaceWarmCoordinator(): WorkspaceWarmCoordinator {
+  const tails = new Map<string, Promise<void>>()
+  return {
+    async runExclusive<T>(workspace: string, operation: () => Promise<T>): Promise<T> {
+      const key = resolve(workspace)
+      const previous = tails.get(key) ?? Promise.resolve()
+      let release!: () => void
+      const current = new Promise<void>((resolveCurrent) => {
+        release = resolveCurrent
+      })
+      const tail = previous.catch(() => undefined).then(() => current)
+      tails.set(key, tail)
+      await previous.catch(() => undefined)
+      try {
+        return await operation()
+      } finally {
+        release()
+        if (tails.get(key) === tail) tails.delete(key)
+      }
+    }
+  }
 }
 
 /**
