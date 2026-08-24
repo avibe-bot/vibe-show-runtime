@@ -53,7 +53,7 @@ export type MarkdownRenderRequest = {
   internalBasePath: string
   renderUrl: string
   workspace: string
-  prepare: () => Promise<void>
+  prepare: () => Promise<{ fingerprint: string }>
 }
 
 export type MarkdownRenderResult = {
@@ -233,9 +233,8 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
             return { markdown: lockedHit.markdown, cache: "hit" }
           }
 
-          await deadline.wait(request.prepare())
-          const renderFingerprint = await deadline.wait(fingerprintOrRenderFailed(request.workspace))
-          const preparedHit = cache.get(cacheKey, renderFingerprint)
+          const snapshot = await deadline.wait(request.prepare())
+          const preparedHit = cache.get(cacheKey, snapshot.fingerprint)
           if (preparedHit) {
             return { markdown: preparedHit.markdown, cache: "hit" }
           }
@@ -249,18 +248,11 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
             maxOutputBytes
           })
 
-          // A file changed while the browser was rendering. Serve this request, but do
-          // not make the possibly transitional result a cache hit for the new state.
-          const completedFingerprint = await deadline.wait(fingerprintOrRenderFailed(request.workspace))
-          if (completedFingerprint === renderFingerprint) {
-            cache.set(cacheKey, {
-              sessionId: request.sessionId,
-              markdown,
-              fingerprint: renderFingerprint
-            })
-          } else {
-            cache.delete(cacheKey)
-          }
+          cache.set(cacheKey, {
+            sessionId: request.sessionId,
+            markdown,
+            fingerprint: snapshot.fingerprint
+          })
           return { markdown, cache: "miss" }
         })
       } catch (error) {

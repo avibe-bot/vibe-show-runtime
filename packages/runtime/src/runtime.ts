@@ -316,7 +316,14 @@ function isSensitiveFileName(segment: string): boolean {
     lower.endsWith(".key")
 }
 
-export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
+type ShowRuntimeLifecycle = {
+  onSessionIdlePruned?: (sessionId: string) => Promise<void>
+}
+
+export function createShowRuntime(
+  options: ShowRuntimeOptions,
+  lifecycle: ShowRuntimeLifecycle = {}
+): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
   const snapshotBuildContexts = new Map<string, SnapshotBuildContext>()
   const snapshotBuilds = new Map<string, Promise<void>>()
@@ -487,6 +494,7 @@ export function createShowRuntime(options: ShowRuntimeOptions): ShowRuntime {
     if (now - session.lastAccessedAt.getTime() <= idleTtlMs) return undefined
     const started = performance.now()
     await closeSession(session, "idle")
+    await lifecycle.onSessionIdlePruned?.(session.id)
     logTiming("pruneIdleSession", session.id, started, { idleTtlMs, state: session.state })
     return toStatus(session)
   }

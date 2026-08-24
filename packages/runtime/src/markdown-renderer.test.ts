@@ -155,7 +155,7 @@ describe("workspace render cache", () => {
     const workspace = await fixtureWorkspace("serialized")
     const browser = new FakeBrowser(() => ({ html: "<h1>Serialized</h1>", mode: "success" }))
     const launches: BrowserTarget[] = []
-    const prepare = vi.fn(async () => undefined)
+    const prepare = vi.fn(async () => ({ fingerprint: await workspaceFingerprint(workspace) }))
     const renderer = createMarkdownRenderer({
       browserProvisioningDisabled: true,
       launchBrowser: async (target) => {
@@ -261,6 +261,7 @@ describe("workspace render cache", () => {
     const firstRequest = renderRequest(workspace, async () => {
       firstPrepareStarted()
       await new Promise((resolve) => setTimeout(resolve, 100))
+      return { fingerprint: await workspaceFingerprint(workspace) }
     })
     const secondRequest = renderRequest(workspace, undefined, "/p/stalled/")
 
@@ -1134,6 +1135,56 @@ document.getElementById("root")!.textContent = leaked
     }
   }, 30_000)
 
+  it("keys rendered Markdown to the prepared snapshot when the workspace changes after prepare", async () => {
+    const workspaceRoot = await temporaryDirectory("snapshot-post-prepare-race")
+    const workspace = await fixtureWorkspace("page", workspaceRoot)
+    const writePage = (label: string) => writeFile(join(workspace, "index.html"), `<!doctype html>
+<html><body><main id="root"><h1>${label}</h1></main><script type="module" src="/src/main.tsx"></script></body></html>\n`)
+    await writePage("Snapshot before prepare change")
+    const browser = new FakeBrowser(() => ({
+      html: "",
+      mode: "success",
+      useNavigationBody: true
+    }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+    const originalPrepare = runtime.renderSnapshots.prepare.bind(runtime.renderSnapshots)
+    vi.spyOn(runtime.renderSnapshots, "prepare").mockImplementationOnce(async (...args) => {
+      const snapshot = await originalPrepare(...args)
+      await writePage("Snapshot after prepare change with new bytes")
+      return snapshot
+    })
+    const buildSnapshot = vi.spyOn(runtime.runtime, "buildSessionSnapshot")
+
+    try {
+      const first = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      expect(first.headers.get("x-avibe-render-cache")).toBe("miss")
+      expect(await first.text()).toContain("# Snapshot before prepare change")
+
+      const changed = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      expect(changed.headers.get("x-avibe-render-cache")).toBe("miss")
+      expect(await changed.text()).toContain("# Snapshot after prepare change with new bytes")
+
+      const cached = await fetch(`${runtime.url}/sessions/page/render-markdown`)
+      expect(cached.headers.get("x-avibe-render-cache")).toBe("hit")
+      expect(await cached.text()).toContain("# Snapshot after prepare change with new bytes")
+      expect(buildSnapshot).toHaveBeenCalledTimes(2)
+      expect(browser.contextCount).toBe(2)
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
   it("routes snapshot API requests through the live handler without caller identity", async () => {
     const workspaceRoot = await temporaryDirectory("snapshot-api")
     const workspace = await fixtureWorkspace("page", workspaceRoot)
@@ -1370,6 +1421,66 @@ document.getElementById("root")!.textContent = leaked
       expect(runtime.renderSnapshots.get("page")).toBeDefined()
       expect(runtime.runtime.getSession("page")?.state).toBe("active")
       expect(buildSnapshot).toHaveBeenCalledTimes(2)
+    } finally {
+      await runtime.close()
+    }
+  }, 30_000)
+
+  it("prunes only the idle session snapshot and Markdown cache", async () => {
+    const workspaceRoot = await temporaryDirectory("idle-render-pruning")
+    const idleWorkspace = await fixtureWorkspace("idle-page", workspaceRoot)
+    const activeWorkspace = await fixtureWorkspace("active-page", workspaceRoot)
+    await writeFile(join(idleWorkspace, "index.html"), "<main id=\"root\"><h1>Idle snapshot</h1></main>\n")
+    await writeFile(join(activeWorkspace, "index.html"), "<main id=\"root\"><h1>Active snapshot</h1></main>\n")
+    const browser = new FakeBrowser(() => ({ html: "", mode: "success", useNavigationBody: true }))
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      cacheRoot: join(workspaceRoot, ".cache"),
+      idleTtlMs: 50,
+      idlePruneIntervalMs: 0,
+      renderTimeoutMs: 15_000
+    }, {
+      launchBrowser: async (target) => {
+        if (target !== "chrome") throw new Error("not found")
+        return browser
+      },
+      browserProvisioningDisabled: true,
+      renderQuietPeriodMs: 0
+    })
+    const buildSnapshot = vi.spyOn(runtime.runtime, "buildSessionSnapshot")
+
+    try {
+      for (const sessionId of ["idle-page", "active-page"]) {
+        const miss = await fetch(`${runtime.url}/sessions/${sessionId}/render-markdown`)
+        expect(miss.headers.get("x-avibe-render-cache")).toBe("miss")
+        await miss.text()
+        const hit = await fetch(`${runtime.url}/sessions/${sessionId}/render-markdown`)
+        expect(hit.headers.get("x-avibe-render-cache")).toBe("hit")
+        await hit.text()
+      }
+
+      const idleSnapshot = runtime.renderSnapshots.get("idle-page")
+      const activeSnapshot = runtime.renderSnapshots.get("active-page")
+      expect(idleSnapshot).toBeDefined()
+      expect(activeSnapshot).toBeDefined()
+      runtime.runtime.getSession("idle-page")!.lastAccessedAt = new Date(Date.now() - 1_000)
+      runtime.runtime.getSession("active-page")!.lastAccessedAt = new Date()
+
+      const pruned = await runtime.runtime.pruneIdleSessions()
+
+      expect(pruned.map((status) => status.sessionId)).toEqual(["idle-page"])
+      expect(runtime.renderSnapshots.get("idle-page")).toBeUndefined()
+      await expect(lstat(idleSnapshot!.outDir)).rejects.toMatchObject({ code: "ENOENT" })
+      expect(runtime.renderSnapshots.get("active-page")).toBe(activeSnapshot)
+      await expect(lstat(join(activeSnapshot!.outDir, "index.html"))).resolves.toMatchObject({})
+
+      const active = await fetch(`${runtime.url}/sessions/active-page/render-markdown`)
+      expect(active.headers.get("x-avibe-render-cache")).toBe("hit")
+      await active.text()
+      const idle = await fetch(`${runtime.url}/sessions/idle-page/render-markdown`)
+      expect(idle.headers.get("x-avibe-render-cache")).toBe("miss")
+      await idle.text()
+      expect(buildSnapshot).toHaveBeenCalledTimes(3)
     } finally {
       await runtime.close()
     }
@@ -1791,7 +1902,7 @@ async function fixtureWorkspace(name: string, root?: string): Promise<string> {
 
 function renderRequest(
   workspace: string,
-  prepare: (() => Promise<void>) | undefined = undefined,
+  prepare: MarkdownRenderRequest["prepare"] | undefined = undefined,
   basePath = "/p/share/"
 ): MarkdownRenderRequest {
   return {
@@ -1802,7 +1913,7 @@ function renderRequest(
     internalBasePath: "/sessions/fixture/app/",
     renderUrl: "http://127.0.0.1:4177/sessions/fixture/app/",
     workspace,
-    prepare: prepare ?? (async () => undefined)
+    prepare: prepare ?? (async () => ({ fingerprint: await workspaceFingerprint(workspace) }))
   }
 }
 

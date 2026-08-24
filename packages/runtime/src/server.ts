@@ -68,8 +68,20 @@ export async function startShowRuntimeServer(
       response.end(JSON.stringify({ error: error instanceof Error ? error.message : "Runtime error" }))
     }
   })
-  const runtime = createShowRuntime({ ...options, server })
-  const renderSnapshots = createRenderSnapshotManager(runtime)
+  let renderSnapshots!: RenderSnapshotManager
+  const runtime = createShowRuntime({
+    ...options,
+    server
+  }, {
+    async onSessionIdlePruned(sessionId) {
+      if (!renderSnapshots) return
+      await markdownRenderer.invalidateSession(
+        sessionId,
+        () => renderSnapshots.invalidateSession(sessionId)
+      )
+    }
+  })
+  renderSnapshots = createRenderSnapshotManager(runtime)
   const eventStreams = new ShowEventStreamBroker()
 
   await new Promise<void>((resolve) => server.listen(port, host, resolve))
@@ -542,7 +554,7 @@ async function handleRenderMarkdown(options: {
       renderUrl: markdownRenderUrl(request, internalBasePath, target),
       workspace,
       async prepare() {
-        await renderSnapshots.prepare(sessionId, workspace, internalBasePath)
+        return await renderSnapshots.prepare(sessionId, workspace, internalBasePath)
       }
     })
     response.statusCode = 200
