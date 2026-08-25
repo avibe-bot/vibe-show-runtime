@@ -24,7 +24,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-annotation-bootstrap.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run src/templates.test.ts"
+    "test": "vitest run src"
   },
   "dependencies": {
     "@avibe/show-sdk": "0.0.0",
@@ -32,8 +32,11 @@
     "@tailwindcss/vite": "^4.3.2",
     "@vitejs/plugin-react": "^5.1.1",
     "esbuild": "^0.27.0",
+    "playwright-core": "^1.62.1",
     "postcss": "^8.5.15",
     "tailwindcss": "^4.3.2",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2",
     "vite": "^7.2.4"
   },
   "devDependencies": {

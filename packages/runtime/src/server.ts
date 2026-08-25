@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
-import { readFile } from "node:fs/promises"
-import { join } from "node:path"
+import { readFile, realpath, stat } from "node:fs/promises"
+import { extname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { parse } from "node:url"
 import type { AddressInfo } from "node:net"
 import { isAgentOnlyShowEventType, isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type ShowEventInput } from "@avibe/show-sdk"
@@ -9,33 +9,99 @@ import { createShowRuntime } from "./runtime.js"
 import { handleApiRequest } from "./handlers.js"
 import { isVendorAssetPath, serveVendorAsset } from "./vendor-runtime.js"
 import { isAnnotationBootstrapPath, serveAnnotationBootstrap } from "./annotation-bootstrap.js"
+import {
+  createMarkdownRenderer,
+  MarkdownRenderError,
+  type BrowserLauncher,
+  type BrowserProvisioner,
+  type MarkdownRenderer,
+  type ShowRenderContext
+} from "./markdown-renderer.js"
+import {
+  createRenderSnapshotManager,
+  type RenderSnapshot,
+  type RenderSnapshotManager
+} from "./render-snapshot.js"
+import {
+  createWorkspaceFingerprinter,
+  type WorkspaceFingerprinter
+} from "./workspace-fingerprint.js"
 
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 
-export async function startShowRuntimeServer(options: ShowRuntimeOptions = { workspaceRoot: ".show" }) {
+export type ShowRuntimeServerDependencies = {
+  launchBrowser?: BrowserLauncher
+  renderQuietPeriodMs?: number
+  browserDiscoveryDisabled?: boolean
+  browserProvisioningDisabled?: boolean
+  provisionBrowser?: BrowserProvisioner
+  workspaceFingerprinter?: WorkspaceFingerprinter
+}
+
+export async function startShowRuntimeServer(
+  options: ShowRuntimeOptions = { workspaceRoot: ".show" },
+  dependencies: ShowRuntimeServerDependencies = {}
+) {
   const host = options.host ?? "127.0.0.1"
   const port = options.port ?? 0
-
+  const workspaceFingerprinter = dependencies.workspaceFingerprinter ?? createWorkspaceFingerprinter()
+  const markdownRenderer = createMarkdownRenderer({
+    timeoutMs: options.renderTimeoutMs,
+    cacheTtlMs: options.renderCacheTtlMs,
+    maxOutputBytes: options.renderMaxOutputBytes,
+    browserIdleMs: options.renderBrowserIdleMs,
+    quietPeriodMs: dependencies.renderQuietPeriodMs,
+    browserDiscoveryDisabled: dependencies.browserDiscoveryDisabled,
+    browserProvisioningDisabled: dependencies.browserProvisioningDisabled,
+    browserProvisionTimeoutMs: options.renderBrowserProvisionTimeoutMs,
+    launchBrowser: dependencies.launchBrowser,
+    provisionBrowser: dependencies.provisionBrowser,
+    workspaceFingerprinter
+  })
   const server = createServer(async (request, response) => {
     try {
-      await routeRequest(runtime, request, response, eventStreams)
+      await routeRequest(
+        runtime,
+        renderSnapshots,
+        request,
+        response,
+        eventStreams,
+        markdownRenderer,
+        options.workspaceRoot
+      )
     } catch (error) {
       response.statusCode = 500
       response.setHeader("content-type", "application/json")
       response.end(JSON.stringify({ error: error instanceof Error ? error.message : "Runtime error" }))
     }
   })
-  const runtime = createShowRuntime({ ...options, server })
+  let renderSnapshots!: RenderSnapshotManager
+  const runtime = createShowRuntime({
+    ...options,
+    server
+  }, {
+    async onSessionIdlePruned(sessionId) {
+      if (!renderSnapshots) return
+      await markdownRenderer.invalidateSession(
+        sessionId,
+        () => renderSnapshots.invalidateSession(sessionId)
+      )
+    }
+  })
+  renderSnapshots = createRenderSnapshotManager(runtime, workspaceFingerprinter)
   const eventStreams = new ShowEventStreamBroker()
 
   await new Promise<void>((resolve) => server.listen(port, host, resolve))
 
   return {
     runtime,
+    renderSnapshots,
     server,
     url: `http://${host}:${(server.address() as AddressInfo).port}`,
     async close() {
       eventStreams.close()
+      await markdownRenderer.close()
+      await renderSnapshots.close()
       await runtime.close()
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
     }
@@ -44,15 +110,23 @@ export async function startShowRuntimeServer(options: ShowRuntimeOptions = { wor
 
 async function routeRequest(
   runtime: ReturnType<typeof createShowRuntime>,
+  renderSnapshots: RenderSnapshotManager,
   request: IncomingMessage,
   response: ServerResponse,
-  eventStreams: ShowEventStreamBroker
+  eventStreams: ShowEventStreamBroker,
+  markdownRenderer: MarkdownRenderer,
+  workspaceRoot: string
 ) {
   const parsed = parse(request.url ?? "/", true)
   const pathname = parsed.pathname ?? "/"
 
   if (request.method === "GET" && pathname === "/health") {
     sendJson(response, 200, { ok: true })
+    return
+  }
+
+  if (request.method === "GET" && pathname === "/capabilities") {
+    sendJson(response, 200, { render_markdown: true })
     return
   }
 
@@ -67,6 +141,19 @@ async function routeRequest(
       return
     }
     await serveVendorAsset(bundle, pathname, response)
+    return
+  }
+
+  const renderMarkdownMatch = pathname.match(/^\/sessions\/([^/]+)\/render-markdown$/)
+  if (request.method === "GET" && renderMarkdownMatch) {
+    await handleRenderMarkdown({
+      renderSnapshots,
+      request,
+      response,
+      renderer: markdownRenderer,
+      workspaceRoot,
+      sessionId: renderMarkdownMatch[1]
+    })
     return
   }
 
@@ -116,7 +203,28 @@ async function routeRequest(
 
   const suspendMatch = pathname.match(/^\/sessions\/([^/]+)\/suspend$/)
   if (request.method === "POST" && suspendMatch) {
-    sendJson(response, 200, await runtime.suspendSession(suspendMatch[1]))
+    const sessionId = suspendMatch[1]
+    let status
+    await markdownRenderer.invalidateSession(sessionId, async () => {
+      await renderSnapshots.invalidateSession(sessionId)
+      status = await runtime.suspendSession(sessionId)
+    })
+    status ??= await runtime.getSessionStatus(sessionId)
+    sendJson(response, 200, status)
+    return
+  }
+
+  const renderAppMatch = pathname.match(/^\/sessions\/([^/]+)\/render-app\/?(.*)$/)
+  if (renderAppMatch) {
+    await handleRenderAppRequest({
+      runtime,
+      renderSnapshots,
+      request,
+      response,
+      eventStreams,
+      sessionId: renderAppMatch[1],
+      appPath: `/${renderAppMatch[2] || ""}`
+    })
     return
   }
 
@@ -255,6 +363,330 @@ async function routeRequest(
   }
 
   sendJson(response, 404, { error: "Not found" })
+}
+
+async function handleRenderAppRequest(options: {
+  runtime: ReturnType<typeof createShowRuntime>
+  renderSnapshots: RenderSnapshotManager
+  request: IncomingMessage
+  response: ServerResponse
+  eventStreams: ShowEventStreamBroker
+  sessionId: string
+  appPath: string
+}) {
+  const { runtime, renderSnapshots, request, response, eventStreams, sessionId, appPath } = options
+  const parsed = parse(request.url ?? "/", true)
+
+  if (request.method === "GET" && isAnnotationBootstrapPath(appPath)) {
+    await serveAnnotationBootstrap(appPath, response)
+    return
+  }
+
+  const snapshot = renderSnapshots.get(sessionId)
+  if (!snapshot) {
+    sendNotFound(response)
+    return
+  }
+  const session = runtime.getSession(sessionId)
+
+  if (isShowEndpointPath(appPath, "events")) {
+    if (request.method === "GET") {
+      if (parsed.query.stream === "1") {
+        const stream = eventStreams.subscribe(sessionId, response, streamAfterId(request, parsed.query.after_id))
+        sendEventStream(response)
+        stream.replay(runtime.listSessionEvents(sessionId))
+        return
+      }
+      sendJson(response, 200, { events: runtime.listSessionEvents(sessionId) })
+      return
+    }
+    if (request.method !== "POST") {
+      sendJson(response, 405, { error: "Method not allowed" })
+      return
+    }
+    if (!session?.vite) {
+      sendJson(response, 503, { error: "Session not ready" })
+      return
+    }
+    const payload = await readJson<ShowEventRequest>(request)
+    const event = recordShowEvent(runtime, sessionId, payload)
+    if (!event.ok) {
+      sendJson(response, event.status, { error: event.error })
+      return
+    }
+    eventStreams.publish(sessionId, event.value)
+    sendJson(response, 201, { ok: true, event: event.value })
+    return
+  }
+
+  if (isShowEndpointPath(appPath, "messages")) {
+    sendJson(response, 200, { messages: runtime.listSessionMessages(sessionId) })
+    return
+  }
+
+  if (appPath === "/__show" || appPath.startsWith("/__show/")) {
+    sendNotFound(response)
+    return
+  }
+
+  if (appPath === "/api" || appPath.startsWith("/api/")) {
+    if (!session?.vite) {
+      sendJson(response, 503, { error: "Session not ready" })
+      return
+    }
+    await handleApiRequest({
+      sessionId,
+      workspace: session.workspace,
+      apiPath: appPath.slice("/api".length),
+      vite: session.vite,
+      request,
+      response
+    })
+    return
+  }
+
+  await serveRenderSnapshot(snapshot, appPath, request, response)
+}
+
+async function serveRenderSnapshot(
+  snapshot: RenderSnapshot,
+  appPath: string,
+  request: IncomingMessage,
+  response: ServerResponse
+) {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    sendJson(response, 405, { error: "Method not allowed" })
+    return
+  }
+
+  const requestedFile = await containedSnapshotFile(snapshot.outDir, appPath)
+  const file = requestedFile ?? (
+    isSpaRoutePath(appPath, request)
+      ? await containedSnapshotFile(snapshot.outDir, "/index.html")
+      : undefined
+  )
+  if (!file) {
+    sendNotFound(response)
+    return
+  }
+
+  const body = await readFile(file)
+  response.statusCode = 200
+  response.setHeader("content-type", snapshotContentType(file))
+  response.setHeader("cache-control", "no-store")
+  response.end(request.method === "HEAD" ? undefined : body)
+}
+
+async function containedSnapshotFile(root: string, rawPath: string): Promise<string | undefined> {
+  let decoded: string
+  try {
+    decoded = decodeURIComponent(rawPath)
+  } catch {
+    return undefined
+  }
+  if (decoded.includes("\0") || decoded.split(/[\\/]/).includes("..")) return undefined
+
+  try {
+    const canonicalRoot = await realpath(root)
+    const candidate = resolve(canonicalRoot, decoded.replace(/^[/\\]+/, ""))
+    const canonicalFile = await realpath(candidate)
+    const relativePath = relative(canonicalRoot, canonicalFile)
+    if (
+      relativePath === ".." ||
+      relativePath.startsWith(`..${sep}`) ||
+      isAbsolute(relativePath) ||
+      !(await stat(canonicalFile)).isFile()
+    ) {
+      return undefined
+    }
+    return canonicalFile
+  } catch {
+    return undefined
+  }
+}
+
+function snapshotContentType(path: string): string {
+  switch (extname(path).toLowerCase()) {
+    case ".html": return "text/html; charset=utf-8"
+    case ".js":
+    case ".mjs": return "text/javascript; charset=utf-8"
+    case ".css": return "text/css; charset=utf-8"
+    case ".json":
+    case ".map": return "application/json; charset=utf-8"
+    case ".svg": return "image/svg+xml"
+    case ".png": return "image/png"
+    case ".jpg":
+    case ".jpeg": return "image/jpeg"
+    case ".gif": return "image/gif"
+    case ".webp": return "image/webp"
+    case ".ico": return "image/x-icon"
+    case ".woff": return "font/woff"
+    case ".woff2": return "font/woff2"
+    case ".ttf": return "font/ttf"
+    case ".otf": return "font/otf"
+    case ".wasm": return "application/wasm"
+    default: return "application/octet-stream"
+  }
+}
+
+async function handleRenderMarkdown(options: {
+  renderSnapshots: RenderSnapshotManager
+  request: IncomingMessage
+  response: ServerResponse
+  renderer: MarkdownRenderer
+  workspaceRoot: string
+  sessionId: string
+}) {
+  const { renderSnapshots, request, response, renderer, workspaceRoot, sessionId } = options
+  response.setHeader("cache-control", "no-store")
+  try {
+    const target = markdownRenderTarget(request)
+    const workspace = sessionWorkspace(workspaceRoot, sessionId)
+    if (!workspace || !await isDirectory(workspace)) {
+      throw new MarkdownRenderError(
+        "session_unknown",
+        404,
+        "No Show Page workspace exists for this session."
+      )
+    }
+
+    const internalBasePath = `/sessions/${sessionId}/render-app/`
+    const basePath = markdownBasePath(request, sessionId)
+    const result = await renderer.render({
+      sessionId,
+      context: markdownRenderContext(request),
+      basePath,
+      target,
+      internalBasePath,
+      renderUrl: markdownRenderUrl(request, internalBasePath, target),
+      workspace,
+      async prepare() {
+        return await renderSnapshots.prepare(sessionId, workspace, internalBasePath)
+      }
+    })
+    response.statusCode = 200
+    response.setHeader("content-type", "text/markdown; charset=utf-8")
+    response.setHeader("x-avibe-render-cache", result.cache)
+    response.end(result.markdown)
+  } catch (error) {
+    sendRenderError(
+      response,
+      error instanceof MarkdownRenderError
+        ? error
+        : new MarkdownRenderError("render_failed", 502, "Show Page rendering failed.", { cause: error })
+    )
+  }
+}
+
+function sendRenderError(response: ServerResponse, error: MarkdownRenderError) {
+  sendJson(response, error.status, {
+    error: {
+      code: error.code,
+      message: error.message
+    }
+  })
+}
+
+function sessionWorkspace(workspaceRoot: string, sessionId: string): string | undefined {
+  const root = resolve(workspaceRoot)
+  const workspace = resolve(root, sessionId)
+  const relativePath = relative(root, workspace)
+  if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(relativePath)) {
+    return undefined
+  }
+  return workspace
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function markdownRenderContext(request: IncomingMessage): ShowRenderContext {
+  return requestHeader(request, "x-avibe-show-context") === "shared" ? "shared" : "private"
+}
+
+function markdownBasePath(request: IncomingMessage, sessionId: string): string {
+  const raw = requestHeader(request, "x-vibe-show-base") ?? `/show/${sessionId}/`
+  let pathname: string
+  try {
+    pathname = new URL(raw, "http://show-runtime.local").pathname
+  } catch {
+    pathname = `/show/${sessionId}/`
+  }
+  const withLeadingSlash = pathname.startsWith("/") ? pathname : `/${pathname}`
+  return withLeadingSlash.endsWith("/") ? withLeadingSlash : `${withLeadingSlash}/`
+}
+
+function markdownRenderTarget(request: IncomingMessage): string {
+  const target = requestHeader(request, "x-vibe-show-target") ?? "/"
+  const queryIndex = target.indexOf("?")
+  const pathname = queryIndex === -1 ? target : target.slice(0, queryIndex)
+  if (
+    !target.startsWith("/") ||
+    target.startsWith("//") ||
+    pathnameHasParentSegment(pathname)
+  ) {
+    throw invalidMarkdownRenderTarget()
+  }
+  return target
+}
+
+function pathnameHasParentSegment(pathname: string): boolean {
+  let decoded = pathname
+  while (true) {
+    if (decoded.split(/[\\/]/).includes("..")) return true
+    try {
+      const next = decodeURIComponent(decoded)
+      if (next === decoded) return false
+      decoded = next
+    } catch {
+      return true
+    }
+  }
+}
+
+function markdownRenderUrl(
+  request: IncomingMessage,
+  internalBasePath: string,
+  target: string
+): string {
+  const origin = loopbackOrigin(request)
+  const internalBase = new URL(internalBasePath, origin)
+  let renderUrl: URL
+  try {
+    renderUrl = new URL(target.slice(1), internalBase)
+  } catch {
+    throw invalidMarkdownRenderTarget()
+  }
+  if (renderUrl.origin !== internalBase.origin || !renderUrl.pathname.startsWith(internalBase.pathname)) {
+    throw invalidMarkdownRenderTarget()
+  }
+  return renderUrl.href
+}
+
+function invalidMarkdownRenderTarget(): MarkdownRenderError {
+  return new MarkdownRenderError(
+    "invalid_target",
+    400,
+    "The x-vibe-show-target header must resolve to a path within the loopback session app."
+  )
+}
+
+function requestHeader(request: IncomingMessage, name: string): string | undefined {
+  const raw = request.headers[name]
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return typeof value === "string" && value.trim() ? value.trim() : undefined
+}
+
+function loopbackOrigin(request: IncomingMessage): string {
+  const port = request.socket.localPort
+  const address = request.socket.localAddress ?? "127.0.0.1"
+  const host = address.includes(":") ? `[${address}]` : address
+  return `http://${host}:${port}`
 }
 
 function isSpaRoutePath(appPath: string, request: IncomingMessage) {

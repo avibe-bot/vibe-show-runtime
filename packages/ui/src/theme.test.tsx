@@ -87,7 +87,7 @@ describe("ThemeProvider", () => {
 })
 
 describe("theme.css", () => {
-  const css = readFileSync(new URL("./theme.css", import.meta.url), "utf8")
+  const css = readFileSync(new URL("./theme.css", import.meta.url), "utf8").replace(/\r\n?/g, "\n")
 
   it("publishes the complete standard shadcn token families", () => {
     for (const token of [
