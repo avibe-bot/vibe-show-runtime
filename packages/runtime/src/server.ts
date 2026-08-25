@@ -29,6 +29,10 @@ import {
 
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 
+// Mirrors avibe's core/show_runtime.py SHOW_RUNTIME_PROTOCOL_VERSION; the
+// /capabilities probe on the avibe side gates every feature flag on this.
+const SHOW_RUNTIME_PROTOCOL_VERSION = 1
+
 export type ShowRuntimeServerDependencies = {
   launchBrowser?: BrowserLauncher
   renderQuietPeriodMs?: number
@@ -126,7 +130,7 @@ async function routeRequest(
   }
 
   if (request.method === "GET" && pathname === "/capabilities") {
-    sendJson(response, 200, { render_markdown: true })
+    sendJson(response, 200, { protocol: SHOW_RUNTIME_PROTOCOL_VERSION, render_markdown: true })
     return
   }
 

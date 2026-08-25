@@ -1763,7 +1763,7 @@ document.getElementById("root")!.textContent = leaked
     try {
       const capabilities = await fetch(`${runtime.url}/capabilities`)
       expect(capabilities.status).toBe(200)
-      expect(await capabilities.json()).toEqual({ render_markdown: true })
+      expect(await capabilities.json()).toEqual({ protocol: 1, render_markdown: true })
 
       const unknown = await fetch(`${runtime.url}/sessions/unknown/render-markdown`)
       await expectRenderError(unknown, 404, "session_unknown")
