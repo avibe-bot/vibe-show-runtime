@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events"
-import { access, cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { access, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { get as httpGet } from "node:http"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
@@ -89,7 +89,8 @@ describe("SSR Markdown endpoint", () => {
     expect(markdown).toContain(
       "[Open details](/p/public-token/teams/acme/details?from=Q3&vibe-embed=1)"
     )
-    expect(markdown).toContain("![Relative chart](/p/public-token/assets/chart.png)")
+    expect(markdown).toContain("[Change period](/p/public-token/teams/acme?period=Q4)")
+    expect(markdown).toContain("![Relative chart](/p/public-token/teams/assets/chart.png)")
 
     const second = await fetch(markdownUrl(runtime.url, "semantic"), { headers })
     expect(second.status).toBe(200)
@@ -215,6 +216,86 @@ describe("SSR Markdown endpoint", () => {
       expect(markdown).toContain(`${attempt}: blocked`)
     }
     expect(markdown).not.toContain(sentinel)
+  }, 60_000)
+
+  it("enforces the workspace boundary before SSR loaders can read module content", async () => {
+    const siblingSecret = "SIBLING_SESSION_SECRET_MUST_NOT_LEAK"
+    const cssSecret = "SIBLING_CSS_SECRET_MUST_NOT_LEAK"
+    const assetSecret = "SIBLING_ASSET_SECRET_MUST_NOT_LEAK"
+    const hostSecret = "HOST_FILE_SECRET_MUST_NOT_LEAK"
+    const hostRoot = await mkdtemp(join(tmpdir(), "avibe-show-ssr-host-secret-"))
+    cleanups.push(async () => rm(hostRoot, { recursive: true, force: true }))
+    const hostFile = join(hostRoot, "value.txt")
+    await writeFile(hostFile, hostSecret)
+
+    const runtime = await startFixtureServer([
+      "boundary-sibling",
+      "boundary-host",
+      "boundary-symlink",
+      "boundary-css",
+      "boundary-asset",
+      "semantic"
+    ])
+    const siblingRoot = join(runtime.workspaceRoot, "sibling-secret")
+    await mkdir(siblingRoot, { recursive: true })
+    await writeFile(join(siblingRoot, "value.txt"), siblingSecret)
+    await writeFile(
+      join(siblingRoot, "secret.css"),
+      `.leak::before { content: "${cssSecret}"; }\n`
+    )
+    await writeFile(
+      join(siblingRoot, "secret.svg"),
+      `<svg xmlns="http://www.w3.org/2000/svg"><text>${assetSecret}</text></svg>\n`
+    )
+    await symlink(
+      hostRoot,
+      join(runtime.workspaceRoot, "boundary-symlink", "src", "pages", "linked-outside"),
+      process.platform === "win32" ? "junction" : "dir"
+    )
+
+    const hostSpecifier = `/@fs/${hostFile.replaceAll("\\", "/").replace(/^\/+/, "")}?raw`
+    const attacks = new Map([
+      ["boundary-sibling", "../../../sibling-secret/value.txt?raw"],
+      ["boundary-host", hostSpecifier],
+      ["boundary-symlink", "./linked-outside/value.txt?raw"],
+      ["boundary-asset", "../../../sibling-secret/secret.svg?url"]
+    ])
+    for (const [sessionId, specifier] of attacks) {
+      const pagePath = join(runtime.workspaceRoot, sessionId, "src", "pages", "index.tsx")
+      const source = await readFile(pagePath, "utf8")
+      await writeFile(pagePath, source.replace("__BOUNDARY_IMPORT__", specifier))
+    }
+
+    for (const sessionId of attacks.keys()) {
+      const response = await fetch(markdownUrl(runtime.url, sessionId))
+      const body = await response.text()
+      expect(response.status, `${sessionId}: ${body}`).toBe(502)
+      expect(JSON.parse(body)).toEqual({
+        error: {
+          code: "render_failed",
+          message: "Show Page rendering failed."
+        }
+      })
+      expect(body).not.toContain(siblingSecret)
+      expect(body).not.toContain(cssSecret)
+      expect(body).not.toContain(assetSecret)
+      expect(body).not.toContain(hostSecret)
+    }
+
+    const css = await fetch(markdownUrl(runtime.url, "boundary-css"))
+    const cssMarkdown = await css.text()
+    expect(css.status, cssMarkdown).toBe(200)
+    expect(cssMarkdown).toContain("CSS import loaded")
+    expect(cssMarkdown).not.toContain(cssSecret)
+
+    const allowed = await fetch(markdownUrl(runtime.url, "semantic"))
+    const allowedMarkdown = await allowed.text()
+    expect(allowed.status, allowedMarkdown).toBe(200)
+    expect(allowedMarkdown).toContain("Built-in Show UI")
+    expect(allowedMarkdown).toContain("![Fixture chart](data:image/svg+xml,")
+    expect(allowedMarkdown).toContain(
+      "![Fixture asset URL](/show/semantic/src/pages/fixture.svg?no-inline)"
+    )
   }, 60_000)
 
   it("keeps API handlers on Vite's ordinary Node SSR environment", async () => {

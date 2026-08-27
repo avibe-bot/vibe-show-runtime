@@ -129,7 +129,7 @@ function rewriteUrlAttribute(
 
   const currentDocument = new URL(options.documentUrl)
   const callerBase = new URL(options.basePath, currentDocument.origin)
-  const documentBase = new URL(callerBase.href)
+  const documentBase = new URL(currentDocument.href)
   const internalBase = new URL(options.internalBasePath, currentDocument.origin)
   const internalRoot = withTrailingSlash(internalBase.pathname)
   const callerRoot = withTrailingSlash(callerBase.pathname)

@@ -36,7 +36,11 @@ and browser-platform CJS entry points are prebundled before VM evaluation. The
 ordinary Vite `ssr` environment is unchanged, so `api/*` handlers retain their
 existing Node execution model.
 
-CSS imports are transformed by Vite and do not contribute text to the SSR tree.
+CSS does not contribute to the semantic SSR tree. After validating the resolved
+CSS entry against the workspace boundary, the Markdown environment substitutes
+an empty stylesheet before Vite's CSS compiler runs. This keeps CSS imports valid
+without letting nested `@import` or `url()` acquisition bypass the module boundary;
+the human-facing Vite environment continues to compile the original CSS normally.
 Small static assets follow Vite's normal SSR behavior and can become data URLs.
 Filesystem asset URLs produced for non-inlined workspace assets are rewritten to
 the caller's Show Page base; an unmappable `/@fs/` URL is removed rather than
@@ -162,14 +166,14 @@ fingerprint.
 
 | Measurement | Result |
 | --- | ---: |
-| cold request | 1,510-1,687 ms |
-| cold load | 1,476-1,653 ms |
-| cold render / conversion | 5.5-5.7 / 7.8-8.3 ms |
-| warm miss median / p95 | 7.0-7.2 / 13.5-14.5 ms |
-| cache hit median / p95 | 0.85-0.97 / 2.15-2.18 ms |
-| RSS before cold | 99-100 MiB |
-| RSS after cold (delta) | 327-372 MiB (+227-272 MiB) |
-| RSS after 20 warm misses | 337-383 MiB |
+| cold request | 1,604-1,879 ms |
+| cold load | 1,571-1,845 ms |
+| cold render / conversion | 5.5-5.7 / 7.6-8.5 ms |
+| warm miss median / p95 | 6.88-6.94 / 13.74-16.17 ms |
+| cache hit median / p95 | 0.85-0.89 / 1.92-2.09 ms |
+| RSS before cold | 100.6-102.5 MiB |
+| RSS after cold (delta) | 334.0-371.1 MiB (+232.4-268.6 MiB) |
+| RSS after 20 warm misses | 344.3-381.4 MiB |
 
 The benchmark created no browser cache. Run `npm run benchmark:ssr-markdown`
 to reproduce the endpoint, phase, memory, and sentinel check.

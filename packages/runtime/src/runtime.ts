@@ -10,7 +10,8 @@ import tailwindcss from "@tailwindcss/vite"
 import {
   createServer as createViteServer,
   defaultClientConditions,
-  defaultClientMainFields
+  defaultClientMainFields,
+  isCSSRequest
 } from "vite"
 import type { InlineConfig, Plugin, ViteDevServer } from "vite"
 import {
@@ -119,7 +120,21 @@ function escapeViteGlobPath(path: string): string {
 function workspaceFileBoundaryPlugin(boundary: WorkspaceFileBoundary): Plugin {
   return {
     name: "avibe-show-workspace-file-boundary",
+    enforce: "pre",
     apply: "serve",
+    async load(id) {
+      if (
+        this.environment.name !== SSR_MARKDOWN_ENVIRONMENT ||
+        id.startsWith("\0")
+      ) return null
+      if (await isDeniedSsrModuleTarget(id, boundary)) {
+        throw new Error("Show Page SSR module access was denied by the workspace boundary")
+      }
+      // CSS has no semantic output in Markdown. Stop at the validated entry so
+      // Vite's CSS compiler cannot acquire nested imports or assets on its own.
+      if (isCSSRequest(id)) return ""
+      return null
+    },
     configureServer(server) {
       // Vite's public/ middleware intentionally skips server.fs checks. Keep one
       // request boundary in front of every Vite serving path so public assets and
@@ -137,6 +152,29 @@ function workspaceFileBoundaryPlugin(boundary: WorkspaceFileBoundary): Plugin {
       })
     }
   }
+}
+
+async function isDeniedSsrModuleTarget(
+  rawId: string,
+  boundary: WorkspaceFileBoundary
+): Promise<boolean> {
+  const filePath = ssrModuleFilePath(rawId)
+  if (!filePath) return true
+  const target = await realpath(filePath).catch(() => undefined)
+  return target ? isDeniedResolvedTarget(target, boundary) : true
+}
+
+function ssrModuleFilePath(rawId: string): string | undefined {
+  const id = rawId.replace(/[?#].*$/, "")
+  if (id.startsWith("file://")) {
+    try {
+      return resolve(fileURLToPath(id))
+    } catch {
+      return undefined
+    }
+  }
+  if (id.startsWith("/@fs/")) return viteFsRequestPath(id)
+  return isAbsolute(id) ? resolve(id) : undefined
 }
 
 async function isDeniedWorkspaceRequest(rawUrl: string | undefined, boundary: WorkspaceFileBoundary): Promise<boolean> {
