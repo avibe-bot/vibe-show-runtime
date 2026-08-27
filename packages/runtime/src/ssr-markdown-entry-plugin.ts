@@ -4,8 +4,16 @@ export const SSR_MARKDOWN_ENTRY_ID = "virtual:avibe-show-ssr-markdown-entry"
 
 const RESOLVED_SSR_MARKDOWN_ENTRY_ID = `\0${SSR_MARKDOWN_ENTRY_ID}`
 const SSR_MARKDOWN_ENTRY_SOURCE = `
-export { default as App } from "/src/App.tsx"
-export { SsrRouterProvider as RouterProvider } from "/src/router.tsx"
+import { createElement } from "react"
+import { renderToStaticMarkup } from "react-dom/server"
+import App from "/src/App.tsx"
+import { SsrRouterProvider } from "/src/router.tsx"
+
+export function render(location) {
+  return renderToStaticMarkup(
+    createElement(SsrRouterProvider, { location }, createElement(App))
+  )
+}
 `
 
 export function ssrMarkdownEntryPlugin(): Plugin {

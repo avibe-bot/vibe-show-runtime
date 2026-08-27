@@ -1,8 +1,6 @@
 import { realpathSync } from "node:fs"
 import { realpath } from "node:fs/promises"
 import { isAbsolute, relative, resolve } from "node:path"
-import { createElement, type ComponentType, type ReactNode } from "react"
-import { renderToStaticMarkup } from "react-dom/server"
 import {
   defaultTreeAdapter,
   html as htmlNames,
@@ -60,12 +58,8 @@ export type SsrMarkdownCacheIdentity = {
   basePath: string
 }
 
-type LoadedSsrModules = {
-  App: ComponentType<Record<string, never>>
-  RouterProvider: ComponentType<{
-    location: SsrRouteLocation
-    children?: ReactNode
-  }>
+type LoadedSsrEntry = {
+  render(location: SsrRouteLocation): string
 }
 
 export type SsrMarkdownPipeline<Loaded> = {
@@ -95,25 +89,13 @@ export async function renderSsrMarkdown(request: SsrMarkdownRequest): Promise<Ss
     return await runSsrMarkdownPipeline({
       async load() {
         const entryModule = await request.vite.ssrLoadModule(SSR_MARKDOWN_ENTRY_ID) as Record<string, unknown>
-        if (!isRenderableComponent(entryModule.App)) {
-          throw new Error("The Show Page App module has no renderable default export")
+        if (typeof entryModule.render !== "function") {
+          throw new Error("The Show Page SSR entry has no render function")
         }
-        if (!isRenderableComponent(entryModule.RouterProvider)) {
-          throw new Error("The Show Page router has no SSR provider")
-        }
-        return {
-          App: entryModule.App as LoadedSsrModules["App"],
-          RouterProvider: entryModule.RouterProvider as LoadedSsrModules["RouterProvider"]
-        }
+        return entryModule as LoadedSsrEntry
       },
-      render({ App, RouterProvider }) {
-        return renderToStaticMarkup(
-          createElement(
-            RouterProvider,
-            { location },
-            createElement(App)
-          )
-        )
+      render(entry) {
+        return entry.render(location)
       },
       cleanup(html) {
         return cleanupSsrRenderedHtml(html, {
@@ -275,8 +257,8 @@ function rewriteUrlAttribute(
   if (!attribute || /^(?:data|javascript|mailto|tel):/i.test(attribute.value.trim())) return
 
   const currentDocument = new URL(options.documentUrl)
-  const documentBase = new URL(options.documentUrl)
   const callerBase = new URL(options.basePath, currentDocument.origin)
+  const documentBase = new URL(callerBase.href)
   const internalBase = new URL(options.internalBasePath, currentDocument.origin)
   const internalRoot = withTrailingSlash(internalBase.pathname)
   const callerRoot = withTrailingSlash(callerBase.pathname)
@@ -413,12 +395,6 @@ function withTrailingSlash(pathname: string): string {
   return pathname.endsWith("/") ? pathname : `${pathname}/`
 }
 
-function isRenderableComponent(value: unknown): boolean {
-  return typeof value === "function" || (
-    typeof value === "object" && value !== null && "$$typeof" in value
-  )
-}
-
 function attributeValue(element: DefaultTreeAdapterTypes.Element, name: string): string | undefined {
   return element.attrs.find((attribute) => attribute.name === name)?.value
 }
@@ -478,6 +454,6 @@ async function waitForAbort<T>(operation: Promise<T>, signal?: AbortSignal): Pro
 }
 
 function isAbortError(error: unknown, signal?: AbortSignal): boolean {
-  return Boolean(signal?.aborted && error === signal.reason) ||
-    error instanceof Error && error.name === "AbortError"
+  if (!signal?.aborted) return false
+  return error === signal.reason || error instanceof Error && error.name === "AbortError"
 }

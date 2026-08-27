@@ -1,4 +1,4 @@
-import { access, cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { access, cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { createServer, type Server } from "node:http"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
@@ -18,7 +18,7 @@ import { workspaceFingerprint } from "./workspace-fingerprint.js"
 const sourceDirectory = dirname(fileURLToPath(import.meta.url))
 const fixtureRoot = join(sourceDirectory, "__fixtures__", "ssr-markdown")
 const dependencyRoot = resolve(sourceDirectory, "../../..")
-const fixtureNames = ["semantic", "module-window", "render-document"] as const
+const fixtureNames = ["semantic", "module-window", "render-document", "render-abort"] as const
 
 let workspaceRoot: string | undefined
 let browserCache: string | undefined
@@ -65,6 +65,33 @@ async function fixtureVite(fixture: typeof fixtureNames[number]) {
   const vite = runtime.getSession(fixture)?.vite
   if (!vite) throw new Error(`Fixture ${fixture} did not create a Vite server`)
   return vite
+}
+
+function installedPackagePath(nodeModules: string, packageName: string): string {
+  return join(nodeModules, ...packageName.split("/"))
+}
+
+async function createIndependentReactDependencyRoot(targetRoot: string): Promise<void> {
+  const sourceNodeModules = join(dependencyRoot, "node_modules")
+  const targetNodeModules = join(targetRoot, "node_modules")
+  await mkdir(targetNodeModules, { recursive: true })
+
+  for (const packageName of ["react", "react-dom", "scheduler"]) {
+    await cp(
+      installedPackagePath(sourceNodeModules, packageName),
+      installedPackagePath(targetNodeModules, packageName),
+      { recursive: true }
+    )
+  }
+  for (const packageName of ["@avibe/show-ui", "@avibe/show-sdk", "motion", "lucide-react"]) {
+    const target = installedPackagePath(targetNodeModules, packageName)
+    await mkdir(dirname(target), { recursive: true })
+    await symlink(
+      await realpath(installedPackagePath(sourceNodeModules, packageName)),
+      target,
+      process.platform === "win32" ? "junction" : "dir"
+    )
+  }
 }
 
 describe("Vite SSR Markdown spike", () => {
@@ -116,11 +143,14 @@ describe("Vite SSR Markdown spike", () => {
       "[Open details](/show/semantic/teams/acme/details?from=Q3&vibe-embed=1)"
     )
     expect(result.markdown).toContain(
-      "[Change period](/show/semantic/teams/acme?period=Q4)"
+      "[Change period](/show/semantic/?period=Q4)"
+    )
+    expect(result.markdown).toContain(
+      "![Relative chart](/show/semantic/assets/chart.png)"
     )
   })
 
-  it("loads App and its router provider through one SSR module snapshot", async () => {
+  it("loads and renders the React tree through one session SSR module snapshot", async () => {
     const vite = await fixtureVite("semantic")
     const loadModule = vi.spyOn(vite, "ssrLoadModule")
     try {
@@ -137,6 +167,55 @@ describe("Vite SSR Markdown spike", () => {
       loadModule.mockRestore()
     }
   })
+
+  it("uses the session dependency root's physical React instance for SSR", async () => {
+    const isolatedRoot = await mkdtemp(join(tmpdir(), "avibe-show-ssr-session-react-"))
+    const isolatedDependencyRoot = join(isolatedRoot, "dependencies")
+    const isolatedWorkspaceRoot = join(isolatedRoot, "workspaces")
+    const isolatedServer = createServer()
+    let isolatedRuntime: ReturnType<typeof createShowRuntime> | undefined
+    try {
+      await createIndependentReactDependencyRoot(isolatedDependencyRoot)
+      await cp(
+        join(fixtureRoot, "session-react"),
+        join(isolatedWorkspaceRoot, "session-react"),
+        { recursive: true }
+      )
+      expect(await realpath(installedPackagePath(
+        join(isolatedDependencyRoot, "node_modules"),
+        "react"
+      ))).not.toBe(await realpath(installedPackagePath(join(dependencyRoot, "node_modules"), "react")))
+
+      await new Promise<void>((resolveListen) => {
+        isolatedServer.listen(0, "127.0.0.1", resolveListen)
+      })
+      isolatedRuntime = createShowRuntime({
+        workspaceRoot: isolatedWorkspaceRoot,
+        dependencyRoot: isolatedDependencyRoot,
+        cacheRoot: join(isolatedRoot, ".vite-cache"),
+        server: isolatedServer,
+        idlePruneIntervalMs: 0
+      })
+      await isolatedRuntime.ensureSession("session-react", "/show/session-react/")
+      const vite = isolatedRuntime.getSession("session-react")?.vite
+      if (!vite) throw new Error("Independent React fixture did not create a Vite server")
+
+      const result = await renderSsrMarkdown({
+        vite,
+        target: "/",
+        basePath: "/show/session-react/"
+      })
+      expect(result.markdown).toContain("# Session React hook rendered")
+    } finally {
+      await isolatedRuntime?.close()
+      if (isolatedServer.listening) {
+        await new Promise<void>((resolveClose, rejectClose) => {
+          isolatedServer.close((error) => error ? rejectClose(error) : resolveClose())
+        })
+      }
+      await rm(isolatedRoot, { force: true, recursive: true })
+    }
+  }, 60_000)
 
   it("does not expose an unmappable Vite filesystem asset URL", async () => {
     if (!workspaceRoot) throw new Error("Fixture workspace was not created")
@@ -168,6 +247,19 @@ describe("Vite SSR Markdown spike", () => {
       vite,
       target: "/",
       basePath: `/show/${fixture}/`
+    })).rejects.toMatchObject({
+      code: "render_failed",
+      status: 502,
+      message: "Show Page rendering failed."
+    })
+  }, 60_000)
+
+  it("maps a page-originated AbortError to render_failed without request cancellation", async () => {
+    const vite = await fixtureVite("render-abort")
+    await expect(renderSsrMarkdown({
+      vite,
+      target: "/",
+      basePath: "/show/render-abort/"
     })).rejects.toMatchObject({
       code: "render_failed",
       status: 502,

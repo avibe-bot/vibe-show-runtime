@@ -19,12 +19,15 @@ server evaluation mode without creating a second artifact lifecycle. An SSR buil
 would duplicate dependency preparation, cache storage, invalidation, and cleanup
 while the live graph still has to exist for the human path.
 
-A Runtime virtual SSR entry statically exports App and its router provider. Each
-request loads that entry once, so both values always use one module-graph snapshot
-and one `SsrRouterContext` identity even while the watcher invalidates modules.
+A Runtime virtual SSR entry imports React, React DOM Server, App, and its router
+provider, then performs the render inside that module. Each request loads that entry
+once, so the renderer and complete tree use one session module-graph snapshot and one
+React/context identity even while the watcher invalidates modules. A fixture runtime
+whose dependency root contains a physically separate React installation passes; the
+Runtime package does not bind SSR to its own React copy.
 
 The measured incremental cost supports this choice. On an already-live session, the
-first SSR module load took about 60 ms and subsequent complete render/clean/convert
+first SSR module load took about 61-65 ms and subsequent complete render/clean/convert
 runs had a median around 1 ms. The Vite watcher also invalidated a changed
 route module and the next SSR request returned the new content.
 
@@ -70,9 +73,10 @@ Vite owns both behaviors; SSR does not invent another asset pipeline.
   import returned Vite's canonical `/@fs/` URL; cleanup proved containment in the
   canonical workspace, removed the absolute local path, and emitted a caller-base
   URL (`/show/<session>/src/...`) instead.
-- The browser-only vendor import-map plugin now steps aside for `options.ssr`; Node
-  resolves the real shared React and Show UI packages. Browser transforms retain the
-  existing import-map behavior.
+- The browser-only vendor import-map plugin now steps aside for `options.ssr`; the
+  session Vite graph resolves the real React, React DOM Server, and Show UI packages
+  from the prepared dependency root. Browser transforms retain the existing import-map
+  behavior.
 
 ## Cancellation And Bounds
 
@@ -99,18 +103,18 @@ for each run and the repository semantic + nested-route fixture:
 
 | Measurement | Result |
 | --- | ---: |
-| Completely cold session warm | 0.68-0.97 s |
-| First SSR after session warm | 65.62-75.36 ms |
-| Completely cold total | about 0.75-1.05 s |
-| First SSR module load | 54.40-63.15 ms |
-| First React render | 4.54-4.75 ms |
-| First cleanup | 2.60-3.03 ms |
-| First Turndown conversion | 3.56-4.44 ms |
-| Warm complete SSR, median of 20 | 0.83-1.13 ms |
-| Warm complete SSR, p95 of 20 | 3.58-4.11 ms |
-| RSS added by cold live session | 86.3-90.8 MiB |
-| RSS added by first SSR | 7.0-7.4 MiB |
-| RSS added by 20 warm SSR runs | 0.5-0.6 MiB |
+| Completely cold session warm | 0.68-0.77 s |
+| First SSR after session warm | 73.37-78.21 ms |
+| Completely cold total | about 0.75-0.85 s |
+| First SSR module load | 60.81-64.76 ms |
+| First React render | 4.77-5.75 ms |
+| First cleanup | 2.90-2.99 ms |
+| First Turndown conversion | 4.30-4.85 ms |
+| Warm complete SSR, median of 20 | 0.96-1.11 ms |
+| Warm complete SSR, p95 of 20 | 3.58-4.54 ms |
+| RSS added by cold live session | 85.0-89.6 MiB |
+| RSS added by first SSR | 7.3-8.7 MiB |
+| RSS added by 20 warm SSR runs | 0.4-0.5 MiB |
 
 The benchmark created no Playwright browser cache. Reproduce it with
 `npm run benchmark:ssr-markdown`.
@@ -119,17 +123,21 @@ The benchmark created no Playwright browser cache. Reproduce it with
 
 The existing exact error for browser-only access at module evaluation or React render
 time is `render_failed`, HTTP 502. Both `window` at module evaluation and `document`
-during render are fixture-tested. There is no browser or HTML fallback.
+during render are fixture-tested. A page-originated error named `AbortError` also maps
+to this envelope unless the request's own signal has actually been cancelled. There is
+no browser or HTML fallback.
 
 ## Fixture Matrix
 
 | Fixture | Proven behavior |
 | --- | --- |
 | Semantic index | `h1`/paragraph Markdown, built-in Card/Badge, CSS import, SVG import, pre-effect `Loading...` tree |
-| Nested `teams/[team]` | Server pathname, dynamic param, query, and caller-base Link href |
+| Nested `teams/[team]` | Server pathname, dynamic param, query, generated Link, and page-base relative URL resolution |
 | Cleanup markup | `data-agent-hidden`, script, and style removal; `agent-note` blockquote preservation |
 | Module-window | Top-level `window` maps to deterministic `render_failed` |
 | Render-document | Render-time `document` maps to deterministic `render_failed` |
+| Render-abort | A page-owned `AbortError` maps to `render_failed` while the request is active |
+| Session-react | A hook renders with a physically independent dependency-root React installation |
 | Cancellation harness | Abort stops the pipeline before render and conversion |
 | Watcher mutation | Workspace fingerprint/cache key changes and Vite SSR returns edited content |
 
