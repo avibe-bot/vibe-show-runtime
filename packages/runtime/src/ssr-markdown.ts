@@ -15,6 +15,7 @@ import {
   convertRenderedHtmlToMarkdown,
   MarkdownRenderError
 } from "./markdown-core.js"
+import { SSR_MARKDOWN_ENTRY_ID } from "./ssr-markdown-entry-plugin.js"
 
 const DEFAULT_SSR_MARKDOWN_MAX_BYTES = 512 * 1024
 const SSR_ORIGIN = "http://show-runtime.local"
@@ -93,17 +94,16 @@ export async function renderSsrMarkdown(request: SsrMarkdownRequest): Promise<Ss
     const maxOutputBytes = positiveInteger(request.maxOutputBytes, DEFAULT_SSR_MARKDOWN_MAX_BYTES)
     return await runSsrMarkdownPipeline({
       async load() {
-        const appModule = await request.vite.ssrLoadModule("/src/App.tsx") as Record<string, unknown>
-        const routerModule = await request.vite.ssrLoadModule("/src/router.tsx") as Record<string, unknown>
-        if (!isRenderableComponent(appModule.default)) {
+        const entryModule = await request.vite.ssrLoadModule(SSR_MARKDOWN_ENTRY_ID) as Record<string, unknown>
+        if (!isRenderableComponent(entryModule.App)) {
           throw new Error("The Show Page App module has no renderable default export")
         }
-        if (!isRenderableComponent(routerModule.SsrRouterProvider)) {
+        if (!isRenderableComponent(entryModule.RouterProvider)) {
           throw new Error("The Show Page router has no SSR provider")
         }
         return {
-          App: appModule.default as LoadedSsrModules["App"],
-          RouterProvider: routerModule.SsrRouterProvider as LoadedSsrModules["RouterProvider"]
+          App: entryModule.App as LoadedSsrModules["App"],
+          RouterProvider: entryModule.RouterProvider as LoadedSsrModules["RouterProvider"]
         }
       },
       render({ App, RouterProvider }) {

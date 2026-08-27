@@ -20,6 +20,7 @@ import {
 import type { ShowRuntime, ShowRuntimeOptions, ShowSession, ShowSessionStatus } from "./types.js"
 import { createShadcnAlias } from "./aliases.js"
 import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
+import { ssrMarkdownEntryPlugin } from "./ssr-markdown-entry-plugin.js"
 import { ensureSessionTemplate } from "./templates.js"
 import { createVendorExternalizePlugins, isProvidedVendorSpecifier } from "./vendor-externalize-plugin.js"
 import {
@@ -691,6 +692,7 @@ export function createShowRuntime(
       },
       plugins: [
         workspaceFileBoundaryPlugin(fileBoundary),
+        ssrMarkdownEntryPlugin(),
         vendorImportMapPlugin(bundle),
         ...createVendorExternalizePlugins(providedSpecifiers),
         // Extras sessions resolve their own declared extras from workspace/node_modules;

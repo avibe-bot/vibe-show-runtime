@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { createShowRuntime } from "./runtime.js"
+import { SSR_MARKDOWN_ENTRY_ID } from "./ssr-markdown-entry-plugin.js"
 import {
   createSsrMarkdownCacheKey,
   cleanupSsrRenderedHtml,
@@ -117,6 +118,24 @@ describe("Vite SSR Markdown spike", () => {
     expect(result.markdown).toContain(
       "[Change period](/show/semantic/teams/acme?period=Q4)"
     )
+  })
+
+  it("loads App and its router provider through one SSR module snapshot", async () => {
+    const vite = await fixtureVite("semantic")
+    const loadModule = vi.spyOn(vite, "ssrLoadModule")
+    try {
+      const result = await renderSsrMarkdown({
+        vite,
+        target: "/teams/acme?period=Q3",
+        basePath: "/show/semantic/"
+      })
+
+      expect(result.markdown).toContain("# Team acme")
+      expect(loadModule).toHaveBeenCalledOnce()
+      expect(loadModule).toHaveBeenCalledWith(SSR_MARKDOWN_ENTRY_ID)
+    } finally {
+      loadModule.mockRestore()
+    }
   })
 
   it("does not expose an unmappable Vite filesystem asset URL", async () => {

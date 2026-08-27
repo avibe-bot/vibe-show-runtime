@@ -19,6 +19,10 @@ server evaluation mode without creating a second artifact lifecycle. An SSR buil
 would duplicate dependency preparation, cache storage, invalidation, and cleanup
 while the live graph still has to exist for the human path.
 
+A Runtime virtual SSR entry statically exports App and its router provider. Each
+request loads that entry once, so both values always use one module-graph snapshot
+and one `SsrRouterContext` identity even while the watcher invalidates modules.
+
 The measured incremental cost supports this choice. On an already-live session, the
 first SSR module load took about 60 ms and subsequent complete render/clean/convert
 runs had a median around 1 ms. The Vite watcher also invalidated a changed
@@ -89,7 +93,7 @@ but they cannot interrupt synchronous JavaScript while it holds the event loop. 
 
 ## Measurements
 
-Measured across four independent runs on 2026-08-27 with Node v22.19.0 on an
+Measured across five independent runs on 2026-08-27 with Node v22.19.0 on an
 Apple M1 Pro (32 GiB, macOS arm64), using a new empty temporary Vite/vendor cache
 for each run and the repository semantic + nested-route fixture:
 
@@ -103,8 +107,8 @@ for each run and the repository semantic + nested-route fixture:
 | First cleanup | 2.60-3.03 ms |
 | First Turndown conversion | 3.56-4.44 ms |
 | Warm complete SSR, median of 20 | 0.83-1.13 ms |
-| Warm complete SSR, p95 of 20 | 3.86-4.11 ms |
-| RSS added by cold live session | 87.0-90.8 MiB |
+| Warm complete SSR, p95 of 20 | 3.58-4.11 ms |
+| RSS added by cold live session | 86.3-90.8 MiB |
 | RSS added by first SSR | 7.0-7.4 MiB |
 | RSS added by 20 warm SSR runs | 0.5-0.6 MiB |
 
