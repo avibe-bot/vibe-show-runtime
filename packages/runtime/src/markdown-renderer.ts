@@ -1,12 +1,22 @@
-import { spawn } from "node:child_process"
-import { createRequire } from "node:module"
-import { dirname, join } from "node:path"
-import { chromium } from "playwright-core"
+import { realpath } from "node:fs/promises"
+import { isAbsolute, relative, resolve, sep } from "node:path"
+import { Worker } from "node:worker_threads"
+import type { FSWatcher, ViteDevServer } from "vite"
+import type { FetchFunctionOptions } from "vite/module-runner"
 import {
   convertRenderedHtmlToMarkdown,
   MarkdownRenderError,
   type MarkdownRenderErrorCode
 } from "./markdown-core.js"
+import type {
+  SsrMarkdownConversionOptions,
+  SsrMarkdownConversionResult
+} from "./ssr-markdown-conversion.js"
+import {
+  createSsrMarkdownCacheKey,
+  type SsrRouteLocation
+} from "./ssr-markdown.js"
+import { SSR_MARKDOWN_ENTRY_ID } from "./ssr-markdown-entry-plugin.js"
 import {
   createWorkspaceFingerprinter,
   type WorkspaceFingerprinter
@@ -19,118 +29,77 @@ export {
   type MarkdownRenderErrorCode
 } from "./markdown-core.js"
 
-export const DEFAULT_MARKDOWN_RENDER_TIMEOUT_MS = 30_000
+export const DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS = 10_000
+export const DEFAULT_MARKDOWN_REACT_TIMEOUT_MS = 5_000
+export const DEFAULT_MARKDOWN_CONVERSION_TIMEOUT_MS = 5_000
 export const DEFAULT_MARKDOWN_CACHE_TTL_MS = 30_000
 export const DEFAULT_MARKDOWN_CACHE_ENTRIES_PER_SESSION = 64
 export const DEFAULT_MARKDOWN_CACHE_ENTRIES_GLOBAL = 256
 export const DEFAULT_MARKDOWN_MAX_BYTES = 512 * 1024
-export const DEFAULT_BROWSER_IDLE_MS = 60_000
-export const DEFAULT_BROWSER_PROVISION_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_MARKDOWN_CACHE_MAINTENANCE_INTERVAL_MS = 5_000
-const DEFAULT_RENDER_QUIET_PERIOD_MS = 150
-const DEFAULT_RENDER_AMBIGUITY_BUDGET_MS = 5_000
-const SYSTEM_BROWSER_CHANNELS = ["chrome", "msedge"] as const
-const MANAGED_BROWSER_TARGET = "managed" as const
-const PLAYWRIGHT_CLI_PATH = join(
-  dirname(createRequire(import.meta.url).resolve("playwright-core/package.json")),
-  "cli.js"
-)
+const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
+const WATCHER_EVENTS = ["add", "change", "unlink", "addDir", "unlinkDir"] as const
 
 export type ShowRenderContext = "private" | "shared"
+export type SsrMarkdownPreparedSession = {
+  vite: ViteDevServer
+  internalBasePath: string
+  origin: string
+}
+
 export type MarkdownRenderRequest = {
   sessionId: string
   context: ShowRenderContext
   basePath: string
   target: string
-  internalBasePath: string
-  renderUrl: string
   workspace: string
-  prepare: () => Promise<{ fingerprint: string }>
+  signal?: AbortSignal
+  prepare(signal: AbortSignal): Promise<SsrMarkdownPreparedSession>
+}
+
+export type MarkdownRenderPhase = "load" | "render" | "conversion"
+export type MarkdownRenderPhaseTiming = {
+  sessionId: string
+  phase: MarkdownRenderPhase
+  durationMs: number
+  outcome: "ok" | "error" | "timeout" | "cancelled"
 }
 
 export type MarkdownRenderResult = {
   markdown: string
   cache: "hit" | "miss"
+  timings: Partial<Record<MarkdownRenderPhase, number>>
 }
 
-export type MarkdownNavigationResponse = {
-  ok(): boolean
-  status(): number
-}
-
-export type MarkdownNetworkRequest = {
-  method(): string
-  resourceType(): string
-  url(): string
-}
-
-export type MarkdownNetworkResponse = {
-  request(): MarkdownNetworkRequest
-  headers(): Record<string, string>
-}
-
-type MarkdownNetworkRequestEvent = "request" | "requestfinished" | "requestfailed"
-
-export type MarkdownPage = {
-  goto(
-    url: string,
-    options: { waitUntil: "domcontentloaded"; timeout: number }
-  ): Promise<MarkdownNavigationResponse | null>
-  on(event: MarkdownNetworkRequestEvent, listener: (request: MarkdownNetworkRequest) => void): void
-  on(event: "response", listener: (response: MarkdownNetworkResponse) => void): void
-  off(event: MarkdownNetworkRequestEvent, listener: (request: MarkdownNetworkRequest) => void): void
-  off(event: "response", listener: (response: MarkdownNetworkResponse) => void): void
-  evaluate<Result>(pageFunction: () => Result | Promise<Result>): Promise<Result>
-  evaluate<Result, Argument>(
-    pageFunction: (argument: Argument) => Result | Promise<Result>,
-    argument: Argument
-  ): Promise<Result>
-}
-
-export type MarkdownBrowserContext = {
-  newPage(): Promise<MarkdownPage>
+export type SsrMarkdownWorker = {
+  load(sessionId: string, vite: ViteDevServer): Promise<void>
+  render(sessionId: string, location: SsrRouteLocation): Promise<string>
+  convert(
+    sessionId: string,
+    html: string,
+    options: SsrMarkdownConversionOptions
+  ): Promise<SsrMarkdownConversionResult>
+  invalidateSession(sessionId: string): Promise<void>
+  terminate(): Promise<void>
   close(): Promise<void>
 }
 
-export type MarkdownBrowser = {
-  isConnected(): boolean
-  newContext(): Promise<MarkdownBrowserContext>
-  close(): Promise<void>
-  on(event: "disconnected", listener: () => void): void
-}
-
-export type SystemBrowserChannel = typeof SYSTEM_BROWSER_CHANNELS[number]
-export type BrowserTarget = SystemBrowserChannel | typeof MANAGED_BROWSER_TARGET
-export type BrowserLauncher = (
-  target: BrowserTarget,
-  timeoutMs: number
-) => Promise<MarkdownBrowser>
-
-export type BrowserProvisionResult = {
-  ok: boolean
-  missingLinuxDependencies?: boolean
-  error?: unknown
-}
-
-export type BrowserProvisioner = (timeoutMs: number) => Promise<BrowserProvisionResult>
+type WorkerFactory = (url: URL) => Worker
 
 export type MarkdownRendererOptions = {
-  timeoutMs?: number
+  loadTimeoutMs?: number
+  reactTimeoutMs?: number
+  conversionTimeoutMs?: number
   cacheTtlMs?: number
   cacheEntriesPerSession?: number
   cacheEntriesGlobal?: number
   cacheMaintenanceIntervalMs?: number
   maxOutputBytes?: number
-  browserIdleMs?: number
-  quietPeriodMs?: number
-  ambiguityBudgetMs?: number
-  browserDiscoveryDisabled?: boolean
-  browserProvisioningDisabled?: boolean
-  browserProvisionTimeoutMs?: number
-  launchBrowser?: BrowserLauncher
-  provisionBrowser?: BrowserProvisioner
   workspaceFingerprinter?: WorkspaceFingerprinter
+  worker?: SsrMarkdownWorker
+  workerFactory?: WorkerFactory
   now?: () => number
+  onPhaseTiming?: (timing: MarkdownRenderPhaseTiming) => void
 }
 
 export type MarkdownRenderer = {
@@ -142,20 +111,28 @@ export type MarkdownRenderer = {
 type CacheEntry = {
   sessionId: string
   markdown: string
-  fingerprint: string
   createdAt: number
 }
 
-type CleanedDocument = {
-  html: string
-  mountEmpty: boolean
-  outputTooLarge: boolean
+type WatcherBinding = {
+  vite: ViteDevServer
+  workspace: string
+  watcher: FSWatcher
+  listener: (path: string) => void
 }
 
 export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): MarkdownRenderer {
-  const timeoutMs = positiveInteger(
-    options.timeoutMs ?? envInteger("VIBE_SHOW_RENDER_TIMEOUT_MS"),
-    DEFAULT_MARKDOWN_RENDER_TIMEOUT_MS
+  const loadTimeoutMs = positiveInteger(
+    options.loadTimeoutMs ?? envInteger("VIBE_SHOW_RENDER_LOAD_TIMEOUT_MS"),
+    DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS
+  )
+  const reactTimeoutMs = positiveInteger(
+    options.reactTimeoutMs ?? envInteger("VIBE_SHOW_RENDER_REACT_TIMEOUT_MS"),
+    DEFAULT_MARKDOWN_REACT_TIMEOUT_MS
+  )
+  const conversionTimeoutMs = positiveInteger(
+    options.conversionTimeoutMs ?? envInteger("VIBE_SHOW_RENDER_CONVERSION_TIMEOUT_MS"),
+    DEFAULT_MARKDOWN_CONVERSION_TIMEOUT_MS
   )
   const cacheTtlMs = nonNegativeInteger(
     options.cacheTtlMs ?? envInteger("VIBE_SHOW_RENDER_CACHE_TTL_MS"),
@@ -177,32 +154,9 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
     options.maxOutputBytes ?? envInteger("VIBE_SHOW_RENDER_MAX_BYTES"),
     DEFAULT_MARKDOWN_MAX_BYTES
   )
-  const browserIdleMs = nonNegativeInteger(
-    options.browserIdleMs ?? envInteger("VIBE_SHOW_RENDER_BROWSER_IDLE_MS"),
-    DEFAULT_BROWSER_IDLE_MS
-  )
-  const quietPeriodMs = nonNegativeInteger(options.quietPeriodMs, DEFAULT_RENDER_QUIET_PERIOD_MS)
-  const ambiguityBudgetMs = nonNegativeInteger(
-    options.ambiguityBudgetMs ?? envInteger("VIBE_SHOW_RENDER_AMBIGUITY_BUDGET_MS"),
-    DEFAULT_RENDER_AMBIGUITY_BUDGET_MS
-  )
-  const browserProvisionTimeoutMs = positiveInteger(
-    options.browserProvisionTimeoutMs,
-    positiveInteger(
-      envInteger("AVIBE_SHOW_RENDER_PROVISION_TIMEOUT_MS"),
-      DEFAULT_BROWSER_PROVISION_TIMEOUT_MS
-    )
-  )
   const now = options.now ?? Date.now
   const workspaceFingerprinter = options.workspaceFingerprinter ?? createWorkspaceFingerprinter()
-  const browserPool = new BrowserPool({
-    idleMs: browserIdleMs,
-    discoveryDisabled: options.browserDiscoveryDisabled ?? envFlag("VIBE_SHOW_RENDER_DISABLE_BROWSER_DISCOVERY"),
-    provisioningDisabled: options.browserProvisioningDisabled ?? envFlag("AVIBE_SHOW_RENDER_NO_PROVISION"),
-    provisionTimeoutMs: browserProvisionTimeoutMs,
-    launchBrowser: options.launchBrowser ?? launchBrowserTarget,
-    provisionBrowser: options.provisionBrowser ?? provisionManagedBrowser
-  })
+  const worker = options.worker ?? createModuleGraphSsrWorker(options.workerFactory)
   const mutex = new AsyncMutex()
   const cache = new MarkdownRenderCache({
     ttlMs: cacheTtlMs,
@@ -210,534 +164,601 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
     entriesGlobal: cacheEntriesGlobal,
     now
   })
+  const loadedFingerprints = new Map<string, string>()
+  const watcherBindings = new Map<string, WatcherBinding>()
+  const scheduledInvalidations = new Set<string>()
+  const closeController = new AbortController()
   const cacheMaintenanceTimer = cacheTtlMs > 0
     ? setInterval(() => cache.deleteExpired(), cacheMaintenanceIntervalMs)
     : undefined
   cacheMaintenanceTimer?.unref?.()
   let closed = false
 
-  return {
+  const renderer: MarkdownRenderer = {
     async render(request) {
-      if (closed) {
-        throw renderFailed("The Markdown renderer is closed.")
-      }
-      const deadline = new RenderDeadline(timeoutMs)
+      if (closed) throw rendererUnavailable("The SSR Markdown renderer is closed.")
+      const combined = combineAbortSignals(request.signal, closeController.signal)
+      const timings: Partial<Record<MarkdownRenderPhase, number>> = {}
 
       try {
-        const cacheKey = renderCacheKey(request)
-        const initialFingerprint = await deadline.wait(fingerprintOrRenderFailed(
-          workspaceFingerprinter,
-          request.sessionId,
-          request.workspace
-        ))
-        const initialHit = cache.get(cacheKey, initialFingerprint)
+        throwIfAborted(combined.signal)
+        const initialBudget = new PhaseBudget("load", loadTimeoutMs)
+        const initialFingerprint = await initialBudget.wait(
+          fingerprintOrRenderFailed(workspaceFingerprinter, request.sessionId, request.workspace),
+          combined.signal
+        )
+        const initialKey = renderCacheKey(request, initialFingerprint)
+        const initialHit = cache.get(initialKey)
         if (initialHit) {
-          return { markdown: initialHit.markdown, cache: "hit" }
+          return { markdown: initialHit.markdown, cache: "hit", timings }
         }
 
-        const waitStart = Date.now()
         return await mutex.runExclusive(async () => {
-          deadline.extendBy(Date.now() - waitStart)
-          const lockedFingerprint = await deadline.wait(fingerprintOrRenderFailed(
-            workspaceFingerprinter,
-            request.sessionId,
-            request.workspace
-          ))
-          const lockedHit = cache.get(cacheKey, lockedFingerprint)
-          if (lockedHit) {
-            return { markdown: lockedHit.markdown, cache: "hit" }
+          throwIfAborted(combined.signal)
+          const loadStarted = performance.now()
+          const loadBudget = new PhaseBudget("load", loadTimeoutMs)
+          let loadOutcome: MarkdownRenderPhaseTiming["outcome"] = "ok"
+          let prepared!: SsrMarkdownPreparedSession
+          let fingerprint!: string
+          let cacheKey!: string
+          try {
+            const lockedFingerprint = await loadBudget.wait(
+              fingerprintOrRenderFailed(workspaceFingerprinter, request.sessionId, request.workspace),
+              combined.signal
+            )
+            const lockedKey = renderCacheKey(request, lockedFingerprint)
+            const lockedHit = cache.get(lockedKey)
+            if (lockedHit) {
+              return { markdown: lockedHit.markdown, cache: "hit", timings }
+            }
+
+            prepared = await loadBudget.wait(request.prepare(combined.signal), combined.signal)
+            const watcherChanged = await loadBudget.wait(
+              bindSessionWatcher(request.sessionId, request.workspace, prepared.vite),
+              combined.signal
+            )
+            if (watcherChanged) {
+              loadedFingerprints.delete(request.sessionId)
+              await runWorkerOperation(
+                loadBudget,
+                combined.signal,
+                worker,
+                () => worker.invalidateSession(request.sessionId)
+              )
+            }
+
+            fingerprint = await loadBudget.wait(
+              fingerprintOrRenderFailed(workspaceFingerprinter, request.sessionId, request.workspace),
+              combined.signal
+            )
+            cacheKey = renderCacheKey(request, fingerprint)
+            const preparedHit = cache.get(cacheKey)
+            if (preparedHit) {
+              return { markdown: preparedHit.markdown, cache: "hit", timings }
+            }
+
+            const loadedFingerprint = loadedFingerprints.get(request.sessionId)
+            if (loadedFingerprint !== undefined && loadedFingerprint !== fingerprint) {
+              invalidateViteSsrGraph(prepared.vite)
+              await runWorkerOperation(
+                loadBudget,
+                combined.signal,
+                worker,
+                () => worker.invalidateSession(request.sessionId)
+              )
+            }
+            await runWorkerOperation(
+              loadBudget,
+              combined.signal,
+              worker,
+              () => worker.load(request.sessionId, prepared.vite)
+            )
+            loadedFingerprints.set(request.sessionId, fingerprint)
+          } catch (error) {
+            loadOutcome = phaseOutcome(error, combined.signal)
+            throw error
+          } finally {
+            timings.load = performance.now() - loadStarted
+            emitPhaseTiming(request.sessionId, "load", timings.load, loadOutcome)
           }
 
-          const snapshot = await deadline.wait(request.prepare())
-          const preparedHit = cache.get(cacheKey, snapshot.fingerprint)
-          if (preparedHit) {
-            return { markdown: preparedHit.markdown, cache: "hit" }
+          const location = ssrRouteLocation(request, prepared)
+          const renderStarted = performance.now()
+          const renderBudget = new PhaseBudget("render", reactTimeoutMs)
+          let renderOutcome: MarkdownRenderPhaseTiming["outcome"] = "ok"
+          let html: string
+          try {
+            html = await runWorkerOperation(
+              renderBudget,
+              combined.signal,
+              worker,
+              () => worker.render(request.sessionId, location)
+            )
+            if (typeof html !== "string") throw new Error("The SSR worker returned invalid HTML")
+          } catch (error) {
+            renderOutcome = phaseOutcome(error, combined.signal)
+            throw error
+          } finally {
+            timings.render = performance.now() - renderStarted
+            emitPhaseTiming(request.sessionId, "render", timings.render, renderOutcome)
           }
 
-          const markdown = await renderPageToMarkdown({
-            request,
-            browserPool,
-            deadline,
-            timeoutMs,
-            quietPeriodMs,
-            ambiguityBudgetMs,
-            maxOutputBytes
-          })
+          const conversionStarted = performance.now()
+          const conversionBudget = new PhaseBudget("conversion", conversionTimeoutMs)
+          let conversionOutcome: MarkdownRenderPhaseTiming["outcome"] = "ok"
+          let converted: SsrMarkdownConversionResult
+          try {
+            const canonicalWorkspace = await conversionBudget.wait(
+              realpath(request.workspace),
+              combined.signal
+            )
+            converted = await runWorkerOperation(
+              conversionBudget,
+              combined.signal,
+              worker,
+              () => worker.convert(request.sessionId, html, {
+                documentUrl: ssrDocumentUrl(request, prepared),
+                basePath: request.basePath,
+                internalBasePath: prepared.internalBasePath,
+                workspace: canonicalWorkspace,
+                maxOutputBytes
+              })
+            )
+            if (
+              !converted ||
+              typeof converted.markdown !== "string" ||
+              typeof converted.html !== "string"
+            ) {
+              throw new Error("The SSR worker returned an invalid conversion result")
+            }
+            if (!converted.markdown.trim()) throw new Error("The rendered page has no Markdown content")
+            if (Buffer.byteLength(converted.markdown, "utf8") > maxOutputBytes) {
+              throw outputTooLarge(maxOutputBytes)
+            }
+          } catch (error) {
+            conversionOutcome = phaseOutcome(error, combined.signal)
+            throw error
+          } finally {
+            timings.conversion = performance.now() - conversionStarted
+            emitPhaseTiming(request.sessionId, "conversion", timings.conversion, conversionOutcome)
+          }
 
           cache.set(cacheKey, {
             sessionId: request.sessionId,
-            markdown,
-            fingerprint: snapshot.fingerprint
+            markdown: converted.markdown
           })
-          return { markdown, cache: "miss" }
-        })
+          return { markdown: converted.markdown, cache: "miss", timings }
+        }, combined.signal)
       } catch (error) {
-        throw normalizeRenderError(error, timeoutMs, deadline)
+        throw normalizeRenderError(error, combined.signal, {
+          load: loadTimeoutMs,
+          render: reactTimeoutMs,
+          conversion: conversionTimeoutMs
+        }, maxOutputBytes)
+      } finally {
+        combined.dispose()
       }
     },
+
     async invalidateSession(sessionId, releaseResources) {
       if (closed) return
+      cache.invalidateSession(sessionId)
+      workspaceFingerprinter.invalidateSession(sessionId)
+      unbindSessionWatcher(sessionId)
       await mutex.runExclusive(async () => {
         cache.invalidateSession(sessionId)
         workspaceFingerprinter.invalidateSession(sessionId)
+        loadedFingerprints.delete(sessionId)
+        const budget = new PhaseBudget("load", loadTimeoutMs)
+        try {
+          await runWorkerOperation(
+            budget,
+            closeController.signal,
+            worker,
+            () => worker.invalidateSession(sessionId)
+          )
+        } catch {
+          await worker.terminate()
+        }
         await releaseResources?.()
-      })
+      }, closeController.signal)
     },
+
     async close() {
+      if (closed) return
       closed = true
+      closeController.abort(new DOMException("The SSR Markdown renderer is closing.", "AbortError"))
       if (cacheMaintenanceTimer) clearInterval(cacheMaintenanceTimer)
       cache.clear()
       workspaceFingerprinter.clear()
-      await mutex.runExclusive(() => browserPool.close())
+      loadedFingerprints.clear()
+      for (const sessionId of [...watcherBindings.keys()]) unbindSessionWatcher(sessionId)
+      await worker.terminate()
+      await mutex.runExclusive(() => worker.close())
     }
   }
-}
 
-async function renderPageToMarkdown(options: {
-  request: MarkdownRenderRequest
-  browserPool: BrowserPool
-  deadline: RenderDeadline
-  timeoutMs: number
-  quietPeriodMs: number
-  ambiguityBudgetMs: number
-  maxOutputBytes: number
-}): Promise<string> {
-  const {
-    request,
-    browserPool,
-    deadline,
-    timeoutMs,
-    quietPeriodMs,
-    ambiguityBudgetMs,
-    maxOutputBytes
-  } = options
-  let browser: MarkdownBrowser | undefined
-  let context: MarkdownBrowserContext | undefined
-  let network: RenderNetworkTracker | undefined
-  let timedOut = false
-
-  try {
-    browser = await browserPool.acquire(deadline)
-    // A fresh context has no cookies, storage, credentials, or caller headers.
-    context = await deadline.wait(browser.newContext())
-    const page = await deadline.wait(context.newPage())
-    network = trackRenderNetwork(page, quietPeriodMs, ambiguityBudgetMs)
-    const navigation = await deadline.wait(page.goto(request.renderUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: deadline.remaining()
+  function emitPhaseTiming(
+    sessionId: string,
+    phase: MarkdownRenderPhase,
+    durationMs: number,
+    outcome: MarkdownRenderPhaseTiming["outcome"]
+  ): void {
+    options.onPhaseTiming?.({ sessionId, phase, durationMs, outcome })
+    if (durationMs < SLOW_TIMING_MS) return
+    console.error(JSON.stringify({
+      level: "warn",
+      source: "show-runtime",
+      event: "ssr-markdown-slow-phase",
+      sessionId,
+      phase,
+      outcome,
+      durationMs: Number(durationMs.toFixed(1))
     }))
-    if (!navigation?.ok()) {
-      throw new Error(`Navigation returned HTTP ${navigation?.status() ?? "unknown"}`)
-    }
-    await deadline.wait(network.waitForIdle())
-    await deadline.wait(page.evaluate(settleRenderedPage, quietPeriodMs))
-    // A mount effect can start data loading after the first idle window. Observe
-    // one more idle edge before extraction, then let the page flush its result.
-    await deadline.wait(network.waitForIdle())
-    await deadline.wait(page.evaluate(settleRenderedPage, 0))
-    const cleaned = await deadline.wait(page.evaluate(cleanupRenderedDocument, {
-      basePath: request.basePath,
-      internalBasePath: request.internalBasePath,
-      maxOutputBytes
-    }))
-    if (cleaned.outputTooLarge) throw outputTooLarge(maxOutputBytes)
-    if (cleaned.mountEmpty) {
-      throw new Error("The Show Page mount is empty")
-    }
-
-    const markdown = convertRenderedHtmlToMarkdown(cleaned.html)
-    if (!markdown.trim()) {
-      throw new Error("The rendered page has no Markdown content")
-    }
-    if (Buffer.byteLength(markdown, "utf8") > maxOutputBytes) {
-      throw outputTooLarge(maxOutputBytes)
-    }
-    return markdown
-  } catch (error) {
-    if (error instanceof MarkdownRenderError) {
-      timedOut = error.code === "render_timeout"
-      throw error
-    }
-    if (isTimeoutError(error) || deadline.expired()) {
-      timedOut = true
-      throw new MarkdownRenderError(
-        "render_timeout",
-        504,
-        `Show Page rendering exceeded the ${formatTimeout(timeoutMs)} timeout.`,
-        { cause: error }
-      )
-    }
-    throw renderFailed("Show Page rendering failed.", error)
-  } finally {
-    network?.dispose()
-    try {
-      if (context) {
-        const closing = context.close().catch(() => undefined)
-        if (!timedOut) {
-          await deadline.wait(closing)
-        }
-      }
-    } finally {
-      if (browser && !browser.isConnected()) {
-        browserPool.discard(browser)
-      }
-      if (timedOut && browser) {
-        // Never hand a browser with a timed-out context to the next serialized
-        // render. Closing is best-effort because the response deadline elapsed.
-        browserPool.discard(browser)
-        void browser.close().catch(() => undefined)
-      }
-      browserPool.release()
-    }
-  }
-}
-
-type RenderNetworkTracker = {
-  waitForIdle(): Promise<void>
-  dispose(): void
-}
-
-function trackRenderNetwork(
-  page: MarkdownPage,
-  quietPeriodMs: number,
-  ambiguityBudgetMs: number
-): RenderNetworkTracker {
-  const pending = new Map<MarkdownNetworkRequest, {
-    key: string
-    ambiguousSince?: number
-  }>()
-  const completedPolls = new Set<string>()
-  let activityVersion = 0
-  let disposed = false
-
-  const requestKey = (request: MarkdownNetworkRequest) =>
-    `${request.method()}\0${request.resourceType()}\0${request.url()}`
-
-  const requestStarted = (request: MarkdownNetworkRequest) => {
-    const resourceType = request.resourceType().toLowerCase()
-    if (resourceType === "eventsource" || resourceType === "websocket") return
-    const key = requestKey(request)
-    // The first XHR/fetch populates the page; identical later requests are a
-    // polling loop and must not make a snapshot impossible.
-    if ((resourceType === "fetch" || resourceType === "xhr") && completedPolls.has(key)) return
-    pending.set(request, { key })
-    activityVersion += 1
-  }
-  const requestSettled = (request: MarkdownNetworkRequest) => {
-    const tracked = pending.get(request)
-    if (tracked === undefined) return
-    pending.delete(request)
-    const resourceType = request.resourceType().toLowerCase()
-    if (resourceType === "fetch" || resourceType === "xhr") completedPolls.add(tracked.key)
-    activityVersion += 1
-  }
-  const responseReceived = (response: MarkdownNetworkResponse) => {
-    const request = response.request()
-    const tracked = pending.get(request)
-    if (tracked === undefined) return
-    const headers = response.headers()
-    if (isStreamingContentType(headers)) {
-      requestSettled(request)
-    } else if (responseHeader(headers, "content-length") === undefined) {
-      tracked.ambiguousSince = Date.now()
-    }
   }
 
-  page.on("request", requestStarted)
-  page.on("response", responseReceived)
-  page.on("requestfinished", requestSettled)
-  page.on("requestfailed", requestSettled)
+  async function bindSessionWatcher(
+    sessionId: string,
+    workspace: string,
+    vite: ViteDevServer
+  ): Promise<boolean> {
+    const logicalWorkspace = resolve(workspace)
+    const canonicalWorkspace = await realpath(workspace)
+    const existing = watcherBindings.get(sessionId)
+    if (existing?.vite === vite && existing.workspace === canonicalWorkspace) return false
+    const changed = existing !== undefined
+    unbindSessionWatcher(sessionId)
 
-  return {
-    async waitForIdle() {
-      let idleSince: number | undefined
-      let idleVersion = -1
-      while (!disposed) {
-        const now = Date.now()
-        for (const [request, tracked] of pending) {
-          if (
-            tracked.ambiguousSince !== undefined &&
-            now - tracked.ambiguousSince >= ambiguityBudgetMs
-          ) {
-            requestSettled(request)
-          }
-        }
-        if (pending.size === 0) {
-          if (idleSince === undefined || idleVersion !== activityVersion) {
-            idleSince = now
-            idleVersion = activityVersion
-          }
-          if (now - idleSince >= quietPeriodMs) return
-        } else {
-          idleSince = undefined
-          idleVersion = activityVersion
-        }
-        await new Promise((resolve) => setTimeout(resolve, 25))
-      }
-    },
-    dispose() {
-      if (disposed) return
-      disposed = true
-      pending.clear()
-      page.off("request", requestStarted)
-      page.off("response", responseReceived)
-      page.off("requestfinished", requestSettled)
-      page.off("requestfailed", requestSettled)
-    }
-  }
-}
-
-function isStreamingContentType(headers: Record<string, string>): boolean {
-  const contentType = responseHeader(headers, "content-type")
-  const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase()
-  return mediaType === "text/event-stream" || mediaType === "application/x-ndjson"
-}
-
-function responseHeader(
-  headers: Record<string, string>,
-  expectedName: string
-): string | undefined {
-  return Object.entries(headers).find(
-    ([name]) => name.toLowerCase() === expectedName
-  )?.[1]
-}
-
-/**
- * Runs inside the browser page. Keep this function self-contained: Playwright
- * serializes its body and does not carry module-scope bindings with it.
- */
-export function settleRenderedPage(quietPeriodMs: number): Promise<void> {
-  return new Promise((resolve) => {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        setTimeout(resolve, quietPeriodMs)
+    const listener = (path: string) => {
+      if (
+        (!pathWithinWorkspace(path, logicalWorkspace) && !pathWithinWorkspace(path, canonicalWorkspace)) ||
+        scheduledInvalidations.has(sessionId)
+      ) return
+      invalidateViteSsrGraph(vite)
+      scheduledInvalidations.add(sessionId)
+      cache.invalidateSession(sessionId)
+      workspaceFingerprinter.invalidateSession(sessionId)
+      void renderer.invalidateSession(sessionId).catch(() => undefined).finally(() => {
+        scheduledInvalidations.delete(sessionId)
       })
+    }
+    for (const event of WATCHER_EVENTS) vite.watcher.on(event, listener)
+    watcherBindings.set(sessionId, {
+      vite,
+      workspace: canonicalWorkspace,
+      watcher: vite.watcher,
+      listener
     })
-  })
+    return changed
+  }
+
+  function unbindSessionWatcher(sessionId: string): void {
+    const binding = watcherBindings.get(sessionId)
+    if (!binding) return
+    watcherBindings.delete(sessionId)
+    for (const event of WATCHER_EVENTS) binding.watcher.off(event, binding.listener)
+  }
+
+  return renderer
 }
 
-/**
- * Runs inside the rendered page before any HTML crosses back into Node. The
- * annotation selectors mirror the runtime SDK's overlay chrome attributes.
- */
-export function cleanupRenderedDocument(options: {
-  basePath: string
-  internalBasePath: string
-  maxOutputBytes: number
-}): CleanedDocument {
-  const initialBody = document.body
-  if (initialBody && !serializedBodyWithinLimit(initialBody, options.maxOutputBytes)) {
-    return { html: "", mountEmpty: false, outputTooLarge: true }
+export function createModuleGraphSsrWorker(workerFactory?: WorkerFactory): SsrMarkdownWorker {
+  return new ModuleGraphSsrWorker(workerFactory)
+}
+
+class ModuleGraphSsrWorker implements SsrMarkdownWorker {
+  private readonly workerFactory: WorkerFactory
+  private readonly workerUrl = new URL("./ssr-markdown-worker.js", import.meta.url)
+  private readonly bindings = new Map<string, { vite: ViteDevServer, generation: number }>()
+  private readonly pending = new Map<number, {
+    command: WorkerCommandName
+    resolve(value: unknown): void
+    reject(error: Error): void
+  }>()
+  private worker: Worker | undefined
+  private nextRequestId = 1
+  private nextGeneration = 1
+  private closed = false
+
+  constructor(workerFactory: WorkerFactory = (url) => new Worker(url, {
+    // The SSR runner is self-contained. Inheriting host-only V8 flags such as
+    // --expose-gc makes Node reject worker startup with ERR_WORKER_INVALID_EXEC_ARGV.
+    execArgv: []
+  })) {
+    this.workerFactory = workerFactory
   }
 
-  const cleanupSelector = [
-    "script",
-    "style",
-    "noscript",
-    "svg",
-    "canvas",
-    '[aria-hidden="true"]',
-    "[hidden]",
-    "[data-agent-hidden]",
-    "[data-show-annotation-ui]",
-    "[data-show-annotation-capture]",
-    "[data-show-agent-mark-layer]",
-    "[data-show-annotation-root]",
-    ".avs-fallback-shell"
-  ].join(",")
-
-  for (const element of document.querySelectorAll(cleanupSelector)) {
-    element.remove()
-  }
-
-  for (const element of document.querySelectorAll<HTMLElement>("[agent-note]")) {
-    const text = element.getAttribute("agent-note")?.trim()
-    element.removeAttribute("agent-note")
-    if (!text) continue
-    const note = document.createElement("blockquote")
-    note.setAttribute("data-avibe-agent-note", "")
-    note.textContent = `agent-note: ${text}`
-    if (!element.insertAdjacentElement("afterend", note)) {
-      element.append(note)
+  async load(sessionId: string, vite: ViteDevServer): Promise<void> {
+    let binding = this.bindings.get(sessionId)
+    if (binding?.vite !== vite) {
+      await this.invalidateWorkerSession(sessionId)
+      binding = { vite, generation: this.nextGeneration++ }
+      this.bindings.set(sessionId, binding)
     }
+    await this.command("load", {
+      sessionId,
+      generation: binding.generation,
+      entryId: SSR_MARKDOWN_ENTRY_ID
+    })
   }
 
-  const documentUrl = new URL(document.URL)
-  const documentBase = new URL(document.baseURI)
-  const callerBase = new URL(options.basePath, documentUrl.origin)
-  const internalBase = new URL(options.internalBasePath, documentUrl.origin)
-  const internalRoot = internalBase.pathname.endsWith("/")
-    ? internalBase.pathname
-    : `${internalBase.pathname}/`
-  const callerRoot = callerBase.pathname.endsWith("/")
-    ? callerBase.pathname
-    : `${callerBase.pathname}/`
-  const callerDocumentBase = new URL(documentBase.href)
-  if (callerDocumentBase.origin === documentUrl.origin) {
-    const suffix = internalPathSuffix(callerDocumentBase.pathname)
-    if (suffix !== undefined) callerDocumentBase.pathname = `${callerRoot}${suffix}`
+  async render(sessionId: string, location: SsrRouteLocation): Promise<string> {
+    const binding = this.requireBinding(sessionId)
+    return await this.command("render", {
+      sessionId,
+      generation: binding.generation,
+      location
+    }) as string
   }
 
-  function internalPathSuffix(pathname: string): string | undefined {
-    if (pathname === internalRoot.slice(0, -1)) return ""
-    if (!pathname.startsWith(internalRoot)) return undefined
-    return pathname.slice(internalRoot.length).replace(/^\/+/, "")
+  async convert(
+    sessionId: string,
+    html: string,
+    options: SsrMarkdownConversionOptions
+  ): Promise<SsrMarkdownConversionResult> {
+    const binding = this.requireBinding(sessionId)
+    return await this.command("convert", {
+      sessionId,
+      generation: binding.generation,
+      html,
+      options
+    }) as SsrMarkdownConversionResult
   }
 
-  function rewriteAttribute(element: Element, attribute: "href" | "src") {
-    const raw = element.getAttribute(attribute)
-    if (raw === null || /^(?:data|javascript|mailto|tel):/i.test(raw.trim())) return
+  async invalidateSession(sessionId: string): Promise<void> {
+    this.bindings.delete(sessionId)
+    await this.invalidateWorkerSession(sessionId)
+  }
 
-    const isCallerRelative = raw === "" || raw.startsWith("#") || raw.startsWith("?") ||
-      (!raw.startsWith("/") && !/^[a-z][a-z\d+.-]*:/i.test(raw))
-    let resolved: URL
+  async terminate(): Promise<void> {
+    const worker = this.worker
+    if (!worker) return
+    this.worker = undefined
+    const error = new WorkerTerminatedError()
+    for (const pending of this.pending.values()) pending.reject(error)
+    this.pending.clear()
+    await worker.terminate().catch(() => undefined)
+  }
+
+  async close(): Promise<void> {
+    this.closed = true
+    this.bindings.clear()
+    await this.terminate()
+  }
+
+  private async invalidateWorkerSession(sessionId: string): Promise<void> {
+    if (!this.worker) return
     try {
-      resolved = new URL(raw, isCallerRelative ? callerDocumentBase : documentBase)
+      await this.command("invalidate", { sessionId })
     } catch {
-      return
+      await this.terminate()
     }
-
-    if (resolved.origin !== documentUrl.origin) {
-      element.setAttribute(attribute, resolved.href)
-      return
-    }
-
-    const suffix = internalPathSuffix(resolved.pathname)
-    if (suffix !== undefined) resolved.pathname = `${callerRoot}${suffix}`
-    element.setAttribute(attribute, `${resolved.pathname}${resolved.search}${resolved.hash}`)
   }
 
-  for (const anchor of document.querySelectorAll("a[href]")) {
-    rewriteAttribute(anchor, "href")
-  }
-  for (const image of document.querySelectorAll("img[src]")) {
-    rewriteAttribute(image, "src")
-  }
-
-  const mount = document.querySelector("#root, #app, [data-show-root]")
-  const mountEmpty = Boolean(
-    mount &&
-    !mount.textContent?.trim() &&
-    !mount.querySelector("img, picture, video, audio, input, button, table, ul, ol, dl")
-  )
-  const body = document.body
-  const withinLimit = !body || serializedBodyWithinLimit(body, options.maxOutputBytes)
-  return {
-    html: withinLimit ? body?.innerHTML.trim() ?? "" : "",
-    mountEmpty,
-    outputTooLarge: !withinLimit
+  private requireBinding(sessionId: string): { vite: ViteDevServer, generation: number } {
+    const binding = this.bindings.get(sessionId)
+    if (!binding) throw new Error("The SSR worker session is not loaded")
+    return binding
   }
 
-  function serializedBodyWithinLimit(body: HTMLElement, rawLimit: number): boolean {
-    // Compute a conservative UTF-8 serialization bound without materializing
-    // subtree HTML. The parallel node budget also caps work for empty-node trees.
-    const limit = Math.max(0, Math.floor(rawLimit))
-    const voidElements = new Set([
-      "area", "base", "br", "col", "embed", "hr", "img", "input",
-      "link", "meta", "param", "source", "track", "wbr"
-    ])
-    let bytes = 0
-    let nodes = 0
-
-    function addBytes(count: number): boolean {
-      bytes += count
-      return bytes <= limit
+  private ensureWorker(): Worker {
+    if (this.closed) throw new SsrWorkerUnavailableError("The SSR worker is closed")
+    if (this.worker) return this.worker
+    let worker: Worker
+    try {
+      worker = this.workerFactory(this.workerUrl)
+    } catch (error) {
+      throw new SsrWorkerUnavailableError("The SSR worker could not be started", { cause: error })
     }
+    this.worker = worker
+    worker.on("message", (message: WorkerMessage) => {
+      if (message?.type === "command-result") this.handleCommandResult(message)
+      else if (message?.type === "vite-rpc") void this.handleViteRpc(worker, message)
+    })
+    worker.once("error", (error) => this.failWorker(worker, error))
+    worker.once("exit", (code) => {
+      if (this.worker !== worker) return
+      this.failWorker(worker, new Error(`The SSR worker exited with code ${code}`))
+    })
+    return worker
+  }
 
-    function addString(value: string, context: "raw" | "text" | "attribute"): boolean {
-      for (let index = 0; index < value.length;) {
-        const codePoint = value.codePointAt(index) ?? 0xfffd
-        index += codePoint > 0xffff ? 2 : 1
-        let encodedBytes: number
-        if (context !== "raw" && codePoint === 0x26) encodedBytes = 5
-        else if (context !== "raw" && (codePoint === 0x3c || codePoint === 0x3e)) encodedBytes = 4
-        else if (context === "attribute" && codePoint === 0x22) encodedBytes = 6
-        else if (context === "attribute" && codePoint < 0x20 && codePoint !== 0x20) encodedBytes = 6
-        else if (context !== "raw" && codePoint === 0xa0) encodedBytes = 6
-        else if (codePoint <= 0x7f) encodedBytes = 1
-        else if (codePoint <= 0x7ff) encodedBytes = 2
-        else if (codePoint <= 0xffff) encodedBytes = 3
-        else encodedBytes = 4
-        if (!addBytes(encodedBytes)) return false
+  private command(name: WorkerCommandName, data: Record<string, unknown>): Promise<unknown> {
+    const worker = this.ensureWorker()
+    const requestId = this.nextRequestId++
+    return new Promise((resolve, reject) => {
+      this.pending.set(requestId, { command: name, resolve, reject })
+      try {
+        worker.postMessage({ type: "command", requestId, name, ...data })
+      } catch (error) {
+        this.pending.delete(requestId)
+        reject(new SsrWorkerUnavailableError("The SSR worker could not accept work", { cause: error }))
       }
-      return true
+    })
+  }
+
+  private handleCommandResult(message: WorkerCommandResult): void {
+    const pending = this.pending.get(message.requestId)
+    if (!pending) return
+    this.pending.delete(message.requestId)
+    if (message.error) {
+      pending.reject(new WorkerCommandError(pending.command, message.error))
+    } else {
+      pending.resolve(message.result)
     }
+  }
 
-    const pendingSiblings: Array<Node | null> = []
-    let node: Node | null = body.firstChild
-    while (node) {
-      nodes += 1
-      if (nodes > limit) return false
-
-      if (node.nodeType === 1) {
-        const element = node as Element
-        const tagName = element.localName || element.tagName.toLowerCase()
-        if (!addBytes(2) || !addString(tagName, "raw")) return false
-        for (let index = 0; index < element.attributes.length; index += 1) {
-          const attribute = element.attributes[index]
-          if (
-            !addBytes(4) ||
-            !addString(attribute.name, "raw") ||
-            !addString(attribute.value, "attribute")
-          ) {
-            return false
-          }
-        }
-        const isHtmlVoidElement = element.namespaceURI === "http://www.w3.org/1999/xhtml" &&
-          voidElements.has(tagName)
-        if (!isHtmlVoidElement && (!addBytes(3) || !addString(tagName, "raw"))) {
-          return false
-        }
-      } else if (node.nodeType === 3) {
-        if (!addString(node.nodeValue ?? "", "text")) return false
-      } else if (node.nodeType === 8) {
-        if (!addBytes(7) || !addString(node.nodeValue ?? "", "raw")) return false
-      } else if (!addBytes(16) || !addString(node.textContent ?? "", "text")) {
-        return false
+  private async handleViteRpc(worker: Worker, message: WorkerViteRpc): Promise<void> {
+    const binding = this.bindings.get(message.sessionId)
+    try {
+      if (!binding || binding.generation !== message.generation) {
+        throw new Error("The Vite session changed while the SSR worker was loading it")
       }
-
-      const element = node.nodeType === 1 ? node as Element : undefined
-      const firstChild = element?.localName === "template" && "content" in element
-        ? (element as HTMLTemplateElement).content.firstChild
-        : node.firstChild
-      if (firstChild) {
-        pendingSiblings.push(node.nextSibling)
-        if (pendingSiblings.length > limit) return false
-        node = firstChild
-        continue
+      const invocation = message.payload.data
+      let result: unknown
+      if (invocation.name === "fetchModule") {
+        const [id, importer, fetchOptions] = invocation.data
+        if (typeof id !== "string") throw new Error("The SSR worker sent an invalid module id")
+        result = await binding.vite.environments.ssr.fetchModule(
+          id,
+          typeof importer === "string" ? importer : undefined,
+          isRecord(fetchOptions) ? fetchOptions as FetchFunctionOptions : undefined
+        )
+      } else if (invocation.name === "getBuiltins") {
+        result = binding.vite.environments.ssr.config.resolve.builtins.map((builtin) =>
+          typeof builtin === "string"
+            ? { type: "string", value: builtin }
+            : { type: "RegExp", source: builtin.source, flags: builtin.flags }
+        )
+      } else {
+        throw new Error(`Unsupported Vite worker RPC: ${invocation.name}`)
       }
-
-      node = node.nextSibling
-      while (!node && pendingSiblings.length > 0) {
-        node = pendingSiblings.pop() ?? null
+      if (this.worker === worker) {
+        worker.postMessage({
+          type: "vite-rpc-result",
+          rpcId: message.rpcId,
+          response: { result }
+        })
+      }
+    } catch (error) {
+      if (this.worker === worker) {
+        worker.postMessage({
+          type: "vite-rpc-result",
+          rpcId: message.rpcId,
+          response: { error: serializeError(error) }
+        })
       }
     }
-    return true
+  }
+
+  private failWorker(worker: Worker, cause: unknown): void {
+    if (this.worker !== worker) return
+    this.worker = undefined
+    const error = new SsrWorkerUnavailableError("The SSR worker stopped unexpectedly", { cause })
+    for (const pending of this.pending.values()) pending.reject(error)
+    this.pending.clear()
   }
 }
 
-function outputTooLarge(maxOutputBytes: number): MarkdownRenderError {
-  return new MarkdownRenderError(
-    "output_too_large",
-    502,
-    `Rendered Markdown exceeds the ${formatByteLimit(maxOutputBytes)} output limit.`
-  )
+type WorkerCommandName = "load" | "render" | "convert" | "invalidate"
+type SerializedError = {
+  name?: string
+  message?: string
+  stack?: string
+  code?: string
+  status?: number
+}
+type WorkerCommandResult = {
+  type: "command-result"
+  requestId: number
+  result?: unknown
+  error?: SerializedError
+}
+type WorkerViteRpc = {
+  type: "vite-rpc"
+  rpcId: number
+  sessionId: string
+  generation: number
+  payload: {
+    type: "custom"
+    event: "vite:invoke"
+    data: {
+      id: string
+      name: string
+      data: unknown[]
+    }
+  }
+}
+type WorkerMessage = WorkerCommandResult | WorkerViteRpc
+
+export class SsrWorkerUnavailableError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = "SsrWorkerUnavailableError"
+  }
 }
 
-async function fingerprintOrRenderFailed(
-  fingerprinter: WorkspaceFingerprinter,
-  sessionId: string,
-  workspace: string
-): Promise<string> {
+class WorkerTerminatedError extends Error {
+  constructor() {
+    super("The SSR worker was terminated")
+    this.name = "WorkerTerminatedError"
+  }
+}
+
+class WorkerCommandError extends Error {
+  readonly code: string | undefined
+  readonly status: number | undefined
+
+  constructor(readonly command: WorkerCommandName, details: SerializedError) {
+    super(details.message ?? `The SSR worker ${command} command failed`)
+    this.name = details.name ?? "WorkerCommandError"
+    this.stack = details.stack ?? this.stack
+    this.code = details.code
+    this.status = details.status
+  }
+}
+
+class PhaseBudget {
+  private readonly expiresAt: number
+
+  constructor(readonly phase: MarkdownRenderPhase, readonly timeoutMs: number) {
+    this.expiresAt = Date.now() + timeoutMs
+  }
+
+  async wait<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+    throwIfAborted(signal)
+    const remaining = this.expiresAt - Date.now()
+    if (remaining <= 0) throw new RenderPhaseTimeoutError(this.phase)
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let abortListener: (() => void) | undefined
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new RenderPhaseTimeoutError(this.phase)), remaining)
+          timer.unref?.()
+        }),
+        new Promise<never>((_resolve, reject) => {
+          abortListener = () => reject(abortReason(signal))
+          signal.addEventListener("abort", abortListener, { once: true })
+        })
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+      if (abortListener) signal.removeEventListener("abort", abortListener)
+    }
+  }
+}
+
+class RenderPhaseTimeoutError extends Error {
+  constructor(readonly phase: MarkdownRenderPhase) {
+    super(`SSR Markdown ${phase} deadline exceeded`)
+    this.name = "TimeoutError"
+  }
+}
+
+async function runWorkerOperation<T>(
+  budget: PhaseBudget,
+  signal: AbortSignal,
+  worker: SsrMarkdownWorker,
+  operation: () => Promise<T>
+): Promise<T> {
+  throwIfAborted(signal)
+  let work: Promise<T>
   try {
-    return await fingerprinter.fingerprint(sessionId, workspace)
+    work = operation()
   } catch (error) {
-    throw renderFailed("Show Page workspace could not be read.", error)
+    throw error
   }
-}
-
-function renderCacheKey(request: MarkdownRenderRequest): string {
-  return JSON.stringify([request.sessionId, request.target, request.basePath])
+  try {
+    return await budget.wait(work, signal)
+  } catch (error) {
+    if (error instanceof RenderPhaseTimeoutError || signal.aborted) {
+      await worker.terminate()
+    }
+    throw error
+  }
 }
 
 class MarkdownRenderCache {
@@ -750,16 +771,13 @@ class MarkdownRenderCache {
     now: () => number
   }) {}
 
-  get(key: string, fingerprint: string): CacheEntry | undefined {
+  get(key: string): CacheEntry | undefined {
     const entry = this.entries.get(key)
     if (!entry) return undefined
-    if (entry.fingerprint !== fingerprint || this.isExpired(entry, this.options.now())) {
+    if (this.isExpired(entry, this.options.now())) {
       this.entries.delete(key)
       return undefined
     }
-
-    // Map insertion order is the global LRU order. A successful serve makes
-    // this entry the most recently served without extending its TTL.
     this.entries.delete(key)
     this.entries.set(key, entry)
     return entry
@@ -770,14 +788,9 @@ class MarkdownRenderCache {
     this.deleteExpired(createdAt)
     this.entries.delete(key)
     if (this.options.ttlMs === 0) return
-
     this.entries.set(key, { ...entry, createdAt })
     this.enforceSessionLimit(entry.sessionId)
     this.enforceGlobalLimit()
-  }
-
-  delete(key: string): void {
-    this.entries.delete(key)
   }
 
   deleteExpired(at = this.options.now()): void {
@@ -806,7 +819,6 @@ class MarkdownRenderCache {
       if (entry.sessionId === sessionId) overflow += 1
     }
     overflow -= this.options.entriesPerSession
-
     for (const [key, entry] of this.entries) {
       if (overflow <= 0) return
       if (entry.sessionId !== sessionId) continue
@@ -824,216 +836,18 @@ class MarkdownRenderCache {
   }
 }
 
-class BrowserPool {
-  private browser: MarkdownBrowser | undefined
-  private idleTimer: ReturnType<typeof setTimeout> | undefined
-  private disposed = false
-
-  constructor(private readonly options: {
-    idleMs: number
-    discoveryDisabled: boolean
-    provisioningDisabled: boolean
-    provisionTimeoutMs: number
-    launchBrowser: BrowserLauncher
-    provisionBrowser: BrowserProvisioner
-  }) {}
-
-  private provisionAttempted = false
-  private provisionFailure: BrowserProvisionResult | undefined
-
-  async acquire(deadline: RenderDeadline): Promise<MarkdownBrowser> {
-    this.clearIdleTimer()
-    if (this.disposed) {
-      throw renderFailed("The Markdown browser pool is closed.")
-    }
-    if (this.browser?.isConnected()) {
-      return this.browser
-    }
-    this.browser = undefined
-    const launchErrors: unknown[] = []
-    if (!this.options.discoveryDisabled) {
-      for (const channel of SYSTEM_BROWSER_CHANNELS) {
-        const launched = await this.tryLaunch(channel, deadline, launchErrors)
-        if (launched) return launched
-      }
-    }
-
-    // A previously provisioned shell remains usable even when NEW provisioning
-    // is disabled. Playwright resolves it from its user-owned browser cache.
-    const cachedManaged = await this.tryLaunch(MANAGED_BROWSER_TARGET, deadline, launchErrors)
-    if (cachedManaged) return cachedManaged
-
-    if (this.options.provisioningDisabled) {
-      throw rendererUnavailable({
-        causes: launchErrors,
-        provisioningDisabled: true
-      })
-    }
-
-    if (!this.provisionAttempted) {
-      this.provisionAttempted = true
-      const provisionStarted = Date.now()
-      try {
-        this.provisionFailure = await this.options.provisionBrowser(this.options.provisionTimeoutMs)
-      } catch (error) {
-        this.provisionFailure = {
-          ok: false,
-          missingLinuxDependencies: missingLinuxDependencies(error),
-          error
-        }
-      } finally {
-        // Browser download time is provisioning, not page-render time. Preserve
-        // the frozen hard timeout for launch/navigation/settling/extraction.
-        deadline.extendBy(Date.now() - provisionStarted)
-      }
-    }
-
-    if (this.provisionFailure?.ok) {
-      const provisioned = await this.tryLaunch(MANAGED_BROWSER_TARGET, deadline, launchErrors)
-      if (provisioned) return provisioned
-    }
-    throw rendererUnavailable({
-      causes: [...launchErrors, this.provisionFailure?.error],
-      provisioningFailed: true,
-      missingLinuxDependencies: this.provisionFailure?.missingLinuxDependencies
-    })
-  }
-
-  release(): void {
-    this.clearIdleTimer()
-    const browser = this.browser
-    if (!browser) return
-    this.idleTimer = setTimeout(() => {
-      if (this.browser !== browser) return
-      this.browser = undefined
-      void browser.close().catch(() => undefined)
-    }, this.options.idleMs)
-    this.idleTimer.unref?.()
-  }
-
-  discard(browser: MarkdownBrowser): void {
-    if (this.browser === browser) {
-      this.browser = undefined
-      this.clearIdleTimer()
-    }
-  }
-
-  async close(): Promise<void> {
-    this.disposed = true
-    this.clearIdleTimer()
-    const browser = this.browser
-    this.browser = undefined
-    if (browser) {
-      await browser.close().catch(() => undefined)
-    }
-  }
-
-  private clearIdleTimer(): void {
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer)
-      this.idleTimer = undefined
-    }
-  }
-
-  private async tryLaunch(
-    target: BrowserTarget,
-    deadline: RenderDeadline,
-    errors: unknown[]
-  ): Promise<MarkdownBrowser | undefined> {
-    try {
-      const launched = await deadline.wait(
-        this.options.launchBrowser(target, deadline.remaining())
-      )
-      if (!launched.isConnected()) {
-        await launched.close().catch(() => undefined)
-        throw new Error(`${target} disconnected during launch`)
-      }
-      launched.on("disconnected", () => {
-        if (this.browser === launched) {
-          this.browser = undefined
-          this.clearIdleTimer()
-        }
-      })
-      this.browser = launched
-      return launched
-    } catch (error) {
-      if (isTimeoutError(error) || deadline.expired()) {
-        throw new MarkdownRenderError(
-          "render_timeout",
-          504,
-          "Show Page rendering exceeded the configured timeout.",
-          { cause: error }
-        )
-      }
-      errors.push(error)
-      return undefined
-    }
-  }
-}
-
-class RenderDeadline {
-  private expiresAt: number
-
-  constructor(timeoutMs: number) {
-    this.expiresAt = Date.now() + timeoutMs
-  }
-
-  remaining(): number {
-    const remaining = this.expiresAt - Date.now()
-    if (remaining <= 0) {
-      throw new RenderDeadlineError()
-    }
-    return remaining
-  }
-
-  expired(): boolean {
-    return Date.now() >= this.expiresAt
-  }
-
-  extendBy(durationMs: number): void {
-    if (Number.isFinite(durationMs) && durationMs > 0) {
-      this.expiresAt += durationMs
-    }
-  }
-
-  async wait<T>(operation: Promise<T>): Promise<T> {
-    const remaining = this.remaining()
-    let timer: ReturnType<typeof setTimeout> | undefined
-    try {
-      return await Promise.race([
-        operation,
-        new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new RenderDeadlineError()), remaining)
-          timer.unref?.()
-        })
-      ])
-    } finally {
-      if (timer) clearTimeout(timer)
-    }
-  }
-}
-
-class RenderDeadlineError extends Error {
-  constructor() {
-    super("Markdown render deadline exceeded")
-    this.name = "TimeoutError"
-  }
-}
-
 class AsyncMutex {
   private tail = Promise.resolve()
 
-  async runExclusive<T>(operation: () => Promise<T>, deadline?: RenderDeadline): Promise<T> {
+  async runExclusive<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const previous = this.tail
     let release!: () => void
     const gate = new Promise<void>((resolve) => {
       release = resolve
     })
-    // Even a caller that times out while queued remains chained behind the
-    // current owner, so abandoning its slot never lets a later render overlap.
     this.tail = previous.then(() => gate)
     try {
-      if (deadline) await deadline.wait(previous)
+      if (signal) await waitForAbort(previous, signal)
       else await previous
     } catch (error) {
       release()
@@ -1047,139 +861,202 @@ class AsyncMutex {
   }
 }
 
-async function launchBrowserTarget(
-  target: BrowserTarget,
-  timeoutMs: number
-): Promise<MarkdownBrowser> {
-  return await chromium.launch({
-    ...(target === MANAGED_BROWSER_TARGET ? {} : { channel: target }),
-    headless: true,
-    timeout: timeoutMs
-  }) as unknown as MarkdownBrowser
+async function fingerprintOrRenderFailed(
+  fingerprinter: WorkspaceFingerprinter,
+  sessionId: string,
+  workspace: string
+): Promise<string> {
+  try {
+    return await fingerprinter.fingerprint(sessionId, workspace)
+  } catch (error) {
+    throw renderFailed("Show Page workspace could not be read.", error)
+  }
 }
 
-async function provisionManagedBrowser(timeoutMs: number): Promise<BrowserProvisionResult> {
-  return await new Promise((resolve) => {
-    const child = spawn(process.execPath, [
-      PLAYWRIGHT_CLI_PATH,
-      "install",
-      "chromium",
-      "--only-shell",
-      "--no-progress"
-    ], {
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
-    })
-    let output = ""
-    const appendOutput = (chunk: Buffer | string) => {
-      if (output.length < 64 * 1024) {
-        output += chunk.toString().slice(0, 64 * 1024 - output.length)
-      }
-    }
-    child.stdout?.on("data", appendOutput)
-    child.stderr?.on("data", appendOutput)
-
-    let settled = false
-    const finish = (result: BrowserProvisionResult) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(result)
-    }
-    const timer = setTimeout(() => {
-      child.kill()
-      finish({
-        ok: false,
-        error: new Error("Managed browser provisioning timed out")
-      })
-    }, timeoutMs)
-    child.once("error", (error) => {
-      finish({
-        ok: false,
-        missingLinuxDependencies: missingLinuxDependencies(error),
-        error
-      })
-    })
-    child.once("exit", (code, signal) => {
-      if (code === 0) {
-        finish({ ok: true })
-        return
-      }
-      const error = new Error(
-        `Managed browser provisioning failed (${signal ? `signal ${signal}` : `exit ${code ?? "unknown"}`}): ${output}`
-      )
-      finish({
-        ok: false,
-        missingLinuxDependencies: missingLinuxDependencies(error),
-        error
-      })
-    })
+function renderCacheKey(request: MarkdownRenderRequest, fingerprint: string): string {
+  return createSsrMarkdownCacheKey({
+    sessionId: request.sessionId,
+    workspaceVersion: fingerprint,
+    context: request.context,
+    target: request.target,
+    basePath: request.basePath
   })
 }
 
-function rendererUnavailable(options: {
-  causes?: unknown[]
-  provisioningDisabled?: boolean
-  provisioningFailed?: boolean
-  missingLinuxDependencies?: boolean
-} = {}): MarkdownRenderError {
-  const causes = (options.causes ?? []).filter((cause) => cause !== undefined)
-  const missingDependencies = options.missingLinuxDependencies || causes.some(missingLinuxDependencies)
-  let message: string
-  if (missingDependencies) {
-    message = "No usable browser was found because Linux browser libraries are missing. Install Google Chrome or Microsoft Edge, or run `playwright install --with-deps chromium` as root, then retry."
-  } else if (options.provisioningDisabled) {
-    message = "No usable browser was found. Install Google Chrome or Microsoft Edge, or enable managed Playwright provisioning by unsetting AVIBE_SHOW_RENDER_NO_PROVISION."
-  } else if (options.provisioningFailed) {
-    message = "No usable browser was found. Install Google Chrome or Microsoft Edge, or restore network access and restart the runtime to retry managed Playwright provisioning."
-  } else {
-    message = "No usable browser was found. Install Google Chrome or Microsoft Edge, or enable managed Playwright provisioning."
+function ssrRouteLocation(
+  request: MarkdownRenderRequest,
+  prepared: SsrMarkdownPreparedSession
+): SsrRouteLocation {
+  const target = new URL(request.target, "http://show-runtime.local")
+  return {
+    pathname: target.pathname,
+    search: target.search,
+    origin: new URL(prepared.origin).origin,
+    basePath: normalizeBasePath(request.basePath)
   }
-  return new MarkdownRenderError(
-    "renderer_unavailable",
-    503,
-    message,
-    { cause: causes.at(-1) }
+}
+
+function ssrDocumentUrl(
+  request: MarkdownRenderRequest,
+  prepared: SsrMarkdownPreparedSession
+): string {
+  const target = new URL(request.target, "http://show-runtime.local")
+  const url = new URL(normalizeBasePath(request.basePath), prepared.origin)
+  url.pathname = `${withTrailingSlash(url.pathname)}${target.pathname.replace(/^\/+/, "")}`
+  url.search = target.search
+  return url.href
+}
+
+function normalizeBasePath(basePath: string): string {
+  const pathname = new URL(basePath, "http://show-runtime.local").pathname
+  return withTrailingSlash(pathname.startsWith("/") ? pathname : `/${pathname}`)
+}
+
+function withTrailingSlash(pathname: string): string {
+  return pathname.endsWith("/") ? pathname : `${pathname}/`
+}
+
+function pathWithinWorkspace(path: string, workspace: string): boolean {
+  const candidate = resolve(path)
+  const relativePath = relative(workspace, candidate)
+  return relativePath === "" || (
+    relativePath !== ".." &&
+    !relativePath.startsWith(`..${sep}`) &&
+    !isAbsolute(relativePath)
   )
+}
+
+function invalidateViteSsrGraph(vite: ViteDevServer): void {
+  vite.environments?.ssr?.moduleGraph.invalidateAll()
+}
+
+function normalizeRenderError(
+  error: unknown,
+  signal: AbortSignal,
+  timeouts: Record<MarkdownRenderPhase, number>,
+  maxOutputBytes: number
+): MarkdownRenderError {
+  if (signal.aborted && (error === signal.reason || isAbortError(error))) throw error
+  if (error instanceof MarkdownRenderError) return error
+  if (error instanceof RenderPhaseTimeoutError) {
+    return new MarkdownRenderError(
+      "render_timeout",
+      504,
+      `Show Page ${phaseLabel(error.phase)} exceeded the ${formatTimeout(timeouts[error.phase])} timeout.`,
+      { cause: error }
+    )
+  }
+  if (error instanceof SsrWorkerUnavailableError) {
+    return rendererUnavailable("The SSR Markdown worker is unavailable.", error)
+  }
+  if (
+    error instanceof WorkerCommandError &&
+    error.command === "convert" &&
+    error.code === "output_too_large"
+  ) {
+    return outputTooLarge(maxOutputBytes)
+  }
+  return renderFailed("Show Page rendering failed.", error)
+}
+
+function phaseOutcome(
+  error: unknown,
+  signal: AbortSignal
+): MarkdownRenderPhaseTiming["outcome"] {
+  if (signal.aborted && (error === signal.reason || isAbortError(error))) return "cancelled"
+  if (error instanceof RenderPhaseTimeoutError) return "timeout"
+  return "error"
+}
+
+function phaseLabel(phase: MarkdownRenderPhase): string {
+  if (phase === "load") return "module loading"
+  if (phase === "render") return "React rendering"
+  return "Markdown conversion"
+}
+
+function outputTooLarge(maxOutputBytes: number): MarkdownRenderError {
+  return new MarkdownRenderError(
+    "output_too_large",
+    502,
+    `Rendered Markdown exceeds the ${formatByteLimit(maxOutputBytes)} output limit.`
+  )
+}
+
+function rendererUnavailable(message: string, cause?: unknown): MarkdownRenderError {
+  return new MarkdownRenderError("renderer_unavailable", 503, message, { cause })
 }
 
 function renderFailed(message: string, cause?: unknown): MarkdownRenderError {
   return new MarkdownRenderError("render_failed", 502, message, { cause })
 }
 
-function normalizeRenderError(
-  error: unknown,
-  timeoutMs: number,
-  deadline: RenderDeadline
-): MarkdownRenderError {
-  if (error instanceof MarkdownRenderError) return error
-  if (isTimeoutError(error) || deadline.expired()) {
-    return new MarkdownRenderError(
-      "render_timeout",
-      504,
-      `Show Page rendering exceeded the ${formatTimeout(timeoutMs)} timeout.`,
-      { cause: error }
-    )
+function combineAbortSignals(...signals: Array<AbortSignal | undefined>): {
+  signal: AbortSignal
+  dispose(): void
+} {
+  const controller = new AbortController()
+  const listeners: Array<{ signal: AbortSignal, listener: () => void }> = []
+  for (const signal of signals) {
+    if (!signal) continue
+    const listener = () => {
+      if (!controller.signal.aborted) controller.abort(abortReason(signal))
+    }
+    if (signal.aborted) listener()
+    else {
+      signal.addEventListener("abort", listener, { once: true })
+      listeners.push({ signal, listener })
+    }
   }
-  return renderFailed("Show Page rendering failed.", error)
+  return {
+    signal: controller.signal,
+    dispose() {
+      for (const item of listeners) item.signal.removeEventListener("abort", item.listener)
+    }
+  }
 }
 
-function isTimeoutError(error: unknown): boolean {
-  return error instanceof RenderDeadlineError || (
-    error instanceof Error && error.name === "TimeoutError"
-  )
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("SSR Markdown rendering was aborted.", "AbortError")
 }
 
-function missingLinuxDependencies(error: unknown): boolean {
-  if (process.platform !== "linux") return false
-  const message = error instanceof Error ? `${error.message}\n${String(error.cause ?? "")}` : String(error ?? "")
-  return /missing dependencies|missing libraries|install-deps|install --with-deps|shared libraries|shared object file/i.test(message)
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw abortReason(signal)
 }
 
-function envFlag(name: string): boolean {
-  const value = process.env[name]?.trim().toLowerCase()
-  return value === "1" || value === "true" || value === "yes" || value === "on"
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError"
+}
+
+async function waitForAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  throwIfAborted(signal)
+  let listener: (() => void) | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        listener = () => reject(abortReason(signal))
+        signal.addEventListener("abort", listener, { once: true })
+      })
+    ])
+  } finally {
+    if (listener) signal.removeEventListener("abort", listener)
+  }
+}
+
+function serializeError(value: unknown): SerializedError {
+  if (!(value instanceof Error)) return { name: "Error", message: String(value) }
+  return {
+    name: value.name,
+    message: value.message,
+    stack: value.stack,
+    code: "code" in value && typeof value.code === "string" ? value.code : undefined
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
 }
 
 function envInteger(name: string): number | undefined {
@@ -1208,8 +1085,5 @@ function formatTimeout(timeoutMs: number): string {
 }
 
 function formatByteLimit(bytes: number): string {
-  if (bytes % 1024 === 0) {
-    return `${bytes / 1024} KiB`
-  }
-  return `${bytes} byte`
+  return bytes % 1024 === 0 ? `${bytes / 1024} KiB` : `${bytes} bytes`
 }

@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
-import { readFile, realpath, stat } from "node:fs/promises"
-import { extname, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { readFile, stat } from "node:fs/promises"
+import { isAbsolute, join, relative, resolve } from "node:path"
 import { parse } from "node:url"
 import type { AddressInfo } from "node:net"
 import { isAgentOnlyShowEventType, isShowEventType, type AgentMark, type MarkAnchor, type ShowEvent, type ShowEventInput } from "@avibe/show-sdk"
@@ -12,16 +12,11 @@ import { isAnnotationBootstrapPath, serveAnnotationBootstrap } from "./annotatio
 import {
   createMarkdownRenderer,
   MarkdownRenderError,
-  type BrowserLauncher,
-  type BrowserProvisioner,
+  type MarkdownRendererOptions,
   type MarkdownRenderer,
+  type SsrMarkdownWorker,
   type ShowRenderContext
 } from "./markdown-renderer.js"
-import {
-  createRenderSnapshotManager,
-  type RenderSnapshot,
-  type RenderSnapshotManager
-} from "./render-snapshot.js"
 import {
   createWorkspaceFingerprinter,
   type WorkspaceFingerprinter
@@ -34,12 +29,13 @@ const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1
 const SHOW_RUNTIME_PROTOCOL_VERSION = 1
 
 export type ShowRuntimeServerDependencies = {
-  launchBrowser?: BrowserLauncher
-  renderQuietPeriodMs?: number
-  browserDiscoveryDisabled?: boolean
-  browserProvisioningDisabled?: boolean
-  provisionBrowser?: BrowserProvisioner
   workspaceFingerprinter?: WorkspaceFingerprinter
+  markdownWorker?: SsrMarkdownWorker
+  markdownRendererOptions?: Omit<
+    MarkdownRendererOptions,
+    "workspaceFingerprinter" | "worker" | "loadTimeoutMs" | "reactTimeoutMs" | "conversionTimeoutMs" |
+    "cacheTtlMs" | "maxOutputBytes"
+  >
 }
 
 export async function startShowRuntimeServer(
@@ -50,23 +46,19 @@ export async function startShowRuntimeServer(
   const port = options.port ?? 0
   const workspaceFingerprinter = dependencies.workspaceFingerprinter ?? createWorkspaceFingerprinter()
   const markdownRenderer = createMarkdownRenderer({
-    timeoutMs: options.renderTimeoutMs,
+    ...dependencies.markdownRendererOptions,
+    loadTimeoutMs: options.renderLoadTimeoutMs,
+    reactTimeoutMs: options.renderReactTimeoutMs,
+    conversionTimeoutMs: options.renderConversionTimeoutMs,
     cacheTtlMs: options.renderCacheTtlMs,
     maxOutputBytes: options.renderMaxOutputBytes,
-    browserIdleMs: options.renderBrowserIdleMs,
-    quietPeriodMs: dependencies.renderQuietPeriodMs,
-    browserDiscoveryDisabled: dependencies.browserDiscoveryDisabled,
-    browserProvisioningDisabled: dependencies.browserProvisioningDisabled,
-    browserProvisionTimeoutMs: options.renderBrowserProvisionTimeoutMs,
-    launchBrowser: dependencies.launchBrowser,
-    provisionBrowser: dependencies.provisionBrowser,
-    workspaceFingerprinter
+    workspaceFingerprinter,
+    worker: dependencies.markdownWorker
   })
   const server = createServer(async (request, response) => {
     try {
       await routeRequest(
         runtime,
-        renderSnapshots,
         request,
         response,
         eventStreams,
@@ -79,33 +71,25 @@ export async function startShowRuntimeServer(
       response.end(JSON.stringify({ error: error instanceof Error ? error.message : "Runtime error" }))
     }
   })
-  let renderSnapshots!: RenderSnapshotManager
   const runtime = createShowRuntime({
     ...options,
     server
   }, {
     async onSessionIdlePruned(sessionId) {
-      if (!renderSnapshots) return
-      await markdownRenderer.invalidateSession(
-        sessionId,
-        () => renderSnapshots.invalidateSession(sessionId)
-      )
+      await markdownRenderer.invalidateSession(sessionId)
     }
   })
-  renderSnapshots = createRenderSnapshotManager(runtime, workspaceFingerprinter)
   const eventStreams = new ShowEventStreamBroker()
 
   await new Promise<void>((resolve) => server.listen(port, host, resolve))
 
   return {
     runtime,
-    renderSnapshots,
     server,
     url: `http://${host}:${(server.address() as AddressInfo).port}`,
     async close() {
       eventStreams.close()
       await markdownRenderer.close()
-      await renderSnapshots.close()
       await runtime.close()
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
     }
@@ -114,7 +98,6 @@ export async function startShowRuntimeServer(
 
 async function routeRequest(
   runtime: ReturnType<typeof createShowRuntime>,
-  renderSnapshots: RenderSnapshotManager,
   request: IncomingMessage,
   response: ServerResponse,
   eventStreams: ShowEventStreamBroker,
@@ -130,7 +113,11 @@ async function routeRequest(
   }
 
   if (request.method === "GET" && pathname === "/capabilities") {
-    sendJson(response, 200, { protocol: SHOW_RUNTIME_PROTOCOL_VERSION, render_markdown: true })
+    sendJson(response, 200, {
+      protocol: SHOW_RUNTIME_PROTOCOL_VERSION,
+      render_markdown: true,
+      render_markdown_ssr: true
+    })
     return
   }
 
@@ -151,7 +138,7 @@ async function routeRequest(
   const renderMarkdownMatch = pathname.match(/^\/sessions\/([^/]+)\/render-markdown$/)
   if (request.method === "GET" && renderMarkdownMatch) {
     await handleRenderMarkdown({
-      renderSnapshots,
+      runtime,
       request,
       response,
       renderer: markdownRenderer,
@@ -210,25 +197,10 @@ async function routeRequest(
     const sessionId = suspendMatch[1]
     let status
     await markdownRenderer.invalidateSession(sessionId, async () => {
-      await renderSnapshots.invalidateSession(sessionId)
       status = await runtime.suspendSession(sessionId)
     })
     status ??= await runtime.getSessionStatus(sessionId)
     sendJson(response, 200, status)
-    return
-  }
-
-  const renderAppMatch = pathname.match(/^\/sessions\/([^/]+)\/render-app\/?(.*)$/)
-  if (renderAppMatch) {
-    await handleRenderAppRequest({
-      runtime,
-      renderSnapshots,
-      request,
-      response,
-      eventStreams,
-      sessionId: renderAppMatch[1],
-      appPath: `/${renderAppMatch[2] || ""}`
-    })
     return
   }
 
@@ -369,182 +341,20 @@ async function routeRequest(
   sendJson(response, 404, { error: "Not found" })
 }
 
-async function handleRenderAppRequest(options: {
-  runtime: ReturnType<typeof createShowRuntime>
-  renderSnapshots: RenderSnapshotManager
-  request: IncomingMessage
-  response: ServerResponse
-  eventStreams: ShowEventStreamBroker
-  sessionId: string
-  appPath: string
-}) {
-  const { runtime, renderSnapshots, request, response, eventStreams, sessionId, appPath } = options
-  const parsed = parse(request.url ?? "/", true)
-
-  if (request.method === "GET" && isAnnotationBootstrapPath(appPath)) {
-    await serveAnnotationBootstrap(appPath, response)
-    return
-  }
-
-  const snapshot = renderSnapshots.get(sessionId)
-  if (!snapshot) {
-    sendNotFound(response)
-    return
-  }
-  const session = runtime.getSession(sessionId)
-
-  if (isShowEndpointPath(appPath, "events")) {
-    if (request.method === "GET") {
-      if (parsed.query.stream === "1") {
-        const stream = eventStreams.subscribe(sessionId, response, streamAfterId(request, parsed.query.after_id))
-        sendEventStream(response)
-        stream.replay(runtime.listSessionEvents(sessionId))
-        return
-      }
-      sendJson(response, 200, { events: runtime.listSessionEvents(sessionId) })
-      return
-    }
-    if (request.method !== "POST") {
-      sendJson(response, 405, { error: "Method not allowed" })
-      return
-    }
-    if (!session?.vite) {
-      sendJson(response, 503, { error: "Session not ready" })
-      return
-    }
-    const payload = await readJson<ShowEventRequest>(request)
-    const event = recordShowEvent(runtime, sessionId, payload)
-    if (!event.ok) {
-      sendJson(response, event.status, { error: event.error })
-      return
-    }
-    eventStreams.publish(sessionId, event.value)
-    sendJson(response, 201, { ok: true, event: event.value })
-    return
-  }
-
-  if (isShowEndpointPath(appPath, "messages")) {
-    sendJson(response, 200, { messages: runtime.listSessionMessages(sessionId) })
-    return
-  }
-
-  if (appPath === "/__show" || appPath.startsWith("/__show/")) {
-    sendNotFound(response)
-    return
-  }
-
-  if (appPath === "/api" || appPath.startsWith("/api/")) {
-    if (!session?.vite) {
-      sendJson(response, 503, { error: "Session not ready" })
-      return
-    }
-    await handleApiRequest({
-      sessionId,
-      workspace: session.workspace,
-      apiPath: appPath.slice("/api".length),
-      vite: session.vite,
-      request,
-      response
-    })
-    return
-  }
-
-  await serveRenderSnapshot(snapshot, appPath, request, response)
-}
-
-async function serveRenderSnapshot(
-  snapshot: RenderSnapshot,
-  appPath: string,
-  request: IncomingMessage,
-  response: ServerResponse
-) {
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    sendJson(response, 405, { error: "Method not allowed" })
-    return
-  }
-
-  const requestedFile = await containedSnapshotFile(snapshot.outDir, appPath)
-  const file = requestedFile ?? (
-    isSpaRoutePath(appPath, request)
-      ? await containedSnapshotFile(snapshot.outDir, "/index.html")
-      : undefined
-  )
-  if (!file) {
-    sendNotFound(response)
-    return
-  }
-
-  const body = await readFile(file)
-  response.statusCode = 200
-  response.setHeader("content-type", snapshotContentType(file))
-  response.setHeader("cache-control", "no-store")
-  response.end(request.method === "HEAD" ? undefined : body)
-}
-
-async function containedSnapshotFile(root: string, rawPath: string): Promise<string | undefined> {
-  let decoded: string
-  try {
-    decoded = decodeURIComponent(rawPath)
-  } catch {
-    return undefined
-  }
-  if (decoded.includes("\0") || decoded.split(/[\\/]/).includes("..")) return undefined
-
-  try {
-    const canonicalRoot = await realpath(root)
-    const candidate = resolve(canonicalRoot, decoded.replace(/^[/\\]+/, ""))
-    const canonicalFile = await realpath(candidate)
-    const relativePath = relative(canonicalRoot, canonicalFile)
-    if (
-      relativePath === ".." ||
-      relativePath.startsWith(`..${sep}`) ||
-      isAbsolute(relativePath) ||
-      !(await stat(canonicalFile)).isFile()
-    ) {
-      return undefined
-    }
-    return canonicalFile
-  } catch {
-    return undefined
-  }
-}
-
-function snapshotContentType(path: string): string {
-  switch (extname(path).toLowerCase()) {
-    case ".html": return "text/html; charset=utf-8"
-    case ".js":
-    case ".mjs": return "text/javascript; charset=utf-8"
-    case ".css": return "text/css; charset=utf-8"
-    case ".json":
-    case ".map": return "application/json; charset=utf-8"
-    case ".svg": return "image/svg+xml"
-    case ".png": return "image/png"
-    case ".jpg":
-    case ".jpeg": return "image/jpeg"
-    case ".gif": return "image/gif"
-    case ".webp": return "image/webp"
-    case ".ico": return "image/x-icon"
-    case ".woff": return "font/woff"
-    case ".woff2": return "font/woff2"
-    case ".ttf": return "font/ttf"
-    case ".otf": return "font/otf"
-    case ".wasm": return "application/wasm"
-    default: return "application/octet-stream"
-  }
-}
-
 async function handleRenderMarkdown(options: {
-  renderSnapshots: RenderSnapshotManager
+  runtime: ReturnType<typeof createShowRuntime>
   request: IncomingMessage
   response: ServerResponse
   renderer: MarkdownRenderer
   workspaceRoot: string
   sessionId: string
 }) {
-  const { renderSnapshots, request, response, renderer, workspaceRoot, sessionId } = options
+  const { runtime, request, response, renderer, workspaceRoot, sessionId } = options
   response.setHeader("cache-control", "no-store")
+  const cancellation = renderCancellation(request, response)
   try {
     const target = markdownRenderTarget(request)
+    markdownRenderUrl(request, `/sessions/${sessionId}/app/`, target)
     const workspace = sessionWorkspace(workspaceRoot, sessionId)
     if (!workspace || !await isDirectory(workspace)) {
       throw new MarkdownRenderError(
@@ -554,31 +364,71 @@ async function handleRenderMarkdown(options: {
       )
     }
 
-    const internalBasePath = `/sessions/${sessionId}/render-app/`
     const basePath = markdownBasePath(request, sessionId)
     const result = await renderer.render({
       sessionId,
       context: markdownRenderContext(request),
       basePath,
       target,
-      internalBasePath,
-      renderUrl: markdownRenderUrl(request, internalBasePath, target),
       workspace,
+      signal: cancellation.signal,
       async prepare() {
-        return await renderSnapshots.prepare(sessionId, workspace, internalBasePath)
+        const existingBasePath = runtime.getSession(sessionId)?.basePath
+        await runtime.ensureSession(sessionId, existingBasePath)
+        const session = runtime.getSession(sessionId)
+        if (!session?.vite) {
+          throw new MarkdownRenderError(
+            "renderer_unavailable",
+            503,
+            "The Show Page SSR module graph is unavailable."
+          )
+        }
+        return {
+          vite: session.vite,
+          internalBasePath: session.basePath ?? `/show/${sessionId}/`,
+          origin: loopbackOrigin(request)
+        }
       }
     })
+    if (cancellation.signal.aborted || response.destroyed) return
     response.statusCode = 200
     response.setHeader("content-type", "text/markdown; charset=utf-8")
     response.setHeader("x-avibe-render-cache", result.cache)
     response.end(result.markdown)
   } catch (error) {
+    if (cancellation.signal.aborted || response.destroyed) return
     sendRenderError(
       response,
       error instanceof MarkdownRenderError
         ? error
         : new MarkdownRenderError("render_failed", 502, "Show Page rendering failed.", { cause: error })
     )
+  } finally {
+    cancellation.dispose()
+  }
+}
+
+function renderCancellation(request: IncomingMessage, response: ServerResponse): {
+  signal: AbortSignal
+  dispose(): void
+} {
+  const controller = new AbortController()
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(new DOMException("The Markdown caller disconnected.", "AbortError"))
+    }
+  }
+  const close = () => {
+    if (!response.writableEnded) abort()
+  }
+  request.once("aborted", abort)
+  response.once("close", close)
+  return {
+    signal: controller.signal,
+    dispose() {
+      request.off("aborted", abort)
+      response.off("close", close)
+    }
   }
 }
 

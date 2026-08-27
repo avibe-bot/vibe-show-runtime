@@ -14,7 +14,9 @@ export type ShowRuntimeOptions = {
   idlePruneIntervalMs?: number
   uiPackageName?: string
   fallbackDelaySeconds?: number
-  renderTimeoutMs?: number
+  renderLoadTimeoutMs?: number
+  renderReactTimeoutMs?: number
+  renderConversionTimeoutMs?: number
   renderCacheTtlMs?: number
   renderMaxOutputBytes?: number
   renderBrowserIdleMs?: number

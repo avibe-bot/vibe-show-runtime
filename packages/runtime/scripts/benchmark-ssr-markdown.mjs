@@ -1,4 +1,3 @@
-import { createServer } from "node:http"
 import { access, cp, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
@@ -11,21 +10,25 @@ const repositoryRoot = resolve(packageRoot, "../..")
 const fixture = join(packageRoot, "src", "__fixtures__", "ssr-markdown", "semantic")
 const workspaceRoot = await mkdtemp(join(tmpdir(), "avibe-show-ssr-benchmark-"))
 const browserCache = join(workspaceRoot, "browser-cache-must-stay-absent")
+const previousBrowserCache = process.env.PLAYWRIGHT_BROWSERS_PATH
 process.env.PLAYWRIGHT_BROWSERS_PATH = browserCache
 
-const { createShowRuntime } = await import("../dist/runtime.js")
-const { renderSsrMarkdown } = await import("../dist/ssr-markdown.js")
+const { startShowRuntimeServer } = await import("../dist/server.js")
 
 const sessionId = "semantic"
+const phaseTimings = []
 await cp(fixture, join(workspaceRoot, sessionId), { recursive: true })
-const hostServer = createServer()
-await new Promise((resolveListen) => hostServer.listen(0, "127.0.0.1", resolveListen))
-const runtime = createShowRuntime({
+const runtime = await startShowRuntimeServer({
   workspaceRoot,
   dependencyRoot: repositoryRoot,
   cacheRoot: join(workspaceRoot, ".vite-cache"),
-  server: hostServer,
   idlePruneIntervalMs: 0
+}, {
+  markdownRendererOptions: {
+    onPhaseTiming(timing) {
+      phaseTimings.push(timing)
+    }
+  }
 })
 
 function collectRssMiB() {
@@ -42,71 +45,105 @@ function percentile(values, fraction) {
   return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))]
 }
 
+function latencySummary(values) {
+  return {
+    iterations: values.length,
+    median: round(percentile(values, 0.5)),
+    p95: round(percentile(values, 0.95)),
+    min: round(Math.min(...values)),
+    max: round(Math.max(...values))
+  }
+}
+
+function phaseSummary(samples) {
+  return Object.fromEntries(["load", "render", "conversion"].map((phase) => {
+    const values = samples
+      .filter((sample) => sample.phase === phase)
+      .map((sample) => sample.durationMs)
+    return [phase, values.length ? latencySummary(values) : undefined]
+  }))
+}
+
+async function render(target, expectedCache) {
+  const phaseOffset = phaseTimings.length
+  const started = performance.now()
+  const response = await fetch(`${runtime.url}/sessions/${sessionId}/render-markdown`, {
+    headers: {
+      "x-avibe-show-protocol": "1",
+      "x-avibe-show-context": "private",
+      "x-vibe-show-base": `/show/${sessionId}/`,
+      "x-vibe-show-target": target
+    }
+  })
+  const markdown = await response.text()
+  const durationMs = performance.now() - started
+  if (!response.ok) {
+    throw new Error(`Benchmark render failed (${response.status}): ${markdown}`)
+  }
+  const cache = response.headers.get("x-avibe-render-cache")
+  if (cache !== expectedCache) {
+    throw new Error(`Expected cache ${expectedCache}, received ${String(cache)}`)
+  }
+  return {
+    durationMs,
+    phaseTimings: phaseTimings.slice(phaseOffset),
+    markdownBytes: Buffer.byteLength(markdown, "utf8")
+  }
+}
+
 let report
 try {
   const rssBaseline = collectRssMiB()
-  const sessionStarted = performance.now()
-  await runtime.ensureSession(sessionId, `/show/${sessionId}/`)
-  const sessionWarmMs = performance.now() - sessionStarted
-  const rssAfterSessionWarm = collectRssMiB()
-  const vite = runtime.getSession(sessionId)?.vite
-  if (!vite) throw new Error("Benchmark fixture did not create a Vite server")
+  const cold = await render("/teams/acme?period=Q3&benchmark=cold", "miss")
+  const rssAfterCold = collectRssMiB()
 
-  const firstStarted = performance.now()
-  const first = await renderSsrMarkdown({
-    vite,
-    target: "/teams/acme?period=Q3",
-    basePath: `/show/${sessionId}/`
-  })
-  const firstSsrMs = performance.now() - firstStarted
-  const rssAfterFirstSsr = collectRssMiB()
-
-  const warmDurations = []
+  const warmMisses = []
   for (let iteration = 0; iteration < 20; iteration += 1) {
-    const started = performance.now()
-    await renderSsrMarkdown({
-      vite,
-      target: "/teams/acme?period=Q3",
-      basePath: `/show/${sessionId}/`
-    })
-    warmDurations.push(performance.now() - started)
+    warmMisses.push(await render(
+      `/teams/acme?period=Q3&benchmark=warm-${iteration}`,
+      "miss"
+    ))
   }
-  const rssAfterWarmRuns = collectRssMiB()
+  const rssAfterWarmMisses = collectRssMiB()
+
+  const cacheHits = []
+  const cachedTarget = "/teams/acme?period=Q3&benchmark=warm-19"
+  for (let iteration = 0; iteration < 20; iteration += 1) {
+    cacheHits.push(await render(cachedTarget, "hit"))
+  }
+  const rssAfterCacheHits = collectRssMiB()
   const browserCacheCreated = await access(browserCache).then(() => true).catch(() => false)
 
   report = {
     shape: "module-graph",
+    path: "startShowRuntimeServer render-markdown endpoint",
     fixture: "semantic + nested dynamic route",
     node: process.version,
     platform: `${process.platform}-${process.arch}`,
-    sessionWarmMs: round(sessionWarmMs),
-    firstSsrMs: round(firstSsrMs),
-    firstPhaseMs: Object.fromEntries(
-      Object.entries(first.timings).map(([name, value]) => [name, round(value)])
-    ),
-    warmSsrMs: {
-      iterations: warmDurations.length,
-      median: round(percentile(warmDurations, 0.5)),
-      p95: round(percentile(warmDurations, 0.95)),
-      min: round(Math.min(...warmDurations)),
-      max: round(Math.max(...warmDurations))
-    },
+    coldRequestMs: round(cold.durationMs),
+    coldPhaseMs: Object.fromEntries(cold.phaseTimings.map(({ phase, durationMs }) => [
+      phase,
+      round(durationMs)
+    ])),
+    markdownBytes: cold.markdownBytes,
+    warmMissMs: latencySummary(warmMisses.map(({ durationMs }) => durationMs)),
+    warmMissPhaseMs: phaseSummary(warmMisses.flatMap(({ phaseTimings: samples }) => samples)),
+    cacheHitMs: latencySummary(cacheHits.map(({ durationMs }) => durationMs)),
     rssMiB: {
       baseline: round(rssBaseline, 1),
-      afterSessionWarm: round(rssAfterSessionWarm, 1),
-      afterFirstSsr: round(rssAfterFirstSsr, 1),
-      afterWarmRuns: round(rssAfterWarmRuns, 1),
-      sessionDelta: round(rssAfterSessionWarm - rssBaseline, 1),
-      firstSsrDelta: round(rssAfterFirstSsr - rssAfterSessionWarm, 1),
-      warmRunsDelta: round(rssAfterWarmRuns - rssAfterFirstSsr, 1)
+      afterCold: round(rssAfterCold, 1),
+      afterWarmMisses: round(rssAfterWarmMisses, 1),
+      afterCacheHits: round(rssAfterCacheHits, 1),
+      coldDelta: round(rssAfterCold - rssBaseline, 1),
+      warmMissDelta: round(rssAfterWarmMisses - rssAfterCold, 1),
+      cacheHitDelta: round(rssAfterCacheHits - rssAfterWarmMisses, 1)
     },
     browserCacheCreated
   }
 } finally {
   await runtime.close()
-  await new Promise((resolveClose, rejectClose) => {
-    hostServer.close((error) => error ? rejectClose(error) : resolveClose())
-  })
+  if (previousBrowserCache === undefined) delete process.env.PLAYWRIGHT_BROWSERS_PATH
+  else process.env.PLAYWRIGHT_BROWSERS_PATH = previousBrowserCache
   await rm(workspaceRoot, { force: true, recursive: true })
 }
 
