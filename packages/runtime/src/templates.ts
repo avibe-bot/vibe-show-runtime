@@ -244,10 +244,18 @@ export default function App() {
 
 function routerTsx() {
   return `import type { ComponentType, MouseEvent, ReactNode } from "react"
-import { useSyncExternalStore } from "react"
+import { createContext, useContext, useSyncExternalStore } from "react"
 
 export type PageProps = {
   params: Record<string, string>
+  query: URLSearchParams
+}
+
+export type SsrRouteLocation = {
+  pathname: string
+  search: string
+  origin: string
+  basePath: string
 }
 
 type PageModule = { default: ComponentType<PageProps> }
@@ -261,6 +269,17 @@ type Route = {
 const PAGES_PREFIX = "./pages/"
 const PAGE_SUFFIX = ".tsx"
 const modules = import.meta.glob<PageModule>("./pages/**/*.tsx", { eager: true })
+const SsrRouterContext = createContext<SsrRouteLocation | null>(null)
+
+export function SsrRouterProvider({
+  location,
+  children
+}: {
+  location: SsrRouteLocation
+  children: ReactNode
+}) {
+  return <SsrRouterContext.Provider value={location}>{children}</SsrRouterContext.Provider>
+}
 
 function filePathToRoute(file: string): string | null {
   const relative = file.slice(PAGES_PREFIX.length, file.length - PAGE_SUFFIX.length)
@@ -331,7 +350,12 @@ function matchRoute(path: string): { route: Route | null; params: Record<string,
   return { route: null, params: {} }
 }
 
-function basePath(): string {
+function basePath(location?: SsrRouteLocation | null): string {
+  if (location) {
+    const pathname = new URL(location.basePath, location.origin).pathname
+    const parts = pathname.split("/").filter(Boolean)
+    return parts.length ? "/" + parts.join("/") + "/" : "/"
+  }
   const configured = globalThis.__AVIBE_SHOW__?.basePath
   const fallback = window.location.pathname.match(/^\\/(?:show|p)\\/[^/]+\\//)?.[0] || "/"
   const pathname = new URL(configured || fallback, window.location.origin).pathname
@@ -346,8 +370,9 @@ function normalizeRoutePath(path: string): string {
     : withLeadingSlash
 }
 
-function readRoutePath(): string {
-  const base = basePath()
+function readRoutePath(location?: SsrRouteLocation | null): string {
+  if (location) return normalizeRoutePath(location.pathname)
+  const base = basePath(location)
   const pathname = window.location.pathname
   if (!pathname.startsWith(base)) return "/"
   const routePath = normalizeRoutePath("/" + pathname.slice(base.length))
@@ -359,17 +384,37 @@ function subscribe(onChange: () => void): () => void {
   return () => window.removeEventListener("popstate", onChange)
 }
 
-export function useRoutePath(): string {
-  return useSyncExternalStore(subscribe, readRoutePath, () => "/")
+function noSubscribe(): () => void {
+  return () => undefined
 }
 
-function routeUrl(to: string): URL {
+export function useRoutePath(): string {
+  const location = useContext(SsrRouterContext)
+  return useSyncExternalStore(
+    location ? noSubscribe : subscribe,
+    location ? () => readRoutePath(location) : readRoutePath,
+    () => readRoutePath(location)
+  )
+}
+
+export function useRouteQuery(): URLSearchParams {
+  const location = useContext(SsrRouterContext)
+  const search = useSyncExternalStore(
+    location ? noSubscribe : subscribe,
+    location ? () => location.search : () => window.location.search,
+    () => location?.search ?? ""
+  )
+  return new URLSearchParams(search)
+}
+
+function routeUrl(to: string, location?: SsrRouteLocation | null): URL {
   const normalizedTo = to.startsWith("/") ? to : "/" + to
-  const route = new URL(normalizedTo, window.location.origin)
-  const current = new URL(window.location.href)
-  const target = new URL(basePath(), window.location.origin)
-  const embed = current.searchParams.get("vibe-embed")
-  target.pathname = basePath() + route.pathname.replace(/^\\/+/, "")
+  const origin = location?.origin ?? window.location.origin
+  const route = new URL(normalizedTo, origin)
+  const currentSearch = location?.search ?? new URL(window.location.href).search
+  const target = new URL(basePath(location), origin)
+  const embed = new URLSearchParams(currentSearch).get("vibe-embed")
+  target.pathname = basePath(location) + route.pathname.replace(/^\\/+/, "")
   target.search = route.search
   if (embed && !target.searchParams.has("vibe-embed")) target.searchParams.set("vibe-embed", embed)
   target.hash = route.hash
@@ -383,16 +428,18 @@ export function navigate(to: string): void {
 }
 
 export function Link({ to, className, children }: { to: string; className?: string; children: ReactNode }) {
+  const location = useContext(SsrRouterContext)
   function onClick(event: MouseEvent<HTMLAnchorElement>) {
     if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
     event.preventDefault()
     navigate(to)
   }
-  return <a href={routeUrl(to).toString()} className={className} onClick={onClick}>{children}</a>
+  return <a href={routeUrl(to, location).toString()} className={className} onClick={onClick}>{children}</a>
 }
 
 export function RouterView() {
   const path = useRoutePath()
+  const query = useRouteQuery()
   const { route, params } = matchRoute(path)
   if (!route) {
     return (
@@ -404,7 +451,7 @@ export function RouterView() {
     )
   }
   const Page = route.Component
-  return <Page params={params} />
+  return <Page params={params} query={query} />
 }
 `
 }

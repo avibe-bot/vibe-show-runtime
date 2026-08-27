@@ -22,6 +22,7 @@
     "lint": "npm run lint --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "check": "npm run build && npm run typecheck && npm run test",
+    "benchmark:ssr-markdown": "npm run build -w @avibe/show-sdk && npm run build -w @avibe/show-ui && npm run build -w @avibe/show-runtime && node --expose-gc packages/runtime/scripts/benchmark-ssr-markdown.mjs",
     "bundle:vibe-remote": "node scripts/bundle-vibe-remote.mjs",
     "smoke": "node scripts/smoke-runtime.mjs"
   },
