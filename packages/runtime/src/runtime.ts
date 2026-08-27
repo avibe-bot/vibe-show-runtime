@@ -7,7 +7,7 @@ import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import react from "@vitejs/plugin-react"
 import tailwindcss from "@tailwindcss/vite"
-import { build as buildVite, createServer as createViteServer } from "vite"
+import { createServer as createViteServer } from "vite"
 import type { InlineConfig, Plugin, ViteDevServer } from "vite"
 import {
   formatShowEventMessage,
@@ -83,8 +83,6 @@ type WorkspaceFileBoundary = {
   allowedRoots: string[]
 }
 
-const WORKSPACE_BUILD_BOUNDARY_ERROR = "Show Page build blocked a file outside the allowed workspace boundary."
-
 async function fileBoundaryRoots(paths: string[]): Promise<string[]> {
   const roots = await Promise.all(paths.map(async (path) => {
     const resolved = resolve(path)
@@ -110,32 +108,7 @@ function escapeViteGlobPath(path: string): string {
   return path.replace(/([\\*?[\]{}()!+@])/g, "\\$1")
 }
 
-function workspaceFileBoundaryPlugin(
-  boundary: WorkspaceFileBoundary,
-  mode: "serve" | "build" = "serve"
-): Plugin {
-  if (mode === "build") {
-    return {
-      name: "avibe-show-workspace-file-boundary",
-      apply: "build",
-      enforce: "pre",
-      async buildStart() {
-        if (await hasDeniedBuildPublicEntry(boundary)) {
-          this.error(WORKSPACE_BUILD_BOUNDARY_ERROR)
-        }
-      },
-      async resolveId(source, importer, options) {
-        const resolvedId = await this.resolve(source, importer, { ...options, skipSelf: true })
-        if (!resolvedId || resolvedId.external) return resolvedId
-        const target = await buildResolvedFileTarget(resolvedId.id)
-        if (target && isDeniedResolvedTarget(target, boundary)) {
-          this.error(WORKSPACE_BUILD_BOUNDARY_ERROR)
-        }
-        return resolvedId
-      }
-    }
-  }
-
+function workspaceFileBoundaryPlugin(boundary: WorkspaceFileBoundary): Plugin {
   return {
     name: "avibe-show-workspace-file-boundary",
     apply: "serve",
@@ -156,58 +129,6 @@ function workspaceFileBoundaryPlugin(
       })
     }
   }
-}
-
-async function buildResolvedFileTarget(id: string): Promise<string | undefined> {
-  const cleanId = id.replace(/[?#].*$/, "")
-  if (!cleanId || cleanId.startsWith("\0")) return undefined
-  let filePath: string
-  try {
-    filePath = cleanId.startsWith("file:")
-      ? fileURLToPath(cleanId)
-      : cleanId.startsWith("/@fs/")
-        ? viteFsRequestPath(cleanId)
-        : cleanId
-  } catch {
-    return undefined
-  }
-  if (!isAbsolute(filePath)) return undefined
-  return await realpath(filePath).catch(() => undefined)
-}
-
-async function hasDeniedBuildPublicEntry(boundary: WorkspaceFileBoundary): Promise<boolean> {
-  const publicDirectory = join(boundary.workspace, "public")
-  try {
-    await access(publicDirectory)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false
-    throw error
-  }
-  return await hasDeniedBuildDirectoryEntry(publicDirectory, boundary, new Set())
-}
-
-async function hasDeniedBuildDirectoryEntry(
-  directory: string,
-  boundary: WorkspaceFileBoundary,
-  visited: Set<string>
-): Promise<boolean> {
-  const canonicalDirectory = await realpath(directory).catch(() => undefined)
-  if (!canonicalDirectory || isDeniedResolvedTarget(canonicalDirectory, boundary)) return true
-  if (visited.has(canonicalDirectory)) return false
-  visited.add(canonicalDirectory)
-
-  const entries = await readdir(directory, { withFileTypes: true })
-  for (const entry of entries) {
-    const entryPath = join(directory, entry.name)
-    const logicalPath = normalizePath(relative(boundary.workspace, entryPath))
-    if (hasDeniedWorkspaceSegment(logicalPath)) return true
-    const target = await realpath(entryPath).catch(() => undefined)
-    if (!target || isDeniedResolvedTarget(target, boundary)) return true
-    if ((await stat(target)).isDirectory() && await hasDeniedBuildDirectoryEntry(entryPath, boundary, visited)) {
-      return true
-    }
-  }
-  return false
 }
 
 async function isDeniedWorkspaceRequest(rawUrl: string | undefined, boundary: WorkspaceFileBoundary): Promise<boolean> {
@@ -329,8 +250,6 @@ export function createShowRuntime(
   lifecycle: ShowRuntimeLifecycle = {}
 ): ShowRuntime {
   const sessions = new Map<string, ShowSession>()
-  const snapshotBuildContexts = new Map<string, SnapshotBuildContext>()
-  const snapshotBuilds = new Map<string, Promise<void>>()
   // The most recently warmed shared vendor bundle. The server serves its assets at a
   // session-independent path; it's set the first time any session warms (the build is
   // cached per dependency root in `ensureVendorBundle`).
@@ -367,8 +286,6 @@ export function createShowRuntime(
     const started = performance.now()
     const existing = getOrCreateSession(sessionId)
     const normalizedBasePath = normalizeBasePath(basePath, sessionId)
-    // Snapshot builds only read prepared dependencies; an exact active match can
-    // keep serving from the existing Vite instance while the build is in flight.
     if (await canReuseActiveSession(existing, normalizedBasePath)) {
       existing.lastAccessedAt = new Date()
       existing.updatedAt = new Date()
@@ -376,7 +293,6 @@ export function createShowRuntime(
       return toStatus(existing)
     }
 
-    await snapshotBuilds.get(sessionId)?.catch(() => undefined)
     existing.lastAccessedAt = new Date()
     if (existing.closing) {
       await existing.closing
@@ -401,7 +317,6 @@ export function createShowRuntime(
       existing.state = "warming"
       existing.updatedAt = new Date()
       existing.warming = warmSession(existing, normalizedBasePath).catch(async (error) => {
-        snapshotBuildContexts.delete(existing.id)
         await closeSession(existing)
         throw error
       })
@@ -445,73 +360,13 @@ export function createShowRuntime(
   async function suspendSession(sessionId: string): Promise<ShowSessionStatus> {
     const session = getOrCreateSession(sessionId)
     await session.warming?.catch(() => undefined)
-    await snapshotBuilds.get(sessionId)?.catch(() => undefined)
     await closeSession(session)
     return toStatus(session)
   }
 
-  async function prepareSessionSnapshot(sessionId: string): Promise<void> {
-    const session = getOrCreateSession(sessionId)
-    await ensureSession(sessionId, session.basePath)
-  }
-
-  async function buildSessionSnapshot(
-    sessionId: string,
-    snapshot: { basePath: string; outDir: string }
-  ): Promise<void> {
-    const session = getOrCreateSession(sessionId)
-    // Reuse an in-flight or active live-session warm without changing its caller-facing
-    // base. The production build consumes the dependency state that warm prepared; it
-    // never creates a second runtime or serves through the live Vite middleware.
-    await prepareSessionSnapshot(sessionId)
-    const prepared = snapshotBuildContexts.get(sessionId)
-    if (!prepared) {
-      throw new Error("Session dependency preparation did not produce build state")
-    }
-    const building = (async () => {
-      const buildRoot = await realpath(session.workspace)
-      await buildVite({
-        configFile: false,
-        root: buildRoot,
-        base: snapshot.basePath,
-        logLevel: "silent",
-        build: {
-          outDir: snapshot.outDir,
-          emptyOutDir: true
-        },
-        plugins: [
-          workspaceFileBoundaryPlugin(prepared.fileBoundary, "build"),
-          snapshotRuntimeConfigPlugin(sessionId, snapshot.basePath),
-          ...(prepared.sharedDependencies.nodeModules === prepared.sharedDependencies.sharedNodeModules
-            ? []
-            : [sharedResolveFallbackPlugin(
-                prepared.sharedDependencies.sharedNodeModules,
-                prepared.providedSpecifiers,
-                "build"
-              )]),
-          tailwindcss(),
-          react()
-        ] as InlineConfig["plugins"],
-        resolve: {
-          alias: createShadcnAlias(prepared.uiPackageName) as InlineConfig["resolve"] extends { alias?: infer Alias } ? Alias : never,
-          dedupe: ["react", "react-dom"]
-        }
-      })
-    })()
-    snapshotBuilds.set(sessionId, building)
-    try {
-      await building
-    } finally {
-      if (snapshotBuilds.get(sessionId) === building) snapshotBuilds.delete(sessionId)
-    }
-  }
-
   async function close() {
     clearInterval(maintenanceTimer)
-    await Promise.allSettled(snapshotBuilds.values())
-    snapshotBuilds.clear()
     await Promise.all([...sessions.values()].map((session) => closeSession(session)))
-    snapshotBuildContexts.clear()
     await disposeSharedInstallResolvers()
   }
 
@@ -669,12 +524,6 @@ export function createShowRuntime(
       workspaceRoots,
       allowedRoots: requestAllowedRoots
     }
-    snapshotBuildContexts.set(session.id, {
-      fileBoundary,
-      providedSpecifiers,
-      sharedDependencies,
-      uiPackageName
-    })
     const viteConfig = {
       // The outer runtime owns the Show Page SPA fallback. Vite's default `spa`
       // middleware also rewrites missing assets and reserved paths to index.html,
@@ -803,8 +652,6 @@ export function createShowRuntime(
     pruneIdleSessions,
     getSession: (sessionId: string) => sessions.get(sessionId),
     getVendorBundle: () => vendorBundle,
-    prepareSessionSnapshot,
-    buildSessionSnapshot,
     suspendSession,
     recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor) {
       return recordShowEvent(sessionId, { type: "assistant.mark.created", mark, anchor })
@@ -860,33 +707,6 @@ type SharedDependencies = {
   packageRoots: string[]
   /** Signature of the declared extras the workspace was installed against. */
   extrasSignature: string
-}
-
-type SnapshotBuildContext = {
-  fileBoundary: WorkspaceFileBoundary
-  providedSpecifiers: string[]
-  sharedDependencies: SharedDependencies
-  uiPackageName: string
-}
-
-function snapshotRuntimeConfigPlugin(sessionId: string, basePath: string): Plugin {
-  const config = JSON.stringify({
-    sessionId,
-    basePath,
-    eventsPath: "__show/events",
-    streamPath: "__show/events?stream=1"
-  }).replaceAll("<", "\\u003c")
-  return {
-    name: "avibe-show-snapshot-runtime-config",
-    apply: "build",
-    transformIndexHtml() {
-      return [{
-        tag: "script",
-        children: `globalThis.__AVIBE_SHOW__ = { ...(globalThis.__AVIBE_SHOW__ || {}), ...${config} }`,
-        injectTo: "head-prepend"
-      }]
-    }
-  }
 }
 
 /**
@@ -1038,15 +858,14 @@ async function ensureSharedSymlink(linkPath: string, sharedNodeModules: string) 
  */
 function sharedResolveFallbackPlugin(
   sharedNodeModules: string,
-  providedSpecifiers: string[],
-  mode: "serve" | "build" = "serve"
+  providedSpecifiers: string[]
 ): Plugin {
   return {
     name: "avibe-show-shared-resolve-fallback",
     enforce: "post",
-    apply: mode,
+    apply: "serve",
     async resolveId(source, importer, options) {
-      if (!isBareImport(source) || (mode === "serve" && isExternalizedImport(source, providedSpecifiers))) {
+      if (!isBareImport(source) || isExternalizedImport(source, providedSpecifiers)) {
         return null
       }
       // Only act as a fallback: defer to the session's own resolution first.

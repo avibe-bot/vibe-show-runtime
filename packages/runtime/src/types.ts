@@ -19,8 +19,6 @@ export type ShowRuntimeOptions = {
   renderConversionTimeoutMs?: number
   renderCacheTtlMs?: number
   renderMaxOutputBytes?: number
-  renderBrowserIdleMs?: number
-  renderBrowserProvisionTimeoutMs?: number
 }
 
 export type ShowSessionState = "created" | "warming" | "active" | "closing" | "idle" | "suspended"
@@ -60,8 +58,6 @@ export type ShowRuntime = {
   getSession(sessionId: string): ShowSession | undefined
   /** The shared vendor bundle warmed for this runtime, or `undefined` before the first warm. */
   getVendorBundle(): VendorBundle | undefined
-  prepareSessionSnapshot(sessionId: string): Promise<void>
-  buildSessionSnapshot(sessionId: string, snapshot: { basePath: string; outDir: string }): Promise<void>
   suspendSession(sessionId: string): Promise<ShowSessionStatus>
   recordAgentMark(sessionId: string, mark: AgentMark, anchor?: MarkAnchor): ShowEvent
   recordShowEvent(sessionId: string, payload: ShowEventInput | ShowEvent): ShowEvent

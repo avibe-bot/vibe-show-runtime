@@ -33,7 +33,6 @@
     "@vitejs/plugin-react": "^5.1.1",
     "esbuild": "^0.27.0",
     "parse5": "^8.0.1",
-    "playwright-core": "^1.62.1",
     "postcss": "^8.5.15",
     "tailwindcss": "^4.3.2",
     "turndown": "^7.2.4",
