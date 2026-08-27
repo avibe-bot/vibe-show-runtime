@@ -10,29 +10,63 @@ server. It does not create an SSR build or a second Vite server.
 
 ```text
 runtime main thread
-  live session Vite SSR module graph
+  live session Vite `avibe_show_markdown` module graph
   workspace fingerprint and Markdown LRU
   one renderer-wide concurrency mutex
-  Vite fetchModule RPC owner
+  Vite fetchModule policy owner
                   |
                   v
 one terminable Node worker
-  Vite ModuleRunner evaluation cache per session
-  React DOM Server render
-  structured HTML cleanup
-  Turndown + GFM conversion
+  restricted VM realm + ModuleRunner cache per session
+    React DOM Server render
+  Runtime-owned trusted layer
+    structured HTML cleanup
+    Turndown + GFM conversion
 ```
 
 The Runtime-owned virtual entry imports the page `App`, generated router
-provider, React DOM Server, and conversion helper through one session SSR graph.
-That preserves the session's physical React instance across application,
-provider, and renderer.
+provider, and React DOM Server through one session SSR graph. That preserves the
+session's physical React instance across application, provider, and renderer.
+Cleanup and conversion do not compose React values, so they run in the same
+terminable worker's trusted Runtime layer rather than in the workspace VM.
+
+The renderer uses a dedicated Vite environment inside the existing session
+server. Its dependency graph is inlined, browser package conditions are used,
+and browser-platform CJS entry points are prebundled before VM evaluation. The
+ordinary Vite `ssr` environment is unchanged, so `api/*` handlers retain their
+existing Node execution model.
 
 CSS imports are transformed by Vite and do not contribute text to the SSR tree.
 Small static assets follow Vite's normal SSR behavior and can become data URLs.
 Filesystem asset URLs produced for non-inlined workspace assets are rewritten to
 the caller's Show Page base; an unmappable `/@fs/` URL is removed rather than
 leaking a local path.
+
+## Workspace authority boundary
+
+Workspace modules and their render-time dependencies do not execute in the
+worker's ordinary Node realm. A custom Vite `ModuleEvaluator` runs transformed
+modules in one `node:vm` context per session with string/Wasm code generation
+disabled. It supplies only the initial-tree web primitives required by React,
+the generated router, and Show UI. `window`, `document`, `fetch`, WebSocket,
+host `process`, and inherited environment variables are absent; the exposed
+`process.env` contains only the non-secret Vite mode.
+
+The parent transport returns no Node built-in list and rejects every
+externalized module request from workspace code. Runtime-owned cleanup and
+conversion are imported directly by the worker outside that transport, so the
+workspace graph has no privileged module or built-in exception to reach.
+
+The VM is backed by Node's worker permission model as a second boundary. The
+worker receives a scrubbed environment, cannot create subprocesses, nested
+workers, or native addons, and may read only the Runtime/Vite packages, the
+conversion dependency packages, and configured Show workspace root. The last
+permission lets trusted conversion canonicalize asset paths; workspace code has
+no filesystem capability. A fixture places a sentinel inside that allowed root
+and verifies that direct built-in imports, `eval`, `Function`, constructor chains
+from URL/timers/encoders/Promises/import metadata, and a dynamic-import error
+cannot read it. Direct `node:fs` use maps to the existing `render_failed`
+envelope.
 
 ## Public contract
 
@@ -121,21 +155,21 @@ render returns `render_failed`.
 ## Measured fixture result
 
 Measured in three fresh processes through the production `render-markdown`
-endpoint on an Apple M1 Pro, Node 24.8.0, darwin-arm64. The cold request includes
+endpoint on an Apple M1 Pro, Node 22.19.0, darwin-arm64. The cold request includes
 session Vite warm-up and the first worker/module load. Warm misses vary the query
 to bypass the Markdown result cache; cache hits still recompute the workspace
 fingerprint.
 
 | Measurement | Result |
 | --- | ---: |
-| cold request | 985-1,188 ms |
-| cold load | 952-1,154 ms |
-| cold render / conversion | 4.7-5.2 / 6.4-7.2 ms |
-| warm miss median / p95 | 7.5-8.9 / 12.2-18.6 ms |
-| cache hit median / p95 | 0.91-0.95 / 2.0-2.1 ms |
-| RSS before cold | 110-114 MiB |
-| RSS after cold (delta) | 252-270 MiB (+139-159 MiB) |
-| RSS after 20 warm misses | 269-310 MiB |
+| cold request | 1,510-1,687 ms |
+| cold load | 1,476-1,653 ms |
+| cold render / conversion | 5.5-5.7 / 7.8-8.3 ms |
+| warm miss median / p95 | 7.0-7.2 / 13.5-14.5 ms |
+| cache hit median / p95 | 0.85-0.97 / 2.15-2.18 ms |
+| RSS before cold | 99-100 MiB |
+| RSS after cold (delta) | 327-372 MiB (+227-272 MiB) |
+| RSS after 20 warm misses | 337-383 MiB |
 
 The benchmark created no browser cache. Run `npm run benchmark:ssr-markdown`
 to reproduce the endpoint, phase, memory, and sentinel check.

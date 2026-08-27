@@ -1,6 +1,9 @@
+import { existsSync } from "node:fs"
 import { realpath } from "node:fs/promises"
-import { isAbsolute, relative, resolve, sep } from "node:path"
-import { Worker } from "node:worker_threads"
+import { createRequire } from "node:module"
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path"
+import { fileURLToPath } from "node:url"
+import { Worker, type WorkerOptions } from "node:worker_threads"
 import type { FSWatcher, ViteDevServer } from "vite"
 import type { FetchFunctionOptions } from "vite/module-runner"
 import {
@@ -16,7 +19,10 @@ import {
   createSsrMarkdownCacheKey,
   type SsrRouteLocation
 } from "./ssr-markdown.js"
-import { SSR_MARKDOWN_ENTRY_ID } from "./ssr-markdown-entry-plugin.js"
+import {
+  SSR_MARKDOWN_ENTRY_ID,
+  SSR_MARKDOWN_ENVIRONMENT
+} from "./ssr-markdown-entry-plugin.js"
 import {
   createWorkspaceFingerprinter,
   type WorkspaceFingerprinter
@@ -39,6 +45,16 @@ export const DEFAULT_MARKDOWN_MAX_BYTES = 512 * 1024
 const DEFAULT_MARKDOWN_CACHE_MAINTENANCE_INTERVAL_MS = 5_000
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
 const WATCHER_EVENTS = ["add", "change", "unlink", "addDir", "unlinkDir"] as const
+const RUNTIME_PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..")
+const runtimeRequire = createRequire(import.meta.url)
+const VITE_PACKAGE_ROOT = dirname(runtimeRequire.resolve("vite/package.json"))
+const CONVERSION_PACKAGE_ROOTS = [
+  "@mixmark-io/domino",
+  "entities",
+  "parse5",
+  "turndown",
+  "turndown-plugin-gfm"
+].map(packageRoot)
 
 export type ShowRenderContext = "private" | "shared"
 export type SsrMarkdownPreparedSession = {
@@ -84,7 +100,7 @@ export type SsrMarkdownWorker = {
   close(): Promise<void>
 }
 
-type WorkerFactory = (url: URL) => Worker
+type WorkerFactory = (url: URL, options: WorkerOptions) => Worker
 
 export type MarkdownRendererOptions = {
   loadTimeoutMs?: number
@@ -98,6 +114,7 @@ export type MarkdownRendererOptions = {
   workspaceFingerprinter?: WorkspaceFingerprinter
   worker?: SsrMarkdownWorker
   workerFactory?: WorkerFactory
+  workspaceRoot?: string
   now?: () => number
   onPhaseTiming?: (timing: MarkdownRenderPhaseTiming) => void
 }
@@ -156,7 +173,10 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
   )
   const now = options.now ?? Date.now
   const workspaceFingerprinter = options.workspaceFingerprinter ?? createWorkspaceFingerprinter()
-  const worker = options.worker ?? createModuleGraphSsrWorker(options.workerFactory)
+  const worker = options.worker ?? createModuleGraphSsrWorker(
+    options.workerFactory,
+    options.workspaceRoot
+  )
   const mutex = new AsyncMutex()
   const cache = new MarkdownRenderCache({
     ttlMs: cacheTtlMs,
@@ -442,13 +462,17 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
   return renderer
 }
 
-export function createModuleGraphSsrWorker(workerFactory?: WorkerFactory): SsrMarkdownWorker {
-  return new ModuleGraphSsrWorker(workerFactory)
+export function createModuleGraphSsrWorker(
+  workerFactory?: WorkerFactory,
+  workspaceRoot?: string
+): SsrMarkdownWorker {
+  return new ModuleGraphSsrWorker(workerFactory, workspaceRoot)
 }
 
 class ModuleGraphSsrWorker implements SsrMarkdownWorker {
   private readonly workerFactory: WorkerFactory
-  private readonly workerUrl = new URL("./ssr-markdown-worker.js", import.meta.url)
+  private readonly workspaceRoot: string | undefined
+  private readonly workerUrl = ssrWorkerUrl()
   private readonly bindings = new Map<string, { vite: ViteDevServer, generation: number }>()
   private readonly pending = new Map<number, {
     command: WorkerCommandName
@@ -460,12 +484,12 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
   private nextGeneration = 1
   private closed = false
 
-  constructor(workerFactory: WorkerFactory = (url) => new Worker(url, {
-    // The SSR runner is self-contained. Inheriting host-only V8 flags such as
-    // --expose-gc makes Node reject worker startup with ERR_WORKER_INVALID_EXEC_ARGV.
-    execArgv: []
-  })) {
+  constructor(
+    workerFactory: WorkerFactory = (url, options) => new Worker(url, options),
+    workspaceRoot?: string
+  ) {
     this.workerFactory = workerFactory
+    this.workspaceRoot = workspaceRoot ? resolve(workspaceRoot) : undefined
   }
 
   async load(sessionId: string, vite: ViteDevServer): Promise<void> {
@@ -546,7 +570,20 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     if (this.worker) return this.worker
     let worker: Worker
     try {
-      worker = this.workerFactory(this.workerUrl)
+      worker = this.workerFactory(this.workerUrl, {
+        // The permission model is a second boundary behind the VM evaluator:
+        // conversion may canonicalize assets inside Show workspaces, while host
+        // files, subprocesses, nested workers, native addons, and inherited
+        // environment secrets remain unavailable.
+        execArgv: [
+          "--permission",
+          `--allow-fs-read=${RUNTIME_PACKAGE_ROOT}`,
+          `--allow-fs-read=${VITE_PACKAGE_ROOT}`,
+          ...CONVERSION_PACKAGE_ROOTS.map((root) => `--allow-fs-read=${root}`),
+          ...(this.workspaceRoot ? [`--allow-fs-read=${this.workspaceRoot}`] : [])
+        ],
+        env: { NODE_ENV: "development" }
+      })
     } catch (error) {
       throw new SsrWorkerUnavailableError("The SSR worker could not be started", { cause: error })
     }
@@ -599,17 +636,17 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
       if (invocation.name === "fetchModule") {
         const [id, importer, fetchOptions] = invocation.data
         if (typeof id !== "string") throw new Error("The SSR worker sent an invalid module id")
-        result = await binding.vite.environments.ssr.fetchModule(
+        const fetched = await binding.vite.environments[SSR_MARKDOWN_ENVIRONMENT].fetchModule(
           id,
           typeof importer === "string" ? importer : undefined,
           isRecord(fetchOptions) ? fetchOptions as FetchFunctionOptions : undefined
         )
+        if ("externalize" in fetched) {
+          throw new Error(`External module ${id} is unavailable during Show Page SSR`)
+        }
+        result = fetched
       } else if (invocation.name === "getBuiltins") {
-        result = binding.vite.environments.ssr.config.resolve.builtins.map((builtin) =>
-          typeof builtin === "string"
-            ? { type: "string", value: builtin }
-            : { type: "RegExp", source: builtin.source, flags: builtin.flags }
-        )
+        result = []
       } else {
         throw new Error(`Unsupported Vite worker RPC: ${invocation.name}`)
       }
@@ -638,6 +675,23 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     for (const pending of this.pending.values()) pending.reject(error)
     this.pending.clear()
   }
+}
+
+function packageRoot(specifier: string): string {
+  let candidate = dirname(runtimeRequire.resolve(specifier))
+  while (!existsSync(resolve(candidate, "package.json"))) {
+    const parent = dirname(candidate)
+    if (parent === candidate) throw new Error(`Could not resolve package root for ${specifier}`)
+    candidate = parent
+  }
+  return candidate
+}
+
+function ssrWorkerUrl(): URL {
+  const adjacentConversion = new URL("./ssr-markdown-conversion.js", import.meta.url)
+  return existsSync(fileURLToPath(adjacentConversion))
+    ? new URL("./ssr-markdown-worker.js", import.meta.url)
+    : new URL("../dist/ssr-markdown-worker.js", import.meta.url)
 }
 
 type WorkerCommandName = "load" | "render" | "convert" | "invalidate"
@@ -928,6 +982,7 @@ function pathWithinWorkspace(path: string, workspace: string): boolean {
 
 function invalidateViteSsrGraph(vite: ViteDevServer): void {
   vite.environments?.ssr?.moduleGraph.invalidateAll()
+  vite.environments?.[SSR_MARKDOWN_ENVIRONMENT]?.moduleGraph.invalidateAll()
 }
 
 function normalizeRenderError(

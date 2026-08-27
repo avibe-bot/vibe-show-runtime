@@ -2,12 +2,16 @@ import { access, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, r
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
-import { createRequire } from "node:module"
+import { builtinModules, createRequire } from "node:module"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import react from "@vitejs/plugin-react"
 import tailwindcss from "@tailwindcss/vite"
-import { createServer as createViteServer } from "vite"
+import {
+  createServer as createViteServer,
+  defaultClientConditions,
+  defaultClientMainFields
+} from "vite"
 import type { InlineConfig, Plugin, ViteDevServer } from "vite"
 import {
   formatShowEventMessage,
@@ -21,8 +25,8 @@ import type { ShowRuntime, ShowRuntimeOptions, ShowSession, ShowSessionStatus } 
 import { createShadcnAlias } from "./aliases.js"
 import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
 import {
-  ssrMarkdownEntryPlugin,
-  ssrMarkdownRuntimeModulePaths
+  SSR_MARKDOWN_ENVIRONMENT,
+  ssrMarkdownEntryPlugin
 } from "./ssr-markdown-entry-plugin.js"
 import { ensureSessionTemplate } from "./templates.js"
 import { createVendorExternalizePlugins, isProvidedVendorSpecifier } from "./vendor-externalize-plugin.js"
@@ -41,6 +45,10 @@ const DEFAULT_IDLE_PRUNE_INTERVAL_MS = 5 * 60 * 1000
  * dir is only ever deleted long after any live process could still be resolving or closing it. */
 const CACHE_GC_TRAILING_MARGIN_MS = 60 * 60 * 1000
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
+const NODE_BUILTIN_SPECIFIERS = new Set([
+  ...builtinModules,
+  ...builtinModules.map((specifier) => `node:${specifier}`)
+])
 const RUNTIME_VITE_PACKAGE_ROOT = dirname(createRequire(import.meta.url).resolve("vite/package.json"))
 const SENSITIVE_FS_DENY_PATTERNS = [
   "**/.git",
@@ -515,15 +523,23 @@ export function createShowRuntime(
       sharedDependencies.sharedNodeModules,
       ...sharedDependencies.packageRoots
     ])
-    // Vite must transform these Runtime-owned files for the SSR environment, but
-    // they are not part of the human-facing /@fs serving surface.
-    const ssrModuleFiles = await fileBoundaryRoots(ssrMarkdownRuntimeModulePaths())
-    const fsAllow = [...new Set([...requestAllowedRoots, ...ssrModuleFiles])]
     const fileBoundary: WorkspaceFileBoundary = {
       workspace: resolve(session.workspace),
       workspaceRoots,
       allowedRoots: requestAllowedRoots
     }
+    const ssrOptimizeIncludes = await optimizableBareImports(
+      [...new Set([
+        ...sourceDependencies.extraBareImports.filter(isSsrJavascriptSpecifier),
+        "react",
+        "react/jsx-dev-runtime",
+        "react/jsx-runtime",
+        "react-dom",
+        "react-dom/server.browser"
+      ])],
+      sharedDependencies.nodeModules,
+      sharedDependencies.sharedNodeModules
+    )
     const viteConfig = {
       // The outer runtime owns the Show Page SPA fallback. Vite's default `spa`
       // middleware also rewrites missing assets and reserved paths to index.html,
@@ -542,7 +558,7 @@ export function createShowRuntime(
         },
         fs: {
           strict: true,
-          allow: fsAllow,
+          allow: requestAllowedRoots,
           deny: workspaceFsDenyPatterns(workspaceRoots)
         }
       },
@@ -572,6 +588,29 @@ export function createShowRuntime(
         // dedupe keeps any stray local resolution collapsed to one copy.
         dedupe: ["react", "react-dom"]
       },
+      environments: {
+        // Keep API handlers on Vite's ordinary Node SSR environment. Only this
+        // renderer-owned graph is inlined for evaluation inside the worker VM.
+        [SSR_MARKDOWN_ENVIRONMENT]: {
+          consumer: "server",
+          keepProcessEnv: false,
+          resolve: {
+            noExternal: true,
+            conditions: [...defaultClientConditions],
+            mainFields: [...defaultClientMainFields]
+          },
+          // Vite's dev SSR runner needs CJS entry points pre-bundled before a
+          // noExternal graph can execute them as ESM in the sandbox. Browser
+          // resolution keeps packages with separate Node/browser entry points on
+          // the same authority-free code path as the human representation.
+          optimizeDeps: {
+            include: ssrOptimizeIncludes,
+            // Browser-platform prebundling converts CJS without injecting Node's
+            // `module`/createRequire bridge, which would reintroduce host authority.
+            esbuildOptions: { platform: "browser" }
+          }
+        }
+      },
       optimizeDeps: {
         noDiscovery: true,
         // The provided vendor set is externalized (left bare for the import map),
@@ -585,7 +624,10 @@ export function createShowRuntime(
         // and the shared resolve fallback serves it on demand instead. Keeping it in
         // `include` would only emit a misleading "Failed to resolve dependency" warning.
         include: await optimizableBareImports(
-          sourceDependencies.extraBareImports.filter((specifier) => !isProvidedVendorSpecifier(specifier, providedSpecifiers)),
+          sourceDependencies.extraBareImports.filter((specifier) =>
+            !isProvidedVendorSpecifier(specifier, providedSpecifiers) &&
+            !NODE_BUILTIN_SPECIFIERS.has(specifier)
+          ),
           sharedDependencies.nodeModules,
           sharedDependencies.sharedNodeModules
         )
@@ -1613,19 +1655,25 @@ function isBareImport(specifier: string) {
     !specifier.startsWith("\0")
 }
 
+function isSsrJavascriptSpecifier(specifier: string): boolean {
+  const clean = specifier.replace(/[?#].*$/, "")
+  return isBareImport(specifier) &&
+    !NODE_BUILTIN_SPECIFIERS.has(clean) &&
+    !/\.(?:css|less|sass|scss|styl|stylus|svg|png|jpe?g|gif|webp|avif)$/i.test(clean)
+}
+
 /**
  * Filter `optimizeDeps.include` to specifiers Vite's dep optimizer can actually resolve
  * from the session's own `node_modules`.
  *
- * Shared-only sessions resolve everything from the single shared dir, so the list is
- * returned unchanged. For extras sessions, a specifier that resolves ONLY from the
- * shared install (not the session's extras-only dir) is dropped: the optimizer (rooted
- * at the session) can't pre-bundle it, and the shared resolve fallback serves it on
- * demand. Keeping it would just emit a misleading "Failed to resolve dependency" warning.
+ * A specifier that does not resolve from the session's own install is dropped: the
+ * optimizer (rooted at the session) cannot pre-bundle it. This also matters for
+ * Runtime-owned SSR imports when a test or embedder supplies a deliberately minimal
+ * dependency root; Vite can still load those modules from their physical source, but
+ * should not advertise them as optimizer entries for that session.
  */
-async function optimizableBareImports(specifiers: string[], nodeModules: string, sharedNodeModules: string): Promise<string[]> {
-  if (nodeModules === sharedNodeModules) return specifiers
-  // Anchor a resolver at the session workspace (the parent of its extras node_modules).
+async function optimizableBareImports(specifiers: string[], nodeModules: string, _sharedNodeModules: string): Promise<string[]> {
+  // Anchor a resolver at the session workspace (the parent of its node_modules).
   const sessionRequire = createRequire(join(dirname(nodeModules), "__avibe-show-session-resolver.js"))
   return specifiers.filter((specifier) => {
     try {

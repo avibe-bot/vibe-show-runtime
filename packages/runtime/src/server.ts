@@ -34,7 +34,7 @@ export type ShowRuntimeServerDependencies = {
   markdownRendererOptions?: Omit<
     MarkdownRendererOptions,
     "workspaceFingerprinter" | "worker" | "loadTimeoutMs" | "reactTimeoutMs" | "conversionTimeoutMs" |
-    "cacheTtlMs" | "maxOutputBytes"
+    "cacheTtlMs" | "maxOutputBytes" | "workspaceRoot"
   >
 }
 
@@ -52,6 +52,7 @@ export async function startShowRuntimeServer(
     conversionTimeoutMs: options.renderConversionTimeoutMs,
     cacheTtlMs: options.renderCacheTtlMs,
     maxOutputBytes: options.renderMaxOutputBytes,
+    workspaceRoot: options.workspaceRoot,
     workspaceFingerprinter,
     worker: dependencies.markdownWorker
   })

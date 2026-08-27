@@ -1,13 +1,12 @@
 import { parentPort } from "node:worker_threads"
-import {
-  ModuleRunner,
-  createNodeImportMeta
-} from "vite/module-runner"
+import { ModuleRunner } from "vite/module-runner"
+import { convertSsrRenderedHtmlToMarkdown } from "./ssr-markdown-conversion.js"
+import { SsrSandboxEvaluator } from "./ssr-markdown-sandbox.js"
 
 if (!parentPort) throw new Error("The SSR Markdown worker requires a parent port")
 const port = parentPort
 
-/** @typedef {{ runner: ModuleRunner, generation: number, entry?: Record<string, unknown> }} SessionState */
+/** @typedef {{ runner: ModuleRunner, evaluator: SsrSandboxEvaluator, generation: number, entry?: Record<string, unknown> }} SessionState */
 /** @type {Map<string, SessionState>} */
 const sessions = new Map()
 /** @type {Map<number, { resolve: (value: unknown) => void, reject: (error: Error) => void }>} */
@@ -46,14 +45,16 @@ async function executeCommand(command) {
         sessions.delete(command.sessionId)
       }
       if (!state) {
+        const evaluator = new SsrSandboxEvaluator(`avibe-show-ssr:${command.sessionId}`)
         state = {
           generation: command.generation,
+          evaluator,
           runner: new ModuleRunner({
             transport: createParentTransport(command.sessionId, command.generation),
-            createImportMeta: createNodeImportMeta,
+            createImportMeta: (modulePath) => evaluator.createImportMeta(modulePath),
             hmr: false,
             sourcemapInterceptor: false
-          })
+          }, evaluator)
         }
         sessions.set(command.sessionId, state)
       }
@@ -61,8 +62,7 @@ async function executeCommand(command) {
       if (
         !entry ||
         typeof entry !== "object" ||
-        typeof entry.render !== "function" ||
-        typeof entry.convert !== "function"
+        typeof entry.render !== "function"
       ) {
         throw new Error("The Show Page SSR entry is incomplete")
       }
@@ -70,21 +70,23 @@ async function executeCommand(command) {
       return undefined
     }
     case "render": {
-      const entry = sessionEntry(command)
-      return entry.render(command.location)
+      const state = sessionState(command)
+      return state.entry.render(state.evaluator.cloneJson(command.location))
     }
     case "convert": {
-      const entry = sessionEntry(command)
-      return entry.convert(command.html, command.options)
+      sessionState(command)
+      return convertSsrRenderedHtmlToMarkdown(command.html, command.options)
     }
     case "invalidate": {
       const state = sessions.get(command.sessionId)
       sessions.delete(command.sessionId)
       await state?.runner.close()
+      state?.evaluator.dispose()
       return undefined
     }
     case "close": {
       const closing = [...sessions.values()].map(({ runner }) => runner.close())
+      for (const { evaluator } of sessions.values()) evaluator.dispose()
       sessions.clear()
       await Promise.allSettled(closing)
       return undefined
@@ -95,12 +97,12 @@ async function executeCommand(command) {
 }
 
 /** @param {Record<string, any>} command */
-function sessionEntry(command) {
+function sessionState(command) {
   const state = sessions.get(command.sessionId)
   if (!state || state.generation !== command.generation || !state.entry) {
     throw new Error("The Show Page SSR entry is not loaded")
   }
-  return /** @type {Record<string, Function>} */ (state.entry)
+  return /** @type {SessionState & { entry: Record<string, Function> }} */ (state)
 }
 
 /** @param {string} sessionId @param {number} generation */
@@ -133,15 +135,16 @@ function settleRpc(message) {
 
 /** @param {unknown} value */
 function serializeError(value) {
-  if (!(value instanceof Error)) {
+  if (!value || typeof value !== "object") {
     return { name: "Error", message: String(value) }
   }
+  const error = /** @type {Record<string, any>} */ (value)
   const code = "code" in value && typeof value.code === "string" ? value.code : undefined
   const status = "status" in value && typeof value.status === "number" ? value.status : undefined
   return {
-    name: value.name,
-    message: value.message,
-    stack: value.stack,
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
     code,
     status
   }

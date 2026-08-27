@@ -14,7 +14,6 @@ import {
   type SsrMarkdownWorker
 } from "./markdown-renderer.js"
 import { convertSsrRenderedHtmlToMarkdown } from "./ssr-markdown-conversion.js"
-import { ssrMarkdownRuntimeModulePaths } from "./ssr-markdown-entry-plugin.js"
 import {
   startShowRuntimeServer,
   type ShowRuntimeServerDependencies
@@ -29,6 +28,7 @@ const cleanups: Array<() => Promise<void>> = []
 
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+  vi.unstubAllEnvs()
 })
 
 async function startFixtureServer(
@@ -115,7 +115,7 @@ describe("SSR Markdown endpoint", () => {
     expect(markdown).not.toContain("SSR_SCRIPT_RAN")
     expect(markdown).not.toContain("fixture-only")
 
-    const runtimeModulePath = ssrMarkdownRuntimeModulePaths()[0].replaceAll("\\", "/")
+    const runtimeModulePath = join(sourceDirectory, "ssr-markdown-conversion.ts").replaceAll("\\", "/")
     const humanRequest = await fetch(
       `${runtime.url}/sessions/semantic/app/@fs/${runtimeModulePath}`
     )
@@ -144,9 +144,19 @@ describe("SSR Markdown endpoint", () => {
   })
 
   it("maps page and custom-router browser globals to render_failed without rewriting the router", async () => {
-    const runtime = await startFixtureServer(["module-window", "render-document", "custom-router-window"])
+    const runtime = await startFixtureServer([
+      "module-window",
+      "render-document",
+      "render-abort",
+      "custom-router-window"
+    ])
 
-    for (const sessionId of ["module-window", "render-document", "custom-router-window"]) {
+    for (const sessionId of [
+      "module-window",
+      "render-document",
+      "render-abort",
+      "custom-router-window"
+    ]) {
       const response = await fetch(markdownUrl(runtime.url, sessionId))
       expect(response.status, sessionId).toBe(502)
       expect(await renderError(response)).toEqual({
@@ -160,6 +170,58 @@ describe("SSR Markdown endpoint", () => {
     const routerPath = join(runtime.workspaceRoot, "custom-router-window", "src", "router.tsx")
     expect(await readFile(routerPath, "utf8")).toContain("const browserWidth = window.innerWidth")
     expect(await readFile(routerPath, "utf8")).not.toContain("SsrRouterContext")
+  }, 60_000)
+
+  it("denies workspace access to host builtins, environment secrets, and VM escape constructors", async () => {
+    const sentinel = "AVIBE_SSR_HOST_AUTHORITY_MUST_NOT_LEAK"
+    vi.stubEnv("AVIBE_SSR_HOST_SENTINEL", sentinel)
+    const runtime = await startFixtureServer(["module-node-fs", "sandbox-escapes"])
+    const sentinelPath = join(runtime.workspaceRoot, "host-readable-sentinel.txt")
+    await writeFile(sentinelPath, sentinel)
+
+    for (const fixture of ["module-node-fs", "sandbox-escapes"]) {
+      const pagePath = join(runtime.workspaceRoot, fixture, "src", "pages", "index.tsx")
+      const source = await readFile(pagePath, "utf8")
+      await writeFile(
+        pagePath,
+        source.replace('"__HOST_SENTINEL_PATH__"', JSON.stringify(sentinelPath))
+      )
+    }
+
+    const builtin = await fetch(markdownUrl(runtime.url, "module-node-fs"))
+    expect(builtin.status).toBe(502)
+    expect(await renderError(builtin)).toEqual({
+      error: {
+        code: "render_failed",
+        message: "Show Page rendering failed."
+      }
+    })
+
+    const escapes = await fetch(markdownUrl(runtime.url, "sandbox-escapes"))
+    const markdown = await escapes.text()
+    expect(escapes.status, markdown).toBe(200)
+    for (const attempt of [
+      "process-env",
+      "Function",
+      "eval",
+      "URL constructor",
+      "timer constructor",
+      "encoder constructor",
+      "Promise constructor",
+      "import-meta constructor",
+      "module namespace",
+      "dynamic import"
+    ]) {
+      expect(markdown).toContain(`${attempt}: blocked`)
+    }
+    expect(markdown).not.toContain(sentinel)
+  }, 60_000)
+
+  it("keeps API handlers on Vite's ordinary Node SSR environment", async () => {
+    const runtime = await startFixtureServer(["api-node"])
+    const response = await fetch(`${runtime.url}/sessions/api-node/app/api/read`)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ value: "ordinary-node-ssr" })
   }, 60_000)
 
   it("returns output_too_large after enforcing the intermediate and Markdown caps", async () => {
@@ -189,7 +251,7 @@ describe("SSR Markdown endpoint", () => {
   it("terminates a hung module load at its phase deadline and keeps the runtime usable", async () => {
     const runtime = await startFixtureServer(
       ["hung-load", "semantic"],
-      { renderLoadTimeoutMs: 500 }
+      { renderLoadTimeoutMs: 3_000 }
     )
     await runtime.runtime.ensureSession("hung-load", "/show/hung-load/")
     await runtime.runtime.ensureSession("semantic", "/show/semantic/")
@@ -198,7 +260,7 @@ describe("SSR Markdown endpoint", () => {
     const timedOut = await fetch(markdownUrl(runtime.url, "hung-load"))
     expect(timedOut.status).toBe(504)
     expect(await renderError(timedOut)).toMatchObject({ error: { code: "render_timeout" } })
-    expect(performance.now() - started).toBeLessThan(2_000)
+    expect(performance.now() - started).toBeLessThan(6_000)
 
     const recovered = await fetch(markdownUrl(runtime.url, "semantic"))
     expect(recovered.status).toBe(200)

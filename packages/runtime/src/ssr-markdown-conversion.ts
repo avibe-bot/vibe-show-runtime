@@ -32,7 +32,7 @@ export function convertSsrRenderedHtmlToMarkdown(
   const html = cleanupSsrRenderedHtml(source, options)
   const markdown = convertRenderedHtmlToMarkdown(html)
   if (!markdown.trim()) throw new Error("The rendered page has no Markdown content")
-  if (Buffer.byteLength(markdown, "utf8") > options.maxOutputBytes) {
+  if (utf8ByteLength(markdown) > options.maxOutputBytes) {
     throw outputTooLarge(options.maxOutputBytes)
   }
   return { markdown, html }
@@ -42,14 +42,14 @@ export function cleanupSsrRenderedHtml(
   source: string,
   options: SsrMarkdownConversionOptions
 ): string {
-  if (Buffer.byteLength(source, "utf8") > options.maxOutputBytes) {
+  if (utf8ByteLength(source) > options.maxOutputBytes) {
     throw outputTooLarge(options.maxOutputBytes)
   }
 
   const fragment = parseFragment(source)
   cleanChildren(fragment, options)
   const cleaned = serialize(fragment).trim()
-  if (Buffer.byteLength(cleaned, "utf8") > options.maxOutputBytes) {
+  if (utf8ByteLength(cleaned) > options.maxOutputBytes) {
     throw outputTooLarge(options.maxOutputBytes)
   }
   return cleaned
@@ -208,6 +208,10 @@ function internalPathSuffix(pathname: string, internalRoot: string): string | un
 
 function withTrailingSlash(pathname: string): string {
   return pathname.endsWith("/") ? pathname : `${pathname}/`
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength
 }
 
 function attributeValue(element: DefaultTreeAdapterTypes.Element, name: string): string | undefined {

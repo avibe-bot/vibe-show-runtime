@@ -118,7 +118,8 @@ describe("generated router migration", () => {
   it("migrates the byte-identical historical Runtime router", async () => {
     const workspace = await workspaceWithStyles("")
     const routerPath = join(workspace, "src", "router.tsx")
-    const historical = await readFile(join(fixtureRoot, "router-history-v1.tsx"), "utf8")
+    const historical = (await readFile(join(fixtureRoot, "router-history-v1.tsx"), "utf8"))
+      .replaceAll("\r\n", "\n")
     await writeFile(routerPath, historical)
 
     await ensureSessionTemplate(workspace)
@@ -134,7 +135,8 @@ describe("generated router migration", () => {
   it("never overwrites a modified historical router", async () => {
     const workspace = await workspaceWithStyles("")
     const routerPath = join(workspace, "src", "router.tsx")
-    const historical = await readFile(join(fixtureRoot, "router-history-v1.tsx"), "utf8")
+    const historical = (await readFile(join(fixtureRoot, "router-history-v1.tsx"), "utf8"))
+      .replaceAll("\r\n", "\n")
     const modified = `${historical}\n// workspace-owned customization\n`
     await writeFile(routerPath, modified)
 
