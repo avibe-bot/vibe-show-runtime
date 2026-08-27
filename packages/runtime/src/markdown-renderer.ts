@@ -2,14 +2,22 @@ import { spawn } from "node:child_process"
 import { createRequire } from "node:module"
 import { dirname, join } from "node:path"
 import { chromium } from "playwright-core"
-import TurndownService from "turndown"
-import { gfm } from "turndown-plugin-gfm"
+import {
+  convertRenderedHtmlToMarkdown,
+  MarkdownRenderError,
+  type MarkdownRenderErrorCode
+} from "./markdown-core.js"
 import {
   createWorkspaceFingerprinter,
   type WorkspaceFingerprinter
 } from "./workspace-fingerprint.js"
 
 export { workspaceFingerprint } from "./workspace-fingerprint.js"
+export {
+  convertRenderedHtmlToMarkdown,
+  MarkdownRenderError,
+  type MarkdownRenderErrorCode
+} from "./markdown-core.js"
 
 export const DEFAULT_MARKDOWN_RENDER_TIMEOUT_MS = 30_000
 export const DEFAULT_MARKDOWN_CACHE_TTL_MS = 30_000
@@ -29,26 +37,6 @@ const PLAYWRIGHT_CLI_PATH = join(
 )
 
 export type ShowRenderContext = "private" | "shared"
-export type MarkdownRenderErrorCode =
-  | "invalid_target"
-  | "session_unknown"
-  | "renderer_unavailable"
-  | "render_timeout"
-  | "render_failed"
-  | "output_too_large"
-
-export class MarkdownRenderError extends Error {
-  constructor(
-    readonly code: MarkdownRenderErrorCode,
-    readonly status: number,
-    message: string,
-    options?: ErrorOptions
-  ) {
-    super(message, options)
-    this.name = "MarkdownRenderError"
-  }
-}
-
 export type MarkdownRenderRequest = {
   sessionId: string
   context: ShowRenderContext
@@ -726,19 +714,6 @@ export function cleanupRenderedDocument(options: {
     }
     return true
   }
-}
-
-export function convertRenderedHtmlToMarkdown(html: string): string {
-  const turndown = new TurndownService({
-    bulletListMarker: "-",
-    codeBlockStyle: "fenced",
-    emDelimiter: "_",
-    headingStyle: "atx",
-    strongDelimiter: "**"
-  })
-  turndown.use(gfm)
-  const markdown = turndown.turndown(html).trim()
-  return markdown ? `${markdown}\n` : ""
 }
 
 function outputTooLarge(maxOutputBytes: number): MarkdownRenderError {

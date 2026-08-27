@@ -3,7 +3,7 @@ import type { Plugin as EsbuildPlugin } from "esbuild"
 
 /**
  * Leave the shared "provided" vendor specifiers as **bare** specifiers in every
- * served dev module so a browser import map (added on the serving side) resolves
+ * browser-served dev module so an import map (added on the serving side) resolves
  * them to the one shared, content-hashed vendor bundle (Stage R-A) — i.e. one
  * React instance across every Show Page session.
  *
@@ -122,13 +122,18 @@ function externalizePlugin(matcher: ProvidedMatcher): Plugin {
       // typed readonly on ResolvedConfig but is the live array Vite iterates.)
       ;(config.plugins as Plugin[]).push(bareRewritePlugin(matcher, config.base ?? "/"))
     },
-    resolveId(source) {
+    resolveId(source, _importer, options) {
+      // SSR has no browser import map. Let Vite's SSR resolver load the real
+      // package from the prepared shared install instead of returning the
+      // browser-only external/stub module.
+      if (options.ssr) return null
       if (matcher.matches(source)) {
         return { id: source, external: true }
       }
       return null
     },
-    load(id) {
+    load(id, options) {
+      if (options?.ssr) return null
       // External ids are not normally loaded, but a stub keeps Vite from logging
       // "could not be resolved" if anything reaches the load hook.
       if (matcher.matches(id)) {
@@ -172,7 +177,8 @@ function bareRewritePlugin(matcher: ProvidedMatcher, base: string): Plugin {
   const pattern = buildBareRewritePattern(base)
   return {
     name: "avibe-show-vendor-bare-rewrite",
-    transform(code) {
+    transform(code, _id, options) {
+      if (options?.ssr) return null
       if (!code.includes("/@id/")) return null
       pattern.lastIndex = 0
       let mutated = false
