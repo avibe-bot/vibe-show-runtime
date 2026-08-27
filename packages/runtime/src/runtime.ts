@@ -20,7 +20,10 @@ import {
 import type { ShowRuntime, ShowRuntimeOptions, ShowSession, ShowSessionStatus } from "./types.js"
 import { createShadcnAlias } from "./aliases.js"
 import { showHmrTransitionPlugin } from "./hmr-transition-plugin.js"
-import { ssrMarkdownEntryPlugin } from "./ssr-markdown-entry-plugin.js"
+import {
+  ssrMarkdownEntryPlugin,
+  ssrMarkdownRuntimeModulePaths
+} from "./ssr-markdown-entry-plugin.js"
 import { ensureSessionTemplate } from "./templates.js"
 import { createVendorExternalizePlugins, isProvidedVendorSpecifier } from "./vendor-externalize-plugin.js"
 import {
@@ -649,7 +652,7 @@ export function createShowRuntime(
     // now — anything untouched past the (hours-wide) cutoff belongs to no live process (#31).
     void pruneRuntimeCaches()
     const workspaceRoots = await fileBoundaryRoots([session.workspace])
-    const fsAllow = await fileBoundaryRoots([
+    const requestAllowedRoots = await fileBoundaryRoots([
       session.workspace,
       cacheDir,
       RUNTIME_VITE_PACKAGE_ROOT,
@@ -657,10 +660,14 @@ export function createShowRuntime(
       sharedDependencies.sharedNodeModules,
       ...sharedDependencies.packageRoots
     ])
+    // Vite must transform these Runtime-owned files for the SSR environment, but
+    // they are not part of the human-facing /@fs serving surface.
+    const ssrModuleFiles = await fileBoundaryRoots(ssrMarkdownRuntimeModulePaths())
+    const fsAllow = [...new Set([...requestAllowedRoots, ...ssrModuleFiles])]
     const fileBoundary: WorkspaceFileBoundary = {
       workspace: resolve(session.workspace),
       workspaceRoots,
-      allowedRoots: fsAllow
+      allowedRoots: requestAllowedRoots
     }
     snapshotBuildContexts.set(session.id, {
       fileBoundary,
