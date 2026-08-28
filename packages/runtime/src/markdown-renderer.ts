@@ -44,7 +44,6 @@ import {
   SSR_MARKDOWN_ENTRY_ID,
   SSR_MARKDOWN_ENVIRONMENT
 } from "./ssr-markdown-entry-plugin.js"
-import { invalidateSsrModuleValidationCache } from "./ssr-module-validation-cache.js"
 import {
   createWorkspaceFingerprinter,
   type WorkspaceFingerprinter
@@ -293,7 +292,6 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
 
             const loadedFingerprint = loadedFingerprints.get(request.sessionId)
             if (loadedFingerprint !== undefined && loadedFingerprint !== fingerprint) {
-              invalidateSsrModuleValidationCache(prepared.vite)
               invalidateViteSsrGraph(prepared.vite)
               await runWorkerOperation(
                 loadBudget,
@@ -412,8 +410,6 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
 
     async invalidateSession(sessionId, releaseResources) {
       if (closed) return
-      const boundVite = watcherBindings.get(sessionId)?.vite
-      if (boundVite) invalidateSsrModuleValidationCache(boundVite)
       cache.invalidateSession(sessionId)
       workspaceFingerprinter.invalidateSession(sessionId)
       unbindSessionWatcher(sessionId)

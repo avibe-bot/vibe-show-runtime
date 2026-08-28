@@ -12,7 +12,15 @@ import { renderToStaticMarkup } from "react-dom/server.browser"
 import App from "/src/App.tsx"
 import * as RouterModule from "/src/router.tsx"
 
-export const hasSsrRouterProvider = typeof RouterModule.SsrRouterProvider === "function"
+function isRenderableComponent(value) {
+  return typeof value === "function" || (
+    typeof value === "object" &&
+    value !== null &&
+    "$$typeof" in value
+  )
+}
+
+export const hasSsrRouterProvider = isRenderableComponent(RouterModule.SsrRouterProvider)
 
 export function render(location) {
   const app = createElement(App)

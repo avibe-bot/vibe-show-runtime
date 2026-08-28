@@ -27,10 +27,11 @@ one long-lived, terminable Node child process
 
 The Runtime-owned virtual entry imports the page `App` and React DOM Server
 through one session SSR graph. If `src/router.tsx` exists, the entry imports its
-namespace and detects the `SsrRouterProvider` export. Current routers use that
-provider for full target fidelity; older routers and App-only workspaces render
-`App` directly at the root document. That preserves the session's physical
-React instance across application, optional provider, and renderer.
+namespace and detects a function or React exotic `SsrRouterProvider` export.
+Current routers use that provider for full target fidelity; older routers and
+App-only workspaces render `App` directly at the root document. That preserves
+the session's physical React instance across application, optional provider,
+and renderer.
 Cleanup and conversion do not compose React values, so they run in the same
 terminable child process's trusted Runtime layer rather than in the workspace VM.
 React render, raw-output enforcement, cleanup, and Turndown run as one child
@@ -84,14 +85,6 @@ temporary, or arbitrary cache artifacts are denied even though the human Vite
 server may use them. The Vite cache identity includes
 `ssr-markdown-acquisition-v1`, so artifacts produced before this policy cannot
 be reused under the new boundary.
-
-Canonical validation verdicts and self-canonical dependency/cache targets are
-cached in two per-live-session LRU maps, each capped at 16,384 entries. Workspace
-source targets are always re-canonicalized, so a retargeted workspace symlink
-cannot inherit an allowed dependency verdict. Watcher events, fingerprint
-mismatches, suspend, and idle pruning clear both maps together with the SSR
-module graph. This keeps repeat graph loads cheap on slower filesystems without
-weakening invalidation.
 
 A configured dependency root may be a symlink forest. Its canonical package
 targets are accepted only as Markdown dependency origins after the same target
@@ -277,18 +270,19 @@ entries are removed during lookup, write, and the five-second idle maintenance
 pass.
 
 Workspace watcher events evict the session's Markdown entries, fingerprint
-memoization, canonical validation verdicts, and child evaluation state. Every
+memoization, and child evaluation state. Every
 lookup also recomputes the workspace fingerprint; a mismatch invalidates the
-Vite SSR graph, validation verdicts, and child state even if a watcher event was
-missed. Session suspend and idle pruning clear the same state before releasing
+Vite SSR graph and child state even if a watcher event was missed. Session
+suspend and idle pruning clear the same state before releasing
 the live Vite server.
 
 ## Router compatibility
 
 Full SSR fidelity requires the current router contract; older workspaces render
 root-only; the Runtime never modifies user workspace files. A router exporting
-`SsrRouterProvider` receives the requested path, params, and query. A router
-without that export, or an App-only workspace, renders `src/App.tsx` only for
+a renderable function or React exotic `SsrRouterProvider` receives the requested
+path, params, and query. A router without that export, or an App-only workspace,
+renders `src/App.tsx` only for
 `/`; a non-root target returns `render_failed` rather than misrepresenting the
 root route. If neither App nor router exists, the unchanged module-load failure
 maps to `render_failed`.
@@ -304,14 +298,14 @@ fingerprint but never contact the child.
 
 | Measurement | Result |
 | --- | ---: |
-| cold request | 1,874-2,164 ms |
-| cold load | 1,840-2,130 ms |
-| cold render / conversion | 5.4-6.1 / 6.7-7.0 ms |
-| warm miss median / p95 | 123.70-134.84 / 153.16-241.21 ms |
-| cache hit median / p95 | 0.96-1.31 / 1.80-10.49 ms |
-| RSS before cold | 115.0-116.5 MiB |
-| RSS after cold (delta) | 477.8-507.1 MiB (+362.1-392.2 MiB) |
-| RSS after 20 warm misses | 774.1-842.1 MiB |
+| cold request | 1,840-1,998 ms |
+| cold load | 1,806-1,964 ms |
+| cold render / conversion | 5.6-5.9 / 6.6-7.1 ms |
+| warm miss median / p95 | 113.82-123.84 / 137.82-173.57 ms |
+| cache hit median / p95 | 1.04-1.13 / 1.68-2.04 ms |
+| RSS before cold | 112.2-116.2 MiB |
+| RSS after cold (delta) | 502.6-506.0 MiB (+386.4-393.8 MiB) |
+| RSS after 20 warm misses | 835.3-861.1 MiB |
 
 RSS after child startup is the OS-reported sum for the Runtime parent and active
 SSR child, rather than the parent's `process.memoryUsage()` alone. The benchmark

@@ -30,7 +30,6 @@ import {
   SSR_MARKDOWN_ENVIRONMENT,
   ssrMarkdownEntryPlugin
 } from "./ssr-markdown-entry-plugin.js"
-import { registerSsrModuleValidationInvalidator } from "./ssr-module-validation-cache.js"
 import { ensureSessionTemplate } from "./templates.js"
 import { createVendorExternalizePlugins, isProvidedVendorSpecifier } from "./vendor-externalize-plugin.js"
 import {
@@ -55,7 +54,6 @@ const NODE_BUILTIN_SPECIFIERS = new Set([
 const RUNTIME_VITE_PACKAGE_ROOT = dirname(createRequire(import.meta.url).resolve("vite/package.json"))
 const SSR_MARKDOWN_ACQUISITION_CONTRACT_VERSION = "ssr-markdown-acquisition-v1"
 const SSR_OPTIMIZER_BOUNDARY_ERROR = "Show Page SSR dependency optimization was denied by the workspace boundary"
-const SSR_MODULE_VALIDATION_CACHE_MAX_ENTRIES = 16_384
 const SENSITIVE_FS_DENY_PATTERNS = [
   "**/.git",
   "**/.git/**",
@@ -98,12 +96,6 @@ type WorkspaceFileBoundary = {
   allowedRoots: string[]
   cacheRoots: string[]
   ssrArtifactRoots: string[]
-  validationCache: {
-    canonicalTargets: Map<string, string>
-    canonicalVerdicts: Map<string, boolean>
-    inFlightTargets: Map<string, Promise<string | undefined>>
-    generation: number
-  }
 }
 
 async function fileBoundaryRoots(paths: string[]): Promise<string[]> {
@@ -190,91 +182,13 @@ async function isDeniedSsrModuleTarget(
 ): Promise<boolean> {
   const filePath = ssrModuleFilePath(rawId)
   if (!filePath) return true
-  while (true) {
-    const generation = boundary.validationCache.generation
-    const target = await canonicalSsrModuleTarget(filePath, boundary)
-    if (generation !== boundary.validationCache.generation) continue
-    if (!target) return true
-    const cached = boundary.validationCache.canonicalVerdicts.get(target)
-    if (cached !== undefined) {
-      touchBoundedCache(boundary.validationCache.canonicalVerdicts, target, cached)
-      return cached
-    }
-    const denied = relativeWithin(boundary.cacheRoots, target) !== undefined
-      ? (() => {
-          const artifactRelative = relativeWithin(boundary.ssrArtifactRoots, target)
-          return artifactRelative === undefined || hasSensitiveFileSegment(normalizePath(artifactRelative))
-        })()
-      : isDeniedResolvedTarget(target, boundary)
-    if (generation !== boundary.validationCache.generation) continue
-    touchBoundedCache(boundary.validationCache.canonicalVerdicts, target, denied)
-    if (!denied && cacheableCanonicalLookup(filePath, target, boundary)) {
-      touchBoundedCache(boundary.validationCache.canonicalTargets, filePath, target)
-    }
-    return denied
+  const target = await realpath(filePath).catch(() => undefined)
+  if (!target) return true
+  if (relativeWithin(boundary.cacheRoots, target) !== undefined) {
+    const artifactRelative = relativeWithin(boundary.ssrArtifactRoots, target)
+    return artifactRelative === undefined || hasSensitiveFileSegment(normalizePath(artifactRelative))
   }
-}
-
-async function canonicalSsrModuleTarget(
-  filePath: string,
-  boundary: WorkspaceFileBoundary
-): Promise<string | undefined> {
-  const cached = boundary.validationCache.canonicalTargets.get(filePath)
-  if (cached !== undefined) {
-    touchBoundedCache(boundary.validationCache.canonicalTargets, filePath, cached)
-    return cached
-  }
-  const inFlight = boundary.validationCache.inFlightTargets.get(filePath)
-  if (inFlight) return await inFlight
-  const pending = realpath(filePath).catch(() => undefined)
-  boundary.validationCache.inFlightTargets.set(filePath, pending)
-  try {
-    return await pending
-  } finally {
-    if (boundary.validationCache.inFlightTargets.get(filePath) === pending) {
-      boundary.validationCache.inFlightTargets.delete(filePath)
-    }
-  }
-}
-
-function cacheableCanonicalLookup(
-  filePath: string,
-  target: string,
-  boundary: WorkspaceFileBoundary
-): boolean {
-  // Workspace paths stay freshly canonicalized so a retargeted symlink cannot
-  // reuse an allowed dependency verdict between invalidation signals.
-  return relativeWithin(boundary.workspaceRoots, filePath) === undefined &&
-    sameFilesystemPath(filePath, target)
-}
-
-function sameFilesystemPath(left: string, right: string): boolean {
-  const normalizedLeft = normalizePath(resolve(left))
-  const normalizedRight = normalizePath(resolve(right))
-  return process.platform === "win32"
-    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
-    : normalizedLeft === normalizedRight
-}
-
-function touchBoundedCache<Key, Value>(
-  cache: Map<Key, Value>,
-  key: Key,
-  value: Value
-): void {
-  cache.delete(key)
-  cache.set(key, value)
-  while (cache.size > SSR_MODULE_VALIDATION_CACHE_MAX_ENTRIES) {
-    const oldest = cache.keys().next()
-    if (oldest.done) break
-    cache.delete(oldest.value)
-  }
-}
-
-function clearSsrModuleValidationCache(boundary: WorkspaceFileBoundary): void {
-  boundary.validationCache.generation += 1
-  boundary.validationCache.canonicalTargets.clear()
-  boundary.validationCache.canonicalVerdicts.clear()
-  boundary.validationCache.inFlightTargets.clear()
+  return isDeniedResolvedTarget(target, boundary)
 }
 
 function ssrModuleFilePath(rawId: string): string | undefined {
@@ -700,13 +614,7 @@ export function createShowRuntime(
       requestAllowedRoots,
       allowedRoots: ssrAllowedRoots,
       cacheRoots,
-      ssrArtifactRoots,
-      validationCache: {
-        canonicalTargets: new Map(),
-        canonicalVerdicts: new Map(),
-        inFlightTargets: new Map(),
-        generation: 0
-      }
+      ssrArtifactRoots
     }
     const ssrOptimizeIncludes = await optimizableBareImports(
       [...new Set([
@@ -820,10 +728,6 @@ export function createShowRuntime(
     await withViteCacheWarmLock(cacheDir, async () => {
       const viteStarted = performance.now()
       session.vite = await createViteServer(viteConfig)
-      registerSsrModuleValidationInvalidator(
-        session.vite,
-        () => clearSsrModuleValidationCache(fileBoundary)
-      )
       logTiming("warmSession.createViteServer", session.id, viteStarted, { cacheDir, basePath })
       const entryStarted = performance.now()
       await warmEntryModuleGraph(session.vite, sourceDependencies.entryRequests)

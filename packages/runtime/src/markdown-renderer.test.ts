@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   createMarkdownRenderer,
   createModuleGraphSsrWorker,
+  DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS,
   MarkdownRenderError,
   SsrWorkerUnavailableError,
   type MarkdownRenderRequest,
@@ -32,7 +33,6 @@ import {
   type ShowRuntimeServerDependencies
 } from "./server.js"
 import { SSR_MARKDOWN_ENVIRONMENT } from "./ssr-markdown-entry-plugin.js"
-import { registerSsrModuleValidationInvalidator } from "./ssr-module-validation-cache.js"
 import { SsrSandboxEvaluator } from "./ssr-markdown-sandbox.js"
 import type { ShowRuntimeOptions } from "./types.js"
 import type { WorkspaceFingerprinter } from "./workspace-fingerprint.js"
@@ -393,6 +393,34 @@ describe("SSR Markdown endpoint", () => {
     })
     expect(nested.status).toBe(502)
     expect(await renderError(nested)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+  }, 60_000)
+
+  it("renders React exotic router providers and treats unmarked objects as legacy", async () => {
+    const runtime = await startFixtureServer([
+      "exotic-router-provider",
+      "invalid-router-provider"
+    ])
+
+    const exotic = await fetch(markdownUrl(runtime.url, "exotic-router-provider"), {
+      headers: { "x-vibe-show-target": "/teams/acme?period=Q4" }
+    })
+    const exoticMarkdown = await exotic.text()
+    expect(exotic.status, exoticMarkdown).toBe(200)
+    expect(exoticMarkdown).toContain("# Exotic provider team acme")
+    expect(exoticMarkdown).toContain("Period: Q4")
+
+    const legacyRoot = await fetch(markdownUrl(runtime.url, "invalid-router-provider"))
+    const legacyMarkdown = await legacyRoot.text()
+    expect(legacyRoot.status, legacyMarkdown).toBe(200)
+    expect(legacyMarkdown).toContain("# Invalid provider legacy root")
+
+    const legacyNested = await fetch(markdownUrl(runtime.url, "invalid-router-provider"), {
+      headers: { "x-vibe-show-target": "/other" }
+    })
+    expect(legacyNested.status).toBe(502)
+    expect(await renderError(legacyNested)).toEqual({
       error: { code: "render_failed", message: "Show Page rendering failed." }
     })
   }, 60_000)
@@ -1072,7 +1100,7 @@ describe("SSR Markdown endpoint", () => {
     const children: ChildProcess[] = []
     const runtime = await startFixtureServer(
       ["hung-load", "semantic"],
-      { renderLoadTimeoutMs: 3_000 },
+      {},
       { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
     )
     await runtime.runtime.ensureSession("hung-load", "/show/hung-load/")
@@ -1080,9 +1108,17 @@ describe("SSR Markdown endpoint", () => {
 
     const started = performance.now()
     const timedOut = await fetch(markdownUrl(runtime.url, "hung-load"))
+    const loadTimeoutSeconds = DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS / 1_000
     expect(timedOut.status).toBe(504)
-    expect(await renderError(timedOut)).toMatchObject({ error: { code: "render_timeout" } })
-    expect(performance.now() - started).toBeLessThan(6_000)
+    expect(await renderError(timedOut)).toEqual({
+      error: {
+        code: "render_timeout",
+        message: `Show Page module loading exceeded the ${loadTimeoutSeconds} seconds timeout.`
+      }
+    })
+    const elapsed = performance.now() - started
+    expect(elapsed).toBeGreaterThanOrEqual(DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS - 1_000)
+    expect(elapsed).toBeLessThan(DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS + 5_000)
     expect(children).toHaveLength(1)
     expect(children[0]?.killed).toBe(true)
 
@@ -1120,7 +1156,7 @@ describe("SSR Markdown endpoint", () => {
     const children: ChildProcess[] = []
     const runtime = await startFixtureServer(
       ["scheduled-work"],
-      { renderLoadTimeoutMs: 5_000 },
+      {},
       { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
     )
     await runtime.runtime.ensureSession("scheduled-work", "/show/scheduled-work/")
@@ -1142,7 +1178,7 @@ describe("SSR Markdown endpoint", () => {
     expect(next.status, nextMarkdown).toBe(200)
     expect(next.headers.get("x-avibe-render-cache")).toBe("miss")
     expect(nextMarkdown).toContain("Deferred callbacks: none")
-    expect(performance.now() - nextStarted).toBeLessThan(5_000)
+    expect(performance.now() - nextStarted).toBeLessThan(DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS)
     expect(children).toHaveLength(1)
   }, 60_000)
 
@@ -1384,7 +1420,7 @@ async function rendererHarness(options: {
       }
     }
   })
-  return { renderer, request, worker, fingerprinter, watcher, vite, workspace }
+  return { renderer, request, worker, fingerprinter, watcher, workspace }
 }
 
 describe("SSR Markdown orchestrator", () => {
@@ -1405,25 +1441,18 @@ describe("SSR Markdown orchestrator", () => {
 
   it("uses fingerprint recomputation and watcher events as independent invalidation signals", async () => {
     const harness = await rendererHarness()
-    const invalidateModuleValidation = vi.fn()
-    registerSsrModuleValidationInvalidator(harness.vite, invalidateModuleValidation)
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("hit")
 
     harness.fingerprinter.versions.set("page", "workspace-v2")
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
     expect(harness.worker.invalidations).toContain("page")
-    expect(invalidateModuleValidation).toHaveBeenCalledTimes(1)
 
     const priorInvalidations = harness.worker.invalidations.length
-    const priorValidationInvalidations = invalidateModuleValidation.mock.calls.length
     harness.watcher.emit("change", join(harness.workspace, "src", "page.tsx"))
     await vi.waitFor(() => {
       expect(harness.worker.invalidations.length).toBeGreaterThan(priorInvalidations)
     })
-    expect(invalidateModuleValidation.mock.calls.length).toBeGreaterThan(
-      priorValidationInvalidations
-    )
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
   })
 
