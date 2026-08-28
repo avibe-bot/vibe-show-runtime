@@ -1,10 +1,9 @@
-import { parentPort } from "node:worker_threads"
+import { readFileSync } from "node:fs"
 import { ModuleRunner } from "vite/module-runner"
 import { convertSsrRenderedHtmlToMarkdown } from "./ssr-markdown-conversion.js"
 import { SsrSandboxEvaluator } from "./ssr-markdown-sandbox.js"
 
-if (!parentPort) throw new Error("The SSR Markdown worker requires a parent port")
-const port = parentPort
+if (!process.send) throw new Error("The SSR Markdown worker requires an IPC channel")
 
 /** @typedef {{ runner: ModuleRunner, evaluator: SsrSandboxEvaluator, generation: number, entry?: Record<string, unknown> }} SessionState */
 /** @type {Map<string, SessionState>} */
@@ -13,26 +12,33 @@ const sessions = new Map()
 const pendingRpc = new Map()
 let nextRpcId = 1
 
-port.on("message", (message) => {
-  if (!message || typeof message !== "object") return
-  if (message.type === "vite-rpc-result") {
-    settleRpc(message)
-    return
-  }
-  if (message.type !== "command") return
-  void executeCommand(message).then(
-    (result) => port.postMessage({
-      type: "command-result",
-      requestId: message.requestId,
-      result
-    }),
-    (error) => port.postMessage({
-      type: "command-result",
-      requestId: message.requestId,
-      error: serializeError(error)
-    })
-  )
-})
+if (permissionSelfCheck(process.argv[2])) {
+  process.on("message", (message) => {
+    if (!message || typeof message !== "object") return
+    const record = /** @type {Record<string, any>} */ (message)
+    if (record.type === "vite-rpc-result") {
+      settleRpc(record)
+      return
+    }
+    if (record.type !== "command") return
+    void executeCommand(record).then(
+      (result) => send({
+        type: "command-result",
+        requestId: record.requestId,
+        result
+      }),
+      (error) => send({
+        type: "command-result",
+        requestId: record.requestId,
+        error: serializeError(error)
+      })
+    )
+  })
+  process.once("disconnect", () => {
+    void closeSessions().finally(() => process.exit(0))
+  })
+  send({ type: "ready" })
+}
 
 /** @param {Record<string, any>} command */
 async function executeCommand(command) {
@@ -85,10 +91,7 @@ async function executeCommand(command) {
       return undefined
     }
     case "close": {
-      const closing = [...sessions.values()].map(({ runner }) => runner.close())
-      for (const { evaluator } of sessions.values()) evaluator.dispose()
-      sessions.clear()
-      await Promise.allSettled(closing)
+      await closeSessions()
       return undefined
     }
     default:
@@ -113,7 +116,7 @@ function createParentTransport(sessionId, generation) {
       const rpcId = nextRpcId++
       return new Promise((resolve, reject) => {
         pendingRpc.set(rpcId, { resolve, reject })
-        port.postMessage({
+        send({
           type: "vite-rpc",
           rpcId,
           sessionId,
@@ -123,6 +126,59 @@ function createParentTransport(sessionId, generation) {
       })
     }
   }
+}
+
+async function closeSessions() {
+  const closing = [...sessions.values()].map(({ runner }) => runner.close())
+  for (const { evaluator } of sessions.values()) evaluator.dispose()
+  sessions.clear()
+  await Promise.allSettled(closing)
+}
+
+/** @param {string | undefined} probePath */
+function permissionSelfCheck(probePath) {
+  if (!probePath) {
+    failBoot("missing_probe")
+    return false
+  }
+  try {
+    readFileSync(probePath)
+    failBoot("outside_read_allowed")
+    return false
+  } catch (error) {
+    const record = error && typeof error === "object"
+      ? /** @type {Record<string, any>} */ (error)
+      : undefined
+    if (record?.code === "ERR_ACCESS_DENIED") return true
+    failBoot(
+      typeof record?.code === "string"
+        ? record.code
+        : "outside_read_failed_unexpectedly"
+    )
+    return false
+  }
+}
+
+/** @param {string} reason */
+function failBoot(reason) {
+  console.error(JSON.stringify({
+    level: "error",
+    source: "show-runtime",
+    event: "ssr-markdown-child-permission-self-check-failed",
+    reason
+  }))
+  const error = new Error("The SSR Markdown child permission self-check failed")
+  if (!process.send) {
+    process.exit(1)
+    return
+  }
+  process.send({ type: "boot-error", error: serializeError(error) }, () => process.exit(1))
+}
+
+/** @param {Record<string, unknown>} message */
+function send(message) {
+  if (!process.send) throw new Error("The SSR Markdown worker IPC channel closed")
+  process.send(message)
 }
 
 /** @param {Record<string, any>} message */

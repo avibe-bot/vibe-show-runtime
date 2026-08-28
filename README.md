@@ -189,8 +189,9 @@ ANY  /sessions/:sessionId/app/*
 
 `render-markdown` loads a Runtime-owned virtual entry through the live session's
 dedicated Vite SSR environment, renders the initial React tree in a terminable
-permission-restricted VM worker, removes non-semantic and annotation-overlay
-markup in the worker's Runtime-owned layer, and returns GFM Markdown.
+permission-restricted Node child process, removes non-semantic and
+annotation-overlay markup in the child's Runtime-owned layer, and returns GFM
+Markdown.
 React effects are not run. `x-vibe-show-target` selects a root-relative SPA path
 and query; it defaults to the app root and rejects traversal or absolute targets.
 The capability probe reports `render_markdown_ssr: true` for this representation.

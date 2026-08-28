@@ -1,9 +1,20 @@
-import { existsSync } from "node:fs"
+import {
+  existsSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync
+} from "node:fs"
+import {
+  fork,
+  type ChildProcess,
+  type ForkOptions
+} from "node:child_process"
 import { realpath } from "node:fs/promises"
 import { createRequire } from "node:module"
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path"
+import { tmpdir } from "node:os"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
-import { Worker, type WorkerOptions } from "node:worker_threads"
 import type { FSWatcher, ViteDevServer } from "vite"
 import type { FetchFunctionOptions } from "vite/module-runner"
 import {
@@ -100,7 +111,11 @@ export type SsrMarkdownWorker = {
   close(): Promise<void>
 }
 
-type WorkerFactory = (url: URL, options: WorkerOptions) => Worker
+type ChildFactory = (
+  modulePath: string,
+  args: string[],
+  options: ForkOptions
+) => ChildProcess
 
 export type MarkdownRendererOptions = {
   loadTimeoutMs?: number
@@ -113,7 +128,7 @@ export type MarkdownRendererOptions = {
   maxOutputBytes?: number
   workspaceFingerprinter?: WorkspaceFingerprinter
   worker?: SsrMarkdownWorker
-  workerFactory?: WorkerFactory
+  childFactory?: ChildFactory
   workspaceRoot?: string
   now?: () => number
   onPhaseTiming?: (timing: MarkdownRenderPhaseTiming) => void
@@ -174,7 +189,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
   const now = options.now ?? Date.now
   const workspaceFingerprinter = options.workspaceFingerprinter ?? createWorkspaceFingerprinter()
   const worker = options.worker ?? createModuleGraphSsrWorker(
-    options.workerFactory,
+    options.childFactory,
     options.workspaceRoot
   )
   const mutex = new AsyncMutex()
@@ -463,32 +478,32 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
 }
 
 export function createModuleGraphSsrWorker(
-  workerFactory?: WorkerFactory,
+  childFactory?: ChildFactory,
   workspaceRoot?: string
 ): SsrMarkdownWorker {
-  return new ModuleGraphSsrWorker(workerFactory, workspaceRoot)
+  return new ModuleGraphSsrWorker(childFactory, workspaceRoot)
 }
 
 class ModuleGraphSsrWorker implements SsrMarkdownWorker {
-  private readonly workerFactory: WorkerFactory
+  private readonly childFactory: ChildFactory
   private readonly workspaceRoot: string | undefined
-  private readonly workerUrl = ssrWorkerUrl()
+  private readonly childPath = fileURLToPath(ssrWorkerUrl())
   private readonly bindings = new Map<string, { vite: ViteDevServer, generation: number }>()
   private readonly pending = new Map<number, {
     command: WorkerCommandName
     resolve(value: unknown): void
     reject(error: Error): void
   }>()
-  private worker: Worker | undefined
+  private childState: SsrChildState | undefined
   private nextRequestId = 1
   private nextGeneration = 1
   private closed = false
 
   constructor(
-    workerFactory: WorkerFactory = (url, options) => new Worker(url, options),
+    childFactory: ChildFactory = (modulePath, args, options) => fork(modulePath, args, options),
     workspaceRoot?: string
   ) {
-    this.workerFactory = workerFactory
+    this.childFactory = childFactory
     this.workspaceRoot = workspaceRoot ? resolve(workspaceRoot) : undefined
   }
 
@@ -535,13 +550,10 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
   }
 
   async terminate(): Promise<void> {
-    const worker = this.worker
-    if (!worker) return
-    this.worker = undefined
-    const error = new WorkerTerminatedError()
-    for (const pending of this.pending.values()) pending.reject(error)
-    this.pending.clear()
-    await worker.terminate().catch(() => undefined)
+    const state = this.childState
+    if (!state) return
+    this.detachChild(state, new SsrChildTerminatedError())
+    await killChildProcess(state.child)
   }
 
   async close(): Promise<void> {
@@ -551,7 +563,7 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
   }
 
   private async invalidateWorkerSession(sessionId: string): Promise<void> {
-    if (!this.worker) return
+    if (!this.childState) return
     try {
       await this.command("invalidate", { sessionId })
     } catch {
@@ -565,53 +577,99 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     return binding
   }
 
-  private ensureWorker(): Worker {
+  private ensureChild(): SsrChildState {
     if (this.closed) throw new SsrWorkerUnavailableError("The SSR worker is closed")
-    if (this.worker) return this.worker
-    let worker: Worker
+    if (this.childState) return this.childState
+
+    const permissionProfile = nodePermissionProfile(this.workspaceRoot)
+    const probe = createPermissionProbe(permissionProfile.allowedReadPaths)
+    let child: ChildProcess
     try {
-      worker = this.workerFactory(this.workerUrl, {
-        // The permission model is a second boundary behind the VM evaluator:
-        // conversion may canonicalize assets inside Show workspaces, while host
-        // files, subprocesses, nested workers, native addons, and inherited
-        // environment secrets remain unavailable.
-        execArgv: [
-          "--permission",
-          `--allow-fs-read=${RUNTIME_PACKAGE_ROOT}`,
-          `--allow-fs-read=${VITE_PACKAGE_ROOT}`,
-          ...CONVERSION_PACKAGE_ROOTS.map((root) => `--allow-fs-read=${root}`),
-          ...(this.workspaceRoot ? [`--allow-fs-read=${this.workspaceRoot}`] : [])
-        ],
-        env: { NODE_ENV: "development" }
+      // Node documents the Permission Model at process start, not as a
+      // security contract for process-affecting worker_threads execArgv.
+      child = this.childFactory(this.childPath, [probe.path], {
+        execPath: process.execPath,
+        execArgv: permissionProfile.execArgv,
+        env: { NODE_ENV: "development" },
+        serialization: "advanced",
+        stdio: ["ignore", "ignore", "inherit", "ipc"]
       })
     } catch (error) {
+      probe.cleanup()
       throw new SsrWorkerUnavailableError("The SSR worker could not be started", { cause: error })
     }
-    this.worker = worker
-    worker.on("message", (message: WorkerMessage) => {
-      if (message?.type === "command-result") this.handleCommandResult(message)
-      else if (message?.type === "vite-rpc") void this.handleViteRpc(worker, message)
+
+    let resolveReady!: () => void
+    let rejectReady!: (error: Error) => void
+    const ready = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolveReady = resolvePromise
+      rejectReady = rejectPromise
     })
-    worker.once("error", (error) => this.failWorker(worker, error))
-    worker.once("exit", (code) => {
-      if (this.worker !== worker) return
-      this.failWorker(worker, new Error(`The SSR worker exited with code ${code}`))
+    const state: SsrChildState = {
+      child,
+      ready,
+      readySettled: false,
+      resolveReady,
+      rejectReady,
+      cleanupProbe: probe.cleanup
+    }
+    this.childState = state
+    child.on("message", (message: unknown) => this.handleChildMessage(state, message))
+    child.once("error", (error) => this.failChild(state, error))
+    child.once("exit", (code, signal) => {
+      if (this.childState !== state) return
+      this.failChild(
+        state,
+        new Error(`The SSR worker exited with code ${String(code)} and signal ${String(signal)}`)
+      )
     })
-    return worker
+    return state
   }
 
-  private command(name: WorkerCommandName, data: Record<string, unknown>): Promise<unknown> {
-    const worker = this.ensureWorker()
+  private async command(name: WorkerCommandName, data: Record<string, unknown>): Promise<unknown> {
+    const state = this.ensureChild()
+    await state.ready
+    if (this.childState !== state) {
+      throw new SsrWorkerUnavailableError("The SSR worker stopped before accepting work")
+    }
     const requestId = this.nextRequestId++
-    return new Promise((resolve, reject) => {
+    return await new Promise((resolve, reject) => {
       this.pending.set(requestId, { command: name, resolve, reject })
       try {
-        worker.postMessage({ type: "command", requestId, name, ...data })
+        this.sendToChild(state, { type: "command", requestId, name, ...data })
       } catch (error) {
-        this.pending.delete(requestId)
-        reject(new SsrWorkerUnavailableError("The SSR worker could not accept work", { cause: error }))
+        this.failChild(state, error)
+        void killChildProcess(state.child)
       }
     })
+  }
+
+  private handleChildMessage(state: SsrChildState, message: unknown): void {
+    if (this.childState !== state || !isRecord(message)) return
+    if (message.type === "ready") {
+      if (state.readySettled) return
+      state.readySettled = true
+      state.cleanupProbe()
+      state.resolveReady()
+      return
+    }
+    if (message.type === "boot-error") {
+      const cause = serializedError(isRecord(message.error) ? message.error : {})
+      this.failChild(
+        state,
+        new SsrWorkerUnavailableError(
+          "The SSR worker permission self-check failed",
+          { cause }
+        )
+      )
+      void killChildProcess(state.child)
+      return
+    }
+    if (message.type === "command-result") {
+      this.handleCommandResult(message as WorkerCommandResult)
+    } else if (message.type === "vite-rpc") {
+      void this.handleViteRpc(state, message as WorkerViteRpc)
+    }
   }
 
   private handleCommandResult(message: WorkerCommandResult): void {
@@ -625,8 +683,9 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     }
   }
 
-  private async handleViteRpc(worker: Worker, message: WorkerViteRpc): Promise<void> {
+  private async handleViteRpc(state: SsrChildState, message: WorkerViteRpc): Promise<void> {
     const binding = this.bindings.get(message.sessionId)
+    let response: { result: unknown } | { error: SerializedError }
     try {
       if (!binding || binding.generation !== message.generation) {
         throw new Error("The Vite session changed while the SSR worker was loading it")
@@ -650,28 +709,50 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
       } else {
         throw new Error(`Unsupported Vite worker RPC: ${invocation.name}`)
       }
-      if (this.worker === worker) {
-        worker.postMessage({
-          type: "vite-rpc-result",
-          rpcId: message.rpcId,
-          response: { result }
-        })
-      }
+      response = { result }
     } catch (error) {
-      if (this.worker === worker) {
-        worker.postMessage({
-          type: "vite-rpc-result",
-          rpcId: message.rpcId,
-          response: { error: serializeError(error) }
-        })
-      }
+      response = { error: serializeError(error) }
+    }
+    if (this.childState !== state) return
+    try {
+      this.sendToChild(state, {
+        type: "vite-rpc-result",
+        rpcId: message.rpcId,
+        response
+      })
+    } catch (error) {
+      this.failChild(state, error)
+      void killChildProcess(state.child)
     }
   }
 
-  private failWorker(worker: Worker, cause: unknown): void {
-    if (this.worker !== worker) return
-    this.worker = undefined
-    const error = new SsrWorkerUnavailableError("The SSR worker stopped unexpectedly", { cause })
+  private sendToChild(state: SsrChildState, message: Record<string, unknown>): void {
+    if (this.childState !== state || !state.child.connected) {
+      throw new SsrWorkerUnavailableError("The SSR worker IPC channel is unavailable")
+    }
+    state.child.send(message, (error) => {
+      if (!error || this.childState !== state) return
+      this.failChild(state, error)
+      void killChildProcess(state.child)
+    })
+  }
+
+  private failChild(state: SsrChildState, cause: unknown): void {
+    if (this.childState !== state) return
+    const error = cause instanceof SsrWorkerUnavailableError
+      ? cause
+      : new SsrWorkerUnavailableError("The SSR worker stopped unexpectedly", { cause })
+    this.detachChild(state, error)
+  }
+
+  private detachChild(state: SsrChildState, error: Error): void {
+    if (this.childState !== state) return
+    this.childState = undefined
+    state.cleanupProbe()
+    if (!state.readySettled) {
+      state.readySettled = true
+      state.rejectReady(error)
+    }
     for (const pending of this.pending.values()) pending.reject(error)
     this.pending.clear()
   }
@@ -723,7 +804,18 @@ type WorkerViteRpc = {
     }
   }
 }
-type WorkerMessage = WorkerCommandResult | WorkerViteRpc
+type SsrChildState = {
+  child: ChildProcess
+  ready: Promise<void>
+  readySettled: boolean
+  resolveReady(): void
+  rejectReady(error: Error): void
+  cleanupProbe(): void
+}
+type NodePermissionProfile = {
+  execArgv: string[]
+  allowedReadPaths: string[]
+}
 
 export class SsrWorkerUnavailableError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -732,10 +824,128 @@ export class SsrWorkerUnavailableError extends Error {
   }
 }
 
-class WorkerTerminatedError extends Error {
+function nodePermissionProfile(workspaceRoot: string | undefined): NodePermissionProfile {
+  const workspaceReads = workspaceRoot ? [workspaceRoot] : []
+  if (process.allowedNodeEnvironmentFlags.has("--permission")) {
+    const allowedReadPaths = [
+      RUNTIME_PACKAGE_ROOT,
+      VITE_PACKAGE_ROOT,
+      ...CONVERSION_PACKAGE_ROOTS,
+      ...workspaceReads
+    ]
+    return {
+      allowedReadPaths,
+      execArgv: [
+        "--permission",
+        ...allowedReadPaths.map((root) => `--allow-fs-read=${root}`)
+      ]
+    }
+  }
+  if (process.allowedNodeEnvironmentFlags.has("--experimental-permission")) {
+    // Node 20's resolver probes package ancestors, so its ruled profile uses
+    // these four boundaries instead of the stable flag's per-package roots.
+    const dependencyModulesRoot = dirname(VITE_PACKAGE_ROOT)
+    const allowedReadPaths = [
+      dirname(RUNTIME_PACKAGE_ROOT),
+      dependencyModulesRoot,
+      resolve(dependencyModulesRoot, "..", "package.json"),
+      ...workspaceReads
+    ]
+    return {
+      allowedReadPaths,
+      execArgv: [
+        "--experimental-permission",
+        ...allowedReadPaths.map((root) => `--allow-fs-read=${root}`)
+      ]
+    }
+  }
+  throw new SsrWorkerUnavailableError("The Node.js permission model is unavailable")
+}
+
+function createPermissionProbe(allowedReadPaths: string[]): {
+  path: string
+  cleanup(): void
+} {
+  let probeDirectory: string | undefined
+  let creationError: unknown
+  try {
+    probeDirectory = mkdtempSync(join(tmpdir(), "avibe-show-ssr-permission-probe-"))
+    const probePath = join(probeDirectory, "outside-root-sentinel")
+    writeFileSync(probePath, "permission-self-check", "utf8")
+    if (!permissionProfileAllows(probePath, allowedReadPaths)) {
+      const directory = probeDirectory
+      return {
+        path: probePath,
+        cleanup: () => rmSync(directory, { recursive: true, force: true })
+      }
+    }
+  } catch (error) {
+    creationError = error
+  }
+  if (probeDirectory) rmSync(probeDirectory, { recursive: true, force: true })
+
+  try {
+    const executablePath = realpathSync(process.execPath)
+    if (!permissionProfileAllows(executablePath, allowedReadPaths)) {
+      return { path: executablePath, cleanup: () => undefined }
+    }
+  } catch (error) {
+    creationError ??= error
+  }
+  throw new SsrWorkerUnavailableError(
+    "The SSR worker permission self-check could not select an outside path",
+    { cause: creationError }
+  )
+}
+
+function permissionProfileAllows(path: string, allowedReadPaths: string[]): boolean {
+  const canonicalPath = realpathSync(path)
+  return allowedReadPaths.some((allowedPath) => {
+    if (pathWithinWorkspace(path, allowedPath)) return true
+    try {
+      return pathWithinWorkspace(canonicalPath, realpathSync(allowedPath))
+    } catch {
+      return false
+    }
+  })
+}
+
+async function killChildProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>((resolveExit) => {
+    let settled = false
+    const timer = setTimeout(finish, 1_000)
+    timer.unref?.()
+    child.once("exit", finish)
+    try {
+      if (!child.kill("SIGKILL")) finish()
+    } catch {
+      finish()
+    }
+
+    function finish() {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      child.off("exit", finish)
+      resolveExit()
+    }
+  })
+}
+
+function serializedError(details: Record<string, unknown>): Error {
+  const error = new Error(
+    typeof details.message === "string" ? details.message : "The SSR worker failed to start"
+  )
+  if (typeof details.name === "string") error.name = details.name
+  if (typeof details.stack === "string") error.stack = details.stack
+  return error
+}
+
+class SsrChildTerminatedError extends Error {
   constructor() {
     super("The SSR worker was terminated")
-    this.name = "WorkerTerminatedError"
+    this.name = "SsrChildTerminatedError"
   }
 }
 

@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events"
+import { fork, spawn, type ChildProcess, type ForkOptions } from "node:child_process"
 import { access, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { get as httpGet } from "node:http"
 import { tmpdir } from "node:os"
@@ -8,6 +9,7 @@ import type { ViteDevServer } from "vite"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   createMarkdownRenderer,
+  createModuleGraphSsrWorker,
   MarkdownRenderError,
   SsrWorkerUnavailableError,
   type MarkdownRenderRequest,
@@ -28,6 +30,7 @@ const cleanups: Array<() => Promise<void>> = []
 
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+  vi.restoreAllMocks()
   vi.unstubAllEnvs()
 })
 
@@ -60,6 +63,70 @@ function markdownUrl(runtimeUrl: string, sessionId: string): string {
 
 async function renderError(response: Response) {
   return await response.json() as { error: { code: string, message: string } }
+}
+
+const permissionProbeSource = String.raw`
+const { readFileSync } = require("node:fs")
+if (!process.send) throw new Error("permission probe requires IPC")
+let error
+try {
+  readFileSync(process.argv[process.argv.length - 1], "utf8")
+  error = new Error("The SSR child read outside its permission profile")
+} catch (candidate) {
+  if (candidate && candidate.code !== "ERR_ACCESS_DENIED") error = candidate
+}
+if (error) {
+  process.send({
+    type: "boot-error",
+    error: { name: error.name, message: error.message, code: error.code }
+  })
+} else {
+  process.on("message", (message) => {
+    if (!message || message.type !== "command") return
+    process.send({
+      type: "command-result",
+      requestId: message.requestId,
+      result: null
+    })
+  })
+  process.send({ type: "ready" })
+}
+`
+
+async function probeChildPermissionProfile(): Promise<ForkOptions["execArgv"]> {
+  const workspace = await mkdtemp(join(tmpdir(), "avibe-show-permission-profile-"))
+  const outsideRoot = await mkdtemp(join(tmpdir(), "avibe-show-permission-outside-"))
+  const deniedPath = join(outsideRoot, "outside-root-sentinel.txt")
+  await writeFile(deniedPath, "outside-root-read-must-be-denied")
+  let execArgv: ForkOptions["execArgv"]
+  const worker = createModuleGraphSsrWorker((_modulePath, _args, options) => {
+    execArgv = options.execArgv
+    return spawn(
+      options.execPath ?? process.execPath,
+      [...(options.execArgv ?? []), "-e", permissionProbeSource, deniedPath],
+      {
+        env: options.env,
+        serialization: options.serialization,
+        stdio: options.stdio
+      }
+    )
+  }, workspace)
+  try {
+    await worker.load("permission-profile", {} as ViteDevServer)
+    return execArgv
+  } finally {
+    await worker.close()
+    await rm(workspace, { recursive: true, force: true })
+    await rm(outsideRoot, { recursive: true, force: true })
+  }
+}
+
+function recordingChildFactory(children: ChildProcess[]) {
+  return (modulePath: string, args: string[], options: ForkOptions): ChildProcess => {
+    const child = fork(modulePath, args, options)
+    children.push(child)
+    return child
+  }
 }
 
 describe("SSR Markdown endpoint", () => {
@@ -312,7 +379,7 @@ describe("SSR Markdown endpoint", () => {
     expect(await renderError(response)).toMatchObject({ error: { code: "output_too_large" } })
   }, 60_000)
 
-  it("returns renderer_unavailable when the terminable worker cannot start", async () => {
+  it("returns renderer_unavailable when the terminable SSR owner cannot start", async () => {
     const worker = new FakeSsrWorker({
       load: async () => {
         throw new SsrWorkerUnavailableError("worker startup failed")
@@ -329,10 +396,75 @@ describe("SSR Markdown endpoint", () => {
     })
   }, 60_000)
 
-  it("terminates a hung module load at its phase deadline and keeps the runtime usable", async () => {
+  it("returns renderer_unavailable when the child permission self-check fails", async () => {
+    const worker = createModuleGraphSsrWorker((modulePath, args, options) => {
+      const child = fork(modulePath, args, {
+        ...options,
+        execArgv: [],
+        stdio: ["ignore", "ignore", "pipe", "ipc"]
+      })
+      child.stderr?.resume()
+      return child
+    })
+    const runtime = await startFixtureServer(["semantic"], {}, { markdownWorker: worker })
+
+    const response = await fetch(markdownUrl(runtime.url, "semantic"))
+
+    expect(response.status).toBe(503)
+    expect(await renderError(response)).toEqual({
+      error: {
+        code: "renderer_unavailable",
+        message: "The SSR Markdown worker is unavailable."
+      }
+    })
+  }, 60_000)
+
+  it("returns renderer_unavailable when Node has no permission-model flag", async () => {
+    vi.spyOn(process, "allowedNodeEnvironmentFlags", "get").mockReturnValue(new Set())
+    const runtime = await startFixtureServer(["semantic"])
+
+    const response = await fetch(markdownUrl(runtime.url, "semantic"))
+
+    expect(response.status).toBe(503)
+    expect(await renderError(response)).toEqual({
+      error: {
+        code: "renderer_unavailable",
+        message: "The SSR Markdown worker is unavailable."
+      }
+    })
+  }, 60_000)
+
+  it.runIf(process.allowedNodeEnvironmentFlags.has("--permission"))(
+    "denies reads outside the stable permission profile",
+    async () => {
+      const execArgv = await probeChildPermissionProfile()
+      expect(execArgv?.[0]).toBe("--permission")
+      expect(execArgv).not.toContain(`--allow-fs-read=${join(dependencyRoot, "packages")}`)
+      expect(execArgv).not.toContain(`--allow-fs-read=${join(dependencyRoot, "node_modules")}`)
+      expect(execArgv).not.toContain(`--allow-fs-read=${join(dependencyRoot, "package.json")}`)
+    }
+  )
+
+  it.runIf(
+    !process.allowedNodeEnvironmentFlags.has("--permission") &&
+    process.allowedNodeEnvironmentFlags.has("--experimental-permission")
+  )("denies reads outside the experimental permission profile", async () => {
+    const execArgv = await probeChildPermissionProfile()
+    expect(execArgv).toEqual([
+      "--experimental-permission",
+      `--allow-fs-read=${join(dependencyRoot, "packages")}`,
+      `--allow-fs-read=${join(dependencyRoot, "node_modules")}`,
+      `--allow-fs-read=${join(dependencyRoot, "package.json")}`,
+      expect.stringMatching(/^--allow-fs-read=/)
+    ])
+  })
+
+  it("kills a hung child at its phase deadline, respawns, and keeps the runtime usable", async () => {
+    const children: ChildProcess[] = []
     const runtime = await startFixtureServer(
       ["hung-load", "semantic"],
-      { renderLoadTimeoutMs: 3_000 }
+      { renderLoadTimeoutMs: 3_000 },
+      { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
     )
     await runtime.runtime.ensureSession("hung-load", "/show/hung-load/")
     await runtime.runtime.ensureSession("semantic", "/show/semantic/")
@@ -342,14 +474,46 @@ describe("SSR Markdown endpoint", () => {
     expect(timedOut.status).toBe(504)
     expect(await renderError(timedOut)).toMatchObject({ error: { code: "render_timeout" } })
     expect(performance.now() - started).toBeLessThan(6_000)
+    expect(children).toHaveLength(1)
+    expect(children[0]?.killed).toBe(true)
 
     const recovered = await fetch(markdownUrl(runtime.url, "semantic"))
     expect(recovered.status).toBe(200)
     expect(await recovered.text()).toContain("# SSR fixture report")
+    expect(children).toHaveLength(2)
   }, 60_000)
 
-  it("propagates caller disconnect cancellation and recycles the worker", async () => {
-    const runtime = await startFixtureServer(["hung-load", "semantic"])
+  it("kills a hung React render at its deadline and respawns for the next render", async () => {
+    const children: ChildProcess[] = []
+    const runtime = await startFixtureServer(
+      ["hung-render", "semantic"],
+      { renderReactTimeoutMs: 3_000 },
+      { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
+    )
+    await runtime.runtime.ensureSession("hung-render", "/show/hung-render/")
+    await runtime.runtime.ensureSession("semantic", "/show/semantic/")
+
+    const started = performance.now()
+    const timedOut = await fetch(markdownUrl(runtime.url, "hung-render"))
+    expect(timedOut.status).toBe(504)
+    expect(await renderError(timedOut)).toMatchObject({ error: { code: "render_timeout" } })
+    expect(performance.now() - started).toBeLessThan(8_000)
+    expect(children).toHaveLength(1)
+    expect(children[0]?.killed).toBe(true)
+
+    const recovered = await fetch(markdownUrl(runtime.url, "semantic"))
+    expect(recovered.status).toBe(200)
+    expect(await recovered.text()).toContain("# SSR fixture report")
+    expect(children).toHaveLength(2)
+  }, 60_000)
+
+  it("propagates caller disconnect, kills the child, and respawns on the next render", async () => {
+    const children: ChildProcess[] = []
+    const runtime = await startFixtureServer(
+      ["hung-load", "semantic"],
+      {},
+      { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
+    )
     await runtime.runtime.ensureSession("hung-load", "/show/hung-load/")
     await runtime.runtime.ensureSession("semantic", "/show/semantic/")
 
@@ -359,12 +523,14 @@ describe("SSR Markdown endpoint", () => {
       request.once("close", resolveDisconnect)
       setTimeout(() => request.destroy(), 200).unref?.()
     })
+    await vi.waitFor(() => expect(children[0]?.killed).toBe(true))
 
     const recovered = await fetch(markdownUrl(runtime.url, "semantic"), {
       signal: AbortSignal.timeout(5_000)
     })
     expect(recovered.status).toBe(200)
     expect(await recovered.text()).toContain("# SSR fixture report")
+    expect(children).toHaveLength(2)
   }, 60_000)
 
   it("invalidates on workspace change and clears session entries on suspend", async () => {

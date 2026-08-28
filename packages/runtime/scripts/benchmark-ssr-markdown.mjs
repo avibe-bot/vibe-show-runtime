@@ -1,8 +1,10 @@
+import { execFile, fork } from "node:child_process"
 import { access, cp, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { performance } from "node:perf_hooks"
+import { promisify } from "node:util"
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDirectory, "..")
@@ -12,6 +14,8 @@ const workspaceRoot = await mkdtemp(join(tmpdir(), "avibe-show-ssr-benchmark-"))
 const browserCache = join(workspaceRoot, "browser-cache-must-stay-absent")
 const previousBrowserCache = process.env.PLAYWRIGHT_BROWSERS_PATH
 process.env.PLAYWRIGHT_BROWSERS_PATH = browserCache
+const activeChildren = new Set()
+const execFileAsync = promisify(execFile)
 
 const { startShowRuntimeServer } = await import("../dist/server.js")
 
@@ -25,15 +29,30 @@ const runtime = await startShowRuntimeServer({
   idlePruneIntervalMs: 0
 }, {
   markdownRendererOptions: {
+    childFactory(modulePath, args, options) {
+      const child = fork(modulePath, args, options)
+      activeChildren.add(child)
+      child.once("exit", () => activeChildren.delete(child))
+      return child
+    },
     onPhaseTiming(timing) {
       phaseTimings.push(timing)
     }
   }
 })
 
-function collectRssMiB() {
+async function collectRssMiB() {
   globalThis.gc?.()
-  return process.memoryUsage().rss / 1024 / 1024
+  const pids = [process.pid, ...[...activeChildren]
+    .map((child) => child.pid)
+    .filter((pid) => pid !== undefined)]
+  if (process.platform === "win32") return process.memoryUsage().rss / 1024 / 1024
+  const { stdout } = await execFileAsync("ps", ["-o", "rss=", "-p", pids.join(",")])
+  const totalKiB = stdout.trim().split(/\s+/).reduce((total, value) => {
+    const rss = Number(value)
+    return Number.isFinite(rss) ? total + rss : total
+  }, 0)
+  return totalKiB / 1024
 }
 
 function round(value, digits = 2) {
@@ -93,9 +112,9 @@ async function render(target, expectedCache) {
 
 let report
 try {
-  const rssBaseline = collectRssMiB()
+  const rssBaseline = await collectRssMiB()
   const cold = await render("/teams/acme?period=Q3&benchmark=cold", "miss")
-  const rssAfterCold = collectRssMiB()
+  const rssAfterCold = await collectRssMiB()
 
   const warmMisses = []
   for (let iteration = 0; iteration < 20; iteration += 1) {
@@ -104,14 +123,14 @@ try {
       "miss"
     ))
   }
-  const rssAfterWarmMisses = collectRssMiB()
+  const rssAfterWarmMisses = await collectRssMiB()
 
   const cacheHits = []
   const cachedTarget = "/teams/acme?period=Q3&benchmark=warm-19"
   for (let iteration = 0; iteration < 20; iteration += 1) {
     cacheHits.push(await render(cachedTarget, "hit"))
   }
-  const rssAfterCacheHits = collectRssMiB()
+  const rssAfterCacheHits = await collectRssMiB()
   const browserCacheCreated = await access(browserCache).then(() => true).catch(() => false)
 
   report = {
@@ -129,6 +148,9 @@ try {
     warmMissMs: latencySummary(warmMisses.map(({ durationMs }) => durationMs)),
     warmMissPhaseMs: phaseSummary(warmMisses.flatMap(({ phaseTimings: samples }) => samples)),
     cacheHitMs: latencySummary(cacheHits.map(({ durationMs }) => durationMs)),
+    rssScope: process.platform === "win32"
+      ? "runtime parent process"
+      : "runtime parent plus active SSR child processes",
     rssMiB: {
       baseline: round(rssBaseline, 1),
       afterCold: round(rssAfterCold, 1),

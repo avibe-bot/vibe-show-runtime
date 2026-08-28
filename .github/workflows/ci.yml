@@ -31,3 +31,16 @@ jobs:
         with:
           name: vibe-show-runtime-node-${{ matrix.os }}
           path: dist/vibe-show-runtime-node-*.tgz
+
+  runtime-node-20:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.0
+          cache: npm
+      - run: npm ci
+      - run: npm run build -w @avibe/show-sdk
+      - run: npm run build -w @avibe/show-ui
+      - run: npm run test -w @avibe/show-runtime

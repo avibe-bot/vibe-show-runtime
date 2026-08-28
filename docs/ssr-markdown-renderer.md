@@ -16,7 +16,8 @@ runtime main thread
   Vite fetchModule policy owner
                   |
                   v
-one terminable Node worker
+one long-lived, terminable Node child process
+  process permission profile + boot self-check
   restricted VM realm + ModuleRunner cache per session
     React DOM Server render
   Runtime-owned trusted layer
@@ -28,7 +29,7 @@ The Runtime-owned virtual entry imports the page `App`, generated router
 provider, and React DOM Server through one session SSR graph. That preserves the
 session's physical React instance across application, provider, and renderer.
 Cleanup and conversion do not compose React values, so they run in the same
-terminable worker's trusted Runtime layer rather than in the workspace VM.
+terminable child process's trusted Runtime layer rather than in the workspace VM.
 
 The renderer uses a dedicated Vite environment inside the existing session
 server. Its dependency graph is inlined, browser package conditions are used,
@@ -49,7 +50,7 @@ leaking a local path.
 ## Workspace authority boundary
 
 Workspace modules and their render-time dependencies do not execute in the
-worker's ordinary Node realm. A custom Vite `ModuleEvaluator` runs transformed
+child process's ordinary Node realm. A custom Vite `ModuleEvaluator` runs transformed
 modules in one `node:vm` context per session with string/Wasm code generation
 disabled. It supplies only the initial-tree web primitives required by React,
 the generated router, and Show UI. `window`, `document`, `fetch`, WebSocket,
@@ -58,19 +59,34 @@ host `process`, and inherited environment variables are absent; the exposed
 
 The parent transport returns no Node built-in list and rejects every
 externalized module request from workspace code. Runtime-owned cleanup and
-conversion are imported directly by the worker outside that transport, so the
+conversion are imported directly by the child outside that transport, so the
 workspace graph has no privileged module or built-in exception to reach.
 
-The VM is backed by Node's worker permission model as a second boundary. The
-worker receives a scrubbed environment, cannot create subprocesses, nested
-workers, or native addons, and may read only the Runtime/Vite packages, the
-conversion dependency packages, and configured Show workspace root. The last
-permission lets trusted conversion canonicalize asset paths; workspace code has
-no filesystem capability. A fixture places a sentinel inside that allowed root
-and verifies that direct built-in imports, `eval`, `Function`, constructor chains
-from URL/timers/encoders/Promises/import metadata, and a dynamic-import error
-cannot read it. Direct `node:fs` use maps to the existing `render_failed`
-envelope.
+The VM is backed by Node's process permission model as a second boundary. The
+child receives a scrubbed environment and cannot create subprocesses, worker
+threads, or native addons. Current Node releases may enforce permission flags on
+a `worker_threads` instance, but the Node documentation disclaims inheritance of
+the process permission model and process-affecting `execArgv` options there. The
+security boundary therefore uses documented process-start flags on a child Node
+process rather than relying on that observed but unsupported behavior.
+
+The profile is selected by `process.allowedNodeEnvironmentFlags`, without Node
+version parsing. When stable `--permission` is supported, filesystem reads stay
+limited to the exact Runtime, Vite, and conversion dependency package roots plus
+the configured Show workspace root. Older supported Node versions use
+`--experimental-permission`; because that resolver probes package ancestors, its
+four allowed paths are the monorepo packages root, installed `node_modules` root,
+repository `package.json`, and configured Show workspace root. It does not allow
+other repository or host files. Before accepting any command, every new child
+must prove that a real file outside all allowed roots returns `ERR_ACCESS_DENIED`.
+Any other result logs `ssr-markdown-child-permission-self-check-failed` without a
+path or file contents and fails closed as `renderer_unavailable`.
+
+Workspace code has no filesystem capability in either profile. Fixtures verify
+that direct built-in imports, `eval`, `Function`, constructor chains from
+URL/timers/encoders/Promises/import metadata, and a dynamic-import error cannot
+recover a sentinel even when trusted conversion can read its containing workspace
+root. Direct `node:fs` use maps to the existing `render_failed` envelope.
 
 ## Public contract
 
@@ -95,7 +111,7 @@ Errors retain the existing JSON envelope and codes:
 | `render_failed` | 502 | Module evaluation or rendering is SSR-incompatible |
 | `render_timeout` | 504 | A phase deadline expired |
 | `output_too_large` | 502 | Raw, cleaned, or Markdown output exceeds the cap |
-| `renderer_unavailable` | 503 | The terminable worker cannot start or continue |
+| `renderer_unavailable` | 503 | The terminable child cannot start or continue |
 
 There is no HTML or browser fallback. Effects and event handlers do not run.
 
@@ -111,9 +127,10 @@ all phase budgets. Once admitted, these independent defaults apply:
 | cleanup + conversion | 5 s | `VIBE_SHOW_RENDER_CONVERSION_TIMEOUT_MS` | `--render-conversion-timeout-ms` |
 
 Caller disconnect and runtime shutdown signals race every phase wait. A timeout
-or cancellation during worker work terminates the worker, which hard-stops
-synchronous module evaluation, React rendering, and conversion. The next
-request creates a fresh worker and reloads only the needed session. Main-thread
+or cancellation during child work kills the process, which hard-stops synchronous
+module evaluation, React rendering, and conversion. An unexpected child exit fails
+the active request; the next request lazily starts a fresh child, repeats the
+permission self-check, and reloads only the needed session. Main-thread
 fingerprinting and live-Vite preparation use the load budget; a late result is
 discarded after cancellation or timeout.
 
@@ -137,8 +154,8 @@ entries are removed during lookup, write, and the five-second idle maintenance
 pass.
 
 Workspace watcher events evict the session's Markdown entries, fingerprint
-memoization, and worker evaluation state. Every lookup also recomputes the
-workspace fingerprint; a mismatch invalidates the Vite SSR graph and worker
+memoization, and child evaluation state. Every lookup also recomputes the
+workspace fingerprint; a mismatch invalidates the Vite SSR graph and child
 state even if a watcher event was missed. Session suspend and idle pruning clear
 the same state before releasing the live Vite server.
 
@@ -160,23 +177,25 @@ render returns `render_failed`.
 
 Measured in three fresh processes through the production `render-markdown`
 endpoint on an Apple M1 Pro, Node 22.19.0, darwin-arm64. The cold request includes
-session Vite warm-up and the first worker/module load. Warm misses vary the query
+session Vite warm-up and the first child/module load. Warm misses vary the query
 to bypass the Markdown result cache; cache hits still recompute the workspace
 fingerprint.
 
 | Measurement | Result |
 | --- | ---: |
-| cold request | 1,604-1,879 ms |
-| cold load | 1,571-1,845 ms |
-| cold render / conversion | 5.5-5.7 / 7.6-8.5 ms |
-| warm miss median / p95 | 6.88-6.94 / 13.74-16.17 ms |
-| cache hit median / p95 | 0.85-0.89 / 1.92-2.09 ms |
-| RSS before cold | 100.6-102.5 MiB |
-| RSS after cold (delta) | 334.0-371.1 MiB (+232.4-268.6 MiB) |
-| RSS after 20 warm misses | 344.3-381.4 MiB |
+| cold request | 1,607-1,852 ms |
+| cold load | 1,573-1,802 ms |
+| cold render / conversion | 5.9-6.3 / 7.6-7.8 ms |
+| warm miss median / p95 | 6.84-7.29 / 13.01-13.38 ms |
+| cache hit median / p95 | 0.85-0.91 / 1.74-1.87 ms |
+| RSS before cold | 98.6-98.9 MiB |
+| RSS after cold (delta) | 392.2-397.8 MiB (+293.5-298.9 MiB) |
+| RSS after 20 warm misses | 402.1-408.1 MiB |
 
-The benchmark created no browser cache. Run `npm run benchmark:ssr-markdown`
-to reproduce the endpoint, phase, memory, and sentinel check.
+RSS after child startup is the OS-reported sum for the Runtime parent and active
+SSR child, rather than the parent's `process.memoryUsage()` alone. The benchmark
+created no browser cache. Run `npm run benchmark:ssr-markdown` to reproduce the
+endpoint, phase, memory, and sentinel check.
 
 ## Removed surface
 
