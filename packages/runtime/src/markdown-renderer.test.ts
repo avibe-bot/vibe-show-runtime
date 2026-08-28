@@ -63,6 +63,93 @@ function markdownUrl(runtimeUrl: string, sessionId: string): string {
   return `${runtimeUrl}/sessions/${sessionId}/render-markdown`
 }
 
+function intrinsicReport(markdown: string): Record<string, any> {
+  const match = /IntrinsicReportBegin`(.+)`IntrinsicReportEnd/.exec(markdown)
+  if (!match) throw new Error(`Intrinsic report was absent from Markdown: ${markdown}`)
+  return JSON.parse(match[1]) as Record<string, any>
+}
+
+function capturedError(operation: () => unknown) {
+  try {
+    operation()
+    return { name: "none", code: 0 }
+  } catch (error) {
+    const candidate = error as { name?: unknown; code?: unknown }
+    return {
+      name: String(candidate.name ?? "Error"),
+      code: typeof candidate.code === "number" ? candidate.code : 0
+    }
+  }
+}
+
+function hostEncodeInto(value: string, size: number) {
+  const destination = new Uint8Array(size)
+  return {
+    result: new TextEncoder().encodeInto(value, destination),
+    bytes: [...destination]
+  }
+}
+
+function hostIntrinsicReport() {
+  const decoder = new TextDecoder()
+  const streamingDecoder = new TextDecoder()
+  const streamingText = streamingDecoder.decode(new Uint8Array([0xe2, 0x82]), { stream: true }) +
+    streamingDecoder.decode(new Uint8Array([0xac]))
+  const params = new URLSearchParams([["duplicate", "first"], ["duplicate", "second"]])
+  params.append("space", "a b")
+  params.delete("duplicate", "first")
+  const url = new URL("../report?period=Q3#summary", "https://example.test/teams/acme/")
+  url.searchParams.append("space", "a b")
+  const abortError = new DOMException("stopped", "AbortError")
+
+  return {
+    textEncoder: {
+      encoded: [...new TextEncoder().encode("A\u00e9\ud83d\ude00\ud800")],
+      shortMultibyte: hostEncodeInto("\u00e9", 1),
+      mixedBoundary: hostEncodeInto("A\u00e9", 2),
+      astralBoundary: hostEncodeInto("\ud83d\ude00", 3),
+      replacementBoundary: hostEncodeInto("\ud800", 3)
+    },
+    textDecoder: {
+      bom: decoder.decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])),
+      ignoreBom: new TextDecoder("utf-8", { ignoreBOM: true })
+        .decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])),
+      utf16: new TextDecoder("utf-16le").decode(new Uint8Array([0x41, 0x00])),
+      streaming: streamingText,
+      fatalError: capturedError(() => {
+        new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array([0xff]))
+      }),
+      properties: {
+        encoding: new TextDecoder("UTF8", { fatal: true, ignoreBOM: true }).encoding,
+        fatal: new TextDecoder("UTF8", { fatal: true }).fatal,
+        ignoreBOM: new TextDecoder("UTF8", { ignoreBOM: true }).ignoreBOM
+      }
+    },
+    base64: {
+      decoded: atob(" YQ== "),
+      encoded: btoa("\u00e9"),
+      atobError: capturedError(() => atob("!!!!")),
+      btoaError: capturedError(() => btoa("\u2713"))
+    },
+    url: {
+      href: url.href,
+      invalidError: capturedError(() => new URL("relative-only")),
+      params: params.toString(),
+      duplicates: params.getAll("duplicate"),
+      size: params.size
+    },
+    domException: {
+      name: abortError.name,
+      message: abortError.message,
+      code: abortError.code,
+      text: abortError.toString(),
+      tag: Object.prototype.toString.call(abortError),
+      staticAbortCode: DOMException.ABORT_ERR,
+      instanceAbortCode: abortError.ABORT_ERR
+    }
+  }
+}
+
 async function renderError(response: Response) {
   return await response.json() as { error: { code: string, message: string } }
 }
@@ -165,6 +252,68 @@ describe("SSR sandbox evaluator", () => {
 })
 
 describe("SSR Markdown endpoint", () => {
+  it("renders legacy App-only workspaces without creating a router", async () => {
+    const runtime = await startFixtureServer(["legacy-routerless", "semantic"])
+    const legacy = await fetch(markdownUrl(runtime.url, "legacy-routerless"))
+    const legacyMarkdown = await legacy.text()
+
+    expect(legacy.status, legacyMarkdown).toBe(200)
+    expect(legacyMarkdown).toContain("# Legacy routerless app")
+    expect(legacyMarkdown).toContain("The Runtime rendered App.tsx without creating a router.")
+    await expect(access(
+      join(runtime.workspaceRoot, "legacy-routerless", "src", "router.tsx")
+    )).rejects.toMatchObject({ code: "ENOENT" })
+
+    const routed = await fetch(markdownUrl(runtime.url, "semantic"), {
+      headers: { "x-vibe-show-target": "/teams/acme?period=Q3" }
+    })
+    expect(routed.status).toBe(200)
+    expect(await routed.text()).toContain("# Team acme")
+
+    await cp(
+      join(fixtureRoot, "legacy-routerless"),
+      join(runtime.workspaceRoot, "missing-entry"),
+      { recursive: true }
+    )
+    await runtime.runtime.ensureSession("missing-entry", "/show/missing-entry/")
+    await rm(join(runtime.workspaceRoot, "missing-entry", "src", "App.tsx"))
+    const missing = await fetch(markdownUrl(runtime.url, "missing-entry"))
+    expect(missing.status).toBe(502)
+    expect(await renderError(missing)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+    await expect(access(
+      join(runtime.workspaceRoot, "missing-entry", "src", "router.tsx")
+    )).rejects.toMatchObject({ code: "ENOENT" })
+  }, 60_000)
+
+  it("matches host intrinsic behavior at the SSR realm boundary", async () => {
+    const runtime = await startFixtureServer(["intrinsic-conformance"])
+    const response = await fetch(markdownUrl(runtime.url, "intrinsic-conformance"))
+    const markdown = await response.text()
+
+    expect(response.status, markdown).toBe(200)
+    const report = intrinsicReport(markdown)
+    const host = hostIntrinsicReport()
+    expect(report.textEncoder).toEqual(host.textEncoder)
+    expect(report.textDecoder).toEqual(host.textDecoder)
+    expect(report.base64).toEqual(host.base64)
+    expect(report.url).toEqual(host.url)
+    expect(report.domException).toEqual(host.domException)
+    expect(report.performance).toEqual({
+      finite: true,
+      monotonic: true,
+      relativeClock: true,
+      epochOrigin: true,
+      tag: "[object Performance]"
+    })
+    expect(report.scheduling).toEqual(["microtask", "message", "timeout"])
+    expect(report.policy).toEqual({
+      nodeEnvironment: "development",
+      delayedIntrinsicsUnavailable: true
+    })
+  }, 60_000)
+
   it("preserves the endpoint contract and advertises the SSR capability", async () => {
     const runtime = await startFixtureServer(["semantic"])
     const capabilities = await fetch(`${runtime.url}/capabilities`)
@@ -333,8 +482,14 @@ describe("SSR Markdown endpoint", () => {
       "Function",
       "eval",
       "URL constructor",
+      "URLSearchParams constructor",
       "timer constructor",
       "encoder constructor",
+      "decoder constructor",
+      "base64 constructor",
+      "performance constructor",
+      "DOMException constructor",
+      "MessageChannel constructor",
       "Promise constructor",
       "deferred intrinsics",
       "import-meta constructor",

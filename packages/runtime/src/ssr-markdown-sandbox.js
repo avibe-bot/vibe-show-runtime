@@ -40,6 +40,100 @@ const SANDBOX_BOOTSTRAP = String.raw`
     }
   }
 
+  const DOM_EXCEPTION_CODES = Object.freeze({
+    IndexSizeError: 1,
+    DOMStringSizeError: 2,
+    HierarchyRequestError: 3,
+    WrongDocumentError: 4,
+    InvalidCharacterError: 5,
+    NoDataAllowedError: 6,
+    NoModificationAllowedError: 7,
+    NotFoundError: 8,
+    NotSupportedError: 9,
+    InUseAttributeError: 10,
+    InvalidStateError: 11,
+    SyntaxError: 12,
+    InvalidModificationError: 13,
+    NamespaceError: 14,
+    InvalidAccessError: 15,
+    ValidationError: 16,
+    TypeMismatchError: 17,
+    SecurityError: 18,
+    NetworkError: 19,
+    AbortError: 20,
+    URLMismatchError: 21,
+    QuotaExceededError: 22,
+    TimeoutError: 23,
+    InvalidNodeTypeError: 24,
+    DataCloneError: 25
+  })
+  const DOM_EXCEPTION_CONSTANTS = Object.freeze({
+    INDEX_SIZE_ERR: 1,
+    DOMSTRING_SIZE_ERR: 2,
+    HIERARCHY_REQUEST_ERR: 3,
+    WRONG_DOCUMENT_ERR: 4,
+    INVALID_CHARACTER_ERR: 5,
+    NO_DATA_ALLOWED_ERR: 6,
+    NO_MODIFICATION_ALLOWED_ERR: 7,
+    NOT_FOUND_ERR: 8,
+    NOT_SUPPORTED_ERR: 9,
+    INUSE_ATTRIBUTE_ERR: 10,
+    INVALID_STATE_ERR: 11,
+    SYNTAX_ERR: 12,
+    INVALID_MODIFICATION_ERR: 13,
+    NAMESPACE_ERR: 14,
+    INVALID_ACCESS_ERR: 15,
+    VALIDATION_ERR: 16,
+    TYPE_MISMATCH_ERR: 17,
+    SECURITY_ERR: 18,
+    NETWORK_ERR: 19,
+    ABORT_ERR: 20,
+    URL_MISMATCH_ERR: 21,
+    QUOTA_EXCEEDED_ERR: 22,
+    TIMEOUT_ERR: 23,
+    INVALID_NODE_TYPE_ERR: 24,
+    DATA_CLONE_ERR: 25
+  })
+
+  // Errors must be recreated in this realm; returning a host Error would expose its Function.
+  class SafeDOMException extends Error {
+    constructor(message = "", name = "Error") {
+      super(String(message))
+      this.name = String(name)
+    }
+
+    get code() { return DOM_EXCEPTION_CODES[this.name] ?? 0 }
+    get [Symbol.toStringTag]() { return "DOMException" }
+  }
+  for (const [name, code] of Object.entries(DOM_EXCEPTION_CONSTANTS)) {
+    Object.defineProperty(SafeDOMException, name, {
+      value: code,
+      writable: false,
+      enumerable: true,
+      configurable: false
+    })
+    Object.defineProperty(SafeDOMException.prototype, name, {
+      value: code,
+      writable: false,
+      enumerable: true,
+      configurable: false
+    })
+  }
+
+  function platformCall(operation, ...args) {
+    const result = JSON.parse(bridgeCall("platform", operation, JSON.stringify(args)))
+    if (result.ok) return result.value
+    const error = result.error
+    if (error.kind === "DOMException") {
+      throw new SafeDOMException(error.message, error.name)
+    }
+    if (error.name === "TypeError") throw new TypeError(error.message)
+    if (error.name === "RangeError") throw new RangeError(error.message)
+    if (error.name === "SyntaxError") throw new SyntaxError(error.message)
+    throw new Error(error.message)
+  }
+
+  // WHATWG URL algorithms stay host-native; only strings and JSON cross into realm-owned facades.
   class SafeURLSearchParams {
     #query
     #onChange
@@ -48,13 +142,25 @@ const SANDBOX_BOOTSTRAP = String.raw`
       if (init instanceof SafeURLSearchParams) {
         this.#query = init.toString()
       } else if (typeof init === "string") {
-        this.#query = bridgeCall("params-normalize", init)
+        this.#query = platformCall("params-normalize", init)
       } else {
-        this.#query = ""
         if (init != null && typeof init[Symbol.iterator] === "function") {
-          for (const pair of init) this.append(pair[0], pair[1])
+          const pairs = []
+          for (const pair of init) {
+            const values = Array.from(pair)
+            if (values.length !== 2) {
+              throw new TypeError("Each query pair must contain exactly two values")
+            }
+            pairs.push([String(values[0]), String(values[1])])
+          }
+          this.#query = platformCall("params-from-pairs", pairs)
         } else if (init != null && typeof init === "object") {
-          for (const [key, value] of Object.entries(init)) this.append(key, value)
+          this.#query = platformCall(
+            "params-from-pairs",
+            Object.entries(init).map(([key, value]) => [key, String(value)])
+          )
+        } else {
+          this.#query = platformCall("params-normalize", init == null ? "" : String(init))
         }
       }
       this.#onChange = typeof onChange === "function" ? onChange : undefined
@@ -73,15 +179,15 @@ const SANDBOX_BOOTSTRAP = String.raw`
     }
 
     get(name) {
-      return bridgeCall("params-get", this.#query, String(name))
+      return platformCall("params-get", this.#query, String(name))
     }
 
     getAll(name) {
-      return JSON.parse(bridgeCall("params-get-all", this.#query, String(name)))
+      return platformCall("params-get-all", this.#query, String(name))
     }
 
     has(name, value) {
-      return bridgeCall(
+      return platformCall(
         "params-has",
         this.#query,
         String(name),
@@ -122,15 +228,15 @@ const SANDBOX_BOOTSTRAP = String.raw`
     }
 
     _replace(query) {
-      this.#query = bridgeCall("params-normalize", query)
+      this.#query = platformCall("params-normalize", query)
     }
 
     #pairs() {
-      return JSON.parse(bridgeCall("params-pairs", this.#query))
+      return platformCall("params-pairs", this.#query)
     }
 
     #mutate(operation, name, value) {
-      this.#query = bridgeCall(
+      this.#query = platformCall(
         "params-mutate",
         this.#query,
         operation,
@@ -139,6 +245,8 @@ const SANDBOX_BOOTSTRAP = String.raw`
       )
       this.#onChange?.(this.#query)
     }
+
+    get [Symbol.toStringTag]() { return "URLSearchParams" }
   }
 
   class SafeURL {
@@ -146,7 +254,7 @@ const SANDBOX_BOOTSTRAP = String.raw`
     #searchParams
 
     constructor(input, base) {
-      this.#href = bridgeCall(
+      this.#href = platformCall(
         "url-create",
         String(input),
         base === undefined ? null : String(base)
@@ -154,7 +262,7 @@ const SANDBOX_BOOTSTRAP = String.raw`
     }
 
     static canParse(input, base) {
-      return bridgeCall(
+      return platformCall(
         "url-can-parse",
         String(input),
         base === undefined ? null : String(base)
@@ -196,61 +304,80 @@ const SANDBOX_BOOTSTRAP = String.raw`
 
     toString() { return this.href }
     toJSON() { return this.href }
+    get [Symbol.toStringTag]() { return "URL" }
 
     #get(property) {
-      return bridgeCall("url-get", this.#href, property)
+      return platformCall("url-get", this.#href, property)
     }
 
     #set(property, value) {
-      this.#href = bridgeCall("url-set", this.#href, property, String(value))
+      this.#href = platformCall("url-set", this.#href, property, String(value))
       if (this.#searchParams) this.#searchParams._replace(this.search)
     }
   }
 
+  // Encoding stays host-native; facades keep buffers, errors, and constructor identity in this realm.
   class SafeTextEncoder {
     get encoding() { return "utf-8" }
 
     encode(value = "") {
-      const bytes = []
-      for (const character of String(value)) {
-        let point = character.codePointAt(0)
-        if (point >= 0xd800 && point <= 0xdfff) point = 0xfffd
-        if (point <= 0x7f) bytes.push(point)
-        else if (point <= 0x7ff) {
-          bytes.push(0xc0 | (point >> 6), 0x80 | (point & 0x3f))
-        } else if (point <= 0xffff) {
-          bytes.push(
-            0xe0 | (point >> 12),
-            0x80 | ((point >> 6) & 0x3f),
-            0x80 | (point & 0x3f)
-          )
-        } else {
-          bytes.push(
-            0xf0 | (point >> 18),
-            0x80 | ((point >> 12) & 0x3f),
-            0x80 | ((point >> 6) & 0x3f),
-            0x80 | (point & 0x3f)
-          )
-        }
-      }
-      return new Uint8Array(bytes)
+      return new Uint8Array(platformCall("text-encode", String(value)))
     }
 
     encodeInto(value, destination) {
-      const bytes = this.encode(value)
-      const written = Math.min(bytes.length, destination.length)
-      destination.set(bytes.subarray(0, written))
-      return { read: String(value).length, written }
+      if (typeof value !== "string") throw new TypeError("TextEncoder source must be a string")
+      if (!(destination instanceof Uint8Array)) {
+        throw new TypeError("TextEncoder destination must be a Uint8Array")
+      }
+      const result = platformCall("text-encode-into", value, destination.byteLength)
+      destination.set(result.bytes)
+      return { read: result.read, written: result.written }
     }
+
+    get [Symbol.toStringTag]() { return "TextEncoder" }
   }
 
   class SafeTextDecoder {
-    get encoding() { return "utf-8" }
-    decode(value = new Uint8Array()) {
-      return bridgeCall("text-decode", JSON.stringify(Array.from(value)))
+    #id
+    #encoding
+    #fatal
+    #ignoreBOM
+
+    constructor(label = "utf-8", options = {}) {
+      const normalizedOptions = options == null ? {} : options
+      const result = platformCall("text-decoder-create", String(label), {
+        fatal: Boolean(normalizedOptions.fatal),
+        ignoreBOM: Boolean(normalizedOptions.ignoreBOM)
+      })
+      this.#id = result.id
+      this.#encoding = result.encoding
+      this.#fatal = result.fatal
+      this.#ignoreBOM = result.ignoreBOM
     }
+
+    get encoding() { return this.#encoding }
+    get fatal() { return this.#fatal }
+    get ignoreBOM() { return this.#ignoreBOM }
+
+    decode(value = undefined, options = {}) {
+      let bytes
+      if (value === undefined) bytes = []
+      else if (value instanceof ArrayBuffer) bytes = [...new Uint8Array(value)]
+      else if (ArrayBuffer.isView(value)) {
+        bytes = [...new Uint8Array(value.buffer, value.byteOffset, value.byteLength)]
+      } else {
+        throw new TypeError("TextDecoder input must be an ArrayBuffer or ArrayBuffer view")
+      }
+      const normalizedOptions = options == null ? {} : options
+      return platformCall("text-decoder-decode", this.#id, bytes, {
+        stream: Boolean(normalizedOptions.stream)
+      })
+    }
+
+    get [Symbol.toStringTag]() { return "TextDecoder" }
   }
 
+  // Scheduling is a policy shim so every callback can be retired with its render command.
   class SafeMessagePort {
     #peer
     #closed = false
@@ -279,20 +406,14 @@ const SANDBOX_BOOTSTRAP = String.raw`
     }
   }
 
-  class SafeDOMException extends Error {
-    constructor(message = "", name = "Error") {
-      super(String(message))
-      this.name = String(name)
-    }
-
-    get code() { return 0 }
-  }
-
   const safeProcess = Object.freeze(Object.assign(Object.create(null), {
     env: Object.freeze(Object.assign(Object.create(null), { NODE_ENV: "development" }))
   }))
+  // The host monotonic clock is pure; only numeric samples cross the serialized bridge.
   const safePerformance = Object.freeze(Object.assign(Object.create(null), {
-    now: () => Date.now()
+    now: () => platformCall("performance-now"),
+    timeOrigin: platformCall("performance-time-origin"),
+    [Symbol.toStringTag]: "Performance"
   }))
 
   Object.defineProperties(globalThis, {
@@ -303,23 +424,24 @@ const SANDBOX_BOOTSTRAP = String.raw`
     TextEncoder: { value: SafeTextEncoder, writable: false, configurable: false },
     TextDecoder: { value: SafeTextDecoder, writable: false, configurable: false },
     atob: {
-      value: (value) => bridgeCall("atob", String(value)),
+      value: function atob(value) {
+        if (arguments.length === 0) throw new TypeError("atob requires an argument")
+        return platformCall("atob", String(value))
+      },
       writable: false,
       configurable: false
     },
     btoa: {
-      value: (value) => {
-        const input = String(value)
-        if ([...input].some((character) => character.charCodeAt(0) > 255)) {
-          throw new TypeError("btoa only accepts Latin-1 input")
-        }
-        return bridgeCall("btoa", input)
+      value: function btoa(value) {
+        if (arguments.length === 0) throw new TypeError("btoa requires an argument")
+        return platformCall("btoa", String(value))
       },
       writable: false,
       configurable: false
     },
     MessageChannel: { value: SafeMessageChannel, writable: false, configurable: false },
     DOMException: { value: SafeDOMException, writable: false, configurable: false },
+    // These delayed-work/authority primitives cannot be made command-bounded, so policy omits them.
     FinalizationRegistry: { value: undefined, writable: false, configurable: false },
     SharedArrayBuffer: { value: undefined, writable: false, configurable: false },
     Atomics: { value: undefined, writable: false, configurable: false },
@@ -429,6 +551,9 @@ export class SsrSandboxEvaluator {
   /** @type {{ active: boolean, timers: Map<number, NodeJS.Timeout> } | undefined} */
   #activeCommand
   #nextTimerId = 1
+  /** @type {Map<number, TextDecoder>} */
+  #textDecoders = new Map()
+  #nextTextDecoderId = 1
 
   /** @param {string} name @param {SsrImportMetaEnv} importMetaEnv */
   constructor(name, importMetaEnv) {
@@ -521,6 +646,7 @@ export class SsrSandboxEvaluator {
 
   dispose() {
     if (this.#activeCommand) this.#disposeCommand(this.#activeCommand)
+    this.#textDecoders.clear()
   }
 
   /** @param {string} operation @param {unknown[]} args @returns {any} */
@@ -574,55 +700,127 @@ export class SsrSandboxEvaluator {
         })
         return undefined
       }
-      case "url-create":
-        return args[1] === null
-          ? new URL(String(args[0])).href
-          : new URL(String(args[0]), String(args[1])).href
-      case "url-can-parse":
-        return args[1] === null
-          ? URL.canParse(String(args[0]))
-          : URL.canParse(String(args[0]), String(args[1]))
-      case "url-get":
-        return /** @type {any} */ (new URL(String(args[0])))[String(args[1])]
-      case "url-set": {
-        const targetUrl = new URL(String(args[0]))
-        ;/** @type {any} */ (targetUrl)[String(args[1])] = args[2]
-        return targetUrl.href
-      }
-      case "params-normalize":
-        return new URLSearchParams(String(args[0]).replace(/^\?/, "")).toString()
-      case "params-get":
-        return new URLSearchParams(String(args[0])).get(String(args[1]))
-      case "params-get-all":
-        return JSON.stringify(new URLSearchParams(String(args[0])).getAll(String(args[1])))
-      case "params-has": {
-        const params = new URLSearchParams(String(args[0]))
-        return args[2] === null
-          ? params.has(String(args[1]))
-          : params.has(String(args[1]), String(args[2]))
-      }
-      case "params-pairs":
-        return JSON.stringify([...new URLSearchParams(String(args[0]))])
-      case "params-mutate": {
-        const [query, mutation, name, value] = args
-        const params = new URLSearchParams(String(query))
-        if (mutation === "append") params.append(String(name), String(value))
-        else if (mutation === "delete") {
-          if (value === null) params.delete(String(name))
-          else params.delete(String(name), String(value))
-        } else if (mutation === "set") params.set(String(name), String(value))
-        else if (mutation === "sort") params.sort()
-        else throw new Error("Unsupported URLSearchParams mutation")
-        return params.toString()
-      }
-      case "atob":
-        return Buffer.from(String(args[0]), "base64").toString("latin1")
-      case "btoa":
-        return Buffer.from(String(args[0]), "latin1").toString("base64")
-      case "text-decode":
-        return Buffer.from(JSON.parse(String(args[0]))).toString("utf8")
+      case "platform":
+        return this.#platformCall(String(args[0]), JSON.parse(String(args[1])))
       default:
         throw new Error(`Unsupported SSR sandbox operation: ${operation}`)
+    }
+  }
+
+  /** @param {string} operation @param {unknown[]} args */
+  #platformCall(operation, args) {
+    try {
+      let value
+      switch (operation) {
+        case "url-create":
+          value = args[1] === null
+            ? new URL(String(args[0])).href
+            : new URL(String(args[0]), String(args[1])).href
+          break
+        case "url-can-parse":
+          value = args[1] === null
+            ? URL.canParse(String(args[0]))
+            : URL.canParse(String(args[0]), String(args[1]))
+          break
+        case "url-get":
+          value = /** @type {any} */ (new URL(String(args[0])))[String(args[1])]
+          break
+        case "url-set": {
+          const targetUrl = new URL(String(args[0]))
+          ;/** @type {any} */ (targetUrl)[String(args[1])] = args[2]
+          value = targetUrl.href
+          break
+        }
+        case "params-normalize":
+          value = new URLSearchParams(String(args[0]).replace(/^\?/, "")).toString()
+          break
+        case "params-from-pairs":
+          value = new URLSearchParams(/** @type {[string, string][]} */ (args[0])).toString()
+          break
+        case "params-get":
+          value = new URLSearchParams(String(args[0])).get(String(args[1]))
+          break
+        case "params-get-all":
+          value = new URLSearchParams(String(args[0])).getAll(String(args[1]))
+          break
+        case "params-has": {
+          const params = new URLSearchParams(String(args[0]))
+          value = args[2] === null
+            ? params.has(String(args[1]))
+            : params.has(String(args[1]), String(args[2]))
+          break
+        }
+        case "params-pairs":
+          value = [...new URLSearchParams(String(args[0]))]
+          break
+        case "params-mutate": {
+          const [query, mutation, name, mutationValue] = args
+          const params = new URLSearchParams(String(query))
+          if (mutation === "append") params.append(String(name), String(mutationValue))
+          else if (mutation === "delete") {
+            if (mutationValue === null) params.delete(String(name))
+            else params.delete(String(name), String(mutationValue))
+          } else if (mutation === "set") params.set(String(name), String(mutationValue))
+          else if (mutation === "sort") params.sort()
+          else throw new Error("Unsupported URLSearchParams mutation")
+          value = params.toString()
+          break
+        }
+        case "text-encode":
+          value = [...new TextEncoder().encode(String(args[0]))]
+          break
+        case "text-encode-into": {
+          const destination = new Uint8Array(Number(args[1]))
+          const result = new TextEncoder().encodeInto(String(args[0]), destination)
+          value = { ...result, bytes: [...destination.subarray(0, result.written)] }
+          break
+        }
+        case "text-decoder-create": {
+          const options = /** @type {{ fatal?: boolean, ignoreBOM?: boolean }} */ (args[1])
+          const decoder = new TextDecoder(String(args[0]), options)
+          const id = this.#nextTextDecoderId++
+          this.#textDecoders.set(id, decoder)
+          value = {
+            id,
+            encoding: decoder.encoding,
+            fatal: decoder.fatal,
+            ignoreBOM: decoder.ignoreBOM
+          }
+          break
+        }
+        case "text-decoder-decode": {
+          const decoder = this.#textDecoders.get(Number(args[0]))
+          if (!decoder) throw new Error("Unknown SSR TextDecoder")
+          const bytes = Uint8Array.from(/** @type {number[]} */ (args[1]))
+          value = decoder.decode(bytes, /** @type {TextDecodeOptions} */ (args[2]))
+          break
+        }
+        case "atob":
+          value = atob(String(args[0]))
+          break
+        case "btoa":
+          value = btoa(String(args[0]))
+          break
+        case "performance-now":
+          value = performance.now()
+          break
+        case "performance-time-origin":
+          value = performance.timeOrigin
+          break
+        default:
+          throw new Error(`Unsupported SSR platform operation: ${operation}`)
+      }
+      return JSON.stringify({ ok: true, value })
+    } catch (error) {
+      const candidate = /** @type {{ name?: unknown, message?: unknown }} */ (error)
+      return JSON.stringify({
+        ok: false,
+        error: {
+          kind: error instanceof DOMException ? "DOMException" : "Error",
+          name: String(candidate?.name ?? "Error"),
+          message: String(candidate?.message ?? "Platform operation failed")
+        }
+      })
     }
   }
 

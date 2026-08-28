@@ -21,8 +21,22 @@ attempt("process-env", () => process.env.AVIBE_SSR_HOST_SENTINEL ?? "blocked")
 attempt("Function", () => hostRead(Function))
 attempt("eval", () => (0, eval)(evalBody))
 attempt("URL constructor", () => hostRead((URL as unknown as { constructor: FunctionConstructor }).constructor))
+attempt("URLSearchParams constructor", () => hostRead(
+  (URLSearchParams as unknown as { constructor: FunctionConstructor }).constructor
+))
 attempt("timer constructor", () => hostRead((setTimeout as unknown as { constructor: FunctionConstructor }).constructor))
 attempt("encoder constructor", () => hostRead((TextEncoder as unknown as { constructor: FunctionConstructor }).constructor))
+attempt("decoder constructor", () => hostRead((TextDecoder as unknown as { constructor: FunctionConstructor }).constructor))
+attempt("base64 constructor", () => hostRead((atob as unknown as { constructor: FunctionConstructor }).constructor))
+attempt("performance constructor", () => hostRead(
+  (performance.now as unknown as { constructor: FunctionConstructor }).constructor
+))
+attempt("DOMException constructor", () => hostRead(
+  (DOMException as unknown as { constructor: FunctionConstructor }).constructor
+))
+attempt("MessageChannel constructor", () => hostRead(
+  (MessageChannel as unknown as { constructor: FunctionConstructor }).constructor
+))
 attempt("Promise constructor", () => hostRead((Promise as unknown as { constructor: FunctionConstructor }).constructor))
 attempt("deferred intrinsics", () => {
   const globals = globalThis as unknown as Record<string, unknown>

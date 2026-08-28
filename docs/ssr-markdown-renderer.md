@@ -25,9 +25,11 @@ one long-lived, terminable Node child process
     Turndown + GFM conversion
 ```
 
-The Runtime-owned virtual entry imports the page `App`, generated router
-provider, and React DOM Server through one session SSR graph. That preserves the
-session's physical React instance across application, provider, and renderer.
+The Runtime-owned virtual entry imports the page `App` and React DOM Server
+through one session SSR graph. It also imports the router provider when
+`src/router.tsx` exists; legacy App-only workspaces render `App` directly, and
+the Runtime never creates a router for them. That preserves the session's
+physical React instance across application, optional provider, and renderer.
 Cleanup and conversion do not compose React values, so they run in the same
 terminable child process's trusted Runtime layer rather than in the workspace VM.
 
@@ -87,6 +89,25 @@ that direct built-in imports, `eval`, `Function`, constructor chains from
 URL/timers/encoders/Promises/import metadata, and a dynamic-import error cannot
 recover a sentinel even when trusted conversion can read its containing workspace
 root. Direct `node:fs` use maps to the existing `render_failed` envelope.
+
+The evaluator does not hand host callables or objects to the VM. Pure platform
+algorithms (`URL`, `URLSearchParams`, `TextEncoder`, stateful `TextDecoder`,
+`atob`, `btoa`, and the monotonic performance clock) run through a
+primitive/JSON-only bridge, while realm-local facades own returned objects,
+buffers, and errors. This is the pass-through set: its conformance fixture
+compares multibyte boundaries, decoder streaming/BOM/fatal modes, URL mutation,
+base64 failures, and clock semantics with the active Node host on both supported
+CI legs.
+
+The justified shim set is deliberately smaller. `DOMException` is recreated
+locally, including legacy codes, because a host Error would expose its host
+constructor. `process.env` is a null-prototype object containing only
+`NODE_ENV`. Timers, intervals, microtasks, and `MessageChannel` use the
+per-command scheduling registry so callbacks cannot outlive a render.
+`FinalizationRegistry`, `SharedArrayBuffer`, `Atomics`, and `WebAssembly` remain
+unavailable because they cannot satisfy that authority/lifetime policy. Normal
+ECMAScript intrinsics such as Array and Promise come directly from the VM realm;
+the evaluator does not reconstruct them.
 
 ## Public contract
 
@@ -176,26 +197,28 @@ runtime#65:
 
 Any byte modification makes the router workspace-owned and ineligible. A custom
 router remains untouched; browser-global access during its module evaluation or
-render returns `render_failed`.
+render returns `render_failed`. An existing App-only workspace remains
+routerless and renders `src/App.tsx` directly. If neither App nor router exists,
+the unchanged module-load failure maps to `render_failed`.
 
 ## Measured fixture result
 
 Measured in three fresh processes through the production `render-markdown`
-endpoint on an Apple M1 Pro, Node 22.19.0, darwin-arm64. The cold request includes
+endpoint on an Apple M1 Pro, Node 24.8.0, darwin-arm64. The cold request includes
 session Vite warm-up and the first child/module load. Warm misses vary the query
 to bypass the Markdown result cache; cache hits still recompute the workspace
 fingerprint.
 
 | Measurement | Result |
 | --- | ---: |
-| cold request | 1,607-1,852 ms |
-| cold load | 1,573-1,802 ms |
-| cold render / conversion | 5.9-6.3 / 7.6-7.8 ms |
-| warm miss median / p95 | 6.84-7.29 / 13.01-13.38 ms |
-| cache hit median / p95 | 0.85-0.91 / 1.74-1.87 ms |
-| RSS before cold | 98.6-98.9 MiB |
-| RSS after cold (delta) | 392.2-397.8 MiB (+293.5-298.9 MiB) |
-| RSS after 20 warm misses | 402.1-408.1 MiB |
+| cold request | 1,999-2,577 ms |
+| cold load | 1,952-2,539 ms |
+| cold render / conversion | 5.1-6.6 / 7.4-8.5 ms |
+| warm miss median / p95 | 8.19-10.71 / 12.06-14.44 ms |
+| cache hit median / p95 | 0.98-1.63 / 1.97-2.96 ms |
+| RSS before cold | 113.3-115.3 MiB |
+| RSS after cold (delta) | 419.6-501.9 MiB (+304.8-388.7 MiB) |
+| RSS after 20 warm misses | 437.0-514.3 MiB |
 
 RSS after child startup is the OS-reported sum for the Runtime parent and active
 SSR child, rather than the parent's `process.memoryUsage()` alone. The benchmark
