@@ -23,9 +23,19 @@ import {
   type MarkdownRenderErrorCode
 } from "./markdown-core.js"
 import type {
-  SsrMarkdownConversionOptions,
-  SsrMarkdownConversionResult
+  SsrMarkdownConversionOptions
 } from "./ssr-markdown-conversion.js"
+import {
+  assertSsrMarkdownIpcValue,
+  serializeSsrMarkdownError,
+  SsrMarkdownIpcBudget,
+  SsrMarkdownIpcLimitError,
+  SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+  SSR_MARKDOWN_IPC_ERROR_MAX_BYTES,
+  SSR_MARKDOWN_IPC_MODULE_MAX_BYTES,
+  SSR_MARKDOWN_IPC_MODULE_TOTAL_MAX_BYTES,
+  type SsrMarkdownSerializedError
+} from "./ssr-markdown-protocol.js"
 import {
   createSsrMarkdownCacheKey,
   type SsrRouteLocation
@@ -100,15 +110,19 @@ export type MarkdownRenderResult = {
 
 export type SsrMarkdownWorker = {
   load(sessionId: string, vite: ViteDevServer): Promise<void>
-  render(sessionId: string, location: SsrRouteLocation): Promise<string>
-  convert(
+  renderMarkdown(
     sessionId: string,
-    html: string,
+    location: SsrRouteLocation,
     options: SsrMarkdownConversionOptions
-  ): Promise<SsrMarkdownConversionResult>
+  ): SsrMarkdownRenderTask
   invalidateSession(sessionId: string): Promise<void>
   terminate(): Promise<void>
   close(): Promise<void>
+}
+
+export type SsrMarkdownRenderTask = {
+  conversionStarted: Promise<void>
+  result: Promise<{ markdown: string }>
 }
 
 type ChildFactory = (
@@ -236,6 +250,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
           let prepared!: SsrMarkdownPreparedSession
           let fingerprint!: string
           let cacheKey!: string
+          let canonicalWorkspace!: string
           try {
             const lockedFingerprint = await loadBudget.wait(
               fingerprintOrRenderFailed(workspaceFingerprinter, request.sessionId, request.workspace),
@@ -282,6 +297,10 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
                 () => worker.invalidateSession(request.sessionId)
               )
             }
+            canonicalWorkspace = await loadBudget.wait(
+              realpath(request.workspace),
+              combined.signal
+            )
             await runWorkerOperation(
               loadBudget,
               combined.signal,
@@ -301,15 +320,21 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
           const renderStarted = performance.now()
           const renderBudget = new PhaseBudget("render", reactTimeoutMs)
           let renderOutcome: MarkdownRenderPhaseTiming["outcome"] = "ok"
-          let html: string
+          let task!: SsrMarkdownRenderTask
           try {
-            html = await runWorkerOperation(
+            task = worker.renderMarkdown(request.sessionId, location, {
+              documentUrl: ssrDocumentUrl(request, prepared),
+              basePath: request.basePath,
+              internalBasePath: prepared.internalBasePath,
+              workspace: canonicalWorkspace,
+              maxOutputBytes
+            })
+            await runWorkerOperation(
               renderBudget,
               combined.signal,
               worker,
-              () => worker.render(request.sessionId, location)
+              () => task.conversionStarted
             )
-            if (typeof html !== "string") throw new Error("The SSR worker returned invalid HTML")
           } catch (error) {
             renderOutcome = phaseOutcome(error, combined.signal)
             throw error
@@ -321,29 +346,15 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
           const conversionStarted = performance.now()
           const conversionBudget = new PhaseBudget("conversion", conversionTimeoutMs)
           let conversionOutcome: MarkdownRenderPhaseTiming["outcome"] = "ok"
-          let converted: SsrMarkdownConversionResult
+          let converted: { markdown: string }
           try {
-            const canonicalWorkspace = await conversionBudget.wait(
-              realpath(request.workspace),
-              combined.signal
-            )
             converted = await runWorkerOperation(
               conversionBudget,
               combined.signal,
               worker,
-              () => worker.convert(request.sessionId, html, {
-                documentUrl: ssrDocumentUrl(request, prepared),
-                basePath: request.basePath,
-                internalBasePath: prepared.internalBasePath,
-                workspace: canonicalWorkspace,
-                maxOutputBytes
-              })
+              () => task.result
             )
-            if (
-              !converted ||
-              typeof converted.markdown !== "string" ||
-              typeof converted.html !== "string"
-            ) {
+            if (!converted || typeof converted.markdown !== "string") {
               throw new Error("The SSR worker returned an invalid conversion result")
             }
             if (!converted.markdown.trim()) throw new Error("The rendered page has no Markdown content")
@@ -488,9 +499,11 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
   private readonly childFactory: ChildFactory
   private readonly workspaceRoot: string | undefined
   private readonly childPath = fileURLToPath(ssrWorkerUrl())
-  private readonly bindings = new Map<string, { vite: ViteDevServer, generation: number }>()
+  private readonly bindings = new Map<string, WorkerSessionBinding>()
   private readonly pending = new Map<number, {
     command: WorkerCommandName
+    maxResultBytes: number
+    onPhase?: (phase: WorkerCommandPhase) => void
     resolve(value: unknown): void
     reject(error: Error): void
   }>()
@@ -511,9 +524,18 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     let binding = this.bindings.get(sessionId)
     if (binding?.vite !== vite) {
       await this.invalidateWorkerSession(sessionId)
-      binding = { vite, generation: this.nextGeneration++ }
+      binding = {
+        vite,
+        generation: this.nextGeneration++,
+        moduleBudget: undefined
+      }
       this.bindings.set(sessionId, binding)
     }
+    binding.moduleBudget = new SsrMarkdownIpcBudget(
+      SSR_MARKDOWN_IPC_MODULE_TOTAL_MAX_BYTES,
+      "cumulative module transport",
+      "module response"
+    )
     await this.command("load", {
       sessionId,
       generation: binding.generation,
@@ -522,27 +544,47 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     })
   }
 
-  async render(sessionId: string, location: SsrRouteLocation): Promise<string> {
-    const binding = this.requireBinding(sessionId)
-    return await this.command("render", {
-      sessionId,
-      generation: binding.generation,
-      location
-    }) as string
-  }
-
-  async convert(
+  renderMarkdown(
     sessionId: string,
-    html: string,
+    location: SsrRouteLocation,
     options: SsrMarkdownConversionOptions
-  ): Promise<SsrMarkdownConversionResult> {
+  ): SsrMarkdownRenderTask {
     const binding = this.requireBinding(sessionId)
-    return await this.command("convert", {
+    let phaseSettled = false
+    let resolveConversionStarted!: () => void
+    let rejectConversionStarted!: (error: Error) => void
+    const conversionStarted = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolveConversionStarted = resolvePromise
+      rejectConversionStarted = rejectPromise
+    })
+    const result = this.command("render-markdown", {
       sessionId,
       generation: binding.generation,
-      html,
+      location,
       options
-    }) as SsrMarkdownConversionResult
+    }, {
+      maxResultBytes: ipcResultLimit(options.maxOutputBytes),
+      onPhase: (phase) => {
+        if (phase !== "conversion" || phaseSettled) return
+        phaseSettled = true
+        resolveConversionStarted()
+      }
+    }) as Promise<{ markdown: string }>
+    void result.then(
+      () => {
+        binding.moduleBudget = undefined
+        if (phaseSettled) return
+        phaseSettled = true
+        rejectConversionStarted(new Error("The SSR worker omitted the conversion phase"))
+      },
+      (error) => {
+        binding.moduleBudget = undefined
+        if (phaseSettled) return
+        phaseSettled = true
+        rejectConversionStarted(error instanceof Error ? error : new Error(String(error)))
+      }
+    )
+    return { conversionStarted, result }
   }
 
   async invalidateSession(sessionId: string): Promise<void> {
@@ -572,7 +614,7 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     }
   }
 
-  private requireBinding(sessionId: string): { vite: ViteDevServer, generation: number } {
+  private requireBinding(sessionId: string): WorkerSessionBinding {
     const binding = this.bindings.get(sessionId)
     if (!binding) throw new Error("The SSR worker session is not loaded")
     return binding
@@ -627,7 +669,14 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     return state
   }
 
-  private async command(name: WorkerCommandName, data: Record<string, unknown>): Promise<unknown> {
+  private async command(
+    name: WorkerCommandName,
+    data: Record<string, unknown>,
+    options: {
+      maxResultBytes?: number
+      onPhase?: (phase: WorkerCommandPhase) => void
+    } = {}
+  ): Promise<unknown> {
     const state = this.ensureChild()
     await state.ready
     if (this.childState !== state) {
@@ -635,10 +684,19 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     }
     const requestId = this.nextRequestId++
     return await new Promise((resolve, reject) => {
-      this.pending.set(requestId, { command: name, resolve, reject })
+      this.pending.set(requestId, {
+        command: name,
+        maxResultBytes: options.maxResultBytes ?? SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+        onPhase: options.onPhase,
+        resolve,
+        reject
+      })
       try {
         this.sendToChild(state, { type: "command", requestId, name, ...data })
       } catch (error) {
+        this.pending.delete(requestId)
+        reject(error instanceof Error ? error : new Error(String(error)))
+        if (error instanceof SsrMarkdownIpcLimitError) return
         this.failChild(state, error)
         void killChildProcess(state.child)
       }
@@ -668,6 +726,8 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     }
     if (message.type === "command-result") {
       this.handleCommandResult(message as WorkerCommandResult)
+    } else if (message.type === "command-phase") {
+      this.handleCommandPhase(message as WorkerCommandPhaseMessage)
     } else if (message.type === "vite-rpc") {
       void this.handleViteRpc(state, message as WorkerViteRpc)
     }
@@ -677,17 +737,48 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     const pending = this.pending.get(message.requestId)
     if (!pending) return
     this.pending.delete(message.requestId)
-    if (message.error) {
-      pending.reject(new WorkerCommandError(pending.command, message.error))
-    } else {
-      pending.resolve(message.result)
+    try {
+      if (message.error) {
+        assertSsrMarkdownIpcValue(
+          message.error,
+          SSR_MARKDOWN_IPC_ERROR_MAX_BYTES,
+          "child error"
+        )
+        pending.reject(new WorkerCommandError(pending.command, message.error))
+      } else {
+        assertSsrMarkdownIpcValue(
+          message.result,
+          pending.maxResultBytes,
+          "child command result"
+        )
+        pending.resolve(message.result)
+      }
+    } catch (error) {
+      pending.reject(error instanceof Error ? error : new Error(String(error)))
+      const state = this.childState
+      if (state) {
+        this.failChild(state, error)
+        void killChildProcess(state.child)
+      }
     }
+  }
+
+  private handleCommandPhase(message: WorkerCommandPhaseMessage): void {
+    const pending = this.pending.get(message.requestId)
+    if (!pending || message.phase !== "conversion") return
+    pending.onPhase?.(message.phase)
   }
 
   private async handleViteRpc(state: SsrChildState, message: WorkerViteRpc): Promise<void> {
     const binding = this.bindings.get(message.sessionId)
     let response: { result: unknown } | { error: SerializedError }
+    let responseMaxBytes = SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES
     try {
+      assertSsrMarkdownIpcValue(
+        message,
+        SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+        "module request"
+      )
       if (!binding || binding.generation !== message.generation) {
         throw new Error("The Vite session changed while the SSR worker was loading it")
       }
@@ -704,7 +795,13 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
         if ("externalize" in fetched) {
           throw new Error(`External module ${id} is unavailable during Show Page SSR`)
         }
+        if (!binding.moduleBudget) {
+          throw new Error("The SSR module transport has no active request budget")
+        }
+        binding.moduleBudget.add(fetched, SSR_MARKDOWN_IPC_MODULE_MAX_BYTES)
         result = fetched
+        responseMaxBytes = SSR_MARKDOWN_IPC_MODULE_MAX_BYTES +
+          SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES
       } else if (invocation.name === "getBuiltins") {
         result = []
       } else {
@@ -712,7 +809,8 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
       }
       response = { result }
     } catch (error) {
-      response = { error: serializeError(error) }
+      response = { error: serializeSsrMarkdownError(error) }
+      responseMaxBytes = SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES
     }
     if (this.childState !== state) return
     try {
@@ -720,17 +818,23 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
         type: "vite-rpc-result",
         rpcId: message.rpcId,
         response
-      })
+      }, responseMaxBytes, "module response")
     } catch (error) {
       this.failChild(state, error)
       void killChildProcess(state.child)
     }
   }
 
-  private sendToChild(state: SsrChildState, message: Record<string, unknown>): void {
+  private sendToChild(
+    state: SsrChildState,
+    message: Record<string, unknown>,
+    maxBytes = SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+    boundary = "control message"
+  ): void {
     if (this.childState !== state || !state.child.connected) {
       throw new SsrWorkerUnavailableError("The SSR worker IPC channel is unavailable")
     }
+    assertSsrMarkdownIpcValue(message, maxBytes, boundary)
     state.child.send(message, (error) => {
       if (!error || this.childState !== state) return
       this.failChild(state, error)
@@ -776,20 +880,25 @@ function ssrWorkerUrl(): URL {
     : new URL("../dist/ssr-markdown-worker.js", import.meta.url)
 }
 
-type WorkerCommandName = "load" | "render" | "convert" | "invalidate"
+type WorkerCommandName = "load" | "render-markdown" | "invalidate"
+type WorkerCommandPhase = "conversion"
 type SsrImportMetaEnv = Readonly<Record<string, unknown>>
-type SerializedError = {
-  name?: string
-  message?: string
-  stack?: string
-  code?: string
-  status?: number
+type SerializedError = SsrMarkdownSerializedError
+type WorkerSessionBinding = {
+  vite: ViteDevServer
+  generation: number
+  moduleBudget: SsrMarkdownIpcBudget | undefined
 }
 type WorkerCommandResult = {
   type: "command-result"
   requestId: number
   result?: unknown
   error?: SerializedError
+}
+type WorkerCommandPhaseMessage = {
+  type: "command-phase"
+  requestId: number
+  phase: WorkerCommandPhase
 }
 type WorkerViteRpc = {
   type: "vite-rpc"
@@ -1226,7 +1335,7 @@ function normalizeRenderError(
   }
   if (
     error instanceof WorkerCommandError &&
-    error.command === "convert" &&
+    error.command === "render-markdown" &&
     error.code === "output_too_large"
   ) {
     return outputTooLarge(maxOutputBytes)
@@ -1320,16 +1429,6 @@ async function waitForAbort<T>(operation: Promise<T>, signal: AbortSignal): Prom
   }
 }
 
-function serializeError(value: unknown): SerializedError {
-  if (!(value instanceof Error)) return { name: "Error", message: String(value) }
-  return {
-    name: value.name,
-    message: value.message,
-    stack: value.stack,
-    code: "code" in value && typeof value.code === "string" ? value.code : undefined
-  }
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
@@ -1361,4 +1460,8 @@ function formatTimeout(timeoutMs: number): string {
 
 function formatByteLimit(bytes: number): string {
   return bytes % 1024 === 0 ? `${bytes / 1024} KiB` : `${bytes} bytes`
+}
+
+function ipcResultLimit(maxOutputBytes: number): number {
+  return Math.min(maxOutputBytes, Number.MAX_SAFE_INTEGER - 1024) + 1024
 }

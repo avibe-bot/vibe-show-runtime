@@ -18,6 +18,15 @@ import {
 } from "./markdown-renderer.js"
 import { convertSsrRenderedHtmlToMarkdown } from "./ssr-markdown-conversion.js"
 import {
+  assertSsrMarkdownIpcValue,
+  serializeSsrMarkdownError,
+  SsrMarkdownIpcBudget,
+  SsrMarkdownIpcLimitError,
+  SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+  SSR_MARKDOWN_IPC_ERROR_MAX_BYTES,
+  SSR_MARKDOWN_IPC_MODULE_MAX_BYTES
+} from "./ssr-markdown-protocol.js"
+import {
   startShowRuntimeServer,
   type ShowRuntimeServerDependencies
 } from "./server.js"
@@ -225,10 +234,11 @@ async function probeChildPermissionProfile(): Promise<ForkOptions["execArgv"]> {
   }
 }
 
-function recordingChildFactory(children: ChildProcess[]) {
+function recordingChildFactory(children: ChildProcess[], messages?: unknown[]) {
   return (modulePath: string, args: string[], options: ForkOptions): ChildProcess => {
     const child = fork(modulePath, args, options)
     children.push(child)
+    if (messages) child.on("message", (message) => messages.push(message))
     return child
   }
 }
@@ -264,6 +274,100 @@ describe("SSR sandbox evaluator", () => {
       evaluator.dispose()
     }
   })
+})
+
+describe("SSR Markdown process protocol", () => {
+  it("bounds control messages, cumulative module transport, and serialized errors", () => {
+    expect(() => assertSsrMarkdownIpcValue(
+      { value: "x".repeat(SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES) },
+      SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+      "test control"
+    )).toThrow(SsrMarkdownIpcLimitError)
+
+    const budget = new SsrMarkdownIpcBudget(100, "test cumulative transport")
+    expect(budget.add({ code: "a".repeat(24) }, 64)).toBeGreaterThan(0)
+    expect(() => budget.add({ code: "b".repeat(64) }, 96))
+      .toThrow(SsrMarkdownIpcLimitError)
+
+    const error = new Error("oversized-error-".repeat(16 * 1024)) as Error & {
+      code: string
+      status: number
+    }
+    error.code = "ERR_FIXTURE"
+    error.status = 502
+    const serialized = serializeSsrMarkdownError(error)
+    expect(assertSsrMarkdownIpcValue(
+      serialized,
+      SSR_MARKDOWN_IPC_ERROR_MAX_BYTES,
+      "test serialized error"
+    )).toBeLessThanOrEqual(SSR_MARKDOWN_IPC_ERROR_MAX_BYTES)
+    expect(Buffer.byteLength(serialized.message ?? "", "utf8")).toBeLessThanOrEqual(4 * 1024)
+    expect(serialized).toMatchObject({ code: "ERR_FIXTURE", status: 502 })
+  })
+
+  it("rejects oversized command input before sending it to the child", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "avibe-show-ipc-command-"))
+    const worker = createModuleGraphSsrWorker(undefined, workspace)
+    try {
+      const fetchModule = vi.fn()
+      const vite = {
+        environments: {
+          [SSR_MARKDOWN_ENVIRONMENT]: {
+            config: {
+              consumer: "server",
+              env: {
+                BASE_URL: "/show/ipc-command/",
+                VITE_OVERSIZED: "x".repeat(SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES)
+              }
+            },
+            fetchModule
+          }
+        }
+      } as unknown as ViteDevServer
+
+      await expect(worker.load("ipc-command", vite)).rejects.toBeInstanceOf(
+        SsrMarkdownIpcLimitError
+      )
+      expect(fetchModule).not.toHaveBeenCalled()
+    } finally {
+      await worker.close()
+      await rm(workspace, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  it("rejects an oversized transformed module before returning it to the child", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "avibe-show-ipc-module-"))
+    const worker = createModuleGraphSsrWorker(undefined, workspace)
+    const marker = "OVERSIZED_TRANSFORM_MUST_NOT_CROSS"
+    try {
+      const fetchModule = vi.fn(async (id: string) => ({
+        code: `${marker}${"x".repeat(SSR_MARKDOWN_IPC_MODULE_MAX_BYTES)}`,
+        file: null,
+        id,
+        url: id,
+        invalidate: false
+      }))
+      const vite = {
+        environments: {
+          [SSR_MARKDOWN_ENVIRONMENT]: {
+            config: {
+              consumer: "server",
+              env: { BASE_URL: "/show/ipc-module/" }
+            },
+            fetchModule
+          }
+        }
+      } as unknown as ViteDevServer
+
+      await expect(worker.load("ipc-module", vite)).rejects.toMatchObject({
+        message: expect.not.stringContaining(marker)
+      })
+      expect(fetchModule).toHaveBeenCalledOnce()
+    } finally {
+      await worker.close()
+      await rm(workspace, { recursive: true, force: true })
+    }
+  }, 60_000)
 })
 
 describe("SSR Markdown endpoint", () => {
@@ -362,6 +466,45 @@ describe("SSR Markdown endpoint", () => {
     expect(second.status).toBe(200)
     expect(second.headers.get("x-avibe-render-cache")).toBe("hit")
     expect(await second.text()).toBe(markdown)
+  }, 60_000)
+
+  it("uses a fresh module-instance graph for every uncached render", async () => {
+    const children: ChildProcess[] = []
+    const messages: unknown[] = []
+    const runtime = await startFixtureServer(
+      ["state-isolation"],
+      {},
+      { markdownRendererOptions: { childFactory: recordingChildFactory(children, messages) } }
+    )
+    const url = markdownUrl(runtime.url, "state-isolation")
+
+    const first = await fetch(url, {
+      headers: { "x-vibe-show-target": "/?owner=A" }
+    })
+    const firstMarkdown = await first.text()
+    expect(first.status, firstMarkdown).toBe(200)
+    expect(first.headers.get("x-avibe-render-cache")).toBe("miss")
+    expect(firstMarkdown).toContain("Render count: 1")
+    expect(firstMarkdown).toContain("Initialized owner: A")
+
+    const second = await fetch(url, {
+      headers: { "x-vibe-show-target": "/?owner=B" }
+    })
+    const secondMarkdown = await second.text()
+    expect(second.status, secondMarkdown).toBe(200)
+    expect(second.headers.get("x-avibe-render-cache")).toBe("miss")
+    expect(secondMarkdown).toContain("Render count: 1")
+    expect(secondMarkdown).toContain("Initialized owner: B")
+    expect(secondMarkdown).not.toContain("Initialized owner: A")
+
+    const messageCountBeforeHit = messages.length
+    const cached = await fetch(url, {
+      headers: { "x-vibe-show-target": "/?owner=B" }
+    })
+    expect(cached.headers.get("x-avibe-render-cache")).toBe("hit")
+    expect(await cached.text()).toBe(secondMarkdown)
+    expect(messages).toHaveLength(messageCountBeforeHit)
+    expect(children).toHaveLength(1)
   }, 60_000)
 
   it("renders Show UI and the pre-effect tree while applying structured cleanup", async () => {
@@ -619,11 +762,69 @@ describe("SSR Markdown endpoint", () => {
     expect(await response.json()).toEqual({ value: "ordinary-node-ssr" })
   }, 60_000)
 
-  it("returns output_too_large after enforcing the intermediate and Markdown caps", async () => {
-    const runtime = await startFixtureServer(["semantic"], { renderMaxOutputBytes: 128 })
+  it("returns output_too_large before raw HTML can cross the child boundary", async () => {
+    const children: ChildProcess[] = []
+    const messages: unknown[] = []
+    const runtime = await startFixtureServer(
+      ["semantic"],
+      { renderMaxOutputBytes: 128 },
+      { markdownRendererOptions: { childFactory: recordingChildFactory(children, messages) } }
+    )
     const response = await fetch(markdownUrl(runtime.url, "semantic"))
     expect(response.status).toBe(502)
     expect(await renderError(response)).toMatchObject({ error: { code: "output_too_large" } })
+    expect(children).toHaveLength(1)
+    const childMessages = JSON.stringify(messages)
+    expect(childMessages).not.toContain("SSR fixture report")
+    expect(childMessages).not.toContain('"html"')
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: "command-result",
+      error: expect.objectContaining({ code: "output_too_large" })
+    }))
+  }, 60_000)
+
+  it("bounds module requests and errors emitted by workspace code", async () => {
+    const children: ChildProcess[] = []
+    const messages: unknown[] = []
+    const runtime = await startFixtureServer(
+      ["ipc-request-boundary", "ipc-error-boundary"],
+      {},
+      { markdownRendererOptions: { childFactory: recordingChildFactory(children, messages) } }
+    )
+
+    const requestOverflow = await fetch(markdownUrl(runtime.url, "ipc-request-boundary"))
+    const requestBody = await requestOverflow.text()
+    expect(requestOverflow.status, requestBody).toBe(502)
+    expect(JSON.parse(requestBody)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+    expect(requestBody).not.toContain("virtual:")
+    expect(JSON.stringify(messages)).not.toContain("x".repeat(1024))
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: "command-result",
+      error: expect.objectContaining({
+        message: expect.stringContaining("module request exceeded its IPC limit")
+      })
+    }))
+
+    const messageOffset = messages.length
+    const errorOverflow = await fetch(markdownUrl(runtime.url, "ipc-error-boundary"))
+    const errorBody = await errorOverflow.text()
+    expect(errorOverflow.status, errorBody).toBe(502)
+    expect(JSON.parse(errorBody)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+    expect(errorBody).not.toContain("oversized-render-error")
+    const emittedError = messages.slice(messageOffset).find((message) => {
+      const record = message as Record<string, any>
+      return record?.type === "command-result" && record.error
+    }) as Record<string, any> | undefined
+    expect(emittedError).toBeDefined()
+    expect(assertSsrMarkdownIpcValue(
+      emittedError?.error,
+      SSR_MARKDOWN_IPC_ERROR_MAX_BYTES,
+      "test emitted child error"
+    )).toBeLessThanOrEqual(SSR_MARKDOWN_IPC_ERROR_MAX_BYTES)
   }, 60_000)
 
   it("returns renderer_unavailable when the terminable SSR owner cannot start", async () => {
@@ -879,11 +1080,14 @@ describe("SSR Markdown endpoint", () => {
 
 type FakeWorkerHooks = {
   load?(sessionId: string, vite: ViteDevServer): Promise<void>
-  render?(sessionId: string, location: Parameters<SsrMarkdownWorker["render"]>[1]): Promise<string>
+  render?(
+    sessionId: string,
+    location: Parameters<SsrMarkdownWorker["renderMarkdown"]>[1]
+  ): Promise<string>
   convert?(
     sessionId: string,
     html: string,
-    options: Parameters<SsrMarkdownWorker["convert"]>[2]
+    options: Parameters<SsrMarkdownWorker["renderMarkdown"]>[2]
   ): Promise<ReturnType<typeof convertSsrRenderedHtmlToMarkdown>>
 }
 
@@ -901,25 +1105,44 @@ class FakeSsrWorker implements SsrMarkdownWorker {
     await this.hooks.load?.(sessionId, vite)
   }
 
-  async render(
+  renderMarkdown(
     sessionId: string,
-    location: Parameters<SsrMarkdownWorker["render"]>[1]
-  ): Promise<string> {
+    location: Parameters<SsrMarkdownWorker["renderMarkdown"]>[1],
+    options: Parameters<SsrMarkdownWorker["renderMarkdown"]>[2]
+  ): ReturnType<SsrMarkdownWorker["renderMarkdown"]> {
     this.renderCalls.push({ sessionId, pathname: location.pathname })
-    return this.hooks.render
-      ? await this.hooks.render(sessionId, location)
-      : `<h1>${sessionId}:${location.pathname}</h1><p>${location.search || "no query"}</p>`
-  }
-
-  async convert(
-    sessionId: string,
-    html: string,
-    options: Parameters<SsrMarkdownWorker["convert"]>[2]
-  ) {
-    this.convertCalls.push(sessionId)
-    return this.hooks.convert
-      ? await this.hooks.convert(sessionId, html, options)
-      : convertSsrRenderedHtmlToMarkdown(html, options)
+    let phaseSettled = false
+    let resolveConversionStarted!: () => void
+    let rejectConversionStarted!: (error: Error) => void
+    const conversionStarted = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolveConversionStarted = resolvePromise
+      rejectConversionStarted = rejectPromise
+    })
+    const result = (async () => {
+      let html: string
+      try {
+        html = this.hooks.render
+          ? await this.hooks.render(sessionId, location)
+          : `<h1>${sessionId}:${location.pathname}</h1><p>${location.search || "no query"}</p>`
+      } catch (error) {
+        phaseSettled = true
+        rejectConversionStarted(error instanceof Error ? error : new Error(String(error)))
+        throw error
+      }
+      phaseSettled = true
+      resolveConversionStarted()
+      this.convertCalls.push(sessionId)
+      const converted = this.hooks.convert
+        ? await this.hooks.convert(sessionId, html, options)
+        : convertSsrRenderedHtmlToMarkdown(html, options)
+      return { markdown: converted.markdown }
+    })()
+    void result.catch((error) => {
+      if (phaseSettled) return
+      phaseSettled = true
+      rejectConversionStarted(error instanceof Error ? error : new Error(String(error)))
+    })
+    return { conversionStarted, result }
   }
 
   async invalidateSession(sessionId: string): Promise<void> {

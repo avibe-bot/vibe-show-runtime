@@ -18,7 +18,7 @@ runtime main thread
                   v
 one long-lived, terminable Node child process
   process permission profile + boot self-check
-  restricted VM realm + ModuleRunner cache per session
+  fresh restricted VM realm + ModuleRunner graph per cache miss
     React DOM Server render
   Runtime-owned trusted layer
     structured HTML cleanup
@@ -32,6 +32,9 @@ the Runtime never creates a router for them. That preserves the session's
 physical React instance across application, optional provider, and renderer.
 Cleanup and conversion do not compose React values, so they run in the same
 terminable child process's trusted Runtime layer rather than in the workspace VM.
+React render, raw-output enforcement, cleanup, and Turndown run as one child
+command. Raw and cleaned HTML never cross IPC; only bounded Markdown or a bounded
+serialized error returns to the Runtime parent.
 
 The renderer uses a dedicated Vite environment inside the existing session
 server. Its dependency graph is inlined, browser package conditions are used,
@@ -169,6 +172,35 @@ limit (`VIBE_SHOW_RENDER_MAX_BYTES` / `--render-max-output-bytes`). Phase timing
 events record `ok`, `error`, `timeout`, or `cancelled` without exposing page
 source or stack traces to the caller.
 
+Every cache miss creates a new evaluator and `ModuleRunner`, imports the entry,
+renders once, and closes that graph in a `finally` path. The live session Vite
+environment keeps its transform/module graph caches, so fresh module instances
+do not require a second Vite server or build. A Markdown result-cache hit does
+not contact the child at all. Module-level state from one target therefore cannot
+be observed by a later uncached target in the same session.
+
+### Child-process seam audit
+
+Every value crossing between workspace-evaluated code and the Runtime parent has
+an explicit size, lifetime, or reset owner:
+
+| Seam | Bound or reset | Regression evidence |
+| --- | --- | --- |
+| Module instances | Fresh evaluator and runner for each uncached render; close on load failure and after render success/failure | Module counter resets to one; target-A store state is absent from target B; cache hits bypass evaluation |
+| Parent to child commands | 64 KiB logical UTF-8/control budget, bounded depth and entry count, checked before send and again on receipt | Oversized resolved Vite env is rejected before `fetchModule` runs |
+| Child to parent module requests | 64 KiB control budget before send and on receipt | Workspace-generated oversized dynamic-import specifier returns `render_failed` without crossing or leaking the specifier |
+| Parent to child module responses | 16 MiB per transformed module and 64 MiB cumulative per render, enforced before send | Oversized transformed-module integration test plus cumulative-budget unit test |
+| Child to parent result | Existing configured raw/cleaned/Markdown cap plus fixed framing; only `{markdown}` crosses | Oversized raw HTML returns `output_too_large`; captured IPC contains neither HTML nor page text |
+| Errors in either direction | 8 KiB serialized-error budget; bounded name/message/stack/code fields; public response remains the generic existing envelope | A workspace-thrown oversized error is truncated in IPC and absent from the response |
+| Scheduling and module transport jobs | Per-command registry disposes timers, intervals, immediates, microtasks, and message tasks; transport promises quiesce before reply | Busy module-level interval cannot fire after its command or delay the next render |
+| Phase time and cancellation | Independent 10 s load, 5 s render, and 5 s conversion budgets; child flushes a phase transition before conversion; timeout/disconnect hard-kills it | Hung load/render and fake conversion each time out; caller disconnect kills; next request respawns and succeeds |
+| Session and process lifecycle | Watcher/fingerprint/suspend/idle invalidation closes session state; crash rejects all pending RPC and drops all child state | Existing invalidation suite plus kill/respawn integration tests |
+
+The control/module/error budgets are internal protocol limits, not new public
+configuration or error codes. A protocol overflow maps through the existing
+`render_failed` envelope; a raw, cleaned, or Markdown overflow remains
+`output_too_large`.
+
 ## Cache and invalidation
 
 The exact key is the JSON encoding of:
@@ -210,19 +242,20 @@ the unchanged module-load failure maps to `render_failed`.
 Measured in three fresh processes through the production `render-markdown`
 endpoint on an Apple M1 Pro, Node 24.8.0, darwin-arm64. The cold request includes
 session Vite warm-up and the first child/module load. Warm misses vary the query
-to bypass the Markdown result cache; cache hits still recompute the workspace
-fingerprint.
+to bypass the Markdown result cache and therefore create a fresh module-instance
+graph while reusing Vite transforms; cache hits still recompute the workspace
+fingerprint but never contact the child.
 
 | Measurement | Result |
 | --- | ---: |
-| cold request | 1,571-1,680 ms |
-| cold load | 1,539-1,644 ms |
-| cold render / conversion | 4.9-5.3 / 6.7-7.1 ms |
-| warm miss median / p95 | 6.81-7.82 / 10.71-10.87 ms |
-| cache hit median / p95 | 0.80-0.86 / 1.54-1.64 ms |
-| RSS before cold | 110.3-110.6 MiB |
-| RSS after cold (delta) | 467.6-500.5 MiB (+357.3-389.9 MiB) |
-| RSS after 20 warm misses | 484.5-508.5 MiB |
+| cold request | 1,574-1,702 ms |
+| cold load | 1,541-1,670 ms |
+| cold render / conversion | 4.8-5.3 / 6.4-6.6 ms |
+| warm miss median / p95 | 103.28-111.21 / 122.76-145.31 ms |
+| cache hit median / p95 | 0.76-0.85 / 1.67-1.76 ms |
+| RSS before cold | 110.1-110.9 MiB |
+| RSS after cold (delta) | 473.9-502.1 MiB (+363.4-391.2 MiB) |
+| RSS after 20 warm misses | 779.3-831.7 MiB |
 
 RSS after child startup is the OS-reported sum for the Runtime parent and active
 SSR child, rather than the parent's `process.memoryUsage()` alone. The benchmark

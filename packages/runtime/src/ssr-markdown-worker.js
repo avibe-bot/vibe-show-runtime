@@ -1,6 +1,12 @@
 import { readFileSync } from "node:fs"
 import { ModuleRunner } from "vite/module-runner"
 import { convertSsrRenderedHtmlToMarkdown } from "./ssr-markdown-conversion.js"
+import {
+  assertSsrMarkdownIpcValue,
+  serializeSsrMarkdownError,
+  SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+  SSR_MARKDOWN_IPC_MODULE_MAX_BYTES
+} from "./ssr-markdown-protocol.js"
 import { SsrSandboxEvaluator } from "./ssr-markdown-sandbox.js"
 
 if (!process.send) throw new Error("The SSR Markdown worker requires an IPC channel")
@@ -23,17 +29,19 @@ if (permissionSelfCheck(process.argv[2])) {
       return
     }
     if (record.type !== "command") return
+    try {
+      assertSsrMarkdownIpcValue(
+        record,
+        SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+        "command input"
+      )
+    } catch (error) {
+      sendCommandError(record, error)
+      return
+    }
     void executeCommand(record).then(
-      (result) => send({
-        type: "command-result",
-        requestId: record.requestId,
-        result
-      }),
-      (error) => send({
-        type: "command-result",
-        requestId: record.requestId,
-        error: serializeError(error)
-      })
+      (result) => sendCommandResult(record, result),
+      (error) => sendCommandError(record, error)
     )
   })
   process.once("disconnect", () => {
@@ -46,61 +54,63 @@ if (permissionSelfCheck(process.argv[2])) {
 async function executeCommand(command) {
   switch (command.name) {
     case "load": {
-      let state = sessions.get(command.sessionId)
-      if (state?.generation !== command.generation) {
-        await state?.runner.close()
-        state = undefined
-        sessions.delete(command.sessionId)
-      }
-      if (!state) {
-        const evaluator = new SsrSandboxEvaluator(
-          `avibe-show-ssr:${command.sessionId}`,
-          command.importMetaEnv
+      await disposeSession(command.sessionId)
+      const evaluator = new SsrSandboxEvaluator(
+        `avibe-show-ssr:${command.sessionId}`,
+        command.importMetaEnv
+      )
+      const state = /** @type {SessionState} */ ({
+        generation: command.generation,
+        evaluator,
+        runner: new ModuleRunner({
+          transport: createParentTransport(command.sessionId, command.generation),
+          createImportMeta: (modulePath) => evaluator.createImportMeta(modulePath),
+          hmr: false,
+          sourcemapInterceptor: false
+        }, evaluator)
+      })
+      sessions.set(command.sessionId, state)
+      try {
+        const entry = await runWorkspaceCommand(
+          command,
+          state.evaluator,
+          () => state.runner.import(command.entryId)
         )
-        state = {
-          generation: command.generation,
-          evaluator,
-          runner: new ModuleRunner({
-            transport: createParentTransport(command.sessionId, command.generation),
-            createImportMeta: (modulePath) => evaluator.createImportMeta(modulePath),
-            hmr: false,
-            sourcemapInterceptor: false
-          }, evaluator)
+        if (
+          !entry ||
+          typeof entry !== "object" ||
+          typeof entry.render !== "function"
+        ) {
+          throw new Error("The Show Page SSR entry is incomplete")
         }
-        sessions.set(command.sessionId, state)
+        state.entry = entry
+        return undefined
+      } catch (error) {
+        await disposeSession(command.sessionId)
+        throw error
       }
-      const entry = await runWorkspaceCommand(
-        command,
-        state.evaluator,
-        () => state.runner.import(command.entryId)
-      )
-      if (
-        !entry ||
-        typeof entry !== "object" ||
-        typeof entry.render !== "function"
-      ) {
-        throw new Error("The Show Page SSR entry is incomplete")
-      }
-      state.entry = entry
-      return undefined
     }
-    case "render": {
+    case "render-markdown": {
       const state = sessionState(command)
-      return runWorkspaceCommand(
-        command,
-        state.evaluator,
-        () => state.entry.render(state.evaluator.cloneJson(command.location))
-      )
-    }
-    case "convert": {
-      sessionState(command)
-      return convertSsrRenderedHtmlToMarkdown(command.html, command.options)
+      try {
+        const html = await runWorkspaceCommand(
+          command,
+          state.evaluator,
+          () => state.entry.render(state.evaluator.cloneJson(command.location))
+        )
+        await sendAndWait({
+          type: "command-phase",
+          requestId: command.requestId,
+          phase: "conversion"
+        })
+        const { markdown } = convertSsrRenderedHtmlToMarkdown(html, command.options)
+        return { markdown }
+      } finally {
+        await disposeSession(command.sessionId)
+      }
     }
     case "invalidate": {
-      const state = sessions.get(command.sessionId)
-      sessions.delete(command.sessionId)
-      await state?.runner.close()
-      state?.evaluator.dispose()
+      await disposeSession(command.sessionId)
       return undefined
     }
     case "close": {
@@ -185,15 +195,21 @@ function createParentTransport(sessionId, generation) {
         ))
       }
       const rpcId = nextRpcId++
+      const message = {
+        type: "vite-rpc",
+        rpcId,
+        sessionId,
+        generation,
+        payload
+      }
+      assertSsrMarkdownIpcValue(
+        message,
+        SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+        "module request"
+      )
       const request = new Promise((resolve, reject) => {
         pendingRpc.set(rpcId, { resolve, reject })
-        send({
-          type: "vite-rpc",
-          rpcId,
-          sessionId,
-          generation,
-          payload
-        })
+        send(message)
       })
       scope.pending.add(request)
       void request.then(
@@ -210,6 +226,18 @@ async function closeSessions() {
   for (const { evaluator } of sessions.values()) evaluator.dispose()
   sessions.clear()
   await Promise.allSettled(closing)
+}
+
+/** @param {string} sessionId */
+async function disposeSession(sessionId) {
+  const state = sessions.get(sessionId)
+  sessions.delete(sessionId)
+  if (!state) return
+  try {
+    await state.runner.close()
+  } finally {
+    state.evaluator.dispose()
+  }
 }
 
 /** @param {string | undefined} probePath */
@@ -249,13 +277,67 @@ function failBoot(reason) {
     process.exit(1)
     return
   }
-  process.send({ type: "boot-error", error: serializeError(error) }, () => process.exit(1))
+  const message = {
+    type: "boot-error",
+    error: serializeSsrMarkdownError(error)
+  }
+  assertSsrMarkdownIpcValue(
+    message,
+    SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+    "boot error"
+  )
+  process.send(message, () => process.exit(1))
+}
+
+/**
+ * @param {Record<string, unknown>} message
+ * @param {number} [maxBytes]
+ * @param {string} [boundary]
+ */
+function send(
+  message,
+  maxBytes = SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+  boundary = "control message"
+) {
+  if (!process.send) throw new Error("The SSR Markdown worker IPC channel closed")
+  assertSsrMarkdownIpcValue(message, maxBytes, boundary)
+  process.send(message)
 }
 
 /** @param {Record<string, unknown>} message */
-function send(message) {
+async function sendAndWait(message) {
   if (!process.send) throw new Error("The SSR Markdown worker IPC channel closed")
-  process.send(message)
+  assertSsrMarkdownIpcValue(
+    message,
+    SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+    "phase transition"
+  )
+  await new Promise((resolveSend, rejectSend) => {
+    process.send?.(message, (error) => error ? rejectSend(error) : resolveSend(undefined))
+  })
+}
+
+/** @param {Record<string, any>} command @param {unknown} result */
+function sendCommandResult(command, result) {
+  const configuredMaxBytes = Number(command.options?.maxOutputBytes)
+  const maxBytes = command.name === "render-markdown" &&
+    Number.isFinite(configuredMaxBytes) && configuredMaxBytes > 0
+    ? Math.min(configuredMaxBytes, Number.MAX_SAFE_INTEGER - 1024) + 1024
+    : SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES
+  send({
+    type: "command-result",
+    requestId: command.requestId,
+    result
+  }, maxBytes, "command result")
+}
+
+/** @param {Record<string, any>} command @param {unknown} error */
+function sendCommandError(command, error) {
+  send({
+    type: "command-result",
+    requestId: command.requestId,
+    error: serializeSsrMarkdownError(error)
+  })
 }
 
 /** @param {Record<string, any>} message */
@@ -263,22 +345,14 @@ function settleRpc(message) {
   const pending = pendingRpc.get(message.rpcId)
   if (!pending) return
   pendingRpc.delete(message.rpcId)
-  pending.resolve(message.response)
-}
-
-/** @param {unknown} value */
-function serializeError(value) {
-  if (!value || typeof value !== "object") {
-    return { name: "Error", message: String(value) }
-  }
-  const error = /** @type {Record<string, any>} */ (value)
-  const code = "code" in value && typeof value.code === "string" ? value.code : undefined
-  const status = "status" in value && typeof value.status === "number" ? value.status : undefined
-  return {
-    name: error.name,
-    message: error.message,
-    stack: error.stack,
-    code,
-    status
+  try {
+    assertSsrMarkdownIpcValue(
+      message,
+      SSR_MARKDOWN_IPC_MODULE_MAX_BYTES + SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES,
+      "module response"
+    )
+    pending.resolve(message.response)
+  } catch (error) {
+    pending.reject(error instanceof Error ? error : new Error(String(error)))
   }
 }
