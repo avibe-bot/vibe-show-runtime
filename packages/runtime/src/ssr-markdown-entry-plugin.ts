@@ -12,12 +12,20 @@ import { renderToStaticMarkup } from "react-dom/server.browser"
 import App from "/src/App.tsx"
 import * as RouterModule from "/src/router.tsx"
 
-function isRenderableComponent(value) {
-  return typeof value === "function" || (
-    typeof value === "object" &&
-    value !== null &&
-    "$$typeof" in value
-  )
+const REACT_MEMO_TYPE = Symbol.for("react.memo")
+const REACT_FORWARD_REF_TYPE = Symbol.for("react.forward_ref")
+const REACT_LAZY_TYPE = Symbol.for("react.lazy")
+
+function isRenderableComponent(value, seen = new Set()) {
+  if (typeof value === "function") return true
+  if (typeof value !== "object" || value === null) return false
+  if (seen.has(value)) return false
+  seen.add(value)
+  if (value.$$typeof === REACT_MEMO_TYPE) return isRenderableComponent(value.type, seen)
+  if (value.$$typeof === REACT_FORWARD_REF_TYPE) return typeof value.render === "function"
+  return value.$$typeof === REACT_LAZY_TYPE &&
+    typeof value._init === "function" &&
+    "_payload" in value
 }
 
 export const hasSsrRouterProvider = isRenderableComponent(RouterModule.SsrRouterProvider)

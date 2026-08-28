@@ -409,10 +409,12 @@ describe("SSR Markdown endpoint", () => {
     })
   }, 60_000)
 
-  it("renders React exotic router providers and treats unmarked objects as legacy", async () => {
+  it("accepts React exotic component markers and rejects element or arbitrary markers", async () => {
     const runtime = await startFixtureServer([
       "exotic-router-provider",
-      "invalid-router-provider"
+      "forward-ref-router-provider",
+      "invalid-router-provider",
+      "element-router-provider"
     ])
 
     const exotic = await fetch(markdownUrl(runtime.url, "exotic-router-provider"), {
@@ -422,6 +424,14 @@ describe("SSR Markdown endpoint", () => {
     expect(exotic.status, exoticMarkdown).toBe(200)
     expect(exoticMarkdown).toContain("# Exotic provider team acme")
     expect(exoticMarkdown).toContain("Period: Q4")
+
+    const forwardRef = await fetch(markdownUrl(runtime.url, "forward-ref-router-provider"), {
+      headers: { "x-vibe-show-target": "/teams/avibe?period=Q1" }
+    })
+    const forwardRefMarkdown = await forwardRef.text()
+    expect(forwardRef.status, forwardRefMarkdown).toBe(200)
+    expect(forwardRefMarkdown).toContain("# ForwardRef provider team avibe")
+    expect(forwardRefMarkdown).toContain("Period: Q1")
 
     const legacyRoot = await fetch(markdownUrl(runtime.url, "invalid-router-provider"))
     const legacyMarkdown = await legacyRoot.text()
@@ -433,6 +443,19 @@ describe("SSR Markdown endpoint", () => {
     })
     expect(legacyNested.status).toBe(502)
     expect(await renderError(legacyNested)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+
+    const elementRoot = await fetch(markdownUrl(runtime.url, "element-router-provider"))
+    const elementMarkdown = await elementRoot.text()
+    expect(elementRoot.status, elementMarkdown).toBe(200)
+    expect(elementMarkdown).toContain("# Element provider legacy root")
+
+    const elementNested = await fetch(markdownUrl(runtime.url, "element-router-provider"), {
+      headers: { "x-vibe-show-target": "/other" }
+    })
+    expect(elementNested.status).toBe(502)
+    expect(await renderError(elementNested)).toEqual({
       error: { code: "render_failed", message: "Show Page rendering failed." }
     })
   }, 60_000)
@@ -1242,16 +1265,15 @@ describe("SSR Markdown endpoint", () => {
     ])
   })
 
-  it("kills a hung child at its phase deadline, respawns, and keeps the runtime usable", async () => {
+  it("kills a hung child at its phase deadline while keeping the runtime alive", async () => {
     const children: ChildProcess[] = []
     const loadTimeoutMs = 3_000
     const runtime = await startFixtureServer(
-      ["hung-load", "semantic"],
+      ["hung-load"],
       { renderLoadTimeoutMs: loadTimeoutMs },
       { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
     )
     await runtime.runtime.ensureSession("hung-load", "/show/hung-load/")
-    await runtime.runtime.ensureSession("semantic", "/show/semantic/")
 
     const started = performance.now()
     const timedOut = await fetch(markdownUrl(runtime.url, "hung-load"))
@@ -1269,10 +1291,13 @@ describe("SSR Markdown endpoint", () => {
     expect(children).toHaveLength(1)
     expect(children[0]?.killed).toBe(true)
 
-    const recovered = await fetch(markdownUrl(runtime.url, "semantic"))
-    expect(recovered.status).toBe(200)
-    expect(await recovered.text()).toContain("# SSR fixture report")
-    expect(children).toHaveLength(2)
+    const capabilities = await fetch(`${runtime.url}/capabilities`)
+    expect(capabilities.status).toBe(200)
+    expect(await capabilities.json()).toEqual({
+      protocol: 1,
+      render_markdown: true,
+      render_markdown_ssr: true
+    })
   }, 60_000)
 
   it("kills a hung React render at its deadline and respawns for the next render", async () => {

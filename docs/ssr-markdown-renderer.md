@@ -27,7 +27,10 @@ one long-lived, terminable Node child process
 
 The Runtime-owned virtual entry imports the page `App` and React DOM Server
 through one session SSR graph. If `src/router.tsx` exists, the entry imports its
-namespace and detects a function or React exotic `SsrRouterProvider` export.
+namespace and detects a function or React exotic component (`memo`,
+`forwardRef`, or `lazy`) exported as `SsrRouterProvider`. React elements and
+objects without the corresponding exotic-component shape use the legacy
+fallback.
 Current routers use that provider for full target fidelity; older routers and
 App-only workspaces render `App` directly at the root document. That preserves
 the session's physical React instance across application, optional provider,
@@ -298,9 +301,10 @@ the live Vite server.
 
 Full SSR fidelity requires the current router contract; older workspaces render
 root-only; the Runtime never modifies user workspace files. A router exporting
-a renderable function or React exotic `SsrRouterProvider` receives the requested
-path, params, and query. A router without that export, or an App-only workspace,
-renders `src/App.tsx` only for
+a renderable function or supported React exotic component exported as
+`SsrRouterProvider` receives the requested path, params, and query. A router
+without that export, a React element or arbitrary exotic-marker object export,
+or an App-only workspace renders `src/App.tsx` only for
 `/`; a non-root target returns `render_failed` rather than misrepresenting the
 root route. If neither App nor router exists, the unchanged module-load failure
 maps to `render_failed`.

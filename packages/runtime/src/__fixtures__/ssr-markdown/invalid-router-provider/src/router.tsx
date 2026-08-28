@@ -1,1 +1,1 @@
-export const SsrRouterProvider = { kind: "not-a-react-component" }
+export const SsrRouterProvider = { $$typeof: Symbol.for("react.memo") }
