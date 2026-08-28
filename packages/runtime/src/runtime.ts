@@ -2036,7 +2036,7 @@ async function findNearestDependencyRoot(uiPackageName = "@avibe/show-ui") {
 }
 
 async function missingDependencyRootPackages(dependencyRoot: string, uiPackageName: string): Promise<string[]> {
-  const required = ["react", "react-dom", uiPackageName, "@avibe/show-sdk"]
+  const required = ["react", "react-dom", "motion", uiPackageName, "@avibe/show-sdk"]
   const missing: string[] = []
   for (const packageName of required) {
     const packageJson = join(packageRoot(dependencyRoot, packageName), "package.json")

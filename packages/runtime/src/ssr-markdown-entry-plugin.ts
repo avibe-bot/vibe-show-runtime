@@ -15,7 +15,6 @@ import * as RouterModule from "/src/router.tsx"
 
 const REACT_MEMO_TYPE = Symbol.for("react.memo")
 const REACT_FORWARD_REF_TYPE = Symbol.for("react.forward_ref")
-const REACT_LAZY_TYPE = Symbol.for("react.lazy")
 
 function isRenderableComponent(value, seen = new Set()) {
   if (typeof value === "function") return true
@@ -24,9 +23,7 @@ function isRenderableComponent(value, seen = new Set()) {
   seen.add(value)
   if (value.$$typeof === REACT_MEMO_TYPE) return isRenderableComponent(value.type, seen)
   if (value.$$typeof === REACT_FORWARD_REF_TYPE) return typeof value.render === "function"
-  return value.$$typeof === REACT_LAZY_TYPE &&
-    typeof value._init === "function" &&
-    "_payload" in value
+  return false
 }
 
 export const hasSsrRouterProvider = isRenderableComponent(RouterModule.SsrRouterProvider)

@@ -470,12 +470,13 @@ describe("SSR Markdown endpoint", () => {
     expect(modernMarkdown).toContain("Window access: ReferenceError")
   }, 60_000)
 
-  it("accepts React exotic component markers and rejects element or arbitrary markers", async () => {
+  it("accepts supported React exotic components and sends unsupported values to legacy", async () => {
     const runtime = await startFixtureServer([
       "exotic-router-provider",
       "forward-ref-router-provider",
       "invalid-router-provider",
-      "element-router-provider"
+      "element-router-provider",
+      "lazy-router-provider"
     ])
 
     const exotic = await fetch(markdownUrl(runtime.url, "exotic-router-provider"), {
@@ -517,6 +518,19 @@ describe("SSR Markdown endpoint", () => {
     })
     expect(elementNested.status).toBe(502)
     expect(await renderError(elementNested)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+
+    const lazyRoot = await fetch(markdownUrl(runtime.url, "lazy-router-provider"))
+    const lazyMarkdown = await lazyRoot.text()
+    expect(lazyRoot.status, lazyMarkdown).toBe(200)
+    expect(lazyMarkdown).toContain("# Lazy provider legacy root")
+
+    const lazyNested = await fetch(markdownUrl(runtime.url, "lazy-router-provider"), {
+      headers: { "x-vibe-show-target": "/other" }
+    })
+    expect(lazyNested.status).toBe(502)
+    expect(await renderError(lazyNested)).toEqual({
       error: { code: "render_failed", message: "Show Page rendering failed." }
     })
   }, 60_000)
