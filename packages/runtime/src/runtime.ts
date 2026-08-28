@@ -5,6 +5,7 @@ import { createHash } from "node:crypto"
 import { builtinModules, createRequire } from "node:module"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
+import type { Plugin as EsbuildPlugin } from "esbuild"
 import react from "@vitejs/plugin-react"
 import tailwindcss from "@tailwindcss/vite"
 import {
@@ -51,6 +52,8 @@ const NODE_BUILTIN_SPECIFIERS = new Set([
   ...builtinModules.map((specifier) => `node:${specifier}`)
 ])
 const RUNTIME_VITE_PACKAGE_ROOT = dirname(createRequire(import.meta.url).resolve("vite/package.json"))
+const SSR_MARKDOWN_ACQUISITION_CONTRACT_VERSION = "ssr-markdown-acquisition-v1"
+const SSR_OPTIMIZER_BOUNDARY_ERROR = "Show Page SSR dependency optimization was denied by the workspace boundary"
 const SENSITIVE_FS_DENY_PATTERNS = [
   "**/.git",
   "**/.git/**",
@@ -89,7 +92,10 @@ async function disposeSharedInstallResolvers() {
 type WorkspaceFileBoundary = {
   workspace: string
   workspaceRoots: string[]
+  requestAllowedRoots: string[]
   allowedRoots: string[]
+  cacheRoots: string[]
+  ssrArtifactRoots: string[]
 }
 
 async function fileBoundaryRoots(paths: string[]): Promise<string[]> {
@@ -154,6 +160,22 @@ function workspaceFileBoundaryPlugin(boundary: WorkspaceFileBoundary): Plugin {
   }
 }
 
+function ssrOptimizerFileBoundaryPlugin(boundary: WorkspaceFileBoundary): EsbuildPlugin {
+  return {
+    name: "avibe-show-ssr-optimizer-file-boundary",
+    setup(build) {
+      // User-configured esbuild plugins run before Vite's dep-pre-bundle plugin.
+      // Returning null after validation lets esbuild's default loader read the file.
+      build.onLoad({ filter: /.*/, namespace: "file" }, async ({ path }) => {
+        if (await isDeniedSsrModuleTarget(path, boundary)) {
+          return { errors: [{ text: SSR_OPTIMIZER_BOUNDARY_ERROR }] }
+        }
+        return null
+      })
+    }
+  }
+}
+
 async function isDeniedSsrModuleTarget(
   rawId: string,
   boundary: WorkspaceFileBoundary
@@ -161,7 +183,12 @@ async function isDeniedSsrModuleTarget(
   const filePath = ssrModuleFilePath(rawId)
   if (!filePath) return true
   const target = await realpath(filePath).catch(() => undefined)
-  return target ? isDeniedResolvedTarget(target, boundary) : true
+  if (!target) return true
+  if (relativeWithin(boundary.cacheRoots, target) !== undefined) {
+    const artifactRelative = relativeWithin(boundary.ssrArtifactRoots, target)
+    return artifactRelative === undefined || hasSensitiveFileSegment(normalizePath(artifactRelative))
+  }
+  return isDeniedResolvedTarget(target, boundary)
 }
 
 function ssrModuleFilePath(rawId: string): string | undefined {
@@ -186,12 +213,12 @@ async function isDeniedWorkspaceRequest(rawUrl: string | undefined, boundary: Wo
     const workspaceRelative = relativeWithin(boundary.workspaceRoots, filePath)
     if (workspaceRelative !== undefined && hasDeniedWorkspaceSegment(normalizePath(workspaceRelative))) return true
     const target = await realpath(filePath).catch(() => undefined)
-    return target ? isDeniedResolvedTarget(target, boundary) : true
+    return target ? isDeniedResolvedTarget(target, boundary, boundary.requestAllowedRoots) : true
   }
 
   if (hasDeniedWorkspaceSegment(pathname)) return true
   const target = await workspaceRequestFileTarget(pathname, boundary.workspace)
-  return target ? isDeniedResolvedTarget(target, boundary) : false
+  return target ? isDeniedResolvedTarget(target, boundary, boundary.requestAllowedRoots) : false
 }
 
 function viteFsRequestPath(pathname: string): string {
@@ -223,12 +250,16 @@ async function workspaceRequestFileTarget(pathname: string, workspace: string): 
   return undefined
 }
 
-function isDeniedResolvedTarget(target: string, boundary: WorkspaceFileBoundary): boolean {
+function isDeniedResolvedTarget(
+  target: string,
+  boundary: WorkspaceFileBoundary,
+  allowedRoots = boundary.allowedRoots
+): boolean {
   const workspaceRelative = relativeWithin(boundary.workspaceRoots, target)
   if (workspaceRelative !== undefined) {
     return hasDeniedWorkspaceSegment(normalizePath(workspaceRelative))
   }
-  const allowedRelative = relativeWithin(boundary.allowedRoots, target)
+  const allowedRelative = relativeWithin(allowedRoots, target)
   if (allowedRelative !== undefined) {
     return hasSensitiveFileSegment(normalizePath(allowedRelative))
   }
@@ -561,10 +592,29 @@ export function createShowRuntime(
       sharedDependencies.sharedNodeModules,
       ...sharedDependencies.packageRoots
     ])
+    const cacheRoots = await fileBoundaryRoots([cacheDir])
+    // A configured dependency root may be a symlink forest whose canonical
+    // package targets sit outside the logical node_modules directory. Those
+    // targets are valid Markdown module origins, but are not added to the human
+    // request roots (which intentionally expose only the Runtime's public UI/SDK
+    // packages and ordinary dependency directory).
+    const ssrAllowedRoots = [
+      ...requestAllowedRoots,
+      ...await resolveSymlinkedPackageRoots(sharedDependencies.sharedNodeModules)
+    ]
+    // Derive the environment subdirectory from each logical/canonical cache
+    // root, but never realpath the subdirectory itself: a replaced symlink must
+    // not turn its outside target into an authorized artifact provenance root.
+    const ssrArtifactRoots = cacheRoots.map((root) =>
+      resolve(root, `deps_${SSR_MARKDOWN_ENVIRONMENT}`)
+    )
     const fileBoundary: WorkspaceFileBoundary = {
       workspace: resolve(session.workspace),
       workspaceRoots,
-      allowedRoots: requestAllowedRoots
+      requestAllowedRoots,
+      allowedRoots: ssrAllowedRoots,
+      cacheRoots,
+      ssrArtifactRoots
     }
     const ssrOptimizeIncludes = await optimizableBareImports(
       [...new Set([
@@ -576,7 +626,8 @@ export function createShowRuntime(
         "react-dom/server.browser"
       ])],
       sharedDependencies.nodeModules,
-      sharedDependencies.sharedNodeModules
+      sharedDependencies.sharedNodeModules,
+      fileBoundary
     )
     const viteConfig = {
       // The outer runtime owns the Show Page SPA fallback. Vite's default `spa`
@@ -637,15 +688,18 @@ export function createShowRuntime(
             conditions: [...defaultClientConditions],
             mainFields: [...defaultClientMainFields]
           },
-          // Vite's dev SSR runner needs CJS entry points pre-bundled before a
-          // noExternal graph can execute them as ESM in the sandbox. Browser
-          // resolution keeps packages with separate Node/browser entry points on
-          // the same authority-free code path as the human representation.
+          // CJS dependencies need browser-platform prebundling before the fully
+          // inlined graph can execute in the authority-free sandbox. The same
+          // canonical file validator runs before every optimizer input is read;
+          // only this environment's provenance-checked artifact directory is
+          // readable by its later module graph.
           optimizeDeps: {
+            noDiscovery: true,
             include: ssrOptimizeIncludes,
-            // Browser-platform prebundling converts CJS without injecting Node's
-            // `module`/createRequire bridge, which would reintroduce host authority.
-            esbuildOptions: { platform: "browser" }
+            esbuildOptions: {
+              platform: "browser",
+              plugins: [ssrOptimizerFileBoundaryPlugin(fileBoundary)]
+            }
           }
         }
       },
@@ -824,17 +878,14 @@ async function ensureSessionDependencies(
   // shared deps stay reachable via the resolve fallback (see warmSession), so we never
   // touch a parent/shared `node_modules` that may be a real host directory.
   const extrasDir = await ensureSessionExtrasInstall(workspace, declaredExtras)
-  // `@tailwindcss/vite` resolves `@import "tailwindcss";` from the workspace by filesystem
-  // walk-up (its own resolver, NOT Vite's JS resolve pipeline — so `sharedResolveFallbackPlugin`
-  // can't reach it). An extras session's node_modules holds only the declared extras, so link
-  // the runtime-owned `tailwindcss` package in from the shared install. Shared-only sessions
-  // already resolve it through the whole-node_modules symlink above.
-  await ensureSharedPackageLink(extrasDir, sharedNodeModules, "tailwindcss")
-  // The workspace Tailwind entry also `@import`s the UI theme (`@avibe/show-ui/theme.css`),
-  // resolved by the same filesystem walk-up. Link the runtime-owned UI package in so extras
-  // sessions can resolve the theme + its `@source`d components. (JS imports of the package
-  // stay externalized to the shared vendor bundle; this symlink only serves CSS resolution.)
-  await ensureSharedPackageLink(extrasDir, sharedNodeModules, uiPackageName)
+  // The human CSS pipeline and the fully inlined Markdown graph cannot use the
+  // shared JS fallback for every Runtime-owned package. Link the pinned copies
+  // into the private install: Tailwind/UI serve CSS filesystem resolution, while
+  // React/React DOM give Markdown's CJS prebundle one physical singleton source.
+  // Browser JS still externalizes to the shared vendor import map.
+  for (const packageName of ["tailwindcss", uiPackageName, "react", "react-dom"]) {
+    await ensureSharedPackageLink(extrasDir, sharedNodeModules, packageName)
+  }
   const declaredPackageRoots = await resolveAllowedPackageRoots(extrasDir, declaredExtras.packageNames)
   return {
     nodeModules: extrasDir,
@@ -846,9 +897,9 @@ async function ensureSessionDependencies(
 
 /**
  * Symlink one runtime-owned package from the shared install into a session's private
- * (extras) `node_modules`, so a tool that resolves it by filesystem walk-up from the
- * workspace (e.g. `@tailwindcss/vite` resolving `@import "tailwindcss";`) finds it without
- * forking it per session. Idempotent and confined to the session's own node_modules.
+ * (extras) `node_modules`, so CSS filesystem resolution and Markdown dependency
+ * prebundling find the pinned singleton without forking it per session. Idempotent
+ * and confined to the session's own node_modules.
  *
  * Replaces any NON-shared occupant: a directly-declared `tailwindcss` extra is dropped by
  * `isRuntimeOwnedDependency`, but an extra can still pull `tailwindcss` in as a peer/
@@ -1005,6 +1056,48 @@ async function resolveAllowedPackageRoots(nodeModules: string, packageNames: str
     }
   }
   return [...roots]
+}
+
+async function resolveSymlinkedPackageRoots(nodeModules: string): Promise<string[]> {
+  const logicalModulesRoot = resolve(nodeModules)
+  const roots = new Set<string>()
+  for (const packageName of await installedPackageNames(nodeModules)) {
+    const logicalPackageRoot = packageName.split("/").reduce(
+      (current, part) => join(current, part),
+      nodeModules
+    )
+    try {
+      const canonicalPackageRoot = await realpath(logicalPackageRoot)
+      if (relativeWithin([logicalModulesRoot], canonicalPackageRoot) === undefined) {
+        roots.add(resolve(logicalPackageRoot))
+        roots.add(canonicalPackageRoot)
+      }
+    } catch {
+      // A concurrently removed optional package is simply unavailable to Vite.
+    }
+  }
+  return [...roots]
+}
+
+async function installedPackageNames(nodeModules: string): Promise<string[]> {
+  const names: string[] = []
+  for (const entry of await readdir(nodeModules, { withFileTypes: true })) {
+    if (entry.name.startsWith(".")) continue
+    if (!entry.name.startsWith("@")) {
+      if (entry.isDirectory() || entry.isSymbolicLink()) names.push(entry.name)
+      continue
+    }
+    try {
+      for (const scoped of await readdir(join(nodeModules, entry.name), { withFileTypes: true })) {
+        if (scoped.isDirectory() || scoped.isSymbolicLink()) {
+          names.push(`${entry.name}/${scoped.name}`)
+        }
+      }
+    } catch {
+      // A concurrently removed scope contributes no packages.
+    }
+  }
+  return names
 }
 
 const execFileAsync = promisify(execFile)
@@ -1710,26 +1803,39 @@ function isSsrJavascriptSpecifier(specifier: string): boolean {
  * dependency root; Vite can still load those modules from their physical source, but
  * should not advertise them as optimizer entries for that session.
  */
-async function optimizableBareImports(specifiers: string[], nodeModules: string, _sharedNodeModules: string): Promise<string[]> {
+async function optimizableBareImports(
+  specifiers: string[],
+  nodeModules: string,
+  _sharedNodeModules: string,
+  boundary?: WorkspaceFileBoundary
+): Promise<string[]> {
   // Anchor a resolver at the session workspace (the parent of its node_modules).
   const sessionRequire = createRequire(join(dirname(nodeModules), "__avibe-show-session-resolver.js"))
-  return specifiers.filter((specifier) => {
+  const included: string[] = []
+  for (const specifier of specifiers) {
+    let target: string
     try {
-      sessionRequire.resolve(specifier)
-      return true
+      target = sessionRequire.resolve(specifier)
     } catch {
-      return false
+      continue
     }
-  })
+    if (boundary && await isDeniedSsrModuleTarget(target, boundary)) {
+      throw new Error(SSR_OPTIMIZER_BOUNDARY_ERROR)
+    }
+    included.push(specifier)
+  }
+  return included
 }
 
-// Keyed by workspace source signature AND the vendor bundle's content hash. Folding the
-// vendor hash in sweeps the optimizeDeps cache into the same content-aware invalidation as
-// the vendor pool: a rebuilt vendor bundle (e.g. a content change in a `0.0.0` workspace
-// package) moves the hash, so a pre-bundled dep from the previous build is never reused.
+// Keyed by workspace source signature, vendor content, and the Markdown acquisition
+// contract. The last term prevents an artifact produced before provenance validation
+// existed from being reused merely because its package inputs are otherwise unchanged.
 async function viteCacheDir(dependencyRoot: string, cacheRoot: string | undefined, dependencySignature = "shared", vendorHash = "") {
   const root = resolve(cacheRoot ?? join(dirname(dependencyRoot), ".vite-cache"))
-  const digest = createHash("sha256").update(`${dependencyRoot}\0${dependencySignature}\0${vendorHash}`).digest("hex").slice(0, 16)
+  const digest = createHash("sha256")
+    .update(`${dependencyRoot}\0${dependencySignature}\0${vendorHash}\0${SSR_MARKDOWN_ACQUISITION_CONTRACT_VERSION}`)
+    .digest("hex")
+    .slice(0, 16)
   const cacheDir = join(root, digest)
   await mkdir(cacheDir, { recursive: true })
   // Single liveness chokepoint for the Vite optimize cache (#31): every resolution of a session's

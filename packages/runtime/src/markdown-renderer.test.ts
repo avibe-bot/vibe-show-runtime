@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events"
 import { fork, spawn, type ChildProcess, type ForkOptions } from "node:child_process"
+import { createHash } from "node:crypto"
 import { access, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { get as httpGet } from "node:http"
 import { tmpdir } from "node:os"
@@ -753,6 +754,108 @@ describe("SSR Markdown endpoint", () => {
     expect(allowedMarkdown).toContain(
       "![Fixture asset URL](/show/semantic/src/pages/fixture.svg?no-inline)"
     )
+  }, 60_000)
+
+  it("denies unchecked sibling-session content from a declared extra", async () => {
+    const sentinel = "OPTIMIZER_SIBLING_SECRET_MUST_NOT_LEAK"
+    const runtime = await startFixtureServer(["optimizer-boundary"])
+    const workspace = join(runtime.workspaceRoot, "optimizer-boundary")
+    const packageName = "show-optimizer-boundary-extra"
+    const packageRoot = join(workspace, "node_modules", packageName)
+    const declaredEntry = `${packageName}@file:${resolve(workspace, "extra-pkg")}`
+    const signature = createHash("sha256").update(declaredEntry).digest("hex").slice(0, 16)
+
+    await mkdir(join(runtime.workspaceRoot, "optimizer-secret"), { recursive: true })
+    await writeFile(
+      join(runtime.workspaceRoot, "optimizer-secret", "secret.js"),
+      `export const secret = ${JSON.stringify(sentinel)}\n`
+    )
+    await mkdir(packageRoot, { recursive: true })
+    await writeFile(
+      join(packageRoot, "package.json"),
+      `${JSON.stringify({
+        name: packageName,
+        version: "1.0.0",
+        type: "module",
+        exports: "./index.js"
+      })}\n`
+    )
+    await writeFile(
+      join(packageRoot, "index.js"),
+      'export { secret } from "../../../optimizer-secret/secret.js"\n'
+    )
+    await writeFile(
+      join(workspace, ".show-extras.json"),
+      `${JSON.stringify({ signature, entries: [declaredEntry] }, null, 2)}\n`
+    )
+
+    const response = await fetch(markdownUrl(runtime.url, "optimizer-boundary"))
+    const body = await response.text()
+    expect(response.status, body).toBe(502)
+    expect(JSON.parse(body)).toEqual({
+      error: {
+        code: "render_failed",
+        message: "Show Page rendering failed."
+      }
+    })
+    expect(body).not.toContain(sentinel)
+    const cacheDir = runtime.runtime.getSession("optimizer-boundary")?.cacheDir
+    if (!cacheDir) throw new Error("Expected the denied fixture to expose its Vite cache")
+    await expect(access(join(
+      cacheDir,
+      `deps_${SSR_MARKDOWN_ENVIRONMENT}`,
+      `${packageName}.js`
+    ))).rejects.toMatchObject({ code: "ENOENT" })
+  }, 60_000)
+
+  it("denies cache artifacts outside the provenance-checked Markdown optimizer", async () => {
+    const sentinel = "UNCHECKED_CLIENT_CACHE_ARTIFACT_MUST_NOT_LEAK"
+    const runtime = await startFixtureServer(["semantic", "cache-artifact-boundary"])
+    await runtime.runtime.ensureSession("semantic", "/show/semantic/")
+    const cacheDir = runtime.runtime.getSession("semantic")?.cacheDir
+    if (!cacheDir) throw new Error("Expected the warmed fixture to expose its Vite cache")
+
+    const artifactPath = join(cacheDir, "deps", "unchecked-cache-artifact.js")
+    await mkdir(dirname(artifactPath), { recursive: true })
+    await writeFile(
+      artifactPath,
+      `export const artifactSecret = ${JSON.stringify(sentinel)}\n`
+    )
+    const pagePath = join(
+      runtime.workspaceRoot,
+      "cache-artifact-boundary",
+      "src",
+      "pages",
+      "index.tsx"
+    )
+    const source = await readFile(pagePath, "utf8")
+    const artifactSpecifier = `/@fs/${artifactPath.replaceAll("\\", "/").replace(/^\/+/, "")}`
+    await writeFile(
+      pagePath,
+      source.replace("__CACHE_ARTIFACT_IMPORT__", artifactSpecifier)
+    )
+
+    const response = await fetch(markdownUrl(runtime.url, "cache-artifact-boundary"))
+    const body = await response.text()
+    expect(response.status, body).toBe(502)
+    expect(JSON.parse(body)).toEqual({
+      error: {
+        code: "render_failed",
+        message: "Show Page rendering failed."
+      }
+    })
+    expect(body).not.toContain(sentinel)
+  }, 60_000)
+
+  it("renders legitimate ESM and CommonJS declared extras", async () => {
+    const runtime = await startFixtureServer(["declared-extras"])
+    const response = await fetch(markdownUrl(runtime.url, "declared-extras"))
+    const markdown = await response.text()
+
+    expect(response.status, markdown).toBe(200)
+    expect(markdown).toContain("# Declared extras")
+    expect(markdown).toContain("ESM extra: available")
+    expect(markdown).toContain("CommonJS extra: available")
   }, 60_000)
 
   it("keeps API handlers on Vite's ordinary Node SSR environment", async () => {

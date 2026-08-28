@@ -13,7 +13,7 @@ runtime main thread
   live session Vite `avibe_show_markdown` module graph
   workspace fingerprint and Markdown LRU
   one renderer-wide concurrency mutex
-  Vite fetchModule policy owner
+  canonical module + optimizer provenance owner
                   |
                   v
 one long-lived, terminable Node child process
@@ -60,11 +60,34 @@ leaking a local path.
 
 Workspace modules and their render-time dependencies do not execute in the
 child process's ordinary Node realm. A custom Vite `ModuleEvaluator` runs transformed
-modules in one `node:vm` context per session with string/Wasm code generation
-disabled. It supplies only the initial-tree web primitives required by React,
-the generated router, and Show UI. `window`, `document`, `fetch`, WebSocket,
-host `process`, and inherited environment variables are absent; the exposed
-`process.env` contains only the non-secret Vite mode.
+modules in a fresh `node:vm` context for each uncached render with string/Wasm
+code generation disabled. It supplies only the initial-tree web primitives
+required by React, the generated router, and Show UI. `window`, `document`,
+`fetch`, WebSocket, host `process`, and inherited environment variables are
+absent; the exposed `process.env` contains only the non-secret Vite mode.
+
+`WorkspaceFileBoundary` is the single source-file authority for the Markdown
+environment. Direct module loads, raw/static-asset loaders, and every file input
+to dependency prebundling call the same resolved/canonical target validator
+before a loader reads bytes. The optimizer is retained because an explicit
+no-optimizer experiment made the fully inlined React/Show UI graph and a CJS
+declared extra fail: Vite's development transform does not convert those CJS
+entries for the authority-free evaluator, and external modules are deliberately
+unavailable. Extras sessions therefore link the pinned shared React packages
+into their private install and prebundle that one physical singleton.
+
+Optimizer provenance is bounded in both directions. Its entry targets are
+validated before Vite inspects exports, its esbuild file loader validates every
+transitive input, and only `deps_avibe_show_markdown` is readable later; client,
+temporary, or arbitrary cache artifacts are denied even though the human Vite
+server may use them. The Vite cache identity includes
+`ssr-markdown-acquisition-v1`, so artifacts produced before this policy cannot
+be reused under the new boundary.
+
+A configured dependency root may be a symlink forest. Its canonical package
+targets are accepted only as Markdown dependency origins after the same target
+validation; they are not added to the human HTTP request roots. Direct requests
+for unrelated Runtime or repository source therefore remain denied.
 
 The parent transport returns no Node built-in list and rejects every
 externalized module request from workspace code. Runtime-owned cleanup and
@@ -115,6 +138,28 @@ per-command scheduling registry so callbacks cannot outlive a render.
 unavailable because they cannot satisfy that authority/lifetime policy. Normal
 ECMAScript intrinsics such as Array and Promise come directly from the VM realm;
 the evaluator does not reconstruct them.
+
+### Content acquisition audit
+
+Every subsystem that can supply bytes or executable source to the Markdown
+environment is either governed by the canonical validator or removed from that
+environment's content path:
+
+| Subsystem | Ownership or elimination | Regression evidence |
+| --- | --- | --- |
+| Vite module transport and in-memory transforms | Resolved/canonical source target is validated in the pre-load hook before raw, asset, or normal loaders run; transform caches can only be populated after that load | Sibling-session raw, host-file raw, symlink escape, and direct static-asset attacks return the generic `render_failed` envelope |
+| Dependency optimizer inputs | Required for React and CJS compatibility; every manual entry is validated before export inspection and every esbuild `file` load calls the same canonical validator | A declared extra importing `../../../optimizer-secret/secret.js` is rejected before its secret can enter an artifact |
+| Optimizer and other Vite cache artifacts | Only the contract-versioned `deps_avibe_show_markdown` provenance root is readable; client, temporary, stale-contract, and arbitrary cache artifacts are denied | A synthetic client-cache module containing a sentinel returns `render_failed` without disclosure |
+| CSS pipeline | The canonical entry is validated, then replaced with an empty module before Vite CSS processing; nested `@import` and `url()` acquisition is eliminated | A CSS entry importing a sibling secret still renders semantic page content and never acquires the secret |
+| Raw and static-asset pipeline | Canonical source target is validated before Vite's query/asset loader reads or inlines it | Denied sibling asset plus allowed SVG inline and caller-base URL fixtures |
+| Shared-package and declared-extra resolution | Resolvers supply IDs only; optimizer/module bytes still pass through the validator. Pinned React links preserve one physical instance; configured symlink targets are scoped to Markdown and do not widen HTTP roots | Legitimate ESM/CommonJS extras render on both Node legs; the custom dependency-root smoke passes while direct Runtime-source HTTP access remains denied |
+| Runtime virtual entry and Vite-generated wrapper namespaces | No workspace-origin bytes: sources are Runtime/Vite-owned constants; any file they subsequently import returns to a governed path | Routed and App-only entry fixtures, plus the Runtime virtual-entry regression |
+| Human client optimizer/cache | Remains available to the browser environment but is not a readable Markdown origin | The explicit cross-environment cache-artifact fixture is denied |
+| `import.meta.env` | Not module content: the complete object is supplied by Vite after its `envPrefix` filtering; Runtime neither reads arbitrary host env nor reconstructs keys | Custom `VITE_` branch/URL matches the human environment while a non-prefixed host variable stays absent |
+| Cleanup URL handling | Conversion resolves filesystem URLs with `realpath` only; it never reads asset bytes, and removes paths outside the rendered workspace | Unmappable `/@fs/` URLs are removed; workspace asset URLs rewrite to the caller base |
+
+The ordinary `api/*` Node SSR environment and the human client pipeline do not
+consume this Markdown module graph and remain unchanged.
 
 ## Public contract
 
@@ -248,14 +293,14 @@ fingerprint but never contact the child.
 
 | Measurement | Result |
 | --- | ---: |
-| cold request | 1,574-1,702 ms |
-| cold load | 1,541-1,670 ms |
-| cold render / conversion | 4.8-5.3 / 6.4-6.6 ms |
-| warm miss median / p95 | 103.28-111.21 / 122.76-145.31 ms |
-| cache hit median / p95 | 0.76-0.85 / 1.67-1.76 ms |
-| RSS before cold | 110.1-110.9 MiB |
-| RSS after cold (delta) | 473.9-502.1 MiB (+363.4-391.2 MiB) |
-| RSS after 20 warm misses | 779.3-831.7 MiB |
+| cold request | 1,600-1,746 ms |
+| cold load | 1,567-1,714 ms |
+| cold render / conversion | 5.2-6.4 / 6.3-6.9 ms |
+| warm miss median / p95 | 105.99-110.35 / 129.28-169.13 ms |
+| cache hit median / p95 | 0.78-0.93 / 1.58-1.71 ms |
+| RSS before cold | 110.2-111.0 MiB |
+| RSS after cold (delta) | 484.8-497.9 MiB (+374.5-387.7 MiB) |
+| RSS after 20 warm misses | 787.1-858.1 MiB |
 
 RSS after child startup is the OS-reported sum for the Runtime parent and active
 SSR child, rather than the parent's `process.memoryUsage()` alone. The benchmark

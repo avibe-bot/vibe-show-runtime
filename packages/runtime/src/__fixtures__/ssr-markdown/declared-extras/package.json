@@ -1,0 +1,8 @@
+{
+  "name": "declared-extras-page",
+  "private": true,
+  "dependencies": {
+    "show-extra-cjs": "file:./extra-cjs",
+    "show-extra-esm": "file:./extra-esm"
+  }
+}
