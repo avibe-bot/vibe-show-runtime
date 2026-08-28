@@ -10,6 +10,8 @@ if (!process.send) throw new Error("The SSR Markdown worker requires an IPC chan
 const sessions = new Map()
 /** @type {Map<number, { resolve: (value: unknown) => void, reject: (error: Error) => void }>} */
 const pendingRpc = new Map()
+/** @type {{ sessionId: string, generation: number, pending: Set<Promise<unknown>> } | undefined} */
+let activeWorkspaceCommand
 let nextRpcId = 1
 
 if (permissionSelfCheck(process.argv[2])) {
@@ -64,7 +66,11 @@ async function executeCommand(command) {
         }
         sessions.set(command.sessionId, state)
       }
-      const entry = await state.runner.import(command.entryId)
+      const entry = await runWorkspaceCommand(
+        command,
+        state.evaluator,
+        () => state.runner.import(command.entryId)
+      )
       if (
         !entry ||
         typeof entry !== "object" ||
@@ -77,7 +83,11 @@ async function executeCommand(command) {
     }
     case "render": {
       const state = sessionState(command)
-      return state.entry.render(state.evaluator.cloneJson(command.location))
+      return runWorkspaceCommand(
+        command,
+        state.evaluator,
+        () => state.entry.render(state.evaluator.cloneJson(command.location))
+      )
     }
     case "convert": {
       sessionState(command)
@@ -99,6 +109,54 @@ async function executeCommand(command) {
   }
 }
 
+/**
+ * @template T
+ * @param {Record<string, any>} command
+ * @param {SsrSandboxEvaluator} evaluator
+ * @param {() => T | Promise<T>} operation
+ * @returns {Promise<T>}
+ */
+async function runWorkspaceCommand(command, evaluator, operation) {
+  if (activeWorkspaceCommand) {
+    throw new Error("The SSR Markdown child cannot run overlapping workspace commands")
+  }
+  const scope = {
+    sessionId: String(command.sessionId),
+    generation: Number(command.generation),
+    pending: new Set()
+  }
+  activeWorkspaceCommand = scope
+  let failed = false
+  let failure
+  let result
+  try {
+    try {
+      result = await evaluator.runCommand(operation)
+    } catch (error) {
+      failed = true
+      failure = error
+    }
+    await settleWorkspaceCommand(scope)
+    if (failed) throw failure
+    return /** @type {T} */ (result)
+  } finally {
+    if (activeWorkspaceCommand === scope) activeWorkspaceCommand = undefined
+  }
+}
+
+/** @param {{ pending: Set<Promise<unknown>> }} scope */
+async function settleWorkspaceCommand(scope) {
+  // Dropped dynamic imports can enqueue more module and Promise jobs after
+  // render returns, so require one transport-idle event-loop turn before reply.
+  for (;;) {
+    if (scope.pending.size > 0) {
+      await Promise.allSettled([...scope.pending])
+    }
+    await new Promise((resolveTurn) => setImmediate(resolveTurn))
+    if (scope.pending.size === 0) return
+  }
+}
+
 /** @param {Record<string, any>} command */
 function sessionState(command) {
   const state = sessions.get(command.sessionId)
@@ -113,8 +171,18 @@ function createParentTransport(sessionId, generation) {
   return {
     /** @param {Parameters<NonNullable<import("vite/module-runner").ModuleRunnerTransport["invoke"]>>[0]} payload */
     invoke(payload) {
+      const scope = activeWorkspaceCommand
+      if (
+        !scope ||
+        scope.sessionId !== sessionId ||
+        scope.generation !== generation
+      ) {
+        return Promise.reject(new Error(
+          "The SSR sandbox requested a module outside its active command"
+        ))
+      }
       const rpcId = nextRpcId++
-      return new Promise((resolve, reject) => {
+      const request = new Promise((resolve, reject) => {
         pendingRpc.set(rpcId, { resolve, reject })
         send({
           type: "vite-rpc",
@@ -124,6 +192,12 @@ function createParentTransport(sessionId, generation) {
           payload
         })
       })
+      scope.pending.add(request)
+      void request.then(
+        () => scope.pending.delete(request),
+        () => scope.pending.delete(request)
+      )
+      return request
     }
   }
 }

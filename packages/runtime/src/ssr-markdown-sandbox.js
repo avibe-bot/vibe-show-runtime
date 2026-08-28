@@ -253,7 +253,7 @@ const SANDBOX_BOOTSTRAP = String.raw`
     postMessage(data) {
       const peer = this.#peer
       if (this.#closed || !peer) return
-      Promise.resolve().then(() => {
+      bridgeCall("microtask-set", () => {
         if (!peer.#closed && typeof peer.onmessage === "function") {
           peer.onmessage({ data })
         }
@@ -311,6 +311,10 @@ const SANDBOX_BOOTSTRAP = String.raw`
     },
     MessageChannel: { value: SafeMessageChannel, writable: false, configurable: false },
     DOMException: { value: SafeDOMException, writable: false, configurable: false },
+    FinalizationRegistry: { value: undefined, writable: false, configurable: false },
+    SharedArrayBuffer: { value: undefined, writable: false, configurable: false },
+    Atomics: { value: undefined, writable: false, configurable: false },
+    WebAssembly: { value: undefined, writable: false, configurable: false },
     setTimeout: {
       value: (callback, delay = 0, ...args) => bridgeCall(
         "timer-set",
@@ -344,7 +348,7 @@ const SANDBOX_BOOTSTRAP = String.raw`
       configurable: false
     },
     queueMicrotask: {
-      value: (callback) => void Promise.resolve().then(callback),
+      value: (callback) => bridgeCall("microtask-set", callback),
       writable: false,
       configurable: false
     }
@@ -411,7 +415,8 @@ export class SsrSandboxEvaluator {
 
   #context
   #helpers
-  #timers = new Map()
+  /** @type {{ active: boolean, timers: Map<number, NodeJS.Timeout> } | undefined} */
+  #activeCommand
   #nextTimerId = 1
 
   /** @param {string} name */
@@ -462,6 +467,20 @@ export class SsrSandboxEvaluator {
     Object.seal(context[ssrModuleExportsKey])
   }
 
+  /** @template T @param {() => T | Promise<T>} operation @returns {Promise<T>} */
+  async runCommand(operation) {
+    if (this.#activeCommand) {
+      throw new Error("The SSR sandbox cannot run overlapping commands")
+    }
+    const command = { active: true, timers: new Map() }
+    this.#activeCommand = command
+    try {
+      return await operation()
+    } finally {
+      this.#disposeCommand(command)
+    }
+  }
+
   /** @param {string} filepath */
   async runExternalModule(filepath) {
     throw new Error(`External module ${filepath} is unavailable during Show Page SSR`)
@@ -489,11 +508,7 @@ export class SsrSandboxEvaluator {
   }
 
   dispose() {
-    for (const timer of this.#timers.values()) {
-      clearTimeout(timer)
-      clearInterval(timer)
-    }
-    this.#timers.clear()
+    if (this.#activeCommand) this.#disposeCommand(this.#activeCommand)
   }
 
   /** @param {string} operation @param {unknown[]} args @returns {any} */
@@ -502,10 +517,13 @@ export class SsrSandboxEvaluator {
       case "timer-set": {
         const [callback, rawDelay, repeat, callbackArgs] = args
         if (typeof callback !== "function") throw new TypeError("Timer callback must be a function")
+        const command = this.#activeCommand
+        if (!command) return 0
         const delay = Number.isFinite(rawDelay) ? Math.max(0, Number(rawDelay)) : 0
         const id = this.#nextTimerId++
         const invoke = () => {
-          if (!repeat) this.#timers.delete(id)
+          if (!command.active) return
+          if (!repeat) command.timers.delete(id)
           try {
             callback(.../** @type {unknown[]} */ (callbackArgs))
           } catch {
@@ -514,16 +532,34 @@ export class SsrSandboxEvaluator {
         }
         const timer = repeat ? setInterval(invoke, delay) : setTimeout(invoke, delay)
         timer.unref?.()
-        this.#timers.set(id, timer)
+        command.timers.set(id, timer)
         return id
       }
       case "timer-clear": {
-        const timer = this.#timers.get(args[0])
+        const id = Number(args[0])
+        const timer = this.#activeCommand?.timers.get(id)
         if (timer) {
           clearTimeout(timer)
           clearInterval(timer)
-          this.#timers.delete(args[0])
+          this.#activeCommand?.timers.delete(id)
         }
+        return undefined
+      }
+      case "microtask-set": {
+        const [callback] = args
+        if (typeof callback !== "function") {
+          throw new TypeError("Microtask callback must be a function")
+        }
+        const command = this.#activeCommand
+        if (!command) return undefined
+        queueMicrotask(() => {
+          if (!command.active) return
+          try {
+            callback()
+          } catch {
+            // Scheduled side effects are outside the initial React tree represented by SSR.
+          }
+        })
         return undefined
       }
       case "url-create":
@@ -576,5 +612,16 @@ export class SsrSandboxEvaluator {
       default:
         throw new Error(`Unsupported SSR sandbox operation: ${operation}`)
     }
+  }
+
+  /** @param {{ active: boolean, timers: Map<number, NodeJS.Timeout> }} command */
+  #disposeCommand(command) {
+    command.active = false
+    for (const timer of command.timers.values()) {
+      clearTimeout(timer)
+      clearInterval(timer)
+    }
+    command.timers.clear()
+    if (this.#activeCommand === command) this.#activeCommand = undefined
   }
 }

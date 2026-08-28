@@ -134,6 +134,11 @@ permission self-check, and reloads only the needed session. Main-thread
 fingerprinting and live-Vite preparation use the load budget; a late result is
 discarded after cancellation or timeout.
 
+Workspace-scheduled work cannot outlive its load or render command: exposed
+timers, microtasks, and `MessageChannel` callbacks share one command registry,
+Promise and module-transport jobs quiesce before reply, delayed host intrinsics
+are absent, and a deadline kills the child.
+
 Raw HTML, cleaned HTML, and final Markdown use the existing 512 KiB default
 limit (`VIBE_SHOW_RENDER_MAX_BYTES` / `--render-max-output-bytes`). Phase timing
 events record `ok`, `error`, `timeout`, or `cancelled` without exposing page

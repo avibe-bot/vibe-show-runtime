@@ -276,6 +276,7 @@ describe("SSR Markdown endpoint", () => {
       "timer constructor",
       "encoder constructor",
       "Promise constructor",
+      "deferred intrinsics",
       "import-meta constructor",
       "module namespace",
       "dynamic import"
@@ -505,6 +506,36 @@ describe("SSR Markdown endpoint", () => {
     expect(recovered.status).toBe(200)
     expect(await recovered.text()).toContain("# SSR fixture report")
     expect(children).toHaveLength(2)
+  }, 60_000)
+
+  it("disposes module-level scheduled work when its command completes", async () => {
+    const children: ChildProcess[] = []
+    const runtime = await startFixtureServer(
+      ["scheduled-work"],
+      { renderLoadTimeoutMs: 5_000 },
+      { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
+    )
+    await runtime.runtime.ensureSession("scheduled-work", "/show/scheduled-work/")
+
+    const first = await fetch(markdownUrl(runtime.url, "scheduled-work"))
+    const firstMarkdown = await first.text()
+    expect(first.status, firstMarkdown).toBe(200)
+    expect(first.headers.get("x-avibe-render-cache")).toBe("miss")
+    expect(firstMarkdown).toContain("# Scheduled work fixture")
+    expect(firstMarkdown).toContain("Deferred callbacks: none")
+    expect(children).toHaveLength(1)
+
+    await new Promise((resolveWait) => setTimeout(resolveWait, 2_350))
+    const nextStarted = performance.now()
+    const next = await fetch(markdownUrl(runtime.url, "scheduled-work"), {
+      headers: { "x-vibe-show-target": "/?request=2" }
+    })
+    const nextMarkdown = await next.text()
+    expect(next.status, nextMarkdown).toBe(200)
+    expect(next.headers.get("x-avibe-render-cache")).toBe("miss")
+    expect(nextMarkdown).toContain("Deferred callbacks: none")
+    expect(performance.now() - nextStarted).toBeLessThan(5_000)
+    expect(children).toHaveLength(1)
   }, 60_000)
 
   it("propagates caller disconnect, kills the child, and respawns on the next render", async () => {

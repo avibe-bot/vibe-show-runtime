@@ -24,6 +24,13 @@ attempt("URL constructor", () => hostRead((URL as unknown as { constructor: Func
 attempt("timer constructor", () => hostRead((setTimeout as unknown as { constructor: FunctionConstructor }).constructor))
 attempt("encoder constructor", () => hostRead((TextEncoder as unknown as { constructor: FunctionConstructor }).constructor))
 attempt("Promise constructor", () => hostRead((Promise as unknown as { constructor: FunctionConstructor }).constructor))
+attempt("deferred intrinsics", () => {
+  const globals = globalThis as unknown as Record<string, unknown>
+  return ["FinalizationRegistry", "SharedArrayBuffer", "Atomics", "WebAssembly"]
+    .every((name) => globals[name] === undefined)
+    ? "blocked"
+    : "available"
+})
 attempt("import-meta constructor", () => hostRead(
   (import.meta.resolve as unknown as { constructor: FunctionConstructor }).constructor
 ))
