@@ -68,7 +68,12 @@ async function startFixtureServer(
   }, dependencies)
   cleanups.push(async () => {
     await server.close()
-    await rm(workspaceRoot, { recursive: true, force: true })
+    await rm(workspaceRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100
+    })
   })
   return { ...server, workspaceRoot }
 }
@@ -296,9 +301,11 @@ describe("SSR Markdown process protocol", () => {
     const error = new Error("oversized-error-".repeat(16 * 1024)) as Error & {
       code: string
       status: number
+      phase: string
     }
     error.code = "ERR_FIXTURE"
     error.status = 502
+    error.phase = "conversion"
     const serialized = serializeSsrMarkdownError(error)
     expect(assertSsrMarkdownIpcValue(
       serialized,
@@ -307,6 +314,7 @@ describe("SSR Markdown process protocol", () => {
     )).toBeLessThanOrEqual(SSR_MARKDOWN_IPC_ERROR_MAX_BYTES)
     expect(Buffer.byteLength(serialized.message ?? "", "utf8")).toBeLessThanOrEqual(4 * 1024)
     expect(serialized).toMatchObject({ code: "ERR_FIXTURE", status: 502 })
+    expect(serialized).not.toHaveProperty("phase")
   })
 
   it("rejects oversized command input before sending it to the child", async () => {
@@ -520,6 +528,35 @@ describe("SSR Markdown endpoint", () => {
       message: "Show Page rendering failed."
     }])
     expect(lines.join("\n")).not.toContain("RENDER_FAILURE_FILE_CONTENT_MUST_NOT_LEAK")
+  }, 60_000)
+
+  it("reports parent-tracked phases when workspace errors spoof phase metadata", async () => {
+    const lines: string[] = []
+    vi.spyOn(console, "error").mockImplementation((...values) => {
+      lines.push(values.map(String).join(" "))
+    })
+    const runtime = await startFixtureServer(["phase-spoof-load", "phase-spoof-render"])
+
+    for (const sessionId of ["phase-spoof-load", "phase-spoof-render"]) {
+      const response = await fetch(markdownUrl(runtime.url, sessionId))
+      expect(response.status).toBe(502)
+      expect(await renderError(response)).toEqual({
+        error: { code: "render_failed", message: "Show Page rendering failed." }
+      })
+    }
+
+    const events = lines.flatMap((line) => {
+      try {
+        const value = JSON.parse(line) as Record<string, unknown>
+        return value.event === "ssr-markdown-render-failed" ? [value] : []
+      } catch {
+        return []
+      }
+    })
+    expect(events.map(({ sessionId, phase }) => ({ sessionId, phase }))).toEqual([
+      { sessionId: "phase-spoof-load", phase: "load" },
+      { sessionId: "phase-spoof-render", phase: "render" }
+    ])
   }, 60_000)
 
   it("matches host intrinsic behavior at the SSR realm boundary", async () => {
@@ -1334,15 +1371,16 @@ class FakeSsrWorker implements SsrMarkdownWorker {
   renderMarkdown(
     sessionId: string,
     location: Parameters<SsrMarkdownWorker["renderMarkdown"]>[1],
-    options: Parameters<SsrMarkdownWorker["renderMarkdown"]>[2]
+    options: Parameters<SsrMarkdownWorker["renderMarkdown"]>[2],
+    onPhase?: Parameters<SsrMarkdownWorker["renderMarkdown"]>[3]
   ): ReturnType<SsrMarkdownWorker["renderMarkdown"]> {
     this.renderCalls.push({ sessionId, pathname: location.pathname })
     let phaseSettled = false
-    let resolveConversionStarted!: () => void
-    let rejectConversionStarted!: (error: Error) => void
-    const conversionStarted = new Promise<void>((resolvePromise, rejectPromise) => {
-      resolveConversionStarted = resolvePromise
-      rejectConversionStarted = rejectPromise
+    let resolvePostRenderStarted!: () => void
+    let rejectPostRenderStarted!: (error: Error) => void
+    const postRenderStarted = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolvePostRenderStarted = resolvePromise
+      rejectPostRenderStarted = rejectPromise
     })
     const result = (async () => {
       let html: string
@@ -1352,11 +1390,13 @@ class FakeSsrWorker implements SsrMarkdownWorker {
           : `<h1>${sessionId}:${location.pathname}</h1><p>${location.search || "no query"}</p>`
       } catch (error) {
         phaseSettled = true
-        rejectConversionStarted(error instanceof Error ? error : new Error(String(error)))
+        rejectPostRenderStarted(error instanceof Error ? error : new Error(String(error)))
         throw error
       }
+      onPhase?.("cleanup")
       phaseSettled = true
-      resolveConversionStarted()
+      resolvePostRenderStarted()
+      onPhase?.("conversion")
       this.convertCalls.push(sessionId)
       const converted = this.hooks.convert
         ? await this.hooks.convert(sessionId, html, options)
@@ -1366,9 +1406,9 @@ class FakeSsrWorker implements SsrMarkdownWorker {
     void result.catch((error) => {
       if (phaseSettled) return
       phaseSettled = true
-      rejectConversionStarted(error instanceof Error ? error : new Error(String(error)))
+      rejectPostRenderStarted(error instanceof Error ? error : new Error(String(error)))
     })
-    return { conversionStarted, result }
+    return { conversionStarted: postRenderStarted, result }
   }
 
   async invalidateSession(sessionId: string): Promise<void> {

@@ -1,6 +1,9 @@
 import { readFileSync } from "node:fs"
 import { ModuleRunner } from "vite/module-runner"
-import { convertSsrRenderedHtmlToMarkdown } from "./ssr-markdown-conversion.js"
+import {
+  cleanupSsrRenderedHtml,
+  convertCleanedSsrHtmlToMarkdown
+} from "./ssr-markdown-conversion.js"
 import {
   assertSsrMarkdownIpcValue,
   serializeSsrMarkdownError,
@@ -110,9 +113,18 @@ async function executeCommand(command) {
         await sendAndWait({
           type: "command-phase",
           requestId: command.requestId,
+          phase: "cleanup"
+        })
+        const cleanedHtml = cleanupSsrRenderedHtml(html, command.options)
+        await sendAndWait({
+          type: "command-phase",
+          requestId: command.requestId,
           phase: "conversion"
         })
-        const { markdown } = convertSsrRenderedHtmlToMarkdown(html, command.options)
+        const markdown = convertCleanedSsrHtmlToMarkdown(
+          cleanedHtml,
+          command.options.maxOutputBytes
+        )
         return { markdown }
       } finally {
         await disposeSession(command.sessionId)

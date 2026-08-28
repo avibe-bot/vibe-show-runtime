@@ -57,7 +57,7 @@ export {
   type MarkdownRenderErrorCode
 } from "./markdown-core.js"
 
-export const DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS = 10_000
+export const DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS = 30_000
 export const DEFAULT_MARKDOWN_REACT_TIMEOUT_MS = 5_000
 export const DEFAULT_MARKDOWN_CONVERSION_TIMEOUT_MS = 5_000
 export const DEFAULT_MARKDOWN_CACHE_TTL_MS = 30_000
@@ -116,7 +116,8 @@ export type SsrMarkdownWorker = {
   renderMarkdown(
     sessionId: string,
     location: SsrRouteLocation,
-    options: SsrMarkdownConversionOptions
+    options: SsrMarkdownConversionOptions,
+    onPhase?: (phase: "cleanup" | "conversion") => void
   ): SsrMarkdownRenderTask
   invalidateSession(sessionId: string): Promise<void>
   terminate(): Promise<void>
@@ -124,6 +125,7 @@ export type SsrMarkdownWorker = {
 }
 
 export type SsrMarkdownRenderTask = {
+  /** Resolves at the cleanup handoff into the combined cleanup/conversion budget. */
   conversionStarted: Promise<void>
   result: Promise<{ markdown: string }>
 }
@@ -328,13 +330,20 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
           let renderOutcome: MarkdownRenderPhaseTiming["outcome"] = "ok"
           let task!: SsrMarkdownRenderTask
           try {
-            task = worker.renderMarkdown(request.sessionId, location, {
-              documentUrl: ssrDocumentUrl(request, prepared),
-              basePath: request.basePath,
-              internalBasePath: prepared.internalBasePath,
-              workspace: canonicalWorkspace,
-              maxOutputBytes
-            })
+            task = worker.renderMarkdown(
+              request.sessionId,
+              location,
+              {
+                documentUrl: ssrDocumentUrl(request, prepared),
+                basePath: request.basePath,
+                internalBasePath: prepared.internalBasePath,
+                workspace: canonicalWorkspace,
+                maxOutputBytes
+              },
+              (phase) => {
+                failurePhase = phase
+              }
+            )
             await runWorkerOperation(
               renderBudget,
               combined.signal,
@@ -349,7 +358,6 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
             emitPhaseTiming(request.sessionId, "render", timings.render, renderOutcome)
           }
 
-          failurePhase = "conversion"
           const conversionStarted = performance.now()
           const conversionBudget = new PhaseBudget("conversion", conversionTimeoutMs)
           let conversionOutcome: MarkdownRenderPhaseTiming["outcome"] = "ok"
@@ -383,7 +391,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
           return { markdown: converted.markdown, cache: "miss", timings }
         }, combined.signal)
       } catch (error) {
-        const phase = workerFailurePhase(error) ?? failurePhase
+        const phase = failurePhase
         if (combined.signal.aborted && (error === combined.signal.reason || isAbortError(error))) {
           emitRenderFailure(
             request.sessionId,
@@ -590,15 +598,16 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
   renderMarkdown(
     sessionId: string,
     location: SsrRouteLocation,
-    options: SsrMarkdownConversionOptions
+    options: SsrMarkdownConversionOptions,
+    onPhase?: (phase: "cleanup" | "conversion") => void
   ): SsrMarkdownRenderTask {
     const binding = this.requireBinding(sessionId)
     let phaseSettled = false
-    let resolveConversionStarted!: () => void
-    let rejectConversionStarted!: (error: Error) => void
-    const conversionStarted = new Promise<void>((resolvePromise, rejectPromise) => {
-      resolveConversionStarted = resolvePromise
-      rejectConversionStarted = rejectPromise
+    let resolvePostRenderStarted!: () => void
+    let rejectPostRenderStarted!: (error: Error) => void
+    const postRenderStarted = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolvePostRenderStarted = resolvePromise
+      rejectPostRenderStarted = rejectPromise
     })
     const result = this.command("render-markdown", {
       sessionId,
@@ -608,9 +617,10 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     }, {
       maxResultBytes: ipcResultLimit(options.maxOutputBytes),
       onPhase: (phase) => {
-        if (phase !== "conversion" || phaseSettled) return
+        onPhase?.(phase)
+        if (phase !== "cleanup" || phaseSettled) return
         phaseSettled = true
-        resolveConversionStarted()
+        resolvePostRenderStarted()
       }
     }) as Promise<{ markdown: string }>
     void result.then(
@@ -618,16 +628,16 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
         binding.moduleBudget = undefined
         if (phaseSettled) return
         phaseSettled = true
-        rejectConversionStarted(new Error("The SSR worker omitted the conversion phase"))
+        rejectPostRenderStarted(new Error("The SSR worker omitted the cleanup phase"))
       },
       (error) => {
         binding.moduleBudget = undefined
         if (phaseSettled) return
         phaseSettled = true
-        rejectConversionStarted(error instanceof Error ? error : new Error(String(error)))
+        rejectPostRenderStarted(error instanceof Error ? error : new Error(String(error)))
       }
     )
-    return { conversionStarted, result }
+    return { conversionStarted: postRenderStarted, result }
   }
 
   async invalidateSession(sessionId: string): Promise<void> {
@@ -808,7 +818,10 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
 
   private handleCommandPhase(message: WorkerCommandPhaseMessage): void {
     const pending = this.pending.get(message.requestId)
-    if (!pending || message.phase !== "conversion") return
+    if (
+      !pending ||
+      (message.phase !== "cleanup" && message.phase !== "conversion")
+    ) return
     pending.onPhase?.(message.phase)
   }
 
@@ -924,7 +937,7 @@ function ssrWorkerUrl(): URL {
 }
 
 type WorkerCommandName = "load" | "render-markdown" | "invalidate"
-type WorkerCommandPhase = "conversion"
+type WorkerCommandPhase = "cleanup" | "conversion"
 type SsrImportMetaEnv = Readonly<Record<string, unknown>>
 type SerializedError = SsrMarkdownSerializedError
 type WorkerSessionBinding = {
@@ -1114,7 +1127,6 @@ class SsrChildTerminatedError extends Error {
 class WorkerCommandError extends Error {
   readonly code: string | undefined
   readonly status: number | undefined
-  readonly phase: "cleanup" | "conversion" | undefined
 
   constructor(readonly command: WorkerCommandName, details: SerializedError) {
     super(details.message ?? `The SSR worker ${command} command failed`)
@@ -1122,7 +1134,6 @@ class WorkerCommandError extends Error {
     this.stack = details.stack ?? this.stack
     this.code = details.code
     this.status = details.status
-    this.phase = details.phase
   }
 }
 
@@ -1395,10 +1406,6 @@ function phaseOutcome(
   if (signal.aborted && (error === signal.reason || isAbortError(error))) return "cancelled"
   if (error instanceof RenderPhaseTimeoutError) return "timeout"
   return "error"
-}
-
-function workerFailurePhase(error: unknown): "cleanup" | "conversion" | undefined {
-  return error instanceof WorkerCommandError ? error.phase : undefined
 }
 
 function renderFailureClass(error: unknown): string {

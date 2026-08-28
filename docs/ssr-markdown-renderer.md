@@ -205,9 +205,12 @@ all phase budgets. Once admitted, these independent defaults apply:
 
 | Phase | Default | Environment | CLI |
 | --- | ---: | --- | --- |
-| module/session load | 10 s | `VIBE_SHOW_RENDER_LOAD_TIMEOUT_MS` | `--render-load-timeout-ms` |
+| module/session load | 30 s | `VIBE_SHOW_RENDER_LOAD_TIMEOUT_MS` | `--render-load-timeout-ms` |
 | React render | 5 s | `VIBE_SHOW_RENDER_REACT_TIMEOUT_MS` | `--render-react-timeout-ms` |
 | cleanup + conversion | 5 s | `VIBE_SHOW_RENDER_CONVERSION_TIMEOUT_MS` | `--render-conversion-timeout-ms` |
+
+The load default includes margin for cold module acquisition on slow-filesystem
+platforms; warm loads still reuse the bounded validation cache described below.
 
 Caller disconnect and runtime shutdown signals race every phase wait. A timeout
 or cancellation during child work kills the process, which hard-stops synchronous
@@ -230,9 +233,11 @@ source or stack traces to the caller.
 Every failed render emits exactly one `ssr-markdown-render-failed` JSON event.
 It records the session, the failing `load`, `render`, `cleanup`, or `conversion`
 phase, a bounded error class, and at most 512 UTF-8 bytes of the normalized
-public-safe error message. Arbitrary workspace and Vite error text is never used
-for those fields, so the event cannot log a stack or module/file body. The public
-error envelope remains unchanged.
+public-safe error message. Phase comes only from the parent tracker, advanced by
+trusted child command-phase acknowledgements; workspace error properties are not
+serialized as phase metadata. Arbitrary workspace and Vite error text is never
+used for event fields, so the event cannot log a stack or module/file body. The
+public error envelope remains unchanged.
 
 Every cache miss creates a new evaluator and `ModuleRunner`, imports the entry,
 renders once, and closes that graph in a `finally` path. The live session Vite
@@ -255,7 +260,7 @@ an explicit size, lifetime, or reset owner:
 | Child to parent result | Existing configured raw/cleaned/Markdown cap plus fixed framing; only `{markdown}` crosses | Oversized raw HTML returns `output_too_large`; captured IPC contains neither HTML nor page text |
 | Errors in either direction | 8 KiB serialized-error budget; bounded name/message/stack/code fields; public response remains the generic existing envelope | A workspace-thrown oversized error is truncated in IPC and absent from the response |
 | Scheduling and module transport jobs | Per-command registry disposes timers, intervals, immediates, microtasks, and message tasks; transport promises quiesce before reply | Busy module-level interval cannot fire after its command or delay the next render |
-| Phase time and cancellation | Independent 10 s load, 5 s render, and 5 s conversion budgets; child flushes a phase transition before conversion; timeout/disconnect hard-kills it | Hung load/render and fake conversion each time out; caller disconnect kills; next request respawns and succeeds |
+| Phase time and cancellation | Independent 30 s load, 5 s render, and 5 s conversion budgets; child flushes trusted cleanup and conversion transitions; timeout/disconnect hard-kills it | Hung load/render and fake conversion each time out; phase-spoofing workspace errors cannot change the logged phase; caller disconnect kills; next request respawns and succeeds |
 | Session and process lifecycle | Watcher/fingerprint/suspend/idle invalidation closes session state; crash rejects all pending RPC and drops all child state | Existing invalidation suite plus kill/respawn integration tests |
 
 The control/module/error budgets are internal protocol limits, not new public
@@ -306,14 +311,14 @@ fingerprint but never contact the child.
 
 | Measurement | Result |
 | --- | ---: |
-| cold request | 1,642.93-1,742.78 ms |
-| cold load | 1,609.87-1,709.93 ms |
-| cold render / conversion | 4.96-5.25 / 6.34-6.88 ms |
-| warm miss median / p95 | 103.69-116.70 / 125.20-130.56 ms |
-| cache hit median / p95 | 0.78-0.85 / 1.67-1.87 ms |
-| RSS before cold | 112.7-116.3 MiB |
-| RSS after cold (delta) | 478.0-507.2 MiB (+365.3-391.0 MiB) |
-| RSS after 20 warm misses | 735.8-850.9 MiB |
+| cold request | 1,584.50-1,646.41 ms |
+| cold load | 1,551.63-1,613.69 ms |
+| cold render / conversion | 5.26-5.38 / 6.30-6.47 ms |
+| warm miss median / p95 | 103.68-114.73 / 121.30-126.71 ms |
+| cache hit median / p95 | 0.81-0.85 / 1.59-1.70 ms |
+| RSS before cold | 110.3-111.7 MiB |
+| RSS after cold (delta) | 473.3-503.4 MiB (+361.6-393.0 MiB) |
+| RSS after 20 warm misses | 778.2-844.2 MiB |
 
 RSS after child startup is the OS-reported sum for the Runtime parent and active
 SSR child, rather than the parent's `process.memoryUsage()` alone. The benchmark
