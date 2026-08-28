@@ -86,6 +86,14 @@ server may use them. The Vite cache identity includes
 `ssr-markdown-acquisition-v1`, so artifacts produced before this policy cannot
 be reused under the new boundary.
 
+Canonical validation verdicts and self-canonical dependency/cache targets are
+cached in two per-live-session LRU maps, each capped at 16,384 entries. Workspace
+source targets are always re-canonicalized, so a retargeted workspace symlink
+cannot inherit an allowed dependency verdict. Watcher events, fingerprint
+mismatches, suspend, and idle pruning clear both maps together with the SSR
+module graph. This keeps repeat graph loads below the production deadline on
+slower filesystems without weakening invalidation.
+
 A configured dependency root may be a symlink forest. Its canonical package
 targets are accepted only as Markdown dependency origins after the same target
 validation; they are not added to the human HTTP request roots. Direct requests
@@ -270,10 +278,10 @@ entries are removed during lookup, write, and the five-second idle maintenance
 pass.
 
 Workspace watcher events evict the session's Markdown entries, fingerprint
-memoization, and child evaluation state. Every
+memoization, canonical validation verdicts, and child evaluation state. Every
 lookup also recomputes the workspace fingerprint; a mismatch invalidates the
-Vite SSR graph and child state even if a watcher event was missed. Session
-suspend and idle pruning clear the same state before releasing
+Vite SSR graph, validation verdicts, and child state even if a watcher event was
+missed. Session suspend and idle pruning clear the same state before releasing
 the live Vite server.
 
 ## Router compatibility
@@ -298,14 +306,14 @@ fingerprint but never contact the child.
 
 | Measurement | Result |
 | --- | ---: |
-| cold request | 1,840-1,998 ms |
-| cold load | 1,806-1,964 ms |
-| cold render / conversion | 5.6-5.9 / 6.6-7.1 ms |
-| warm miss median / p95 | 113.82-123.84 / 137.82-173.57 ms |
-| cache hit median / p95 | 1.04-1.13 / 1.68-2.04 ms |
-| RSS before cold | 112.2-116.2 MiB |
-| RSS after cold (delta) | 502.6-506.0 MiB (+386.4-393.8 MiB) |
-| RSS after 20 warm misses | 835.3-861.1 MiB |
+| cold request | 1,642.93-1,742.78 ms |
+| cold load | 1,609.87-1,709.93 ms |
+| cold render / conversion | 4.96-5.25 / 6.34-6.88 ms |
+| warm miss median / p95 | 103.69-116.70 / 125.20-130.56 ms |
+| cache hit median / p95 | 0.78-0.85 / 1.67-1.87 ms |
+| RSS before cold | 112.7-116.3 MiB |
+| RSS after cold (delta) | 478.0-507.2 MiB (+365.3-391.0 MiB) |
+| RSS after 20 warm misses | 735.8-850.9 MiB |
 
 RSS after child startup is the OS-reported sum for the Runtime parent and active
 SSR child, rather than the parent's `process.memoryUsage()` alone. The benchmark

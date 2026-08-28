@@ -15,6 +15,7 @@ import {
   DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS,
   MarkdownRenderError,
   SsrWorkerUnavailableError,
+  type MarkdownRenderPhaseTiming,
   type MarkdownRenderRequest,
   type SsrMarkdownWorker
 } from "./markdown-renderer.js"
@@ -33,6 +34,7 @@ import {
   type ShowRuntimeServerDependencies
 } from "./server.js"
 import { SSR_MARKDOWN_ENVIRONMENT } from "./ssr-markdown-entry-plugin.js"
+import { registerSsrModuleValidationInvalidator } from "./ssr-module-validation-cache.js"
 import { SsrSandboxEvaluator } from "./ssr-markdown-sandbox.js"
 import type { ShowRuntimeOptions } from "./types.js"
 import type { WorkspaceFingerprinter } from "./workspace-fingerprint.js"
@@ -423,6 +425,33 @@ describe("SSR Markdown endpoint", () => {
     expect(await renderError(legacyNested)).toEqual({
       error: { code: "render_failed", message: "Show Page rendering failed." }
     })
+  }, 60_000)
+
+  it("reuses validation verdicts on the second load of one module graph", async () => {
+    const phaseTimings: MarkdownRenderPhaseTiming[] = []
+    const runtime = await startFixtureServer(
+      ["validation-cache"],
+      {},
+      { markdownRendererOptions: { onPhaseTiming: (timing) => phaseTimings.push(timing) } }
+    )
+    const url = markdownUrl(runtime.url, "validation-cache")
+
+    const first = await fetch(url, {
+      headers: { "x-vibe-show-target": "/?request=1" }
+    })
+    expect(first.status, await first.text()).toBe(200)
+    expect(first.headers.get("x-avibe-render-cache")).toBe("miss")
+    const second = await fetch(url, {
+      headers: { "x-vibe-show-target": "/?request=2" }
+    })
+    expect(second.status, await second.text()).toBe(200)
+    expect(second.headers.get("x-avibe-render-cache")).toBe("miss")
+
+    const loadDurations = phaseTimings
+      .filter((timing) => timing.sessionId === "validation-cache" && timing.phase === "load")
+      .map((timing) => timing.durationMs)
+    expect(loadDurations).toHaveLength(2)
+    expect(loadDurations[1]).toBeLessThan(loadDurations[0] * 0.75)
   }, 60_000)
 
   it("renders legacy App-only workspaces without creating a router", async () => {
@@ -1420,7 +1449,7 @@ async function rendererHarness(options: {
       }
     }
   })
-  return { renderer, request, worker, fingerprinter, watcher, workspace }
+  return { renderer, request, worker, fingerprinter, watcher, vite, workspace }
 }
 
 describe("SSR Markdown orchestrator", () => {
@@ -1441,18 +1470,25 @@ describe("SSR Markdown orchestrator", () => {
 
   it("uses fingerprint recomputation and watcher events as independent invalidation signals", async () => {
     const harness = await rendererHarness()
+    const invalidateModuleValidation = vi.fn()
+    registerSsrModuleValidationInvalidator(harness.vite, invalidateModuleValidation)
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("hit")
 
     harness.fingerprinter.versions.set("page", "workspace-v2")
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
     expect(harness.worker.invalidations).toContain("page")
+    expect(invalidateModuleValidation).toHaveBeenCalledTimes(1)
 
     const priorInvalidations = harness.worker.invalidations.length
+    const priorValidationInvalidations = invalidateModuleValidation.mock.calls.length
     harness.watcher.emit("change", join(harness.workspace, "src", "page.tsx"))
     await vi.waitFor(() => {
       expect(harness.worker.invalidations.length).toBeGreaterThan(priorInvalidations)
     })
+    expect(invalidateModuleValidation.mock.calls.length).toBeGreaterThan(
+      priorValidationInvalidations
+    )
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
   })
 
