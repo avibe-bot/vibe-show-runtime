@@ -6,6 +6,7 @@ import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { ViteDevServer } from "vite"
+import { createNodeImportMeta } from "vite/module-runner"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   createMarkdownRenderer,
@@ -233,18 +234,32 @@ function recordingChildFactory(children: ChildProcess[]) {
 }
 
 describe("SSR sandbox evaluator", () => {
-  it("uses the Vite environment supplied by its execution owner", () => {
+  it("uses Vite's complete environment and native import-meta path semantics", async () => {
     const expected = {
       BASE_URL: "/internal/vite-env/",
       MODE: "staging",
       DEV: false,
       PROD: true,
-      SSR: true
+      SSR: true,
+      VITE_API_ORIGIN: "https://api.example.test/v1/"
     }
     const evaluator = new SsrSandboxEvaluator("avibe-show-ssr:test", expected)
     try {
-      const meta = evaluator.createImportMeta("/workspace/src/page.tsx")
+      const modulePath = join(sourceDirectory, "fixture-module.tsx")
+      const nativeMeta = await createNodeImportMeta(modulePath)
+      const meta = evaluator.createImportMeta(modulePath)
       expect(JSON.parse(JSON.stringify(meta.env))).toEqual(expected)
+      expect({
+        filename: meta.filename,
+        dirname: meta.dirname,
+        url: meta.url,
+        main: meta.main
+      }).toEqual({
+        filename: nativeMeta.filename,
+        dirname: nativeMeta.dirname,
+        url: nativeMeta.url,
+        main: nativeMeta.main
+      })
     } finally {
       evaluator.dispose()
     }
@@ -374,14 +389,25 @@ describe("SSR Markdown endpoint", () => {
     expect(humanRequest.status).toBe(404)
   }, 60_000)
 
-  it("uses the active Vite SSR environment for import.meta.env", async () => {
+  it("uses Vite's complete resolved SSR environment for import.meta.env", async () => {
+    vi.stubEnv("AVIBE_SSR_HOST_ONLY_ORIGIN", "https://host-secret.example.test/")
     const runtime = await startFixtureServer(["vite-env"])
     await runtime.runtime.ensureSession("vite-env", "/internal/vite-env/")
-    const environment = runtime.runtime.getSession("vite-env")?.vite
-      ?.environments[SSR_MARKDOWN_ENVIRONMENT]
+    const vite = runtime.runtime.getSession("vite-env")?.vite
+    const environment = vite?.environments[SSR_MARKDOWN_ENVIRONMENT]
+    const humanEnvironment = vite?.environments.client
     expect(environment).toBeDefined()
-    if (!environment) throw new Error("Expected the active Vite SSR environment")
+    expect(humanEnvironment).toBeDefined()
+    if (!environment || !humanEnvironment) {
+      throw new Error("Expected the active human and Markdown Vite environments")
+    }
     expect(environment.config.env.BASE_URL).toBe("/internal/vite-env/")
+    expect(environment.config.env.VITE_API_ORIGIN).toBe(
+      humanEnvironment.config.env.VITE_API_ORIGIN
+    )
+    expect(environment.config.env.VITE_API_ORIGIN).toBe("https://api.example.test/v1/")
+    expect(environment.config.env).not.toHaveProperty("AVIBE_SSR_HOST_ONLY_ORIGIN")
+    expect(humanEnvironment.config.env).not.toHaveProperty("AVIBE_SSR_HOST_ONLY_ORIGIN")
 
     const response = await fetch(markdownUrl(runtime.url, "vite-env"), {
       headers: { "x-vibe-show-base": "/p/public-token/" }
@@ -397,6 +423,11 @@ describe("SSR Markdown endpoint", () => {
     expect(markdown).toContain(
       `SSR: ${String(environment.config.consumer === "server")}`
     )
+    expect(markdown).toContain("Custom environment branch: enabled")
+    expect(markdown).toContain(
+      "[Custom environment URL](https://api.example.test/v1/reports)"
+    )
+    expect(markdown).toContain("Host environment visible: false")
   }, 60_000)
 
   it("returns session_unknown and rejects every target that escapes the session app", async () => {

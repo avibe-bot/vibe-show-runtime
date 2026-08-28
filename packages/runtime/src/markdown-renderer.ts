@@ -777,13 +777,7 @@ function ssrWorkerUrl(): URL {
 }
 
 type WorkerCommandName = "load" | "render" | "convert" | "invalidate"
-type SsrImportMetaEnv = {
-  BASE_URL: string
-  MODE: string
-  DEV: boolean
-  PROD: boolean
-  SSR: boolean
-}
+type SsrImportMetaEnv = Readonly<Record<string, unknown>>
 type SerializedError = {
   name?: string
   message?: string
@@ -872,20 +866,8 @@ function nodePermissionProfile(workspaceRoot: string | undefined): NodePermissio
 
 function activeSsrImportMetaEnv(vite: ViteDevServer): SsrImportMetaEnv {
   const config = vite.environments[SSR_MARKDOWN_ENVIRONMENT].config
-  const { BASE_URL, MODE, DEV, PROD } = config.env
-  if (
-    typeof BASE_URL !== "string" ||
-    typeof MODE !== "string" ||
-    typeof DEV !== "boolean" ||
-    typeof PROD !== "boolean"
-  ) {
-    throw new Error("The active Vite environment has invalid import.meta.env values")
-  }
   return {
-    BASE_URL,
-    MODE,
-    DEV,
-    PROD,
+    ...config.env,
     SSR: config.consumer === "server"
   }
 }

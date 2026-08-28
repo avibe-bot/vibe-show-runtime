@@ -39,6 +39,10 @@ and browser-platform CJS entry points are prebundled before VM evaluation. The
 ordinary Vite `ssr` environment is unchanged, so `api/*` handlers retain their
 existing Node execution model.
 
+Security boundaries are Runtime-owned; environment semantics are Vite-owned, so
+the renderer transports the active SSR environment's complete resolved `env`
+object plus its SSR consumer bit and never re-derives or enumerates Vite env keys.
+
 CSS does not contribute to the semantic SSR tree. After validating the resolved
 CSS entry against the workspace boundary, the Markdown environment substitutes
 an empty stylesheet before Vite's CSS compiler runs. This keeps CSS imports valid
@@ -211,14 +215,14 @@ fingerprint.
 
 | Measurement | Result |
 | --- | ---: |
-| cold request | 1,999-2,577 ms |
-| cold load | 1,952-2,539 ms |
-| cold render / conversion | 5.1-6.6 / 7.4-8.5 ms |
-| warm miss median / p95 | 8.19-10.71 / 12.06-14.44 ms |
-| cache hit median / p95 | 0.98-1.63 / 1.97-2.96 ms |
-| RSS before cold | 113.3-115.3 MiB |
-| RSS after cold (delta) | 419.6-501.9 MiB (+304.8-388.7 MiB) |
-| RSS after 20 warm misses | 437.0-514.3 MiB |
+| cold request | 1,571-1,680 ms |
+| cold load | 1,539-1,644 ms |
+| cold render / conversion | 4.9-5.3 / 6.7-7.1 ms |
+| warm miss median / p95 | 6.81-7.82 / 10.71-10.87 ms |
+| cache hit median / p95 | 0.80-0.86 / 1.54-1.64 ms |
+| RSS before cold | 110.3-110.6 MiB |
+| RSS after cold (delta) | 467.6-500.5 MiB (+357.3-389.9 MiB) |
+| RSS after 20 warm misses | 484.5-508.5 MiB |
 
 RSS after child startup is the OS-reported sum for the Runtime parent and active
 SSR child, rather than the parent's `process.memoryUsage()` alone. The benchmark

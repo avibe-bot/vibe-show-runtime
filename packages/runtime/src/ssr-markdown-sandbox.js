@@ -1,7 +1,6 @@
-import { dirname } from "node:path"
-import { pathToFileURL } from "node:url"
 import { createContext, Script } from "node:vm"
 import {
+  createDefaultImportMeta,
   ssrDynamicImportKey,
   ssrExportAllKey,
   ssrExportNameKey,
@@ -19,14 +18,7 @@ const MODULE_PARAMETERS = [
   ssrExportNameKey
 ]
 
-/**
- * @typedef {object} SsrImportMetaEnv
- * @property {string} BASE_URL
- * @property {string} MODE
- * @property {boolean} DEV
- * @property {boolean} PROD
- * @property {boolean} SSR
- */
+/** @typedef {Readonly<Record<string, unknown>>} SsrImportMetaEnv */
 
 const SANDBOX_BOOTSTRAP = String.raw`
 (function bootstrap(bridge) {
@@ -557,13 +549,7 @@ export class SsrSandboxEvaluator {
 
   /** @param {string} name @param {SsrImportMetaEnv} importMetaEnv */
   constructor(name, importMetaEnv) {
-    this.#importMetaEnv = Object.freeze({
-      BASE_URL: importMetaEnv.BASE_URL,
-      MODE: importMetaEnv.MODE,
-      DEV: importMetaEnv.DEV,
-      PROD: importMetaEnv.PROD,
-      SSR: importMetaEnv.SSR
-    })
+    this.#importMetaEnv = Object.freeze({ ...importMetaEnv })
     this.#context = createContext(Object.create(null), {
       name,
       codeGeneration: { strings: false, wasm: false }
@@ -631,10 +617,12 @@ export class SsrSandboxEvaluator {
 
   /** @param {string} modulePath */
   createImportMeta(modulePath) {
+    const viteMeta = createDefaultImportMeta(modulePath)
     return this.#helpers.createImportMeta(JSON.stringify({
-      filename: modulePath,
-      dirname: dirname(modulePath),
-      url: pathToFileURL(modulePath).href,
+      filename: viteMeta.filename,
+      dirname: viteMeta.dirname,
+      url: viteMeta.url,
+      main: false,
       env: this.#importMetaEnv
     }))
   }
