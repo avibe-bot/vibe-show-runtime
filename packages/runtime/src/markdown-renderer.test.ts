@@ -42,6 +42,8 @@ import type { WorkspaceFingerprinter } from "./workspace-fingerprint.js"
 const sourceDirectory = dirname(fileURLToPath(import.meta.url))
 const fixtureRoot = join(sourceDirectory, "__fixtures__", "ssr-markdown")
 const dependencyRoot = resolve(sourceDirectory, "../../..")
+const SCHEDULED_WORK_LOAD_TIMEOUT_MS = 30_000
+const SCHEDULED_WORK_INTERVAL_DELAY_MS = 35_000
 const cleanups: Array<() => Promise<void>> = []
 
 afterEach(async () => {
@@ -999,6 +1001,84 @@ describe("SSR Markdown endpoint", () => {
     expect(body).not.toContain(sentinel)
   }, 60_000)
 
+  it("revalidates a cached dependency after its file identity changes", async () => {
+    const sentinel = "RETARGETED_VALIDATION_CACHE_CONTENT_MUST_NOT_LEAK"
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "avibe-show-validation-workspace-"))
+    const dependencyPackage = await mkdtemp(join(tmpdir(), "avibe-show-validation-dependency-"))
+    const outsideRoot = await mkdtemp(join(tmpdir(), "avibe-show-validation-outside-"))
+    cleanups.push(async () => {
+      await rm(dependencyPackage, { recursive: true, force: true })
+      await rm(outsideRoot, { recursive: true, force: true })
+    })
+    const sessionId = "validation-cache-dependency"
+    const workspace = join(workspaceRoot, sessionId)
+    await cp(join(fixtureRoot, "validation-cache"), workspace, { recursive: true })
+    await writeFile(join(dependencyPackage, "package.json"), `${JSON.stringify({
+      name: "show-validation-cache-dependency",
+      version: "1.0.0",
+      type: "module",
+      exports: "./index.js"
+    }, null, 2)}\n`)
+    const dependencyPath = join(dependencyPackage, "index.js")
+    await writeFile(dependencyPath, 'export const value = "allowed dependency bytes"\n')
+    await writeFile(join(workspace, "package.json"), `${JSON.stringify({
+      name: "validation-cache-dependency-page",
+      private: true,
+      dependencies: {
+        "show-validation-cache-dependency": `file:${dependencyPackage}`
+      }
+    }, null, 2)}\n`)
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      dependencyRoot,
+      cacheRoot: join(workspaceRoot, ".vite-cache"),
+      idlePruneIntervalMs: 0
+    })
+    cleanups.push(async () => {
+      await runtime.close()
+      await rm(workspaceRoot, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 100
+      })
+    })
+
+    await runtime.runtime.ensureSession(sessionId, `/show/${sessionId}/`)
+    const session = runtime.runtime.getSession(sessionId)
+    const environment = session?.vite?.environments[SSR_MARKDOWN_ENVIRONMENT]
+    if (!environment) {
+      throw new Error("Expected the warmed fixture to expose its Markdown environment")
+    }
+    const dependencyRequest = `/@fs/${dependencyPath.replaceAll("\\", "/").replace(/^\/+/, "")}`
+
+    const first = await environment.fetchModule(dependencyRequest)
+    environment.moduleGraph.invalidateAll()
+    const unchanged = await environment.fetchModule(dependencyRequest)
+    expect("code" in first ? first.code : "").toContain("allowed dependency bytes")
+    expect("code" in unchanged ? unchanged.code : "").toContain("allowed dependency bytes")
+
+    const deniedPath = join(outsideRoot, "denied.js")
+    await writeFile(deniedPath, `export const value = ${JSON.stringify(sentinel)}\n`)
+    await rm(dependencyPath)
+    await symlink(deniedPath, dependencyPath, "file")
+    environment.moduleGraph.invalidateAll()
+
+    const outcome = await environment
+      .fetchModule(dependencyRequest)
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error })
+      )
+    expect(outcome).toHaveProperty("error")
+    const denied = "error" in outcome ? outcome.error : undefined
+    expect(denied).toBeInstanceOf(Error)
+    expect((denied as Error).message).toBe(
+      "Show Page SSR module access was denied by the workspace boundary"
+    )
+    expect((denied as Error).message).not.toContain(sentinel)
+  }, 60_000)
+
   it("renders legitimate ESM and CommonJS declared extras", async () => {
     const runtime = await startFixtureServer(["declared-extras"])
     const response = await fetch(markdownUrl(runtime.url, "declared-extras"))
@@ -1164,9 +1244,10 @@ describe("SSR Markdown endpoint", () => {
 
   it("kills a hung child at its phase deadline, respawns, and keeps the runtime usable", async () => {
     const children: ChildProcess[] = []
+    const loadTimeoutMs = 3_000
     const runtime = await startFixtureServer(
       ["hung-load", "semantic"],
-      {},
+      { renderLoadTimeoutMs: loadTimeoutMs },
       { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
     )
     await runtime.runtime.ensureSession("hung-load", "/show/hung-load/")
@@ -1174,7 +1255,7 @@ describe("SSR Markdown endpoint", () => {
 
     const started = performance.now()
     const timedOut = await fetch(markdownUrl(runtime.url, "hung-load"))
-    const loadTimeoutSeconds = DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS / 1_000
+    const loadTimeoutSeconds = loadTimeoutMs / 1_000
     expect(timedOut.status).toBe(504)
     expect(await renderError(timedOut)).toEqual({
       error: {
@@ -1183,8 +1264,8 @@ describe("SSR Markdown endpoint", () => {
       }
     })
     const elapsed = performance.now() - started
-    expect(elapsed).toBeGreaterThanOrEqual(DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS - 1_000)
-    expect(elapsed).toBeLessThan(DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS + 5_000)
+    expect(elapsed).toBeGreaterThanOrEqual(loadTimeoutMs - 1_000)
+    expect(elapsed).toBeLessThan(loadTimeoutMs + 5_000)
     expect(children).toHaveLength(1)
     expect(children[0]?.killed).toBe(true)
 
@@ -1222,7 +1303,7 @@ describe("SSR Markdown endpoint", () => {
     const children: ChildProcess[] = []
     const runtime = await startFixtureServer(
       ["scheduled-work"],
-      {},
+      { renderLoadTimeoutMs: SCHEDULED_WORK_LOAD_TIMEOUT_MS },
       { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
     )
     await runtime.runtime.ensureSession("scheduled-work", "/show/scheduled-work/")
@@ -1235,7 +1316,10 @@ describe("SSR Markdown endpoint", () => {
     expect(firstMarkdown).toContain("Deferred callbacks: none")
     expect(children).toHaveLength(1)
 
-    await new Promise((resolveWait) => setTimeout(resolveWait, 2_350))
+    await new Promise((resolveWait) => setTimeout(
+      resolveWait,
+      SCHEDULED_WORK_INTERVAL_DELAY_MS + 350
+    ))
     const nextStarted = performance.now()
     const next = await fetch(markdownUrl(runtime.url, "scheduled-work"), {
       headers: { "x-vibe-show-target": "/?request=2" }
@@ -1246,13 +1330,13 @@ describe("SSR Markdown endpoint", () => {
     expect(nextMarkdown).toContain("Deferred callbacks: none")
     expect(performance.now() - nextStarted).toBeLessThan(DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS)
     expect(children).toHaveLength(1)
-  }, 60_000)
+  }, 90_000)
 
   it("propagates caller disconnect, kills the child, and respawns on the next render", async () => {
     const children: ChildProcess[] = []
     const runtime = await startFixtureServer(
       ["hung-load", "semantic"],
-      {},
+      { renderLoadTimeoutMs: 30_000 },
       { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
     )
     await runtime.runtime.ensureSession("hung-load", "/show/hung-load/")
@@ -1266,9 +1350,7 @@ describe("SSR Markdown endpoint", () => {
     })
     await vi.waitFor(() => expect(children[0]?.killed).toBe(true))
 
-    const recovered = await fetch(markdownUrl(runtime.url, "semantic"), {
-      signal: AbortSignal.timeout(5_000)
-    })
+    const recovered = await fetch(markdownUrl(runtime.url, "semantic"))
     expect(recovered.status).toBe(200)
     expect(await recovered.text()).toContain("# SSR fixture report")
     expect(children).toHaveLength(2)
@@ -1522,6 +1604,12 @@ describe("SSR Markdown orchestrator", () => {
 
     const priorInvalidations = harness.worker.invalidations.length
     const priorValidationInvalidations = invalidateModuleValidation.mock.calls.length
+    harness.watcher.emit("change", join(dirname(harness.workspace), "dependency", "index.js"))
+    expect(invalidateModuleValidation).toHaveBeenCalledTimes(
+      priorValidationInvalidations + 1
+    )
+    expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("hit")
+
     harness.watcher.emit("change", join(harness.workspace, "src", "page.tsx"))
     await vi.waitFor(() => {
       expect(harness.worker.invalidations.length).toBeGreaterThan(priorInvalidations)

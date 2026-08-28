@@ -57,7 +57,7 @@ export {
   type MarkdownRenderErrorCode
 } from "./markdown-core.js"
 
-export const DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS = 30_000
+export const DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS = 10_000
 export const DEFAULT_MARKDOWN_REACT_TIMEOUT_MS = 5_000
 export const DEFAULT_MARKDOWN_CONVERSION_TIMEOUT_MS = 5_000
 export const DEFAULT_MARKDOWN_CACHE_TTL_MS = 30_000
@@ -507,6 +507,9 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
     unbindSessionWatcher(sessionId)
 
     const listener = (path: string) => {
+      // Dependency and cache replacements do not change the workspace
+      // fingerprint, but they must still invalidate cached path identities.
+      invalidateSsrModuleValidationCache(vite, path)
       if (
         (!pathWithinWorkspace(path, logicalWorkspace) && !pathWithinWorkspace(path, canonicalWorkspace)) ||
         scheduledInvalidations.has(sessionId)

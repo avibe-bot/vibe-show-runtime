@@ -86,13 +86,14 @@ server may use them. The Vite cache identity includes
 `ssr-markdown-acquisition-v1`, so artifacts produced before this policy cannot
 be reused under the new boundary.
 
-Canonical validation verdicts and self-canonical dependency/cache targets are
-cached in two per-live-session LRU maps, each capped at 16,384 entries. Workspace
-source targets are always re-canonicalized, so a retargeted workspace symlink
-cannot inherit an allowed dependency verdict. Watcher events, fingerprint
-mismatches, suspend, and idle pruning clear both maps together with the SSR
-module graph. This keeps repeat graph loads below the production deadline on
-slower filesystems without weakening invalidation.
+Canonical validation verdicts and stable self-canonical dependency/cache targets
+are cached in two per-live-session LRU maps, each capped at 16,384 entries. Every
+grant first compares the path's lstat identity; an unchanged file reuses its
+canonical target and verdict, while replacement or retargeting forces a fresh
+realpath before any loader reads it. Workspace sources remain freshly
+canonicalized. Watcher events for workspace, dependency, and cache paths,
+fingerprint mismatches, suspend, and idle pruning clear the maps with the SSR
+module graph.
 
 A configured dependency root may be a symlink forest. Its canonical package
 targets are accepted only as Markdown dependency origins after the same target
@@ -205,12 +206,14 @@ all phase budgets. Once admitted, these independent defaults apply:
 
 | Phase | Default | Environment | CLI |
 | --- | ---: | --- | --- |
-| module/session load | 30 s | `VIBE_SHOW_RENDER_LOAD_TIMEOUT_MS` | `--render-load-timeout-ms` |
+| module/session load | 10 s | `VIBE_SHOW_RENDER_LOAD_TIMEOUT_MS` | `--render-load-timeout-ms` |
 | React render | 5 s | `VIBE_SHOW_RENDER_REACT_TIMEOUT_MS` | `--render-react-timeout-ms` |
 | cleanup + conversion | 5 s | `VIBE_SHOW_RENDER_CONVERSION_TIMEOUT_MS` | `--render-conversion-timeout-ms` |
 
-The load default includes margin for cold module acquisition on slow-filesystem
-platforms; warm loads still reuse the bounded validation cache described below.
+The load default remains derived from measured production fixture latency. Tests
+whose subject is child recovery or scheduling disposal use their own generous
+load allowance so slow CI filesystems do not turn those semantic checks into
+load-speed checks.
 
 Caller disconnect and runtime shutdown signals race every phase wait. A timeout
 or cancellation during child work kills the process, which hard-stops synchronous
@@ -260,7 +263,7 @@ an explicit size, lifetime, or reset owner:
 | Child to parent result | Existing configured raw/cleaned/Markdown cap plus fixed framing; only `{markdown}` crosses | Oversized raw HTML returns `output_too_large`; captured IPC contains neither HTML nor page text |
 | Errors in either direction | 8 KiB serialized-error budget; bounded name/message/stack/code fields; public response remains the generic existing envelope | A workspace-thrown oversized error is truncated in IPC and absent from the response |
 | Scheduling and module transport jobs | Per-command registry disposes timers, intervals, immediates, microtasks, and message tasks; transport promises quiesce before reply | Busy module-level interval cannot fire after its command or delay the next render |
-| Phase time and cancellation | Independent 30 s load, 5 s render, and 5 s conversion budgets; child flushes trusted cleanup and conversion transitions; timeout/disconnect hard-kills it | Hung load/render and fake conversion each time out; phase-spoofing workspace errors cannot change the logged phase; caller disconnect kills; next request respawns and succeeds |
+| Phase time and cancellation | Independent 10 s load, 5 s render, and 5 s conversion budgets; child flushes trusted cleanup and conversion transitions; timeout/disconnect hard-kills it | Hung load/render and fake conversion each time out; phase-spoofing workspace errors cannot change the logged phase; caller disconnect kills; next request respawns and succeeds |
 | Session and process lifecycle | Watcher/fingerprint/suspend/idle invalidation closes session state; crash rejects all pending RPC and drops all child state | Existing invalidation suite plus kill/respawn integration tests |
 
 The control/module/error budgets are internal protocol limits, not new public
@@ -283,9 +286,11 @@ entries are removed during lookup, write, and the five-second idle maintenance
 pass.
 
 Workspace watcher events evict the session's Markdown entries, fingerprint
-memoization, canonical validation verdicts, and child evaluation state. Every
-lookup also recomputes the workspace fingerprint; a mismatch invalidates the
-Vite SSR graph, validation verdicts, and child state even if a watcher event was
+memoization, canonical validation verdicts, and child evaluation state.
+Dependency and cache watcher events also clear canonical target identities and
+verdicts even though they do not change the workspace fingerprint. Every lookup
+recomputes that fingerprint; a mismatch invalidates the Vite SSR graph,
+validation verdicts, and child state even if a workspace watcher event was
 missed. Session suspend and idle pruning clear the same state before releasing
 the live Vite server.
 

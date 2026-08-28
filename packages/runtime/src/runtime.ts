@@ -99,9 +99,8 @@ type WorkspaceFileBoundary = {
   cacheRoots: string[]
   ssrArtifactRoots: string[]
   validationCache: {
-    canonicalTargets: Map<string, string>
+    canonicalTargets: Map<string, { target: string, identity: string }>
     canonicalVerdicts: Map<string, boolean>
-    inFlightTargets: Map<string, Promise<string | undefined>>
     generation: number
   }
 }
@@ -192,12 +191,16 @@ async function isDeniedSsrModuleTarget(
   if (!filePath) return true
   while (true) {
     const generation = boundary.validationCache.generation
-    const target = await canonicalSsrModuleTarget(filePath, boundary)
+    const canonical = await canonicalSsrModuleTarget(filePath, boundary)
     if (generation !== boundary.validationCache.generation) continue
-    if (!target) return true
+    if (!canonical) return true
+    const { target, identity } = canonical
     const cached = boundary.validationCache.canonicalVerdicts.get(target)
     if (cached !== undefined) {
       touchBoundedCache(boundary.validationCache.canonicalVerdicts, target, cached)
+      if (!cached && cacheableCanonicalLookup(filePath, target, boundary)) {
+        touchBoundedCache(boundary.validationCache.canonicalTargets, filePath, canonical)
+      }
       return cached
     }
     const denied = relativeWithin(boundary.cacheRoots, target) !== undefined
@@ -209,7 +212,10 @@ async function isDeniedSsrModuleTarget(
     if (generation !== boundary.validationCache.generation) continue
     touchBoundedCache(boundary.validationCache.canonicalVerdicts, target, denied)
     if (!denied && cacheableCanonicalLookup(filePath, target, boundary)) {
-      touchBoundedCache(boundary.validationCache.canonicalTargets, filePath, target)
+      touchBoundedCache(boundary.validationCache.canonicalTargets, filePath, {
+        target,
+        identity
+      })
     }
     return denied
   }
@@ -218,22 +224,45 @@ async function isDeniedSsrModuleTarget(
 async function canonicalSsrModuleTarget(
   filePath: string,
   boundary: WorkspaceFileBoundary
-): Promise<string | undefined> {
+): Promise<{ target: string, identity: string } | undefined> {
+  let identity = await ssrModuleFileIdentity(filePath)
+  if (!identity) {
+    boundary.validationCache.canonicalTargets.delete(filePath)
+    return undefined
+  }
   const cached = boundary.validationCache.canonicalTargets.get(filePath)
-  if (cached !== undefined) {
+  if (cached?.identity === identity) {
     touchBoundedCache(boundary.validationCache.canonicalTargets, filePath, cached)
     return cached
   }
-  const inFlight = boundary.validationCache.inFlightTargets.get(filePath)
-  if (inFlight) return await inFlight
-  const pending = realpath(filePath).catch(() => undefined)
-  boundary.validationCache.inFlightTargets.set(filePath, pending)
+  boundary.validationCache.canonicalTargets.delete(filePath)
+
+  // A path may be replaced while it is being canonicalized. Only grant a
+  // target observed under one stable lstat identity; repeated churn fails closed.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const target = await realpath(filePath).catch(() => undefined)
+    if (!target) return undefined
+    const confirmedIdentity = await ssrModuleFileIdentity(filePath)
+    if (!confirmedIdentity) return undefined
+    if (confirmedIdentity === identity) return { target, identity }
+    identity = confirmedIdentity
+  }
+  return undefined
+}
+
+async function ssrModuleFileIdentity(filePath: string): Promise<string | undefined> {
   try {
-    return await pending
-  } finally {
-    if (boundary.validationCache.inFlightTargets.get(filePath) === pending) {
-      boundary.validationCache.inFlightTargets.delete(filePath)
-    }
+    const value = await lstat(filePath, { bigint: true })
+    return [
+      value.dev,
+      value.ino,
+      value.mode,
+      value.size,
+      value.mtimeNs,
+      value.ctimeNs
+    ].join(":")
+  } catch {
+    return undefined
   }
 }
 
@@ -274,7 +303,6 @@ function clearSsrModuleValidationCache(boundary: WorkspaceFileBoundary): void {
   boundary.validationCache.generation += 1
   boundary.validationCache.canonicalTargets.clear()
   boundary.validationCache.canonicalVerdicts.clear()
-  boundary.validationCache.inFlightTargets.clear()
 }
 
 function ssrModuleFilePath(rawId: string): string | undefined {
@@ -704,7 +732,6 @@ export function createShowRuntime(
       validationCache: {
         canonicalTargets: new Map(),
         canonicalVerdicts: new Map(),
-        inFlightTargets: new Map(),
         generation: 0
       }
     }
@@ -822,7 +849,14 @@ export function createShowRuntime(
       session.vite = await createViteServer(viteConfig)
       registerSsrModuleValidationInvalidator(
         session.vite,
-        () => clearSsrModuleValidationCache(fileBoundary)
+        (changedPath) => {
+          if (
+            changedPath === undefined ||
+            relativeWithin(fileBoundary.allowedRoots, resolve(changedPath)) !== undefined
+          ) {
+            clearSsrModuleValidationCache(fileBoundary)
+          }
+        }
       )
       logTiming("warmSession.createViteServer", session.id, viteStarted, { cacheDir, basePath })
       const entryStarted = performance.now()

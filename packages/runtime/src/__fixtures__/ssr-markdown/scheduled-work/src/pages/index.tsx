@@ -6,11 +6,11 @@ setInterval(() => {
   deferredCallbacks.push("interval")
   queueMicrotask(() => deferredCallbacks.push("microtask"))
   channel.port2.postMessage("deferred")
-}, 2_000)
+}, 35_000)
 
 setInterval(() => {
   while (true) Math.random()
-}, 2_100)
+}, 35_000)
 
 export default function ScheduledWorkFixture() {
   return (
