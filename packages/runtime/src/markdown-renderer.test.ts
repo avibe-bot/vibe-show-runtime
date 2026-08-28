@@ -32,6 +32,7 @@ import {
   type ShowRuntimeServerDependencies
 } from "./server.js"
 import { SSR_MARKDOWN_ENVIRONMENT } from "./ssr-markdown-entry-plugin.js"
+import { registerSsrModuleValidationInvalidator } from "./ssr-module-validation-cache.js"
 import { SsrSandboxEvaluator } from "./ssr-markdown-sandbox.js"
 import type { ShowRuntimeOptions } from "./types.js"
 import type { WorkspaceFingerprinter } from "./workspace-fingerprint.js"
@@ -372,6 +373,30 @@ describe("SSR Markdown process protocol", () => {
 })
 
 describe("SSR Markdown endpoint", () => {
+  it("renders a field legacy router only at the root without modifying it", async () => {
+    const fixtureRouterPath = join(fixtureRoot, "legacy-router-field", "src", "router.tsx")
+    const fixtureRouter = await readFile(fixtureRouterPath, "utf8")
+    const runtime = await startFixtureServer(["legacy-router-field"])
+
+    const root = await fetch(markdownUrl(runtime.url, "legacy-router-field"))
+    const rootMarkdown = await root.text()
+    expect(root.status, rootMarkdown).toBe(200)
+    expect(rootMarkdown).toContain("# Legacy field router root")
+    expect(rootMarkdown).toContain("historical router server snapshot selected its index route")
+    expect(await readFile(
+      join(runtime.workspaceRoot, "legacy-router-field", "src", "router.tsx"),
+      "utf8"
+    )).toBe(fixtureRouter)
+
+    const nested = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+      headers: { "x-vibe-show-target": "/other" }
+    })
+    expect(nested.status).toBe(502)
+    expect(await renderError(nested)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+  }, 60_000)
+
   it("renders legacy App-only workspaces without creating a router", async () => {
     const runtime = await startFixtureServer(["legacy-routerless", "semantic"])
     const legacy = await fetch(markdownUrl(runtime.url, "legacy-routerless"))
@@ -405,6 +430,39 @@ describe("SSR Markdown endpoint", () => {
     await expect(access(
       join(runtime.workspaceRoot, "missing-entry", "src", "router.tsx")
     )).rejects.toMatchObject({ code: "ENOENT" })
+  }, 60_000)
+
+  it("logs exactly one structured render failure without source contents", async () => {
+    const lines: string[] = []
+    vi.spyOn(console, "error").mockImplementation((...values) => {
+      lines.push(values.map(String).join(" "))
+    })
+    const runtime = await startFixtureServer(["render-failure-log"])
+
+    const response = await fetch(markdownUrl(runtime.url, "render-failure-log"))
+    expect(response.status).toBe(502)
+    expect(await renderError(response)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+
+    const events = lines.flatMap((line) => {
+      try {
+        const value = JSON.parse(line) as Record<string, unknown>
+        return value.event === "ssr-markdown-render-failed" ? [value] : []
+      } catch {
+        return []
+      }
+    })
+    expect(events).toEqual([{
+      level: "error",
+      source: "show-runtime",
+      event: "ssr-markdown-render-failed",
+      sessionId: "render-failure-log",
+      phase: "render",
+      errorClass: "WorkerCommandError",
+      message: "Show Page rendering failed."
+    }])
+    expect(lines.join("\n")).not.toContain("RENDER_FAILURE_FILE_CONTENT_MUST_NOT_LEAK")
   }, 60_000)
 
   it("matches host intrinsic behavior at the SSR realm boundary", async () => {
@@ -1326,7 +1384,7 @@ async function rendererHarness(options: {
       }
     }
   })
-  return { renderer, request, worker, fingerprinter, watcher, workspace }
+  return { renderer, request, worker, fingerprinter, watcher, vite, workspace }
 }
 
 describe("SSR Markdown orchestrator", () => {
@@ -1347,18 +1405,25 @@ describe("SSR Markdown orchestrator", () => {
 
   it("uses fingerprint recomputation and watcher events as independent invalidation signals", async () => {
     const harness = await rendererHarness()
+    const invalidateModuleValidation = vi.fn()
+    registerSsrModuleValidationInvalidator(harness.vite, invalidateModuleValidation)
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("hit")
 
     harness.fingerprinter.versions.set("page", "workspace-v2")
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
     expect(harness.worker.invalidations).toContain("page")
+    expect(invalidateModuleValidation).toHaveBeenCalledTimes(1)
 
     const priorInvalidations = harness.worker.invalidations.length
+    const priorValidationInvalidations = invalidateModuleValidation.mock.calls.length
     harness.watcher.emit("change", join(harness.workspace, "src", "page.tsx"))
     await vi.waitFor(() => {
       expect(harness.worker.invalidations.length).toBeGreaterThan(priorInvalidations)
     })
+    expect(invalidateModuleValidation.mock.calls.length).toBeGreaterThan(
+      priorValidationInvalidations
+    )
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
   })
 

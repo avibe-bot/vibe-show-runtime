@@ -205,7 +205,7 @@ with `--render-cache-ttl-ms` and `--render-max-output-bytes` (defaults: 30 secon
 and 512 KiB). The Markdown cache is bounded to 64 entries per session and 256
 globally, with Vite watcher invalidation and workspace fingerprint recomputation
 as the correctness backstop. See [SSR Markdown Renderer](docs/ssr-markdown-renderer.md)
-for the cache identity, cancellation model, router migration rule, and measured
+for the cache identity, cancellation model, legacy-router policy, and measured
 fixture results.
 
 `/sessions/:sessionId/app/api/*` dispatches to Web-standard handlers in the

@@ -10,12 +10,15 @@ const ROUTED_SSR_MARKDOWN_ENTRY_SOURCE = `
 import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server.browser"
 import App from "/src/App.tsx"
-import { SsrRouterProvider } from "/src/router.tsx"
+import * as RouterModule from "/src/router.tsx"
+
+export const hasSsrRouterProvider = typeof RouterModule.SsrRouterProvider === "function"
 
 export function render(location) {
-  return renderToStaticMarkup(
-    createElement(SsrRouterProvider, { location }, createElement(App))
-  )
+  const app = createElement(App)
+  return renderToStaticMarkup(hasSsrRouterProvider
+    ? createElement(RouterModule.SsrRouterProvider, { location }, app)
+    : app)
 }
 `
 
@@ -23,6 +26,8 @@ const ROUTERLESS_SSR_MARKDOWN_ENTRY_SOURCE = `
 import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server.browser"
 import App from "/src/App.tsx"
+
+export const hasSsrRouterProvider = false
 
 export function render() {
   return renderToStaticMarkup(createElement(App))

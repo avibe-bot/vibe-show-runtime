@@ -29,13 +29,40 @@ export function convertSsrRenderedHtmlToMarkdown(
   source: string,
   options: SsrMarkdownConversionOptions
 ): SsrMarkdownConversionResult {
-  const html = cleanupSsrRenderedHtml(source, options)
-  const markdown = convertRenderedHtmlToMarkdown(html)
-  if (!markdown.trim()) throw new Error("The rendered page has no Markdown content")
-  if (utf8ByteLength(markdown) > options.maxOutputBytes) {
-    throw outputTooLarge(options.maxOutputBytes)
+  let html: string
+  try {
+    html = cleanupSsrRenderedHtml(source, options)
+  } catch (error) {
+    throw postRenderPhaseError("cleanup", error)
   }
-  return { markdown, html }
+
+  try {
+    const markdown = convertRenderedHtmlToMarkdown(html)
+    if (!markdown.trim()) throw new Error("The rendered page has no Markdown content")
+    if (utf8ByteLength(markdown) > options.maxOutputBytes) {
+      throw outputTooLarge(options.maxOutputBytes)
+    }
+    return { markdown, html }
+  } catch (error) {
+    throw postRenderPhaseError("conversion", error)
+  }
+}
+
+function postRenderPhaseError(phase: "cleanup" | "conversion", cause: unknown): Error {
+  const source = cause && typeof cause === "object"
+    ? cause as Record<string, unknown>
+    : { message: String(cause) }
+  const error = new Error(
+    typeof source.message === "string" ? source.message : "SSR Markdown processing failed",
+    { cause }
+  ) as Error & { code?: string; status?: number; phase: "cleanup" | "conversion" }
+  if (typeof source.name === "string") error.name = source.name
+  if (typeof source.code === "string") error.code = source.code
+  if (typeof source.status === "number" && Number.isFinite(source.status)) {
+    error.status = source.status
+  }
+  error.phase = phase
+  return error
 }
 
 export function cleanupSsrRenderedHtml(

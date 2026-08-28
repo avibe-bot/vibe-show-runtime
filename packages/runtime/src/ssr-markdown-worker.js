@@ -79,7 +79,8 @@ async function executeCommand(command) {
         if (
           !entry ||
           typeof entry !== "object" ||
-          typeof entry.render !== "function"
+          typeof entry.render !== "function" ||
+          typeof entry.hasSsrRouterProvider !== "boolean"
         ) {
           throw new Error("The Show Page SSR entry is incomplete")
         }
@@ -93,6 +94,14 @@ async function executeCommand(command) {
     case "render-markdown": {
       const state = sessionState(command)
       try {
+        if (
+          !state.entry.hasSsrRouterProvider &&
+          command.location?.pathname !== "/"
+        ) {
+          throw new Error(
+            "This Show Page router supports SSR Markdown only for the root document"
+          )
+        }
         const html = await runWorkspaceCommand(
           command,
           state.evaluator,

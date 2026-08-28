@@ -12,6 +12,7 @@ export type SsrMarkdownSerializedError = {
   stack?: string
   code?: string
   status?: number
+  phase?: "cleanup" | "conversion"
 }
 
 export class SsrMarkdownIpcLimitError extends Error {
@@ -140,6 +141,9 @@ export function serializeSsrMarkdownError(value: unknown): SsrMarkdownSerialized
     code: boundedText(error.code, 128),
     status: typeof error.status === "number" && Number.isFinite(error.status)
       ? error.status
+      : undefined,
+    phase: error.phase === "cleanup" || error.phase === "conversion"
+      ? error.phase
       : undefined
   }
   assertSsrMarkdownIpcValue(
