@@ -94,6 +94,33 @@ async function createIndependentReactDependencyRoot(targetRoot: string): Promise
   }
 }
 
+async function createNonHoistedDependencyRootWithoutMotion(targetRoot: string): Promise<void> {
+  const sourceNodeModules = join(dependencyRoot, "node_modules")
+  const targetNodeModules = join(targetRoot, "node_modules")
+  await mkdir(targetNodeModules, { recursive: true })
+
+  for (const packageName of ["react", "react-dom", "@avibe/show-sdk"]) {
+    const target = installedPackagePath(targetNodeModules, packageName)
+    await mkdir(dirname(target), { recursive: true })
+    await symlink(
+      await realpath(installedPackagePath(sourceNodeModules, packageName)),
+      target,
+      process.platform === "win32" ? "junction" : "dir"
+    )
+  }
+
+  const uiRoot = installedPackagePath(targetNodeModules, "@avibe/show-ui")
+  await mkdir(uiRoot, { recursive: true })
+  await cp(join(dependencyRoot, "packages", "ui", "package.json"), join(uiRoot, "package.json"))
+  const nestedMotion = installedPackagePath(join(uiRoot, "node_modules"), "motion")
+  await mkdir(dirname(nestedMotion), { recursive: true })
+  await symlink(
+    await realpath(installedPackagePath(sourceNodeModules, "motion")),
+    nestedMotion,
+    process.platform === "win32" ? "junction" : "dir"
+  )
+}
+
 describe("Vite SSR Markdown spike", () => {
   it("renders semantic React, Show UI, pre-effect state, cleanup, CSS, and an asset without a browser", async () => {
     const vite = await fixtureVite("semantic")
@@ -213,6 +240,40 @@ describe("Vite SSR Markdown spike", () => {
           isolatedServer.close((error) => error ? rejectClose(error) : resolveClose())
         })
       }
+      await rm(isolatedRoot, { force: true, recursive: true })
+    }
+  }, 60_000)
+
+  it("rejects a non-hoisted dependency root without top-level Motion during warm-up", async () => {
+    const isolatedRoot = await mkdtemp(join(tmpdir(), "avibe-show-ssr-non-hoisted-motion-"))
+    const isolatedDependencyRoot = join(isolatedRoot, "dependencies")
+    const isolatedWorkspaceRoot = join(isolatedRoot, "workspaces")
+    let isolatedRuntime: ReturnType<typeof createShowRuntime> | undefined
+    try {
+      await createNonHoistedDependencyRootWithoutMotion(isolatedDependencyRoot)
+      await expect(access(installedPackagePath(
+        join(isolatedDependencyRoot, "node_modules"),
+        "motion"
+      ))).rejects.toMatchObject({ code: "ENOENT" })
+      await expect(access(installedPackagePath(
+        join(isolatedDependencyRoot, "node_modules", "@avibe", "show-ui", "node_modules"),
+        "motion"
+      ))).resolves.toBeUndefined()
+
+      isolatedRuntime = createShowRuntime({
+        workspaceRoot: isolatedWorkspaceRoot,
+        dependencyRoot: isolatedDependencyRoot,
+        cacheRoot: join(isolatedRoot, ".vite-cache"),
+        idlePruneIntervalMs: 0
+      })
+      await expect(isolatedRuntime.ensureSession(
+        "missing-top-level-motion",
+        "/show/missing-top-level-motion/"
+      )).rejects.toThrow(
+        `Invalid Show Runtime dependency root ${isolatedDependencyRoot}: missing motion`
+      )
+    } finally {
+      await isolatedRuntime?.close()
       await rm(isolatedRoot, { force: true, recursive: true })
     }
   }, 60_000)

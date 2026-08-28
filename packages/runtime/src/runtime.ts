@@ -30,6 +30,7 @@ import {
   SSR_MARKDOWN_ENVIRONMENT,
   ssrMarkdownEntryPlugin
 } from "./ssr-markdown-entry-plugin.js"
+import { registerSsrModuleValidationInvalidator } from "./ssr-module-validation-cache.js"
 import { ensureSessionTemplate } from "./templates.js"
 import { createVendorExternalizePlugins, isProvidedVendorSpecifier } from "./vendor-externalize-plugin.js"
 import {
@@ -54,6 +55,7 @@ const NODE_BUILTIN_SPECIFIERS = new Set([
 const RUNTIME_VITE_PACKAGE_ROOT = dirname(createRequire(import.meta.url).resolve("vite/package.json"))
 const SSR_MARKDOWN_ACQUISITION_CONTRACT_VERSION = "ssr-markdown-acquisition-v1"
 const SSR_OPTIMIZER_BOUNDARY_ERROR = "Show Page SSR dependency optimization was denied by the workspace boundary"
+const SSR_MODULE_VALIDATION_CACHE_MAX_ENTRIES = 16_384
 const SENSITIVE_FS_DENY_PATTERNS = [
   "**/.git",
   "**/.git/**",
@@ -96,6 +98,11 @@ type WorkspaceFileBoundary = {
   allowedRoots: string[]
   cacheRoots: string[]
   ssrArtifactRoots: string[]
+  validationCache: {
+    canonicalTargets: Map<string, { target: string, identity: string }>
+    canonicalVerdicts: Map<string, boolean>
+    generation: number
+  }
 }
 
 async function fileBoundaryRoots(paths: string[]): Promise<string[]> {
@@ -182,13 +189,120 @@ async function isDeniedSsrModuleTarget(
 ): Promise<boolean> {
   const filePath = ssrModuleFilePath(rawId)
   if (!filePath) return true
-  const target = await realpath(filePath).catch(() => undefined)
-  if (!target) return true
-  if (relativeWithin(boundary.cacheRoots, target) !== undefined) {
-    const artifactRelative = relativeWithin(boundary.ssrArtifactRoots, target)
-    return artifactRelative === undefined || hasSensitiveFileSegment(normalizePath(artifactRelative))
+  while (true) {
+    const generation = boundary.validationCache.generation
+    const canonical = await canonicalSsrModuleTarget(filePath, boundary)
+    if (generation !== boundary.validationCache.generation) continue
+    if (!canonical) return true
+    const { target, identity } = canonical
+    const cached = boundary.validationCache.canonicalVerdicts.get(target)
+    if (cached !== undefined) {
+      touchBoundedCache(boundary.validationCache.canonicalVerdicts, target, cached)
+      if (!cached && cacheableCanonicalLookup(filePath, target, boundary)) {
+        touchBoundedCache(boundary.validationCache.canonicalTargets, filePath, canonical)
+      }
+      return cached
+    }
+    const denied = relativeWithin(boundary.cacheRoots, target) !== undefined
+      ? (() => {
+          const artifactRelative = relativeWithin(boundary.ssrArtifactRoots, target)
+          return artifactRelative === undefined || hasSensitiveFileSegment(normalizePath(artifactRelative))
+        })()
+      : isDeniedResolvedTarget(target, boundary)
+    if (generation !== boundary.validationCache.generation) continue
+    touchBoundedCache(boundary.validationCache.canonicalVerdicts, target, denied)
+    if (!denied && cacheableCanonicalLookup(filePath, target, boundary)) {
+      touchBoundedCache(boundary.validationCache.canonicalTargets, filePath, {
+        target,
+        identity
+      })
+    }
+    return denied
   }
-  return isDeniedResolvedTarget(target, boundary)
+}
+
+async function canonicalSsrModuleTarget(
+  filePath: string,
+  boundary: WorkspaceFileBoundary
+): Promise<{ target: string, identity: string } | undefined> {
+  let identity = await ssrModuleFileIdentity(filePath)
+  if (!identity) {
+    boundary.validationCache.canonicalTargets.delete(filePath)
+    return undefined
+  }
+  const cached = boundary.validationCache.canonicalTargets.get(filePath)
+  if (cached?.identity === identity) {
+    touchBoundedCache(boundary.validationCache.canonicalTargets, filePath, cached)
+    return cached
+  }
+  boundary.validationCache.canonicalTargets.delete(filePath)
+
+  // A path may be replaced while it is being canonicalized. Only grant a
+  // target observed under one stable lstat identity; repeated churn fails closed.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const target = await realpath(filePath).catch(() => undefined)
+    if (!target) return undefined
+    const confirmedIdentity = await ssrModuleFileIdentity(filePath)
+    if (!confirmedIdentity) return undefined
+    if (confirmedIdentity === identity) return { target, identity }
+    identity = confirmedIdentity
+  }
+  return undefined
+}
+
+async function ssrModuleFileIdentity(filePath: string): Promise<string | undefined> {
+  try {
+    const value = await lstat(filePath, { bigint: true })
+    return [
+      value.dev,
+      value.ino,
+      value.mode,
+      value.size,
+      value.mtimeNs,
+      value.ctimeNs
+    ].join(":")
+  } catch {
+    return undefined
+  }
+}
+
+function cacheableCanonicalLookup(
+  filePath: string,
+  target: string,
+  boundary: WorkspaceFileBoundary
+): boolean {
+  // Workspace paths stay freshly canonicalized so a retargeted symlink cannot
+  // reuse an allowed dependency verdict between invalidation signals.
+  return relativeWithin(boundary.workspaceRoots, filePath) === undefined &&
+    sameFilesystemPath(filePath, target)
+}
+
+function sameFilesystemPath(left: string, right: string): boolean {
+  const normalizedLeft = normalizePath(resolve(left))
+  const normalizedRight = normalizePath(resolve(right))
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight
+}
+
+function touchBoundedCache<Key, Value>(
+  cache: Map<Key, Value>,
+  key: Key,
+  value: Value
+): void {
+  cache.delete(key)
+  cache.set(key, value)
+  while (cache.size > SSR_MODULE_VALIDATION_CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next()
+    if (oldest.done) break
+    cache.delete(oldest.value)
+  }
+}
+
+function clearSsrModuleValidationCache(boundary: WorkspaceFileBoundary): void {
+  boundary.validationCache.generation += 1
+  boundary.validationCache.canonicalTargets.clear()
+  boundary.validationCache.canonicalVerdicts.clear()
 }
 
 function ssrModuleFilePath(rawId: string): string | undefined {
@@ -614,7 +728,12 @@ export function createShowRuntime(
       requestAllowedRoots,
       allowedRoots: ssrAllowedRoots,
       cacheRoots,
-      ssrArtifactRoots
+      ssrArtifactRoots,
+      validationCache: {
+        canonicalTargets: new Map(),
+        canonicalVerdicts: new Map(),
+        generation: 0
+      }
     }
     const ssrOptimizeIncludes = await optimizableBareImports(
       [...new Set([
@@ -728,6 +847,17 @@ export function createShowRuntime(
     await withViteCacheWarmLock(cacheDir, async () => {
       const viteStarted = performance.now()
       session.vite = await createViteServer(viteConfig)
+      registerSsrModuleValidationInvalidator(
+        session.vite,
+        (changedPath) => {
+          if (
+            changedPath === undefined ||
+            relativeWithin(fileBoundary.allowedRoots, resolve(changedPath)) !== undefined
+          ) {
+            clearSsrModuleValidationCache(fileBoundary)
+          }
+        }
+      )
       logTiming("warmSession.createViteServer", session.id, viteStarted, { cacheDir, basePath })
       const entryStarted = performance.now()
       await warmEntryModuleGraph(session.vite, sourceDependencies.entryRequests)
@@ -881,9 +1011,9 @@ async function ensureSessionDependencies(
   // The human CSS pipeline and the fully inlined Markdown graph cannot use the
   // shared JS fallback for every Runtime-owned package. Link the pinned copies
   // into the private install: Tailwind/UI serve CSS filesystem resolution, while
-  // React/React DOM give Markdown's CJS prebundle one physical singleton source.
+  // React/React DOM and Motion give Markdown one physical singleton source.
   // Browser JS still externalizes to the shared vendor import map.
-  for (const packageName of ["tailwindcss", uiPackageName, "react", "react-dom"]) {
+  for (const packageName of ["tailwindcss", uiPackageName, "react", "react-dom", "motion"]) {
     await ensureSharedPackageLink(extrasDir, sharedNodeModules, packageName)
   }
   const declaredPackageRoots = await resolveAllowedPackageRoots(extrasDir, declaredExtras.packageNames)
@@ -1906,7 +2036,7 @@ async function findNearestDependencyRoot(uiPackageName = "@avibe/show-ui") {
 }
 
 async function missingDependencyRootPackages(dependencyRoot: string, uiPackageName: string): Promise<string[]> {
-  const required = ["react", "react-dom", uiPackageName, "@avibe/show-sdk"]
+  const required = ["react", "react-dom", "motion", uiPackageName, "@avibe/show-sdk"]
   const missing: string[] = []
   for (const packageName of required) {
     const packageJson = join(packageRoot(dependencyRoot, packageName), "package.json")

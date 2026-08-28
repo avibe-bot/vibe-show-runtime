@@ -1,6 +1,9 @@
 import { readFileSync } from "node:fs"
 import { ModuleRunner } from "vite/module-runner"
-import { convertSsrRenderedHtmlToMarkdown } from "./ssr-markdown-conversion.js"
+import {
+  cleanupSsrRenderedHtml,
+  convertCleanedSsrHtmlToMarkdown
+} from "./ssr-markdown-conversion.js"
 import {
   assertSsrMarkdownIpcValue,
   serializeSsrMarkdownError,
@@ -79,7 +82,8 @@ async function executeCommand(command) {
         if (
           !entry ||
           typeof entry !== "object" ||
-          typeof entry.render !== "function"
+          typeof entry.render !== "function" ||
+          typeof entry.hasSsrRouterProvider !== "boolean"
         ) {
           throw new Error("The Show Page SSR entry is incomplete")
         }
@@ -93,17 +97,38 @@ async function executeCommand(command) {
     case "render-markdown": {
       const state = sessionState(command)
       try {
+        if (
+          !state.entry.hasSsrRouterProvider &&
+          command.location?.pathname !== "/"
+        ) {
+          throw new Error(
+            "This Show Page router supports SSR Markdown only for the root document"
+          )
+        }
+        const legacyLocation = state.entry.hasSsrRouterProvider
+          ? undefined
+          : legacyWindowLocation(command.options.documentUrl)
         const html = await runWorkspaceCommand(
           command,
           state.evaluator,
-          () => state.entry.render(state.evaluator.cloneJson(command.location))
+          () => state.entry.render(state.evaluator.cloneJson(command.location)),
+          legacyLocation
         )
+        await sendAndWait({
+          type: "command-phase",
+          requestId: command.requestId,
+          phase: "cleanup"
+        })
+        const cleanedHtml = cleanupSsrRenderedHtml(html, command.options)
         await sendAndWait({
           type: "command-phase",
           requestId: command.requestId,
           phase: "conversion"
         })
-        const { markdown } = convertSsrRenderedHtmlToMarkdown(html, command.options)
+        const markdown = convertCleanedSsrHtmlToMarkdown(
+          cleanedHtml,
+          command.options.maxOutputBytes
+        )
         return { markdown }
       } finally {
         await disposeSession(command.sessionId)
@@ -127,9 +152,10 @@ async function executeCommand(command) {
  * @param {Record<string, any>} command
  * @param {SsrSandboxEvaluator} evaluator
  * @param {() => T | Promise<T>} operation
+ * @param {Readonly<{ pathname: string, search: string, hash: string, href: string, origin: string }>} [legacyLocation]
  * @returns {Promise<T>}
  */
-async function runWorkspaceCommand(command, evaluator, operation) {
+async function runWorkspaceCommand(command, evaluator, operation, legacyLocation) {
   if (activeWorkspaceCommand) {
     throw new Error("The SSR Markdown child cannot run overlapping workspace commands")
   }
@@ -144,7 +170,7 @@ async function runWorkspaceCommand(command, evaluator, operation) {
   let result
   try {
     try {
-      result = await evaluator.runCommand(operation)
+      result = await evaluator.runCommand(operation, legacyLocation)
     } catch (error) {
       failed = true
       failure = error
@@ -155,6 +181,18 @@ async function runWorkspaceCommand(command, evaluator, operation) {
   } finally {
     if (activeWorkspaceCommand === scope) activeWorkspaceCommand = undefined
   }
+}
+
+/** @param {string} documentUrl */
+function legacyWindowLocation(documentUrl) {
+  const location = new URL(documentUrl)
+  return Object.freeze({
+    pathname: location.pathname,
+    search: location.search,
+    hash: location.hash,
+    href: location.href,
+    origin: location.origin
+  })
 }
 
 /** @param {{ pending: Set<Promise<unknown>> }} scope */

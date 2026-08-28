@@ -30,12 +30,20 @@ export function convertSsrRenderedHtmlToMarkdown(
   options: SsrMarkdownConversionOptions
 ): SsrMarkdownConversionResult {
   const html = cleanupSsrRenderedHtml(source, options)
+  return {
+    markdown: convertCleanedSsrHtmlToMarkdown(html, options.maxOutputBytes),
+    html
+  }
+}
+
+export function convertCleanedSsrHtmlToMarkdown(
+  html: string,
+  maxOutputBytes: number
+): string {
   const markdown = convertRenderedHtmlToMarkdown(html)
   if (!markdown.trim()) throw new Error("The rendered page has no Markdown content")
-  if (utf8ByteLength(markdown) > options.maxOutputBytes) {
-    throw outputTooLarge(options.maxOutputBytes)
-  }
-  return { markdown, html }
+  if (utf8ByteLength(markdown) > maxOutputBytes) throw outputTooLarge(maxOutputBytes)
+  return markdown
 }
 
 export function cleanupSsrRenderedHtml(

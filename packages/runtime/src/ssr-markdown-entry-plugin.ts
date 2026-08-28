@@ -9,23 +9,47 @@ const RESOLVED_SSR_MARKDOWN_ENTRY_ID = `\0${SSR_MARKDOWN_ENTRY_ID}`
 const ROUTED_SSR_MARKDOWN_ENTRY_SOURCE = `
 import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server.browser"
+import { MotionConfig } from "motion/react"
 import App from "/src/App.tsx"
-import { SsrRouterProvider } from "/src/router.tsx"
+import * as RouterModule from "/src/router.tsx"
+
+const REACT_MEMO_TYPE = Symbol.for("react.memo")
+const REACT_FORWARD_REF_TYPE = Symbol.for("react.forward_ref")
+
+function isRenderableComponent(value, seen = new Set()) {
+  if (typeof value === "function") return true
+  if (typeof value !== "object" || value === null) return false
+  if (seen.has(value)) return false
+  seen.add(value)
+  if (value.$$typeof === REACT_MEMO_TYPE) return isRenderableComponent(value.type, seen)
+  if (value.$$typeof === REACT_FORWARD_REF_TYPE) return typeof value.render === "function"
+  return false
+}
+
+export const hasSsrRouterProvider = isRenderableComponent(RouterModule.SsrRouterProvider)
 
 export function render(location) {
-  return renderToStaticMarkup(
-    createElement(SsrRouterProvider, { location }, createElement(App))
-  )
+  const app = createElement(App)
+  return renderToStaticMarkup(hasSsrRouterProvider
+    ? createElement(RouterModule.SsrRouterProvider, { location }, app)
+    : createElement(MotionConfig, { isStatic: true }, app))
 }
 `
 
 const ROUTERLESS_SSR_MARKDOWN_ENTRY_SOURCE = `
 import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server.browser"
+import { MotionConfig } from "motion/react"
 import App from "/src/App.tsx"
 
+export const hasSsrRouterProvider = false
+
 export function render() {
-  return renderToStaticMarkup(createElement(App))
+  return renderToStaticMarkup(createElement(
+    MotionConfig,
+    { isStatic: true },
+    createElement(App)
+  ))
 }
 `
 

@@ -1,13 +1,10 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
-import { fileURLToPath } from "node:url"
+import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import { ensureSessionTemplate } from "./templates.js"
 
 const workspaces: string[] = []
-const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), "__fixtures__", "router-migration")
-
 afterEach(async () => {
   await Promise.all(workspaces.splice(0).map((workspace) => rm(workspace, { force: true, recursive: true })))
 })
@@ -111,37 +108,5 @@ describe("theme import ordering", () => {
     expect(migrated.startsWith('@import "tailwindcss";\n@import "@avibe/show-ui/theme.css";\n@import "./brand.css";')).toBe(true)
     expect(migrated.match(/@import "tailwindcss"/g)).toHaveLength(1)
     expect(migrated.match(/@import "@avibe\/show-ui\/theme\.css"/g)).toHaveLength(1)
-  })
-})
-
-describe("generated router migration", () => {
-  it("migrates the byte-identical historical Runtime router", async () => {
-    const workspace = await workspaceWithStyles("")
-    const routerPath = join(workspace, "src", "router.tsx")
-    const historical = (await readFile(join(fixtureRoot, "router-history-v1.tsx"), "utf8"))
-      .replaceAll("\r\n", "\n")
-    await writeFile(routerPath, historical)
-
-    await ensureSessionTemplate(workspace)
-
-    const migrated = await readFile(routerPath, "utf8")
-    expect(migrated).not.toBe(historical)
-    expect(migrated).toContain("export function SsrRouterProvider")
-    expect(migrated).toContain("query: URLSearchParams")
-    await ensureSessionTemplate(workspace)
-    expect(await readFile(routerPath, "utf8")).toBe(migrated)
-  })
-
-  it("never overwrites a modified historical router", async () => {
-    const workspace = await workspaceWithStyles("")
-    const routerPath = join(workspace, "src", "router.tsx")
-    const historical = (await readFile(join(fixtureRoot, "router-history-v1.tsx"), "utf8"))
-      .replaceAll("\r\n", "\n")
-    const modified = `${historical}\n// workspace-owned customization\n`
-    await writeFile(routerPath, modified)
-
-    await ensureSessionTemplate(workspace)
-
-    expect(await readFile(routerPath, "utf8")).toBe(modified)
   })
 })

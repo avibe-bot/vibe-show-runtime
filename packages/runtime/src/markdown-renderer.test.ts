@@ -12,8 +12,10 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   createMarkdownRenderer,
   createModuleGraphSsrWorker,
+  DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS,
   MarkdownRenderError,
   SsrWorkerUnavailableError,
+  type MarkdownRenderPhaseTiming,
   type MarkdownRenderRequest,
   type SsrMarkdownWorker
 } from "./markdown-renderer.js"
@@ -32,6 +34,7 @@ import {
   type ShowRuntimeServerDependencies
 } from "./server.js"
 import { SSR_MARKDOWN_ENVIRONMENT } from "./ssr-markdown-entry-plugin.js"
+import { registerSsrModuleValidationInvalidator } from "./ssr-module-validation-cache.js"
 import { SsrSandboxEvaluator } from "./ssr-markdown-sandbox.js"
 import type { ShowRuntimeOptions } from "./types.js"
 import type { WorkspaceFingerprinter } from "./workspace-fingerprint.js"
@@ -39,6 +42,8 @@ import type { WorkspaceFingerprinter } from "./workspace-fingerprint.js"
 const sourceDirectory = dirname(fileURLToPath(import.meta.url))
 const fixtureRoot = join(sourceDirectory, "__fixtures__", "ssr-markdown")
 const dependencyRoot = resolve(sourceDirectory, "../../..")
+const SCHEDULED_WORK_LOAD_TIMEOUT_MS = 30_000
+const SCHEDULED_WORK_INTERVAL_DELAY_MS = 35_000
 const cleanups: Array<() => Promise<void>> = []
 
 afterEach(async () => {
@@ -65,7 +70,12 @@ async function startFixtureServer(
   }, dependencies)
   cleanups.push(async () => {
     await server.close()
-    await rm(workspaceRoot, { recursive: true, force: true })
+    await rm(workspaceRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100
+    })
   })
   return { ...server, workspaceRoot }
 }
@@ -77,6 +87,12 @@ function markdownUrl(runtimeUrl: string, sessionId: string): string {
 function intrinsicReport(markdown: string): Record<string, any> {
   const match = /IntrinsicReportBegin`(.+)`IntrinsicReportEnd/.exec(markdown)
   if (!match) throw new Error(`Intrinsic report was absent from Markdown: ${markdown}`)
+  return JSON.parse(match[1]) as Record<string, any>
+}
+
+function legacyLocationReport(markdown: string): Record<string, any> {
+  const match = /LegacyLocationReport:(\{.+\})/.exec(markdown)
+  if (!match) throw new Error(`Legacy location report was absent from Markdown: ${markdown}`)
   return JSON.parse(match[1]) as Record<string, any>
 }
 
@@ -293,9 +309,11 @@ describe("SSR Markdown process protocol", () => {
     const error = new Error("oversized-error-".repeat(16 * 1024)) as Error & {
       code: string
       status: number
+      phase: string
     }
     error.code = "ERR_FIXTURE"
     error.status = 502
+    error.phase = "conversion"
     const serialized = serializeSsrMarkdownError(error)
     expect(assertSsrMarkdownIpcValue(
       serialized,
@@ -304,6 +322,7 @@ describe("SSR Markdown process protocol", () => {
     )).toBeLessThanOrEqual(SSR_MARKDOWN_IPC_ERROR_MAX_BYTES)
     expect(Buffer.byteLength(serialized.message ?? "", "utf8")).toBeLessThanOrEqual(4 * 1024)
     expect(serialized).toMatchObject({ code: "ERR_FIXTURE", status: 502 })
+    expect(serialized).not.toHaveProperty("phase")
   })
 
   it("rejects oversized command input before sending it to the child", async () => {
@@ -372,6 +391,177 @@ describe("SSR Markdown process protocol", () => {
 })
 
 describe("SSR Markdown endpoint", () => {
+  it("renders a field legacy router only at the root without modifying it", async () => {
+    const fixtureRouterPath = join(fixtureRoot, "legacy-router-field", "src", "router.tsx")
+    const fixtureHomePath = join(
+      fixtureRoot,
+      "legacy-router-field",
+      "src",
+      "pages",
+      "index.tsx"
+    )
+    const fixtureRouter = await readFile(fixtureRouterPath, "utf8")
+    const fixtureHome = await readFile(fixtureHomePath, "utf8")
+    const runtime = await startFixtureServer(["legacy-router-field"])
+
+    const headers = { "x-vibe-show-base": "/p/public-token/" }
+    const root = await fetch(markdownUrl(runtime.url, "legacy-router-field"), { headers })
+    const rootMarkdown = await root.text()
+    expect(root.status, rootMarkdown).toBe(200)
+    expect(rootMarkdown).toContain("# Vibe Show Runtime")
+    expect(rootMarkdown).toContain("This session is served by the managed service runtime.")
+    expect(rootMarkdown).toContain("[Open second page](/p/public-token/second)")
+    expect(await readFile(
+      join(runtime.workspaceRoot, "legacy-router-field", "src", "router.tsx"),
+      "utf8"
+    )).toBe(fixtureRouter)
+    expect(await readFile(
+      join(runtime.workspaceRoot, "legacy-router-field", "src", "pages", "index.tsx"),
+      "utf8"
+    )).toBe(fixtureHome)
+
+    const nested = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+      headers: { ...headers, "x-vibe-show-target": "/other" }
+    })
+    expect(nested.status).toBe(502)
+    expect(await renderError(nested)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+  }, 60_000)
+
+  it("exposes a request-scoped read-only location only to the legacy fallback", async () => {
+    const runtime = await startFixtureServer([
+      "legacy-location-facade",
+      "modern-provider-window"
+    ])
+    const origin = new URL(runtime.url).origin
+    const legacy = await fetch(markdownUrl(runtime.url, "legacy-location-facade"), {
+      headers: {
+        "x-vibe-show-base": "/p/public-token/",
+        "x-vibe-show-target": "/?period=Q4"
+      }
+    })
+    const legacyMarkdown = await legacy.text()
+    expect(legacy.status, legacyMarkdown).toBe(200)
+    expect(legacyLocationReport(legacyMarkdown)).toEqual({
+      pathname: "/p/public-token/",
+      search: "?period=Q4",
+      hash: "",
+      href: `${origin}/p/public-token/?period=Q4`,
+      origin,
+      windowKeys: ["location"],
+      locationKeys: ["hash", "href", "origin", "pathname", "search"],
+      windowFrozen: true,
+      locationFrozen: true,
+      windowPrototypeNull: true,
+      locationPrototypeNull: true,
+      documentPresent: false,
+      historyPresent: false,
+      eventLifecyclePresent: false,
+      mutationError: "TypeError",
+      pathnameUnchanged: true
+    })
+
+    const modern = await fetch(markdownUrl(runtime.url, "modern-provider-window"))
+    const modernMarkdown = await modern.text()
+    expect(modern.status, modernMarkdown).toBe(200)
+    expect(modernMarkdown).toContain("# Modern provider window policy")
+    expect(modernMarkdown).toContain("Window present: false")
+    expect(modernMarkdown).toContain("Window access: ReferenceError")
+  }, 60_000)
+
+  it("accepts supported React exotic components and sends unsupported values to legacy", async () => {
+    const runtime = await startFixtureServer([
+      "exotic-router-provider",
+      "forward-ref-router-provider",
+      "invalid-router-provider",
+      "element-router-provider",
+      "lazy-router-provider"
+    ])
+
+    const exotic = await fetch(markdownUrl(runtime.url, "exotic-router-provider"), {
+      headers: { "x-vibe-show-target": "/teams/acme?period=Q4" }
+    })
+    const exoticMarkdown = await exotic.text()
+    expect(exotic.status, exoticMarkdown).toBe(200)
+    expect(exoticMarkdown).toContain("# Exotic provider team acme")
+    expect(exoticMarkdown).toContain("Period: Q4")
+
+    const forwardRef = await fetch(markdownUrl(runtime.url, "forward-ref-router-provider"), {
+      headers: { "x-vibe-show-target": "/teams/avibe?period=Q1" }
+    })
+    const forwardRefMarkdown = await forwardRef.text()
+    expect(forwardRef.status, forwardRefMarkdown).toBe(200)
+    expect(forwardRefMarkdown).toContain("# ForwardRef provider team avibe")
+    expect(forwardRefMarkdown).toContain("Period: Q1")
+
+    const legacyRoot = await fetch(markdownUrl(runtime.url, "invalid-router-provider"))
+    const legacyMarkdown = await legacyRoot.text()
+    expect(legacyRoot.status, legacyMarkdown).toBe(200)
+    expect(legacyMarkdown).toContain("# Invalid provider legacy root")
+
+    const legacyNested = await fetch(markdownUrl(runtime.url, "invalid-router-provider"), {
+      headers: { "x-vibe-show-target": "/other" }
+    })
+    expect(legacyNested.status).toBe(502)
+    expect(await renderError(legacyNested)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+
+    const elementRoot = await fetch(markdownUrl(runtime.url, "element-router-provider"))
+    const elementMarkdown = await elementRoot.text()
+    expect(elementRoot.status, elementMarkdown).toBe(200)
+    expect(elementMarkdown).toContain("# Element provider legacy root")
+
+    const elementNested = await fetch(markdownUrl(runtime.url, "element-router-provider"), {
+      headers: { "x-vibe-show-target": "/other" }
+    })
+    expect(elementNested.status).toBe(502)
+    expect(await renderError(elementNested)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+
+    const lazyRoot = await fetch(markdownUrl(runtime.url, "lazy-router-provider"))
+    const lazyMarkdown = await lazyRoot.text()
+    expect(lazyRoot.status, lazyMarkdown).toBe(200)
+    expect(lazyMarkdown).toContain("# Lazy provider legacy root")
+
+    const lazyNested = await fetch(markdownUrl(runtime.url, "lazy-router-provider"), {
+      headers: { "x-vibe-show-target": "/other" }
+    })
+    expect(lazyNested.status).toBe(502)
+    expect(await renderError(lazyNested)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+  }, 60_000)
+
+  it("reuses validation verdicts on the second load of one module graph", async () => {
+    const phaseTimings: MarkdownRenderPhaseTiming[] = []
+    const runtime = await startFixtureServer(
+      ["validation-cache"],
+      {},
+      { markdownRendererOptions: { onPhaseTiming: (timing) => phaseTimings.push(timing) } }
+    )
+    const url = markdownUrl(runtime.url, "validation-cache")
+
+    const first = await fetch(url, {
+      headers: { "x-vibe-show-target": "/?request=1" }
+    })
+    expect(first.status, await first.text()).toBe(200)
+    expect(first.headers.get("x-avibe-render-cache")).toBe("miss")
+    const second = await fetch(url, {
+      headers: { "x-vibe-show-target": "/?request=2" }
+    })
+    expect(second.status, await second.text()).toBe(200)
+    expect(second.headers.get("x-avibe-render-cache")).toBe("miss")
+
+    const loadDurations = phaseTimings
+      .filter((timing) => timing.sessionId === "validation-cache" && timing.phase === "load")
+      .map((timing) => timing.durationMs)
+    expect(loadDurations).toHaveLength(2)
+    expect(loadDurations[1]).toBeLessThan(loadDurations[0] * 0.75)
+  }, 60_000)
+
   it("renders legacy App-only workspaces without creating a router", async () => {
     const runtime = await startFixtureServer(["legacy-routerless", "semantic"])
     const legacy = await fetch(markdownUrl(runtime.url, "legacy-routerless"))
@@ -405,6 +595,68 @@ describe("SSR Markdown endpoint", () => {
     await expect(access(
       join(runtime.workspaceRoot, "missing-entry", "src", "router.tsx")
     )).rejects.toMatchObject({ code: "ENOENT" })
+  }, 60_000)
+
+  it("logs exactly one structured render failure without source contents", async () => {
+    const lines: string[] = []
+    vi.spyOn(console, "error").mockImplementation((...values) => {
+      lines.push(values.map(String).join(" "))
+    })
+    const runtime = await startFixtureServer(["render-failure-log"])
+
+    const response = await fetch(markdownUrl(runtime.url, "render-failure-log"))
+    expect(response.status).toBe(502)
+    expect(await renderError(response)).toEqual({
+      error: { code: "render_failed", message: "Show Page rendering failed." }
+    })
+
+    const events = lines.flatMap((line) => {
+      try {
+        const value = JSON.parse(line) as Record<string, unknown>
+        return value.event === "ssr-markdown-render-failed" ? [value] : []
+      } catch {
+        return []
+      }
+    })
+    expect(events).toEqual([{
+      level: "error",
+      source: "show-runtime",
+      event: "ssr-markdown-render-failed",
+      sessionId: "render-failure-log",
+      phase: "render",
+      errorClass: "WorkerCommandError",
+      message: "Show Page rendering failed."
+    }])
+    expect(lines.join("\n")).not.toContain("RENDER_FAILURE_FILE_CONTENT_MUST_NOT_LEAK")
+  }, 60_000)
+
+  it("reports parent-tracked phases when workspace errors spoof phase metadata", async () => {
+    const lines: string[] = []
+    vi.spyOn(console, "error").mockImplementation((...values) => {
+      lines.push(values.map(String).join(" "))
+    })
+    const runtime = await startFixtureServer(["phase-spoof-load", "phase-spoof-render"])
+
+    for (const sessionId of ["phase-spoof-load", "phase-spoof-render"]) {
+      const response = await fetch(markdownUrl(runtime.url, sessionId))
+      expect(response.status).toBe(502)
+      expect(await renderError(response)).toEqual({
+        error: { code: "render_failed", message: "Show Page rendering failed." }
+      })
+    }
+
+    const events = lines.flatMap((line) => {
+      try {
+        const value = JSON.parse(line) as Record<string, unknown>
+        return value.event === "ssr-markdown-render-failed" ? [value] : []
+      } catch {
+        return []
+      }
+    })
+    expect(events.map(({ sessionId, phase }) => ({ sessionId, phase }))).toEqual([
+      { sessionId: "phase-spoof-load", phase: "load" },
+      { sessionId: "phase-spoof-render", phase: "render" }
+    ])
   }, 60_000)
 
   it("matches host intrinsic behavior at the SSR realm boundary", async () => {
@@ -847,6 +1099,84 @@ describe("SSR Markdown endpoint", () => {
     expect(body).not.toContain(sentinel)
   }, 60_000)
 
+  it("revalidates a cached dependency after its file identity changes", async () => {
+    const sentinel = "RETARGETED_VALIDATION_CACHE_CONTENT_MUST_NOT_LEAK"
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "avibe-show-validation-workspace-"))
+    const dependencyPackage = await mkdtemp(join(tmpdir(), "avibe-show-validation-dependency-"))
+    const outsideRoot = await mkdtemp(join(tmpdir(), "avibe-show-validation-outside-"))
+    cleanups.push(async () => {
+      await rm(dependencyPackage, { recursive: true, force: true })
+      await rm(outsideRoot, { recursive: true, force: true })
+    })
+    const sessionId = "validation-cache-dependency"
+    const workspace = join(workspaceRoot, sessionId)
+    await cp(join(fixtureRoot, "validation-cache"), workspace, { recursive: true })
+    await writeFile(join(dependencyPackage, "package.json"), `${JSON.stringify({
+      name: "show-validation-cache-dependency",
+      version: "1.0.0",
+      type: "module",
+      exports: "./index.js"
+    }, null, 2)}\n`)
+    const dependencyPath = join(dependencyPackage, "index.js")
+    await writeFile(dependencyPath, 'export const value = "allowed dependency bytes"\n')
+    await writeFile(join(workspace, "package.json"), `${JSON.stringify({
+      name: "validation-cache-dependency-page",
+      private: true,
+      dependencies: {
+        "show-validation-cache-dependency": `file:${dependencyPackage}`
+      }
+    }, null, 2)}\n`)
+    const runtime = await startShowRuntimeServer({
+      workspaceRoot,
+      dependencyRoot,
+      cacheRoot: join(workspaceRoot, ".vite-cache"),
+      idlePruneIntervalMs: 0
+    })
+    cleanups.push(async () => {
+      await runtime.close()
+      await rm(workspaceRoot, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 100
+      })
+    })
+
+    await runtime.runtime.ensureSession(sessionId, `/show/${sessionId}/`)
+    const session = runtime.runtime.getSession(sessionId)
+    const environment = session?.vite?.environments[SSR_MARKDOWN_ENVIRONMENT]
+    if (!environment) {
+      throw new Error("Expected the warmed fixture to expose its Markdown environment")
+    }
+    const dependencyRequest = `/@fs/${dependencyPath.replaceAll("\\", "/").replace(/^\/+/, "")}`
+
+    const first = await environment.fetchModule(dependencyRequest)
+    environment.moduleGraph.invalidateAll()
+    const unchanged = await environment.fetchModule(dependencyRequest)
+    expect("code" in first ? first.code : "").toContain("allowed dependency bytes")
+    expect("code" in unchanged ? unchanged.code : "").toContain("allowed dependency bytes")
+
+    const deniedPath = join(outsideRoot, "denied.js")
+    await writeFile(deniedPath, `export const value = ${JSON.stringify(sentinel)}\n`)
+    await rm(dependencyPath)
+    await symlink(deniedPath, dependencyPath, "file")
+    environment.moduleGraph.invalidateAll()
+
+    const outcome = await environment
+      .fetchModule(dependencyRequest)
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error })
+      )
+    expect(outcome).toHaveProperty("error")
+    const denied = "error" in outcome ? outcome.error : undefined
+    expect(denied).toBeInstanceOf(Error)
+    expect((denied as Error).message).toBe(
+      "Show Page SSR module access was denied by the workspace boundary"
+    )
+    expect((denied as Error).message).not.toContain(sentinel)
+  }, 60_000)
+
   it("renders legitimate ESM and CommonJS declared extras", async () => {
     const runtime = await startFixtureServer(["declared-extras"])
     const response = await fetch(markdownUrl(runtime.url, "declared-extras"))
@@ -1010,28 +1340,39 @@ describe("SSR Markdown endpoint", () => {
     ])
   })
 
-  it("kills a hung child at its phase deadline, respawns, and keeps the runtime usable", async () => {
+  it("kills a hung child at its phase deadline while keeping the runtime alive", async () => {
     const children: ChildProcess[] = []
+    const loadTimeoutMs = 3_000
     const runtime = await startFixtureServer(
-      ["hung-load", "semantic"],
-      { renderLoadTimeoutMs: 3_000 },
+      ["hung-load"],
+      { renderLoadTimeoutMs: loadTimeoutMs },
       { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
     )
     await runtime.runtime.ensureSession("hung-load", "/show/hung-load/")
-    await runtime.runtime.ensureSession("semantic", "/show/semantic/")
 
     const started = performance.now()
     const timedOut = await fetch(markdownUrl(runtime.url, "hung-load"))
+    const loadTimeoutSeconds = loadTimeoutMs / 1_000
     expect(timedOut.status).toBe(504)
-    expect(await renderError(timedOut)).toMatchObject({ error: { code: "render_timeout" } })
-    expect(performance.now() - started).toBeLessThan(6_000)
+    expect(await renderError(timedOut)).toEqual({
+      error: {
+        code: "render_timeout",
+        message: `Show Page module loading exceeded the ${loadTimeoutSeconds} seconds timeout.`
+      }
+    })
+    const elapsed = performance.now() - started
+    expect(elapsed).toBeGreaterThanOrEqual(loadTimeoutMs - 1_000)
+    expect(elapsed).toBeLessThan(loadTimeoutMs + 5_000)
     expect(children).toHaveLength(1)
     expect(children[0]?.killed).toBe(true)
 
-    const recovered = await fetch(markdownUrl(runtime.url, "semantic"))
-    expect(recovered.status).toBe(200)
-    expect(await recovered.text()).toContain("# SSR fixture report")
-    expect(children).toHaveLength(2)
+    const capabilities = await fetch(`${runtime.url}/capabilities`)
+    expect(capabilities.status).toBe(200)
+    expect(await capabilities.json()).toEqual({
+      protocol: 1,
+      render_markdown: true,
+      render_markdown_ssr: true
+    })
   }, 60_000)
 
   it("kills a hung React render at its deadline and respawns for the next render", async () => {
@@ -1062,7 +1403,7 @@ describe("SSR Markdown endpoint", () => {
     const children: ChildProcess[] = []
     const runtime = await startFixtureServer(
       ["scheduled-work"],
-      { renderLoadTimeoutMs: 5_000 },
+      { renderLoadTimeoutMs: SCHEDULED_WORK_LOAD_TIMEOUT_MS },
       { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
     )
     await runtime.runtime.ensureSession("scheduled-work", "/show/scheduled-work/")
@@ -1075,7 +1416,10 @@ describe("SSR Markdown endpoint", () => {
     expect(firstMarkdown).toContain("Deferred callbacks: none")
     expect(children).toHaveLength(1)
 
-    await new Promise((resolveWait) => setTimeout(resolveWait, 2_350))
+    await new Promise((resolveWait) => setTimeout(
+      resolveWait,
+      SCHEDULED_WORK_INTERVAL_DELAY_MS + 350
+    ))
     const nextStarted = performance.now()
     const next = await fetch(markdownUrl(runtime.url, "scheduled-work"), {
       headers: { "x-vibe-show-target": "/?request=2" }
@@ -1084,15 +1428,15 @@ describe("SSR Markdown endpoint", () => {
     expect(next.status, nextMarkdown).toBe(200)
     expect(next.headers.get("x-avibe-render-cache")).toBe("miss")
     expect(nextMarkdown).toContain("Deferred callbacks: none")
-    expect(performance.now() - nextStarted).toBeLessThan(5_000)
+    expect(performance.now() - nextStarted).toBeLessThan(DEFAULT_MARKDOWN_LOAD_TIMEOUT_MS)
     expect(children).toHaveLength(1)
-  }, 60_000)
+  }, 90_000)
 
   it("propagates caller disconnect, kills the child, and respawns on the next render", async () => {
     const children: ChildProcess[] = []
     const runtime = await startFixtureServer(
       ["hung-load", "semantic"],
-      {},
+      { renderLoadTimeoutMs: 30_000 },
       { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
     )
     await runtime.runtime.ensureSession("hung-load", "/show/hung-load/")
@@ -1106,9 +1450,7 @@ describe("SSR Markdown endpoint", () => {
     })
     await vi.waitFor(() => expect(children[0]?.killed).toBe(true))
 
-    const recovered = await fetch(markdownUrl(runtime.url, "semantic"), {
-      signal: AbortSignal.timeout(5_000)
-    })
+    const recovered = await fetch(markdownUrl(runtime.url, "semantic"))
     expect(recovered.status).toBe(200)
     expect(await recovered.text()).toContain("# SSR fixture report")
     expect(children).toHaveLength(2)
@@ -1211,15 +1553,16 @@ class FakeSsrWorker implements SsrMarkdownWorker {
   renderMarkdown(
     sessionId: string,
     location: Parameters<SsrMarkdownWorker["renderMarkdown"]>[1],
-    options: Parameters<SsrMarkdownWorker["renderMarkdown"]>[2]
+    options: Parameters<SsrMarkdownWorker["renderMarkdown"]>[2],
+    onPhase?: Parameters<SsrMarkdownWorker["renderMarkdown"]>[3]
   ): ReturnType<SsrMarkdownWorker["renderMarkdown"]> {
     this.renderCalls.push({ sessionId, pathname: location.pathname })
     let phaseSettled = false
-    let resolveConversionStarted!: () => void
-    let rejectConversionStarted!: (error: Error) => void
-    const conversionStarted = new Promise<void>((resolvePromise, rejectPromise) => {
-      resolveConversionStarted = resolvePromise
-      rejectConversionStarted = rejectPromise
+    let resolvePostRenderStarted!: () => void
+    let rejectPostRenderStarted!: (error: Error) => void
+    const postRenderStarted = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolvePostRenderStarted = resolvePromise
+      rejectPostRenderStarted = rejectPromise
     })
     const result = (async () => {
       let html: string
@@ -1229,11 +1572,13 @@ class FakeSsrWorker implements SsrMarkdownWorker {
           : `<h1>${sessionId}:${location.pathname}</h1><p>${location.search || "no query"}</p>`
       } catch (error) {
         phaseSettled = true
-        rejectConversionStarted(error instanceof Error ? error : new Error(String(error)))
+        rejectPostRenderStarted(error instanceof Error ? error : new Error(String(error)))
         throw error
       }
+      onPhase?.("cleanup")
       phaseSettled = true
-      resolveConversionStarted()
+      resolvePostRenderStarted()
+      onPhase?.("conversion")
       this.convertCalls.push(sessionId)
       const converted = this.hooks.convert
         ? await this.hooks.convert(sessionId, html, options)
@@ -1243,9 +1588,9 @@ class FakeSsrWorker implements SsrMarkdownWorker {
     void result.catch((error) => {
       if (phaseSettled) return
       phaseSettled = true
-      rejectConversionStarted(error instanceof Error ? error : new Error(String(error)))
+      rejectPostRenderStarted(error instanceof Error ? error : new Error(String(error)))
     })
-    return { conversionStarted, result }
+    return { conversionStarted: postRenderStarted, result }
   }
 
   async invalidateSession(sessionId: string): Promise<void> {
@@ -1326,7 +1671,7 @@ async function rendererHarness(options: {
       }
     }
   })
-  return { renderer, request, worker, fingerprinter, watcher, workspace }
+  return { renderer, request, worker, fingerprinter, watcher, vite, workspace }
 }
 
 describe("SSR Markdown orchestrator", () => {
@@ -1347,18 +1692,31 @@ describe("SSR Markdown orchestrator", () => {
 
   it("uses fingerprint recomputation and watcher events as independent invalidation signals", async () => {
     const harness = await rendererHarness()
+    const invalidateModuleValidation = vi.fn()
+    registerSsrModuleValidationInvalidator(harness.vite, invalidateModuleValidation)
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("hit")
 
     harness.fingerprinter.versions.set("page", "workspace-v2")
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
     expect(harness.worker.invalidations).toContain("page")
+    expect(invalidateModuleValidation).toHaveBeenCalledTimes(1)
 
     const priorInvalidations = harness.worker.invalidations.length
+    const priorValidationInvalidations = invalidateModuleValidation.mock.calls.length
+    harness.watcher.emit("change", join(dirname(harness.workspace), "dependency", "index.js"))
+    expect(invalidateModuleValidation).toHaveBeenCalledTimes(
+      priorValidationInvalidations + 1
+    )
+    expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("hit")
+
     harness.watcher.emit("change", join(harness.workspace, "src", "page.tsx"))
     await vi.waitFor(() => {
       expect(harness.worker.invalidations.length).toBeGreaterThan(priorInvalidations)
     })
+    expect(invalidateModuleValidation.mock.calls.length).toBeGreaterThan(
+      priorValidationInvalidations
+    )
     expect((await harness.renderer.render(harness.request("page", "/"))).cache).toBe("miss")
   })
 

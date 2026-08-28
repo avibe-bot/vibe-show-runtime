@@ -155,9 +155,8 @@ diagnostics. Then remove the superseded browser surface in one release:
 - retain `markdown-core.ts`, Turndown/GFM behavior, the workspace fingerprinter,
   cleanup rules, output limits, and the public error envelope.
 
-Before Phase 2, Runtime ownership of existing generated routers needs one explicit
-compatibility rule. This spike updates newly generated routers with an SSR provider.
-The recommended rule is to auto-migrate only byte-for-byte/hash-known historical
-Runtime router templates; never overwrite a modified/custom router. A custom router
-that reads browser globals during module evaluation or render remains outside the SSR
-contract and fails with `render_failed`.
+Phase 2.1 replaced the spike's proposed file migration with runtime feature
+detection. Full SSR fidelity requires the current router contract; older
+workspaces render root-only; the Runtime never modifies user workspace files.
+A custom router that reads browser globals during module evaluation or render
+remains outside the SSR contract and fails with `render_failed`.

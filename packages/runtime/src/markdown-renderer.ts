@@ -44,6 +44,7 @@ import {
   SSR_MARKDOWN_ENTRY_ID,
   SSR_MARKDOWN_ENVIRONMENT
 } from "./ssr-markdown-entry-plugin.js"
+import { invalidateSsrModuleValidationCache } from "./ssr-module-validation-cache.js"
 import {
   createWorkspaceFingerprinter,
   type WorkspaceFingerprinter
@@ -65,6 +66,7 @@ export const DEFAULT_MARKDOWN_CACHE_ENTRIES_GLOBAL = 256
 export const DEFAULT_MARKDOWN_MAX_BYTES = 512 * 1024
 const DEFAULT_MARKDOWN_CACHE_MAINTENANCE_INTERVAL_MS = 5_000
 const SLOW_TIMING_MS = Number(process.env.VIBE_SHOW_RUNTIME_SLOW_TIMING_MS ?? "1000")
+const RENDER_FAILURE_MESSAGE_MAX_BYTES = 512
 const WATCHER_EVENTS = ["add", "change", "unlink", "addDir", "unlinkDir"] as const
 const RUNTIME_PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const runtimeRequire = createRequire(import.meta.url)
@@ -95,6 +97,7 @@ export type MarkdownRenderRequest = {
 }
 
 export type MarkdownRenderPhase = "load" | "render" | "conversion"
+type MarkdownRenderFailurePhase = MarkdownRenderPhase | "cleanup"
 export type MarkdownRenderPhaseTiming = {
   sessionId: string
   phase: MarkdownRenderPhase
@@ -113,7 +116,8 @@ export type SsrMarkdownWorker = {
   renderMarkdown(
     sessionId: string,
     location: SsrRouteLocation,
-    options: SsrMarkdownConversionOptions
+    options: SsrMarkdownConversionOptions,
+    onPhase?: (phase: "cleanup" | "conversion") => void
   ): SsrMarkdownRenderTask
   invalidateSession(sessionId: string): Promise<void>
   terminate(): Promise<void>
@@ -121,6 +125,7 @@ export type SsrMarkdownWorker = {
 }
 
 export type SsrMarkdownRenderTask = {
+  /** Resolves at the cleanup handoff into the combined cleanup/conversion budget. */
   conversionStarted: Promise<void>
   result: Promise<{ markdown: string }>
 }
@@ -228,6 +233,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
       if (closed) throw rendererUnavailable("The SSR Markdown renderer is closed.")
       const combined = combineAbortSignals(request.signal, closeController.signal)
       const timings: Partial<Record<MarkdownRenderPhase, number>> = {}
+      let failurePhase: MarkdownRenderFailurePhase = "load"
 
       try {
         throwIfAborted(combined.signal)
@@ -289,6 +295,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
 
             const loadedFingerprint = loadedFingerprints.get(request.sessionId)
             if (loadedFingerprint !== undefined && loadedFingerprint !== fingerprint) {
+              invalidateSsrModuleValidationCache(prepared.vite)
               invalidateViteSsrGraph(prepared.vite)
               await runWorkerOperation(
                 loadBudget,
@@ -317,18 +324,26 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
           }
 
           const location = ssrRouteLocation(request, prepared)
+          failurePhase = "render"
           const renderStarted = performance.now()
           const renderBudget = new PhaseBudget("render", reactTimeoutMs)
           let renderOutcome: MarkdownRenderPhaseTiming["outcome"] = "ok"
           let task!: SsrMarkdownRenderTask
           try {
-            task = worker.renderMarkdown(request.sessionId, location, {
-              documentUrl: ssrDocumentUrl(request, prepared),
-              basePath: request.basePath,
-              internalBasePath: prepared.internalBasePath,
-              workspace: canonicalWorkspace,
-              maxOutputBytes
-            })
+            task = worker.renderMarkdown(
+              request.sessionId,
+              location,
+              {
+                documentUrl: ssrDocumentUrl(request, prepared),
+                basePath: request.basePath,
+                internalBasePath: prepared.internalBasePath,
+                workspace: canonicalWorkspace,
+                maxOutputBytes
+              },
+              (phase) => {
+                failurePhase = phase
+              }
+            )
             await runWorkerOperation(
               renderBudget,
               combined.signal,
@@ -376,11 +391,28 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
           return { markdown: converted.markdown, cache: "miss", timings }
         }, combined.signal)
       } catch (error) {
-        throw normalizeRenderError(error, combined.signal, {
+        const phase = failurePhase
+        if (combined.signal.aborted && (error === combined.signal.reason || isAbortError(error))) {
+          emitRenderFailure(
+            request.sessionId,
+            phase,
+            error,
+            "Show Page rendering was cancelled."
+          )
+          throw error
+        }
+        const normalized = normalizeRenderError(error, combined.signal, {
           load: loadTimeoutMs,
           render: reactTimeoutMs,
           conversion: conversionTimeoutMs
         }, maxOutputBytes)
+        emitRenderFailure(
+          request.sessionId,
+          phase,
+          error,
+          normalized.message
+        )
+        throw normalized
       } finally {
         combined.dispose()
       }
@@ -388,6 +420,8 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
 
     async invalidateSession(sessionId, releaseResources) {
       if (closed) return
+      const boundVite = watcherBindings.get(sessionId)?.vite
+      if (boundVite) invalidateSsrModuleValidationCache(boundVite)
       cache.invalidateSession(sessionId)
       workspaceFingerprinter.invalidateSession(sessionId)
       unbindSessionWatcher(sessionId)
@@ -443,6 +477,23 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
     }))
   }
 
+  function emitRenderFailure(
+    sessionId: string,
+    phase: MarkdownRenderFailurePhase,
+    error: unknown,
+    safeMessage: string
+  ): void {
+    console.error(JSON.stringify({
+      level: "error",
+      source: "show-runtime",
+      event: "ssr-markdown-render-failed",
+      sessionId,
+      phase,
+      errorClass: renderFailureClass(error),
+      message: boundedLogMessage(safeMessage, RENDER_FAILURE_MESSAGE_MAX_BYTES)
+    }))
+  }
+
   async function bindSessionWatcher(
     sessionId: string,
     workspace: string,
@@ -456,6 +507,9 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
     unbindSessionWatcher(sessionId)
 
     const listener = (path: string) => {
+      // Dependency and cache replacements do not change the workspace
+      // fingerprint, but they must still invalidate cached path identities.
+      invalidateSsrModuleValidationCache(vite, path)
       if (
         (!pathWithinWorkspace(path, logicalWorkspace) && !pathWithinWorkspace(path, canonicalWorkspace)) ||
         scheduledInvalidations.has(sessionId)
@@ -547,15 +601,16 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
   renderMarkdown(
     sessionId: string,
     location: SsrRouteLocation,
-    options: SsrMarkdownConversionOptions
+    options: SsrMarkdownConversionOptions,
+    onPhase?: (phase: "cleanup" | "conversion") => void
   ): SsrMarkdownRenderTask {
     const binding = this.requireBinding(sessionId)
     let phaseSettled = false
-    let resolveConversionStarted!: () => void
-    let rejectConversionStarted!: (error: Error) => void
-    const conversionStarted = new Promise<void>((resolvePromise, rejectPromise) => {
-      resolveConversionStarted = resolvePromise
-      rejectConversionStarted = rejectPromise
+    let resolvePostRenderStarted!: () => void
+    let rejectPostRenderStarted!: (error: Error) => void
+    const postRenderStarted = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolvePostRenderStarted = resolvePromise
+      rejectPostRenderStarted = rejectPromise
     })
     const result = this.command("render-markdown", {
       sessionId,
@@ -565,9 +620,10 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     }, {
       maxResultBytes: ipcResultLimit(options.maxOutputBytes),
       onPhase: (phase) => {
-        if (phase !== "conversion" || phaseSettled) return
+        onPhase?.(phase)
+        if (phase !== "cleanup" || phaseSettled) return
         phaseSettled = true
-        resolveConversionStarted()
+        resolvePostRenderStarted()
       }
     }) as Promise<{ markdown: string }>
     void result.then(
@@ -575,16 +631,16 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
         binding.moduleBudget = undefined
         if (phaseSettled) return
         phaseSettled = true
-        rejectConversionStarted(new Error("The SSR worker omitted the conversion phase"))
+        rejectPostRenderStarted(new Error("The SSR worker omitted the cleanup phase"))
       },
       (error) => {
         binding.moduleBudget = undefined
         if (phaseSettled) return
         phaseSettled = true
-        rejectConversionStarted(error instanceof Error ? error : new Error(String(error)))
+        rejectPostRenderStarted(error instanceof Error ? error : new Error(String(error)))
       }
     )
-    return { conversionStarted, result }
+    return { conversionStarted: postRenderStarted, result }
   }
 
   async invalidateSession(sessionId: string): Promise<void> {
@@ -765,7 +821,10 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
 
   private handleCommandPhase(message: WorkerCommandPhaseMessage): void {
     const pending = this.pending.get(message.requestId)
-    if (!pending || message.phase !== "conversion") return
+    if (
+      !pending ||
+      (message.phase !== "cleanup" && message.phase !== "conversion")
+    ) return
     pending.onPhase?.(message.phase)
   }
 
@@ -881,7 +940,7 @@ function ssrWorkerUrl(): URL {
 }
 
 type WorkerCommandName = "load" | "render-markdown" | "invalidate"
-type WorkerCommandPhase = "conversion"
+type WorkerCommandPhase = "cleanup" | "conversion"
 type SsrImportMetaEnv = Readonly<Record<string, unknown>>
 type SerializedError = SsrMarkdownSerializedError
 type WorkerSessionBinding = {
@@ -1350,6 +1409,37 @@ function phaseOutcome(
   if (signal.aborted && (error === signal.reason || isAbortError(error))) return "cancelled"
   if (error instanceof RenderPhaseTimeoutError) return "timeout"
   return "error"
+}
+
+function renderFailureClass(error: unknown): string {
+  if (error instanceof MarkdownRenderError) return error.code
+  if (error instanceof RenderPhaseTimeoutError) return "RenderPhaseTimeoutError"
+  if (error instanceof SsrWorkerUnavailableError) return "SsrWorkerUnavailableError"
+  if (error instanceof SsrChildTerminatedError) return "SsrChildTerminatedError"
+  if (error instanceof WorkerCommandError) return "WorkerCommandError"
+  if (isAbortError(error)) return "AbortError"
+  if (error instanceof Error) return "Error"
+  return typeof error
+}
+
+function boundedLogMessage(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value
+  let low = 0
+  let high = Math.min(value.length, maxBytes)
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    if (Buffer.byteLength(value.slice(0, middle), "utf8") <= maxBytes) low = middle
+    else high = middle - 1
+  }
+  if (
+    low > 0 &&
+    low < value.length &&
+    /[\uD800-\uDBFF]/.test(value[low - 1] ?? "") &&
+    /[\uDC00-\uDFFF]/.test(value[low] ?? "")
+  ) {
+    low -= 1
+  }
+  return value.slice(0, low)
 }
 
 function phaseLabel(phase: MarkdownRenderPhase): string {

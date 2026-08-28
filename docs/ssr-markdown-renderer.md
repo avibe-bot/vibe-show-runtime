@@ -26,10 +26,21 @@ one long-lived, terminable Node child process
 ```
 
 The Runtime-owned virtual entry imports the page `App` and React DOM Server
-through one session SSR graph. It also imports the router provider when
-`src/router.tsx` exists; legacy App-only workspaces render `App` directly, and
-the Runtime never creates a router for them. That preserves the session's
-physical React instance across application, optional provider, and renderer.
+through one session SSR graph. If `src/router.tsx` exists, the entry imports its
+namespace and detects a function or React exotic component (`memo`,
+`forwardRef`) exported as `SsrRouterProvider`. React elements, unresolved
+`React.lazy` values, and objects without the corresponding exotic-component
+shape use the legacy fallback.
+Current routers use that provider for full target fidelity; older routers and
+App-only workspaces render `App` directly at the root document. That preserves
+the session's physical React instance across application, optional provider,
+and renderer.
+Legacy degradation has one explicit contract exception: its root render receives
+a request-scoped, read-only `window.location` facade containing only `pathname`,
+`search`, `hash`, `href`, and `origin`, derived from the caller-facing document
+URL. No other `window` property or `document` is exposed, and current-provider
+renders remain windowless. The legacy tree also uses Motion's static SSR mode so
+the location facade cannot activate browser lifecycle behavior in shared UI.
 Cleanup and conversion do not compose React values, so they run in the same
 terminable child process's trusted Runtime layer rather than in the workspace VM.
 React render, raw-output enforcement, cleanup, and Turndown run as one child
@@ -64,7 +75,9 @@ modules in a fresh `node:vm` context for each uncached render with string/Wasm
 code generation disabled. It supplies only the initial-tree web primitives
 required by React, the generated router, and Show UI. `window`, `document`,
 `fetch`, WebSocket, host `process`, and inherited environment variables are
-absent; the exposed `process.env` contains only the non-secret Vite mode.
+absent during module loading and current-provider rendering; the exposed
+`process.env` contains only the non-secret Vite mode. The only exception is the
+legacy root-render location facade described above.
 
 `WorkspaceFileBoundary` is the single source-file authority for the Markdown
 environment. Direct module loads, raw/static-asset loaders, and every file input
@@ -83,6 +96,15 @@ temporary, or arbitrary cache artifacts are denied even though the human Vite
 server may use them. The Vite cache identity includes
 `ssr-markdown-acquisition-v1`, so artifacts produced before this policy cannot
 be reused under the new boundary.
+
+Canonical validation verdicts and stable self-canonical dependency/cache targets
+are cached in two per-live-session LRU maps, each capped at 16,384 entries. Every
+grant first compares the path's lstat identity; an unchanged file reuses its
+canonical target and verdict, while replacement or retargeting forces a fresh
+realpath before any loader reads it. Workspace sources remain freshly
+canonicalized. Watcher events for workspace, dependency, and cache paths,
+fingerprint mismatches, suspend, and idle pruning clear the maps with the SSR
+module graph.
 
 A configured dependency root may be a symlink forest. Its canonical package
 targets are accepted only as Markdown dependency origins after the same target
@@ -199,6 +221,11 @@ all phase budgets. Once admitted, these independent defaults apply:
 | React render | 5 s | `VIBE_SHOW_RENDER_REACT_TIMEOUT_MS` | `--render-react-timeout-ms` |
 | cleanup + conversion | 5 s | `VIBE_SHOW_RENDER_CONVERSION_TIMEOUT_MS` | `--render-conversion-timeout-ms` |
 
+The load default remains derived from measured production fixture latency. Tests
+whose subject is child recovery or scheduling disposal use their own generous
+load allowance so slow CI filesystems do not turn those semantic checks into
+load-speed checks.
+
 Caller disconnect and runtime shutdown signals race every phase wait. A timeout
 or cancellation during child work kills the process, which hard-stops synchronous
 module evaluation, React rendering, and conversion. An unexpected child exit fails
@@ -216,6 +243,15 @@ Raw HTML, cleaned HTML, and final Markdown use the existing 512 KiB default
 limit (`VIBE_SHOW_RENDER_MAX_BYTES` / `--render-max-output-bytes`). Phase timing
 events record `ok`, `error`, `timeout`, or `cancelled` without exposing page
 source or stack traces to the caller.
+
+Every failed render emits exactly one `ssr-markdown-render-failed` JSON event.
+It records the session, the failing `load`, `render`, `cleanup`, or `conversion`
+phase, a bounded error class, and at most 512 UTF-8 bytes of the normalized
+public-safe error message. Phase comes only from the parent tracker, advanced by
+trusted child command-phase acknowledgements; workspace error properties are not
+serialized as phase metadata. Arbitrary workspace and Vite error text is never
+used for event fields, so the event cannot log a stack or module/file body. The
+public error envelope remains unchanged.
 
 Every cache miss creates a new evaluator and `ModuleRunner`, imports the entry,
 renders once, and closes that graph in a `finally` path. The live session Vite
@@ -238,7 +274,7 @@ an explicit size, lifetime, or reset owner:
 | Child to parent result | Existing configured raw/cleaned/Markdown cap plus fixed framing; only `{markdown}` crosses | Oversized raw HTML returns `output_too_large`; captured IPC contains neither HTML nor page text |
 | Errors in either direction | 8 KiB serialized-error budget; bounded name/message/stack/code fields; public response remains the generic existing envelope | A workspace-thrown oversized error is truncated in IPC and absent from the response |
 | Scheduling and module transport jobs | Per-command registry disposes timers, intervals, immediates, microtasks, and message tasks; transport promises quiesce before reply | Busy module-level interval cannot fire after its command or delay the next render |
-| Phase time and cancellation | Independent 10 s load, 5 s render, and 5 s conversion budgets; child flushes a phase transition before conversion; timeout/disconnect hard-kills it | Hung load/render and fake conversion each time out; caller disconnect kills; next request respawns and succeeds |
+| Phase time and cancellation | Independent 10 s load, 5 s render, and 5 s conversion budgets; child flushes trusted cleanup and conversion transitions; timeout/disconnect hard-kills it | Hung load/render and fake conversion each time out; phase-spoofing workspace errors cannot change the logged phase; caller disconnect kills; next request respawns and succeeds |
 | Session and process lifecycle | Watcher/fingerprint/suspend/idle invalidation closes session state; crash rejects all pending RPC and drops all child state | Existing invalidation suite plus kill/respawn integration tests |
 
 The control/module/error budgets are internal protocol limits, not new public
@@ -261,26 +297,26 @@ entries are removed during lookup, write, and the five-second idle maintenance
 pass.
 
 Workspace watcher events evict the session's Markdown entries, fingerprint
-memoization, and child evaluation state. Every lookup also recomputes the
-workspace fingerprint; a mismatch invalidates the Vite SSR graph and child
-state even if a watcher event was missed. Session suspend and idle pruning clear
-the same state before releasing the live Vite server.
+memoization, canonical validation verdicts, and child evaluation state.
+Dependency and cache watcher events also clear canonical target identities and
+verdicts even though they do not change the workspace fingerprint. Every lookup
+recomputes that fingerprint; a mismatch invalidates the Vite SSR graph,
+validation verdicts, and child state even if a workspace watcher event was
+missed. Session suspend and idle pruning clear the same state before releasing
+the live Vite server.
 
-## Router migration
+## Router compatibility
 
-Runtime migrates only byte-identical, hash-known generated routers. The current
-ledger contains the History-mode router shipped from runtime#53 through
-runtime#65:
-
-```text
-631249e584e3cd2464d28fcba2f5b9dad2ba7991a5f42479002ae3405ce86a2a
-```
-
-Any byte modification makes the router workspace-owned and ineligible. A custom
-router remains untouched; browser-global access during its module evaluation or
-render returns `render_failed`. An existing App-only workspace remains
-routerless and renders `src/App.tsx` directly. If neither App nor router exists,
-the unchanged module-load failure maps to `render_failed`.
+Full SSR fidelity requires the current router contract; older workspaces render
+root-only; the Runtime never modifies user workspace files. A router exporting
+a renderable function or supported React exotic component exported as
+`SsrRouterProvider` receives the requested path, params, and query. A router
+without that export, an unresolved `React.lazy` provider, a React element or
+arbitrary exotic-marker object export, or an App-only workspace renders
+`src/App.tsx` only for
+`/`; a non-root target returns `render_failed` rather than misrepresenting the
+root route. If neither App nor router exists, the unchanged module-load failure
+maps to `render_failed`.
 
 ## Measured fixture result
 
@@ -293,14 +329,14 @@ fingerprint but never contact the child.
 
 | Measurement | Result |
 | --- | ---: |
-| cold request | 1,600-1,746 ms |
-| cold load | 1,567-1,714 ms |
-| cold render / conversion | 5.2-6.4 / 6.3-6.9 ms |
-| warm miss median / p95 | 105.99-110.35 / 129.28-169.13 ms |
-| cache hit median / p95 | 0.78-0.93 / 1.58-1.71 ms |
-| RSS before cold | 110.2-111.0 MiB |
-| RSS after cold (delta) | 484.8-497.9 MiB (+374.5-387.7 MiB) |
-| RSS after 20 warm misses | 787.1-858.1 MiB |
+| cold request | 1,584.50-1,646.41 ms |
+| cold load | 1,551.63-1,613.69 ms |
+| cold render / conversion | 5.26-5.38 / 6.30-6.47 ms |
+| warm miss median / p95 | 103.68-114.73 / 121.30-126.71 ms |
+| cache hit median / p95 | 0.81-0.85 / 1.59-1.70 ms |
+| RSS before cold | 110.3-111.7 MiB |
+| RSS after cold (delta) | 473.3-503.4 MiB (+361.6-393.0 MiB) |
+| RSS after 20 warm misses | 778.2-844.2 MiB |
 
 RSS after child startup is the OS-reported sum for the Runtime parent and active
 SSR child, rather than the parent's `process.memoryUsage()` alone. The benchmark
