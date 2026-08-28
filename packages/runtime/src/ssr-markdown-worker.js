@@ -53,7 +53,10 @@ async function executeCommand(command) {
         sessions.delete(command.sessionId)
       }
       if (!state) {
-        const evaluator = new SsrSandboxEvaluator(`avibe-show-ssr:${command.sessionId}`)
+        const evaluator = new SsrSandboxEvaluator(
+          `avibe-show-ssr:${command.sessionId}`,
+          command.importMetaEnv
+        )
         state = {
           generation: command.generation,
           evaluator,

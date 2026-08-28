@@ -20,6 +20,8 @@ import {
   startShowRuntimeServer,
   type ShowRuntimeServerDependencies
 } from "./server.js"
+import { SSR_MARKDOWN_ENVIRONMENT } from "./ssr-markdown-entry-plugin.js"
+import { SsrSandboxEvaluator } from "./ssr-markdown-sandbox.js"
 import type { ShowRuntimeOptions } from "./types.js"
 import type { WorkspaceFingerprinter } from "./workspace-fingerprint.js"
 
@@ -112,7 +114,21 @@ async function probeChildPermissionProfile(): Promise<ForkOptions["execArgv"]> {
     )
   }, workspace)
   try {
-    await worker.load("permission-profile", {} as ViteDevServer)
+    await worker.load("permission-profile", {
+      environments: {
+        [SSR_MARKDOWN_ENVIRONMENT]: {
+          config: {
+            consumer: "server",
+            env: {
+              BASE_URL: "/show/permission-profile/",
+              MODE: "development",
+              DEV: true,
+              PROD: false
+            }
+          }
+        }
+      }
+    } as unknown as ViteDevServer)
     return execArgv
   } finally {
     await worker.close()
@@ -128,6 +144,25 @@ function recordingChildFactory(children: ChildProcess[]) {
     return child
   }
 }
+
+describe("SSR sandbox evaluator", () => {
+  it("uses the Vite environment supplied by its execution owner", () => {
+    const expected = {
+      BASE_URL: "/internal/vite-env/",
+      MODE: "staging",
+      DEV: false,
+      PROD: true,
+      SSR: true
+    }
+    const evaluator = new SsrSandboxEvaluator("avibe-show-ssr:test", expected)
+    try {
+      const meta = evaluator.createImportMeta("/workspace/src/page.tsx")
+      expect(JSON.parse(JSON.stringify(meta.env))).toEqual(expected)
+    } finally {
+      evaluator.dispose()
+    }
+  })
+})
 
 describe("SSR Markdown endpoint", () => {
   it("preserves the endpoint contract and advertises the SSR capability", async () => {
@@ -188,6 +223,31 @@ describe("SSR Markdown endpoint", () => {
       `${runtime.url}/sessions/semantic/app/@fs/${runtimeModulePath}`
     )
     expect(humanRequest.status).toBe(404)
+  }, 60_000)
+
+  it("uses the active Vite SSR environment for import.meta.env", async () => {
+    const runtime = await startFixtureServer(["vite-env"])
+    await runtime.runtime.ensureSession("vite-env", "/internal/vite-env/")
+    const environment = runtime.runtime.getSession("vite-env")?.vite
+      ?.environments[SSR_MARKDOWN_ENVIRONMENT]
+    expect(environment).toBeDefined()
+    if (!environment) throw new Error("Expected the active Vite SSR environment")
+    expect(environment.config.env.BASE_URL).toBe("/internal/vite-env/")
+
+    const response = await fetch(markdownUrl(runtime.url, "vite-env"), {
+      headers: { "x-vibe-show-base": "/p/public-token/" }
+    })
+    const markdown = await response.text()
+
+    expect(response.status, markdown).toBe(200)
+    expect(markdown).toContain("[Environment base link](/p/public-token/guide)")
+    expect(markdown).toContain("![Environment base asset](/p/public-token/assets/chart.png)")
+    expect(markdown).toContain(`MODE: ${String(environment.config.env.MODE)}`)
+    expect(markdown).toContain(`DEV: ${String(environment.config.env.DEV)}`)
+    expect(markdown).toContain(`PROD: ${String(environment.config.env.PROD)}`)
+    expect(markdown).toContain(
+      `SSR: ${String(environment.config.consumer === "server")}`
+    )
   }, 60_000)
 
   it("returns session_unknown and rejects every target that escapes the session app", async () => {

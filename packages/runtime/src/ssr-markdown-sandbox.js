@@ -19,6 +19,15 @@ const MODULE_PARAMETERS = [
   ssrExportNameKey
 ]
 
+/**
+ * @typedef {object} SsrImportMetaEnv
+ * @property {string} BASE_URL
+ * @property {string} MODE
+ * @property {boolean} DEV
+ * @property {boolean} PROD
+ * @property {boolean} SSR
+ */
+
 const SANDBOX_BOOTSTRAP = String.raw`
 (function bootstrap(bridge) {
   "use strict"
@@ -415,12 +424,21 @@ export class SsrSandboxEvaluator {
 
   #context
   #helpers
+  /** @type {Readonly<SsrImportMetaEnv>} */
+  #importMetaEnv
   /** @type {{ active: boolean, timers: Map<number, NodeJS.Timeout> } | undefined} */
   #activeCommand
   #nextTimerId = 1
 
-  /** @param {string} name */
-  constructor(name) {
+  /** @param {string} name @param {SsrImportMetaEnv} importMetaEnv */
+  constructor(name, importMetaEnv) {
+    this.#importMetaEnv = Object.freeze({
+      BASE_URL: importMetaEnv.BASE_URL,
+      MODE: importMetaEnv.MODE,
+      DEV: importMetaEnv.DEV,
+      PROD: importMetaEnv.PROD,
+      SSR: importMetaEnv.SSR
+    })
     this.#context = createContext(Object.create(null), {
       name,
       codeGeneration: { strings: false, wasm: false }
@@ -492,13 +510,7 @@ export class SsrSandboxEvaluator {
       filename: modulePath,
       dirname: dirname(modulePath),
       url: pathToFileURL(modulePath).href,
-      env: {
-        BASE_URL: "/",
-        MODE: "development",
-        DEV: true,
-        PROD: false,
-        SSR: true
-      }
+      env: this.#importMetaEnv
     }))
   }
 

@@ -517,7 +517,8 @@ class ModuleGraphSsrWorker implements SsrMarkdownWorker {
     await this.command("load", {
       sessionId,
       generation: binding.generation,
-      entryId: SSR_MARKDOWN_ENTRY_ID
+      entryId: SSR_MARKDOWN_ENTRY_ID,
+      importMetaEnv: activeSsrImportMetaEnv(vite)
     })
   }
 
@@ -776,6 +777,13 @@ function ssrWorkerUrl(): URL {
 }
 
 type WorkerCommandName = "load" | "render" | "convert" | "invalidate"
+type SsrImportMetaEnv = {
+  BASE_URL: string
+  MODE: string
+  DEV: boolean
+  PROD: boolean
+  SSR: boolean
+}
 type SerializedError = {
   name?: string
   message?: string
@@ -860,6 +868,26 @@ function nodePermissionProfile(workspaceRoot: string | undefined): NodePermissio
     }
   }
   throw new SsrWorkerUnavailableError("The Node.js permission model is unavailable")
+}
+
+function activeSsrImportMetaEnv(vite: ViteDevServer): SsrImportMetaEnv {
+  const config = vite.environments[SSR_MARKDOWN_ENVIRONMENT].config
+  const { BASE_URL, MODE, DEV, PROD } = config.env
+  if (
+    typeof BASE_URL !== "string" ||
+    typeof MODE !== "string" ||
+    typeof DEV !== "boolean" ||
+    typeof PROD !== "boolean"
+  ) {
+    throw new Error("The active Vite environment has invalid import.meta.env values")
+  }
+  return {
+    BASE_URL,
+    MODE,
+    DEV,
+    PROD,
+    SSR: config.consumer === "server"
+  }
 }
 
 function createPermissionProbe(allowedReadPaths: string[]): {
