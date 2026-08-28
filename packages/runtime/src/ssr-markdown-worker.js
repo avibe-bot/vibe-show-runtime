@@ -105,10 +105,14 @@ async function executeCommand(command) {
             "This Show Page router supports SSR Markdown only for the root document"
           )
         }
+        const legacyLocation = state.entry.hasSsrRouterProvider
+          ? undefined
+          : legacyWindowLocation(command.options.documentUrl)
         const html = await runWorkspaceCommand(
           command,
           state.evaluator,
-          () => state.entry.render(state.evaluator.cloneJson(command.location))
+          () => state.entry.render(state.evaluator.cloneJson(command.location)),
+          legacyLocation
         )
         await sendAndWait({
           type: "command-phase",
@@ -148,9 +152,10 @@ async function executeCommand(command) {
  * @param {Record<string, any>} command
  * @param {SsrSandboxEvaluator} evaluator
  * @param {() => T | Promise<T>} operation
+ * @param {Readonly<{ pathname: string, search: string, hash: string, href: string, origin: string }>} [legacyLocation]
  * @returns {Promise<T>}
  */
-async function runWorkspaceCommand(command, evaluator, operation) {
+async function runWorkspaceCommand(command, evaluator, operation, legacyLocation) {
   if (activeWorkspaceCommand) {
     throw new Error("The SSR Markdown child cannot run overlapping workspace commands")
   }
@@ -165,7 +170,7 @@ async function runWorkspaceCommand(command, evaluator, operation) {
   let result
   try {
     try {
-      result = await evaluator.runCommand(operation)
+      result = await evaluator.runCommand(operation, legacyLocation)
     } catch (error) {
       failed = true
       failure = error
@@ -176,6 +181,18 @@ async function runWorkspaceCommand(command, evaluator, operation) {
   } finally {
     if (activeWorkspaceCommand === scope) activeWorkspaceCommand = undefined
   }
+}
+
+/** @param {string} documentUrl */
+function legacyWindowLocation(documentUrl) {
+  const location = new URL(documentUrl)
+  return Object.freeze({
+    pathname: location.pathname,
+    search: location.search,
+    hash: location.hash,
+    href: location.href,
+    origin: location.origin
+  })
 }
 
 /** @param {{ pending: Set<Promise<unknown>> }} scope */

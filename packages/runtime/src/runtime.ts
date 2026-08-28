@@ -1011,9 +1011,9 @@ async function ensureSessionDependencies(
   // The human CSS pipeline and the fully inlined Markdown graph cannot use the
   // shared JS fallback for every Runtime-owned package. Link the pinned copies
   // into the private install: Tailwind/UI serve CSS filesystem resolution, while
-  // React/React DOM give Markdown's CJS prebundle one physical singleton source.
+  // React/React DOM and Motion give Markdown one physical singleton source.
   // Browser JS still externalizes to the shared vendor import map.
-  for (const packageName of ["tailwindcss", uiPackageName, "react", "react-dom"]) {
+  for (const packageName of ["tailwindcss", uiPackageName, "react", "react-dom", "motion"]) {
     await ensureSharedPackageLink(extrasDir, sharedNodeModules, packageName)
   }
   const declaredPackageRoots = await resolveAllowedPackageRoots(extrasDir, declaredExtras.packageNames)

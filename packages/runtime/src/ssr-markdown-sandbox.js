@@ -19,6 +19,7 @@ const MODULE_PARAMETERS = [
 ]
 
 /** @typedef {Readonly<Record<string, unknown>>} SsrImportMetaEnv */
+/** @typedef {Readonly<{ pathname: string, search: string, hash: string, href: string, origin: string }>} SsrLegacyLocation */
 
 const SANDBOX_BOOTSTRAP = String.raw`
 (function bootstrap(bridge) {
@@ -529,7 +530,31 @@ const SANDBOX_BOOTSTRAP = String.raw`
     return new Error(message)
   }
 
-  return Object.freeze({ wrapModuleContext, parseJson, createImportMeta, createError })
+  function installLegacyWindow(serializedLocation) {
+    const values = JSON.parse(serializedLocation)
+    const location = Object.freeze(Object.assign(Object.create(null), {
+      pathname: String(values.pathname),
+      search: String(values.search),
+      hash: String(values.hash),
+      href: String(values.href),
+      origin: String(values.origin)
+    }))
+    const legacyWindow = Object.freeze(Object.assign(Object.create(null), { location }))
+    Object.defineProperty(globalThis, "window", {
+      value: legacyWindow,
+      writable: false,
+      enumerable: false,
+      configurable: false
+    })
+  }
+
+  return Object.freeze({
+    wrapModuleContext,
+    parseJson,
+    createImportMeta,
+    createError,
+    installLegacyWindow
+  })
 })
 `
 
@@ -596,14 +621,24 @@ export class SsrSandboxEvaluator {
     Object.seal(context[ssrModuleExportsKey])
   }
 
-  /** @template T @param {() => T | Promise<T>} operation @returns {Promise<T>} */
-  async runCommand(operation) {
+  /**
+   * @template T
+   * @param {() => T | Promise<T>} operation
+   * @param {SsrLegacyLocation} [legacyLocation]
+   * @returns {Promise<T>}
+   */
+  async runCommand(operation, legacyLocation) {
     if (this.#activeCommand) {
       throw new Error("The SSR sandbox cannot run overlapping commands")
     }
     const command = { active: true, timers: new Map() }
     this.#activeCommand = command
     try {
+      // This binding is non-configurable because the evaluator is disposed after
+      // its one render; it cannot be mutated by workspace code or reused later.
+      if (legacyLocation) {
+        this.#helpers.installLegacyWindow(JSON.stringify(legacyLocation))
+      }
       return await operation()
     } finally {
       this.#disposeCommand(command)

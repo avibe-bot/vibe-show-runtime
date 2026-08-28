@@ -35,6 +35,12 @@ Current routers use that provider for full target fidelity; older routers and
 App-only workspaces render `App` directly at the root document. That preserves
 the session's physical React instance across application, optional provider,
 and renderer.
+Legacy degradation has one explicit contract exception: its root render receives
+a request-scoped, read-only `window.location` facade containing only `pathname`,
+`search`, `hash`, `href`, and `origin`, derived from the caller-facing document
+URL. No other `window` property or `document` is exposed, and current-provider
+renders remain windowless. The legacy tree also uses Motion's static SSR mode so
+the location facade cannot activate browser lifecycle behavior in shared UI.
 Cleanup and conversion do not compose React values, so they run in the same
 terminable child process's trusted Runtime layer rather than in the workspace VM.
 React render, raw-output enforcement, cleanup, and Turndown run as one child
@@ -69,7 +75,9 @@ modules in a fresh `node:vm` context for each uncached render with string/Wasm
 code generation disabled. It supplies only the initial-tree web primitives
 required by React, the generated router, and Show UI. `window`, `document`,
 `fetch`, WebSocket, host `process`, and inherited environment variables are
-absent; the exposed `process.env` contains only the non-secret Vite mode.
+absent during module loading and current-provider rendering; the exposed
+`process.env` contains only the non-secret Vite mode. The only exception is the
+legacy root-render location facade described above.
 
 `WorkspaceFileBoundary` is the single source-file authority for the Markdown
 environment. Direct module loads, raw/static-asset loaders, and every file input

@@ -9,6 +9,7 @@ const RESOLVED_SSR_MARKDOWN_ENTRY_ID = `\0${SSR_MARKDOWN_ENTRY_ID}`
 const ROUTED_SSR_MARKDOWN_ENTRY_SOURCE = `
 import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server.browser"
+import { MotionConfig } from "motion/react"
 import App from "/src/App.tsx"
 import * as RouterModule from "/src/router.tsx"
 
@@ -34,19 +35,24 @@ export function render(location) {
   const app = createElement(App)
   return renderToStaticMarkup(hasSsrRouterProvider
     ? createElement(RouterModule.SsrRouterProvider, { location }, app)
-    : app)
+    : createElement(MotionConfig, { isStatic: true }, app))
 }
 `
 
 const ROUTERLESS_SSR_MARKDOWN_ENTRY_SOURCE = `
 import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server.browser"
+import { MotionConfig } from "motion/react"
 import App from "/src/App.tsx"
 
 export const hasSsrRouterProvider = false
 
 export function render() {
-  return renderToStaticMarkup(createElement(App))
+  return renderToStaticMarkup(createElement(
+    MotionConfig,
+    { isStatic: true },
+    createElement(App)
+  ))
 }
 `
 

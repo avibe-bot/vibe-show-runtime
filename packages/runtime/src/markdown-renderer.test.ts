@@ -90,6 +90,12 @@ function intrinsicReport(markdown: string): Record<string, any> {
   return JSON.parse(match[1]) as Record<string, any>
 }
 
+function legacyLocationReport(markdown: string): Record<string, any> {
+  const match = /LegacyLocationReport:(\{.+\})/.exec(markdown)
+  if (!match) throw new Error(`Legacy location report was absent from Markdown: ${markdown}`)
+  return JSON.parse(match[1]) as Record<string, any>
+}
+
 function capturedError(operation: () => unknown) {
   try {
     operation()
@@ -387,26 +393,81 @@ describe("SSR Markdown process protocol", () => {
 describe("SSR Markdown endpoint", () => {
   it("renders a field legacy router only at the root without modifying it", async () => {
     const fixtureRouterPath = join(fixtureRoot, "legacy-router-field", "src", "router.tsx")
+    const fixtureHomePath = join(
+      fixtureRoot,
+      "legacy-router-field",
+      "src",
+      "pages",
+      "index.tsx"
+    )
     const fixtureRouter = await readFile(fixtureRouterPath, "utf8")
+    const fixtureHome = await readFile(fixtureHomePath, "utf8")
     const runtime = await startFixtureServer(["legacy-router-field"])
 
-    const root = await fetch(markdownUrl(runtime.url, "legacy-router-field"))
+    const headers = { "x-vibe-show-base": "/p/public-token/" }
+    const root = await fetch(markdownUrl(runtime.url, "legacy-router-field"), { headers })
     const rootMarkdown = await root.text()
     expect(root.status, rootMarkdown).toBe(200)
-    expect(rootMarkdown).toContain("# Legacy field router root")
-    expect(rootMarkdown).toContain("historical router server snapshot selected its index route")
+    expect(rootMarkdown).toContain("# Vibe Show Runtime")
+    expect(rootMarkdown).toContain("This session is served by the managed service runtime.")
+    expect(rootMarkdown).toContain("[Open second page](/p/public-token/second)")
     expect(await readFile(
       join(runtime.workspaceRoot, "legacy-router-field", "src", "router.tsx"),
       "utf8"
     )).toBe(fixtureRouter)
+    expect(await readFile(
+      join(runtime.workspaceRoot, "legacy-router-field", "src", "pages", "index.tsx"),
+      "utf8"
+    )).toBe(fixtureHome)
 
     const nested = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
-      headers: { "x-vibe-show-target": "/other" }
+      headers: { ...headers, "x-vibe-show-target": "/other" }
     })
     expect(nested.status).toBe(502)
     expect(await renderError(nested)).toEqual({
       error: { code: "render_failed", message: "Show Page rendering failed." }
     })
+  }, 60_000)
+
+  it("exposes a request-scoped read-only location only to the legacy fallback", async () => {
+    const runtime = await startFixtureServer([
+      "legacy-location-facade",
+      "modern-provider-window"
+    ])
+    const origin = new URL(runtime.url).origin
+    const legacy = await fetch(markdownUrl(runtime.url, "legacy-location-facade"), {
+      headers: {
+        "x-vibe-show-base": "/p/public-token/",
+        "x-vibe-show-target": "/?period=Q4"
+      }
+    })
+    const legacyMarkdown = await legacy.text()
+    expect(legacy.status, legacyMarkdown).toBe(200)
+    expect(legacyLocationReport(legacyMarkdown)).toEqual({
+      pathname: "/p/public-token/",
+      search: "?period=Q4",
+      hash: "",
+      href: `${origin}/p/public-token/?period=Q4`,
+      origin,
+      windowKeys: ["location"],
+      locationKeys: ["hash", "href", "origin", "pathname", "search"],
+      windowFrozen: true,
+      locationFrozen: true,
+      windowPrototypeNull: true,
+      locationPrototypeNull: true,
+      documentPresent: false,
+      historyPresent: false,
+      eventLifecyclePresent: false,
+      mutationError: "TypeError",
+      pathnameUnchanged: true
+    })
+
+    const modern = await fetch(markdownUrl(runtime.url, "modern-provider-window"))
+    const modernMarkdown = await modern.text()
+    expect(modern.status, modernMarkdown).toBe(200)
+    expect(modernMarkdown).toContain("# Modern provider window policy")
+    expect(modernMarkdown).toContain("Window present: false")
+    expect(modernMarkdown).toContain("Window access: ReferenceError")
   }, 60_000)
 
   it("accepts React exotic component markers and rejects element or arbitrary markers", async () => {
