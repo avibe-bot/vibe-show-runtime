@@ -187,25 +187,26 @@ POST /sessions/:sessionId/suspend
 ANY  /sessions/:sessionId/app/*
 ```
 
-`render-markdown` creates a fingerprinted production build of the session app,
-serves that snapshot on a static loopback route, and loads it in an anonymous
-Playwright browser context. Snapshot `api/*` requests still use the session's
-existing handler runtime; no second live Vite runtime is created. The renderer
-removes non-semantic and annotation-overlay DOM and returns GFM Markdown.
-`x-vibe-show-target` selects a root-relative SPA path and query; it defaults to
-the app root and rejects traversal or absolute targets. The runtime discovers
-system Chrome and Edge first. When neither is usable,
-the first render provisions Playwright's managed Chromium headless shell in the
-normal user cache. Set `AVIBE_SHOW_RENDER_NO_PROVISION=1` to disable downloads;
-in that mode a browserless host receives the deterministic
-`renderer_unavailable` response.
+`render-markdown` loads a Runtime-owned virtual entry through the live session's
+dedicated Vite SSR environment, renders the initial React tree in a terminable
+permission-restricted Node child process, removes non-semantic and
+annotation-overlay markup in the child's Runtime-owned layer, and returns GFM
+Markdown.
+React effects are not run. `x-vibe-show-target` selects a root-relative SPA path
+and query; it defaults to the app root and rejects traversal or absolute targets.
+The capability probe reports `render_markdown_ssr: true` for this representation.
 
-The render timeout, cache TTL, output limit, browser idle timeout, and browser
-provisioning timeout are configurable with `--render-timeout-ms`,
-`--render-cache-ttl-ms`, `--render-max-output-bytes`,
-`--render-browser-idle-ms`, and `--render-browser-provision-timeout-ms`.
-Defaults are 30 seconds, 30 seconds, 512 KiB, 60 seconds, and 5 minutes,
-respectively.
+The runtime's single renderer-wide queue owns SSR concurrency. Queue wait is
+outside the phase budgets; module load, React render, and conversion have
+independent defaults of 10 seconds, 5 seconds, and 5 seconds. Configure them with
+`--render-load-timeout-ms`, `--render-react-timeout-ms`, and
+`--render-conversion-timeout-ms`. Cache TTL and output size remain configurable
+with `--render-cache-ttl-ms` and `--render-max-output-bytes` (defaults: 30 seconds
+and 512 KiB). The Markdown cache is bounded to 64 entries per session and 256
+globally, with Vite watcher invalidation and workspace fingerprint recomputation
+as the correctness backstop. See [SSR Markdown Renderer](docs/ssr-markdown-renderer.md)
+for the cache identity, cancellation model, router migration rule, and measured
+fixture results.
 
 `/sessions/:sessionId/app/api/*` dispatches to Web-standard handlers in the
 session workspace:

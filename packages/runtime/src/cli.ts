@@ -39,11 +39,11 @@ async function runServer() {
   const port = Number(getArg("--port") ?? "0")
   const host = getArg("--host") ?? "127.0.0.1"
   const fallbackDelaySeconds = numberArg("--fallback-delay-seconds")
-  const renderTimeoutMs = positiveNumberArg("--render-timeout-ms")
+  const renderLoadTimeoutMs = positiveNumberArg("--render-load-timeout-ms")
+  const renderReactTimeoutMs = positiveNumberArg("--render-react-timeout-ms")
+  const renderConversionTimeoutMs = positiveNumberArg("--render-conversion-timeout-ms")
   const renderCacheTtlMs = numberArg("--render-cache-ttl-ms")
   const renderMaxOutputBytes = positiveNumberArg("--render-max-output-bytes")
-  const renderBrowserIdleMs = numberArg("--render-browser-idle-ms")
-  const renderBrowserProvisionTimeoutMs = positiveNumberArg("--render-browser-provision-timeout-ms")
 
   const runtime = await startShowRuntimeServer({
     workspaceRoot,
@@ -51,11 +51,11 @@ async function runServer() {
     host,
     port,
     fallbackDelaySeconds,
-    renderTimeoutMs,
+    renderLoadTimeoutMs,
+    renderReactTimeoutMs,
+    renderConversionTimeoutMs,
     renderCacheTtlMs,
-    renderMaxOutputBytes,
-    renderBrowserIdleMs,
-    renderBrowserProvisionTimeoutMs
+    renderMaxOutputBytes
   })
 
   console.log(`Vibe Show Runtime listening at ${runtime.url}`)

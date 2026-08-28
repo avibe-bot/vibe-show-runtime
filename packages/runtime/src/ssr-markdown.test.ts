@@ -143,10 +143,10 @@ describe("Vite SSR Markdown spike", () => {
       "[Open details](/show/semantic/teams/acme/details?from=Q3&vibe-embed=1)"
     )
     expect(result.markdown).toContain(
-      "[Change period](/show/semantic/?period=Q4)"
+      "[Change period](/show/semantic/teams/acme?period=Q4)"
     )
     expect(result.markdown).toContain(
-      "![Relative chart](/show/semantic/assets/chart.png)"
+      "![Relative chart](/show/semantic/teams/assets/chart.png)"
     )
   })
 

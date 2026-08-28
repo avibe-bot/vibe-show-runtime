@@ -1,0 +1,7 @@
+{
+  "name": "optimizer-boundary-page",
+  "private": true,
+  "dependencies": {
+    "show-optimizer-boundary-extra": "file:./extra-pkg"
+  }
+}

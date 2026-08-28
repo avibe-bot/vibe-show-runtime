@@ -67,6 +67,7 @@ try {
   })
   assertNoNestedPackageInstalls(stage)
   assertBundleDependencyRoot(stage)
+  assertNoBrowserRuntime(stage)
 
   mkdirSync(outDir, { recursive: true })
   rmSync(archivePath, { force: true })
@@ -98,7 +99,6 @@ function assertBundleDependencyRoot(root) {
   const required = [
     "react",
     "react-dom",
-    "playwright-core",
     "turndown",
     "turndown-plugin-gfm",
     "@avibe/show-runtime",
@@ -108,6 +108,14 @@ function assertBundleDependencyRoot(root) {
   const missing = required.filter((name) => !existsSync(join(root, "node_modules", ...name.split("/"), "package.json")))
   if (missing.length) {
     throw new Error(`Show Runtime bundle is missing shared dependencies: ${missing.join(", ")}`)
+  }
+}
+
+function assertNoBrowserRuntime(root) {
+  const forbidden = ["playwright", "playwright-core", "puppeteer", "puppeteer-core"]
+  const present = forbidden.filter((name) => existsSync(join(root, "node_modules", name, "package.json")))
+  if (present.length) {
+    throw new Error(`Show Runtime bundle contains browser automation dependencies: ${present.join(", ")}`)
   }
 }
 
