@@ -1036,11 +1036,11 @@ function AnnotationVoiceTextarea({
   ): boolean => {
     if (operationRef.current !== operation) return false
     const insertion = insertAnnotationVoiceTranscript(valueRef.current, snapshot, transcript)
-    if (!insertion) {
-      retainedTranscriptRef.current = transcript
+    if (!insertion.ok) {
+      retainedTranscriptRef.current = insertion.code === "draft_changed" ? transcript : null
       retainedSessionRef.current = null
-      setStatus("failed")
-      setErrorCode("draft_changed")
+      setStatus(insertion.code === "draft_changed" ? "failed" : "idle")
+      setErrorCode(insertion.code)
       return false
     }
     retainedTranscriptRef.current = null
@@ -1153,7 +1153,7 @@ function AnnotationVoiceTextarea({
     const session = retainedSessionRef.current
     if (!session) return
     setPreview("")
-    void processResult(session.retry(), session, snapshot, operation)
+    void processResult(session.retry({ before: snapshot.before, after: snapshot.after }), session, snapshot, operation)
   }, [captureSnapshot, commitTranscript, disabled, processResult])
 
   const discard = React.useCallback(() => {

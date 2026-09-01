@@ -37,8 +37,13 @@ export type AnnotationVoiceSnapshot = {
 export type AnnotationVoiceSession = {
   readonly done: Promise<string>
   stop(): void
-  retry(): Promise<string>
+  retry(input: AnnotationVoiceRetryInput): Promise<string>
   abort(): void
+}
+
+export type AnnotationVoiceRetryInput = {
+  before: string
+  after: string
 }
 
 export type AnnotationVoiceStartInput = {
@@ -62,7 +67,14 @@ export type AnnotationVoiceRequest =
       before: string
       after: string
     }
-  | { type: typeof ANNOTATION_VOICE_REQUEST_MESSAGE; action: "stop" | "retry" | "abort"; requestId: string }
+  | { type: typeof ANNOTATION_VOICE_REQUEST_MESSAGE; action: "stop" | "abort"; requestId: string }
+  | {
+      type: typeof ANNOTATION_VOICE_REQUEST_MESSAGE
+      action: "retry"
+      requestId: string
+      before: string
+      after: string
+    }
 
 export type AnnotationVoiceEvent =
   | {
@@ -182,14 +194,18 @@ const needsBoundarySpace = (
 }
 
 /** Insert a finalized transcript at the selection captured before the mic button took focus. */
+export type AnnotationVoiceInsertionResult =
+  | { ok: true; text: string; start: number; end: number }
+  | { ok: false; code: "draft_changed" | "empty" }
+
 export function insertAnnotationVoiceTranscript(
   currentText: string,
   snapshot: AnnotationVoiceSnapshot,
   transcript: string
-): { text: string; start: number; end: number } | null {
-  if (currentText !== snapshot.text) return null
+): AnnotationVoiceInsertionResult {
   const normalized = transcript.trim()
-  if (!normalized) return null
+  if (!normalized) return { ok: false, code: "empty" }
+  if (currentText !== snapshot.text) return { ok: false, code: "draft_changed" }
 
   const left = currentText.slice(0, snapshot.start)
   const right = currentText.slice(snapshot.end)
@@ -202,7 +218,7 @@ export function insertAnnotationVoiceTranscript(
     ? `${needsBoundarySpace(left, normalized, leftBoundary) ? " " : ""}${normalized}${needsBoundarySpace(normalized, right, transcriptBoundary) ? " " : ""}`
     : `${leadingWhitespace}${normalized}${trailingWhitespace}`
   const text = `${left}${insertion}${right}`
-  return { text, start: snapshot.start, end: snapshot.start + insertion.length }
+  return { ok: true, text, start: snapshot.start, end: snapshot.start + insertion.length }
 }
 
 const newRequestId = (): string =>
@@ -279,6 +295,7 @@ export type AnnotationVoiceBridgeDependencies = {
   parent?: AnnotationVoiceBridgeTarget
   origin?: string
   availabilityTimeoutMs?: number
+  startTimeoutMs?: number
   setTimeout?: typeof globalThis.setTimeout
   clearTimeout?: typeof globalThis.clearTimeout
 }
@@ -289,6 +306,7 @@ type BridgeSessionState = {
   onPreview?: (text: string) => void
   signal?: AbortSignal
   abortFromSignal?: () => void
+  startTimer?: ReturnType<typeof globalThis.setTimeout>
 }
 
 /** Use the owning Avibe client as the one voice implementation for an embedded Show Page. */
@@ -304,6 +322,7 @@ export function createAnnotationVoiceBridgeAdapter(
   const schedule = dependencies.setTimeout ?? globalThis.setTimeout
   const cancelTimer = dependencies.clearTimeout ?? globalThis.clearTimeout
   const availabilityTimeoutMs = dependencies.availabilityTimeoutMs ?? 1_500
+  const startTimeoutMs = dependencies.startTimeoutMs ?? 30_000
   const availability = new Map<string, Deferred<boolean>>()
   const sessions = new Map<string, BridgeSessionState>()
 
@@ -313,6 +332,10 @@ export function createAnnotationVoiceBridgeAdapter(
   const releaseSession = (requestId: string, state: BridgeSessionState): void => {
     if (sessions.get(requestId) !== state) return
     sessions.delete(requestId)
+    if (state.startTimer !== undefined) {
+      cancelTimer(state.startTimer)
+      state.startTimer = undefined
+    }
     if (state.abortFromSignal) state.signal?.removeEventListener("abort", state.abortFromSignal)
   }
   const listener = (event: MessageEvent) => {
@@ -328,6 +351,10 @@ export function createAnnotationVoiceBridgeAdapter(
     const state = sessions.get(message.requestId)
     if (!state) return
     if (message.kind === "started") {
+      if (state.startTimer !== undefined) {
+        cancelTimer(state.startTimer)
+        state.startTimer = undefined
+      }
       state.started.resolve()
     } else if (message.kind === "preview") {
       state.onPreview?.(message.text ?? "")
@@ -335,9 +362,14 @@ export function createAnnotationVoiceBridgeAdapter(
       state.result.resolve(message.text ?? "")
       releaseSession(message.requestId, state)
     } else if (message.kind === "error") {
+      if (state.startTimer !== undefined) {
+        cancelTimer(state.startTimer)
+        state.startTimer = undefined
+      }
       const error = new AnnotationVoiceError(message.code, { retryable: message.retryable })
       state.started.reject(error)
       state.result.reject(error)
+      if (!message.retryable) releaseSession(message.requestId, state)
     }
   }
   targetWindow?.addEventListener("message", listener)
@@ -386,6 +418,14 @@ export function createAnnotationVoiceBridgeAdapter(
         throw new AnnotationVoiceError("cancelled")
       }
       input.signal?.addEventListener("abort", abort, { once: true })
+      state.startTimer = schedule(() => {
+        if (sessions.get(requestId) !== state) return
+        post({ type: ANNOTATION_VOICE_REQUEST_MESSAGE, action: "abort", requestId })
+        const error = new AnnotationVoiceError("timeout")
+        state.started.reject(error)
+        state.result.reject(error)
+        releaseSession(requestId, state)
+      }, startTimeoutMs)
       post({
         type: ANNOTATION_VOICE_REQUEST_MESSAGE,
         action: "start",
@@ -403,12 +443,18 @@ export function createAnnotationVoiceBridgeAdapter(
       const session: AnnotationVoiceSession = {
         done: state.result.promise,
         stop: () => post({ type: ANNOTATION_VOICE_REQUEST_MESSAGE, action: "stop", requestId }),
-        retry: () => {
+        retry: (retryInput) => {
           const nextResult = deferred<string>()
           void nextResult.promise.catch(() => undefined)
           state.result = nextResult
           sessions.set(requestId, state)
-          post({ type: ANNOTATION_VOICE_REQUEST_MESSAGE, action: "retry", requestId })
+          post({
+            type: ANNOTATION_VOICE_REQUEST_MESSAGE,
+            action: "retry",
+            requestId,
+            before: retryInput.before,
+            after: retryInput.after
+          })
           return nextResult.promise
         },
         abort

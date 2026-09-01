@@ -16,6 +16,7 @@ describe("annotation voice text insertion", () => {
   it("inserts at the captured caret with language-aware boundaries", () => {
     const english = annotationVoiceSnapshot("Please review", 6, 6)
     expect(insertAnnotationVoiceTranscript("Please review", english, "carefully")).toEqual({
+      ok: true,
       text: "Please carefully review",
       start: 6,
       end: 16
@@ -23,6 +24,7 @@ describe("annotation voice text insertion", () => {
 
     const chinese = annotationVoiceSnapshot("这里需要调整", 2, 2)
     expect(insertAnnotationVoiceTranscript("这里需要调整", chinese, "还")).toEqual({
+      ok: true,
       text: "这里还需要调整",
       start: 2,
       end: 3
@@ -32,16 +34,25 @@ describe("annotation voice text insertion", () => {
   it("replaces only the captured selection and refuses a changed draft", () => {
     const snapshot = annotationVoiceSnapshot("Keep  old  text", 5, 10)
     expect(insertAnnotationVoiceTranscript(snapshot.text, snapshot, "new")).toEqual({
+      ok: true,
       text: "Keep  new  text",
       start: 5,
       end: 10
     })
-    expect(insertAnnotationVoiceTranscript("Draft changed", snapshot, "new")).toBeNull()
+    expect(insertAnnotationVoiceTranscript("Draft changed", snapshot, "new")).toEqual({
+      ok: false,
+      code: "draft_changed"
+    })
+    expect(insertAnnotationVoiceTranscript("Draft changed", snapshot, "  ")).toEqual({
+      ok: false,
+      code: "empty"
+    })
   })
 
   it("separates dictated sentences from adjacent punctuation and words", () => {
     const afterSentence = annotationVoiceSnapshot("Please fix.", 11, 11)
     expect(insertAnnotationVoiceTranscript(afterSentence.text, afterSentence, "Also update tests")).toEqual({
+      ok: true,
       text: "Please fix. Also update tests",
       start: 11,
       end: 29
@@ -49,6 +60,7 @@ describe("annotation voice text insertion", () => {
 
     const beforeWord = annotationVoiceSnapshot("today", 0, 0)
     expect(insertAnnotationVoiceTranscript(beforeWord.text, beforeWord, "Ready.")).toEqual({
+      ok: true,
       text: "Ready. today",
       start: 0,
       end: 7
@@ -72,13 +84,14 @@ class FakeBridgeWindow {
   }
 }
 
-const bridge = () => {
+const bridge = (dependencies: Parameters<typeof createAnnotationVoiceBridgeAdapter>[0] = {}) => {
   const targetWindow = new FakeBridgeWindow()
   const requests: AnnotationVoiceRequest[] = []
   const parent = {
     postMessage: (message: unknown) => requests.push(message as AnnotationVoiceRequest)
   }
   const adapter = createAnnotationVoiceBridgeAdapter({
+    ...dependencies,
     window: targetWindow,
     parent,
     origin: "https://show.test"
@@ -173,6 +186,27 @@ describe("annotation voice host bridge", () => {
     await expect(session.done).resolves.toBe("整理后的文字")
   })
 
+  it("times out a dropped start handshake and aborts the host request", async () => {
+    vi.useFakeTimers()
+    try {
+      const { adapter, requests } = bridge({ startTimeoutMs: 2_000 })
+      const starting = adapter.start({ before: "", after: "" })
+      const rejection = expect(starting).rejects.toMatchObject<Partial<AnnotationVoiceError>>({ code: "timeout" })
+      const requestId = requests[0]!.requestId
+
+      await vi.advanceTimersByTimeAsync(2_000)
+
+      await rejection
+      expect(requests.at(-1)).toEqual({
+        type: ANNOTATION_VOICE_REQUEST_MESSAGE,
+        action: "abort",
+        requestId
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("preserves a failed client session for retry and supports explicit discard", async () => {
     const { adapter, reply, requests } = bridge()
     const starting = adapter.start({ before: "", after: "" })
@@ -186,11 +220,13 @@ describe("annotation voice host bridge", () => {
       retryable: true
     })
 
-    const retried = session.retry()
+    const retried = session.retry({ before: "latest before", after: "latest after" })
     expect(requests.at(-1)).toEqual({
       type: ANNOTATION_VOICE_REQUEST_MESSAGE,
       action: "retry",
-      requestId
+      requestId,
+      before: "latest before",
+      after: "latest after"
     })
     reply({ kind: "result", requestId, text: "retry worked" })
     await expect(retried).resolves.toBe("retry worked")
