@@ -7,7 +7,7 @@ import {
   LoaderCircle as LoaderCircleIcon,
   Mic as MicIcon,
   RotateCcw as RotateCcwIcon,
-  X as XIcon
+  Trash2 as Trash2Icon
 } from "lucide-react"
 import {
   annotationFromAreaSelection,
@@ -291,6 +291,8 @@ export type AnnotationOverlayLabels = {
   voiceStart?: string
   /** Finish the current recording and begin transcription. */
   voiceStop?: string
+  /** Cancel the current recording without transcribing it. */
+  voiceCancel?: string
   /** Accessible label while the recording is being prepared or transcribed. */
   voiceProcessing?: string
   /** Retry transcription for the retained recording. */
@@ -369,6 +371,7 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   helpTrigger: "帮助",
   voiceStart: "语音输入",
   voiceStop: "结束录音",
+  voiceCancel: "取消录音",
   voiceProcessing: "正在整理语音",
   voiceRetry: "重试语音转写",
   voiceDiscard: "丢弃录音",
@@ -938,6 +941,9 @@ export function annotationVoiceErrorLabel(
 const voiceBusy = (status: AnnotationVoiceStatus): boolean =>
   status === "starting" || status === "recording" || status === "processing"
 
+export const annotationVoiceDiscardAvailable = (status: AnnotationVoiceStatus): boolean =>
+  status === "recording" || status === "failed"
+
 const recordingDuration = (seconds: number): string => {
   const minutes = Math.floor(seconds / 60)
   return `${minutes}:${String(seconds % 60).padStart(2, "0")}`
@@ -1176,6 +1182,8 @@ function AnnotationVoiceTextarea({
     pendingSnapshotRef.current = captureSnapshot()
   }
   const controlDisabled = Boolean(disabled) || available !== true
+  const discardAvailable = annotationVoiceDiscardAvailable(status)
+  const discardLabel = status === "recording" ? labels.voiceCancel : labels.voiceDiscard
 
   return (
     <div style={voiceFieldStackStyle}>
@@ -1189,7 +1197,7 @@ function AnnotationVoiceTextarea({
           onChange={(event) => onValueChange(event.target.value)}
           style={{
             ...style,
-            ...(voiceInput ? { paddingRight: 92 } : undefined)
+            ...(voiceInput ? { paddingRight: status === "recording" ? 132 : 92 } : undefined)
           }}
         />
         {voiceInput && available === true ? (
@@ -1198,28 +1206,17 @@ function AnnotationVoiceTextarea({
               <span aria-hidden style={voiceDurationStyle}>{recordingDuration(recordingSeconds)}</span>
             ) : null}
             {status === "failed" ? (
-              <>
-                <button
-                  type="button"
-                  aria-label={labels.voiceRetry}
-                  title={labels.voiceRetry}
-                  disabled={Boolean(disabled)}
-                  onPointerDown={rememberSelection}
-                  onClick={retry}
-                  style={voiceButtonStyle}
-                >
-                  <RotateCcwIcon size={15} aria-hidden />
-                </button>
-                <button
-                  type="button"
-                  aria-label={labels.voiceDiscard}
-                  title={labels.voiceDiscard}
-                  onClick={discard}
-                  style={voiceButtonStyle}
-                >
-                  <XIcon size={16} aria-hidden />
-                </button>
-              </>
+              <button
+                type="button"
+                aria-label={labels.voiceRetry}
+                title={labels.voiceRetry}
+                disabled={Boolean(disabled)}
+                onPointerDown={rememberSelection}
+                onClick={retry}
+                style={voiceButtonStyle}
+              >
+                <RotateCcwIcon size={15} aria-hidden />
+              </button>
             ) : status === "recording" ? (
               <button
                 type="button"
@@ -1253,6 +1250,17 @@ function AnnotationVoiceTextarea({
                 <MicIcon size={16} aria-hidden />
               </button>
             )}
+            {discardAvailable ? (
+              <button
+                type="button"
+                aria-label={discardLabel}
+                title={discardLabel}
+                onClick={discard}
+                style={voiceDiscardButtonStyle}
+              >
+                <Trash2Icon size={16} aria-hidden />
+              </button>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -3928,6 +3936,11 @@ const voiceRecordingButtonStyle: React.CSSProperties = {
   background: COLORS.human,
   borderColor: COLORS.human,
   boxShadow: `0 6px 18px ${COLORS.human}35`
+}
+
+const voiceDiscardButtonStyle: React.CSSProperties = {
+  ...voiceButtonStyle,
+  color: COLORS.danger
 }
 
 const voiceDurationStyle: React.CSSProperties = {
