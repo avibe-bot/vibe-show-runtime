@@ -11,6 +11,7 @@ import {
   edgeHandleVisual,
   createChromeFocusController,
   annotationVoiceErrorLabel,
+  annotationVoiceDiscardAvailable,
   TOUCH_CAPABLE_QUERY
 } from "./react.js"
 import {
@@ -423,6 +424,15 @@ describe("annotation voice copy", () => {
     for (const code of codes) {
       expect(annotationVoiceErrorLabel(code, labels).trim()).not.toBe("")
     }
+  })
+
+  it("offers discard for active and retained recordings", () => {
+    expect(annotationVoiceDiscardAvailable("recording")).toBe(true)
+    expect(annotationVoiceDiscardAvailable("failed")).toBe(true)
+    expect(annotationVoiceDiscardAvailable("idle")).toBe(false)
+    expect(annotationVoiceDiscardAvailable("starting")).toBe(false)
+    expect(annotationVoiceDiscardAvailable("processing")).toBe(false)
+    expect(DEFAULT_ANNOTATION_LABELS.voiceCancel).toBe("取消录音")
   })
 })
 
