@@ -40,6 +40,7 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@zumer/snapdom": "^2.16.0"
+    "@zumer/snapdom": "^2.16.0",
+    "lucide-react": "^0.555.0"
   }
 }

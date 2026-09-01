@@ -460,6 +460,9 @@ try {
   if (!annotationBootstrapBody.includes("data-show-annotation-root")) {
     throw new Error("Expected the annotation bootstrap to mount the overlay root")
   }
+  if (!annotationBootstrapBody.includes("avibe:annotation:voice:request") || !annotationBootstrapBody.includes("avibe:annotation:voice:event")) {
+    throw new Error("Expected the annotation bootstrap to include the Avibe client voice bridge")
+  }
   // Served for a pre-existing/second session too, and without warming it through Vite.
   const annotationBootstrapTwo = await fetch(`${runtime.url}/sessions/smoke-two/app/__show/annotation.js`)
   if (annotationBootstrapTwo.status !== 200) {

@@ -3,6 +3,13 @@ import { createPortal } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
 import { flushSync } from "react-dom"
 import {
+  Check as CheckIcon,
+  LoaderCircle as LoaderCircleIcon,
+  Mic as MicIcon,
+  RotateCcw as RotateCcwIcon,
+  X as XIcon
+} from "lucide-react"
+import {
   annotationFromAreaSelection,
   captureScreenshotRegion,
   collectAreaSelection,
@@ -96,6 +103,15 @@ import {
   type AnnotationHost,
   type AnnotationModeStorage
 } from "./annotation-control.js"
+import {
+  AnnotationVoiceError,
+  annotationVoiceSnapshot,
+  insertAnnotationVoiceTranscript,
+  type AnnotationVoiceAdapter,
+  type AnnotationVoiceErrorCode,
+  type AnnotationVoiceSession,
+  type AnnotationVoiceSnapshot
+} from "./annotation-voice.js"
 
 export type AgentMarkSubmitResult = Awaited<ReturnType<typeof submitShowEvent>>
 
@@ -271,6 +287,24 @@ export type AnnotationOverlayLabels = {
   copyFailedLabel?: string
   /** Accessible name for the '?' help trigger, used when a host suppresses the visible tip copy. */
   helpTrigger?: string
+  /** Start recording into the active annotation comment field. */
+  voiceStart?: string
+  /** Finish the current recording and begin transcription. */
+  voiceStop?: string
+  /** Accessible label while the recording is being prepared or transcribed. */
+  voiceProcessing?: string
+  /** Retry transcription for the retained recording. */
+  voiceRetry?: string
+  /** Discard a retained failed recording. */
+  voiceDiscard?: string
+  voicePermissionFailed?: string
+  voiceStartFailed?: string
+  voiceFailed?: string
+  voiceTimedOut?: string
+  voiceUnavailable?: string
+  voiceTooLarge?: string
+  voiceEmpty?: string
+  voiceDraftChanged?: string
 }
 
 // Required<> so the built-in defaults must stay complete (every field, incl. the optional ones)
@@ -332,7 +366,20 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   // select the link that is still on screen — never gets suggested. Paired with the `failed` dwell in
   // toastDwellMs, which gives that slower gesture its time back.
   copyFailedLabel: "请手动复制",
-  helpTrigger: "帮助"
+  helpTrigger: "帮助",
+  voiceStart: "语音输入",
+  voiceStop: "结束录音",
+  voiceProcessing: "正在整理语音",
+  voiceRetry: "重试语音转写",
+  voiceDiscard: "丢弃录音",
+  voicePermissionFailed: "无法使用麦克风，请检查浏览器权限后重试。",
+  voiceStartFailed: "当前浏览器无法启动语音录制，请刷新页面或更换支持的浏览器。",
+  voiceFailed: "语音转写失败，录音已保留，可以重试。",
+  voiceTimedOut: "语音转写超时，录音已保留，可以重试。",
+  voiceUnavailable: "语音转写暂时不可用。",
+  voiceTooLarge: "这段录音太大，无法转写。",
+  voiceEmpty: "这段录音中没有检测到语音。",
+  voiceDraftChanged: "标注文字已发生变化，录音已保留，可以重试。"
 }
 
 /**
@@ -374,6 +421,8 @@ export type AnnotationOverlayProps = {
   defaultIntent?: ShowAnnotationIntent | string
   severity?: string
   labels?: Partial<AnnotationOverlayLabels>
+  /** Optional host voice adapter. Omit it to render the annotation fields without a mic. */
+  voiceInput?: AnnotationVoiceAdapter
   onEnable?: (mode?: AnnotationMode) => void
   onDisable?: () => void
   onSetMode?: (mode: AnnotationMode) => void
@@ -859,6 +908,364 @@ export function ActionButton({
   )
 }
 
+type AnnotationVoiceStatus = "idle" | "starting" | "recording" | "processing" | "failed"
+
+type AnnotationVoiceTextareaProps = Omit<
+  React.TextareaHTMLAttributes<HTMLTextAreaElement>,
+  "onChange" | "value"
+> & {
+  value: string
+  onValueChange: (value: string) => void
+  voiceInput?: AnnotationVoiceAdapter
+  labels: Required<AnnotationOverlayLabels>
+  onVoiceBusyChange?: (busy: boolean) => void
+}
+
+export function annotationVoiceErrorLabel(
+  code: AnnotationVoiceErrorCode,
+  labels: Required<AnnotationOverlayLabels>
+): string {
+  if (code === "permission") return labels.voicePermissionFailed
+  if (code === "start_failed") return labels.voiceStartFailed
+  if (code === "timeout") return labels.voiceTimedOut
+  if (code === "unavailable") return labels.voiceUnavailable
+  if (code === "too_large") return labels.voiceTooLarge
+  if (code === "empty") return labels.voiceEmpty
+  if (code === "draft_changed") return labels.voiceDraftChanged
+  return labels.voiceFailed
+}
+
+const voiceBusy = (status: AnnotationVoiceStatus): boolean =>
+  status === "starting" || status === "recording" || status === "processing"
+
+const recordingDuration = (seconds: number): string => {
+  const minutes = Math.floor(seconds / 60)
+  return `${minutes}:${String(seconds % 60).padStart(2, "0")}`
+}
+
+/** One controlled annotation textarea with a host-injected voice capability. */
+function AnnotationVoiceTextarea({
+  value,
+  onValueChange,
+  voiceInput,
+  labels,
+  onVoiceBusyChange,
+  disabled,
+  readOnly,
+  style,
+  ...textareaProps
+}: AnnotationVoiceTextareaProps) {
+  const textareaRef = React.useRef<HTMLTextAreaElement | null>(null)
+  const valueRef = React.useRef(value)
+  const operationRef = React.useRef(0)
+  const recordingRef = React.useRef<AnnotationVoiceSession | null>(null)
+  const retainedSessionRef = React.useRef<AnnotationVoiceSession | null>(null)
+  const retainedTranscriptRef = React.useRef<string | null>(null)
+  const pendingSnapshotRef = React.useRef<AnnotationVoiceSnapshot | null>(null)
+  const requestRef = React.useRef<AbortController | null>(null)
+  const timerRef = React.useRef<ReturnType<typeof setInterval> | null>(null)
+  const [available, setAvailable] = React.useState<boolean | null>(voiceInput ? null : false)
+  const [status, setStatus] = React.useState<AnnotationVoiceStatus>("idle")
+  const [errorCode, setErrorCode] = React.useState<AnnotationVoiceErrorCode | null>(null)
+  const [recordingSeconds, setRecordingSeconds] = React.useState(0)
+  const [preview, setPreview] = React.useState("")
+  valueRef.current = value
+
+  const clearTimer = React.useCallback(() => {
+    if (timerRef.current === null) return
+    clearInterval(timerRef.current)
+    timerRef.current = null
+  }, [])
+
+  const captureSnapshot = React.useCallback((): AnnotationVoiceSnapshot => {
+    const textarea = textareaRef.current
+    const start = textarea?.selectionStart ?? valueRef.current.length
+    const end = textarea?.selectionEnd ?? start
+    return annotationVoiceSnapshot(valueRef.current, start, end)
+  }, [])
+
+  React.useEffect(() => {
+    if (!voiceInput) {
+      setAvailable(false)
+      return
+    }
+    let cancelled = false
+    setAvailable(null)
+    void voiceInput.isAvailable().then(
+      (next) => {
+        if (!cancelled) setAvailable(next)
+      },
+      () => {
+        if (!cancelled) setAvailable(false)
+      }
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [voiceInput])
+
+  const busy = voiceBusy(status)
+  React.useEffect(() => {
+    onVoiceBusyChange?.(busy)
+  }, [busy, onVoiceBusyChange])
+
+  React.useEffect(() => () => {
+    operationRef.current += 1
+    clearTimer()
+    recordingRef.current?.abort()
+    recordingRef.current = null
+    retainedSessionRef.current?.abort()
+    retainedSessionRef.current = null
+    retainedTranscriptRef.current = null
+    requestRef.current?.abort()
+    requestRef.current = null
+    onVoiceBusyChange?.(false)
+  }, [clearTimer, onVoiceBusyChange])
+
+  const restoreSelection = React.useCallback((start: number, end: number) => {
+    globalThis.requestAnimationFrame?.(() => {
+      textareaRef.current?.focus()
+      textareaRef.current?.setSelectionRange(start, end)
+    })
+  }, [])
+
+  const commitTranscript = React.useCallback((
+    transcript: string,
+    snapshot: AnnotationVoiceSnapshot,
+    operation: number
+  ): boolean => {
+    if (operationRef.current !== operation) return false
+    const insertion = insertAnnotationVoiceTranscript(valueRef.current, snapshot, transcript)
+    if (!insertion.ok) {
+      retainedTranscriptRef.current = insertion.code === "draft_changed" ? transcript : null
+      retainedSessionRef.current = null
+      setStatus(insertion.code === "draft_changed" ? "failed" : "idle")
+      setErrorCode(insertion.code)
+      return false
+    }
+    retainedTranscriptRef.current = null
+    retainedSessionRef.current = null
+    setStatus("idle")
+    setErrorCode(null)
+    setPreview("")
+    onValueChange(insertion.text)
+    restoreSelection(insertion.start, insertion.end)
+    return true
+  }, [onValueChange, restoreSelection])
+
+  const processResult = React.useCallback(async (
+    result: Promise<string>,
+    session: AnnotationVoiceSession,
+    snapshot: AnnotationVoiceSnapshot,
+    operation: number
+  ) => {
+    if (operationRef.current !== operation) return
+    clearTimer()
+    setStatus("processing")
+    setErrorCode(null)
+    try {
+      const transcript = await result
+      if (operationRef.current !== operation) return
+      recordingRef.current = null
+      commitTranscript(transcript, snapshot, operation)
+    } catch (error) {
+      if (operationRef.current !== operation || requestRef.current?.signal.aborted) return
+      recordingRef.current = null
+      const code = error instanceof AnnotationVoiceError ? error.code : "failed"
+      const retryable = error instanceof AnnotationVoiceError && error.retryable
+      retainedSessionRef.current = retryable ? session : null
+      retainedTranscriptRef.current = null
+      setStatus(retryable ? "failed" : "idle")
+      setErrorCode(code)
+    }
+  }, [clearTimer, commitTranscript])
+
+  const beginRecording = React.useCallback(async () => {
+    if (!voiceInput || available !== true || disabled || voiceBusy(status)) return
+    const operation = ++operationRef.current
+    const snapshot = pendingSnapshotRef.current ?? captureSnapshot()
+    pendingSnapshotRef.current = null
+    retainedSessionRef.current?.abort()
+    retainedSessionRef.current = null
+    retainedTranscriptRef.current = null
+    setPreview("")
+    setErrorCode(null)
+    setStatus("starting")
+    const controller = new AbortController()
+    requestRef.current?.abort()
+    requestRef.current = controller
+    try {
+      const recording = await voiceInput.start({
+        before: snapshot.before,
+        after: snapshot.after,
+        signal: controller.signal,
+        onPreview: (text) => {
+          if (operationRef.current === operation) setPreview(text)
+        }
+      })
+      if (operationRef.current !== operation) {
+        recording.abort()
+        return
+      }
+      recordingRef.current = recording
+      setRecordingSeconds(0)
+      setStatus("recording")
+      const startedAt = Date.now()
+      timerRef.current = setInterval(() => {
+        setRecordingSeconds(Math.floor((Date.now() - startedAt) / 1000))
+      }, 1000)
+      void recording.done.then(
+        (transcript) => {
+          if (operationRef.current !== operation || recordingRef.current !== recording) return
+          void processResult(Promise.resolve(transcript), recording, snapshot, operation)
+        },
+        (error) => {
+          if (operationRef.current !== operation || recordingRef.current !== recording) return
+          void processResult(Promise.reject(error), recording, snapshot, operation)
+        }
+      )
+    } catch (error) {
+      if (operationRef.current !== operation || controller.signal.aborted) return
+      clearTimer()
+      setStatus("idle")
+      setErrorCode(error instanceof AnnotationVoiceError ? error.code : "start_failed")
+    }
+  }, [available, captureSnapshot, clearTimer, disabled, processResult, status, voiceInput])
+
+  const finishRecording = React.useCallback(() => {
+    const recording = recordingRef.current
+    if (!recording || status !== "recording") return
+    clearTimer()
+    setStatus("processing")
+    recording.stop()
+  }, [clearTimer, status])
+
+  const retry = React.useCallback(() => {
+    if (disabled) return
+    const operation = ++operationRef.current
+    const snapshot = pendingSnapshotRef.current ?? captureSnapshot()
+    pendingSnapshotRef.current = null
+    const transcript = retainedTranscriptRef.current
+    if (transcript) {
+      commitTranscript(transcript, snapshot, operation)
+      return
+    }
+    const session = retainedSessionRef.current
+    if (!session) return
+    setPreview("")
+    void processResult(session.retry({ before: snapshot.before, after: snapshot.after }), session, snapshot, operation)
+  }, [captureSnapshot, commitTranscript, disabled, processResult])
+
+  const discard = React.useCallback(() => {
+    operationRef.current += 1
+    clearTimer()
+    recordingRef.current?.abort()
+    recordingRef.current = null
+    retainedSessionRef.current?.abort()
+    retainedSessionRef.current = null
+    retainedTranscriptRef.current = null
+    requestRef.current?.abort()
+    requestRef.current = null
+    pendingSnapshotRef.current = null
+    setStatus("idle")
+    setErrorCode(null)
+    setPreview("")
+  }, [clearTimer])
+
+  const rememberSelection = () => {
+    pendingSnapshotRef.current = captureSnapshot()
+  }
+  const controlDisabled = Boolean(disabled) || available !== true
+
+  return (
+    <div style={voiceFieldStackStyle}>
+      <div style={voiceFieldStyle}>
+        <textarea
+          {...textareaProps}
+          ref={textareaRef}
+          value={value}
+          disabled={disabled}
+          readOnly={readOnly || busy}
+          onChange={(event) => onValueChange(event.target.value)}
+          style={{
+            ...style,
+            ...(voiceInput ? { paddingRight: 92 } : undefined)
+          }}
+        />
+        {voiceInput && available === true ? (
+          <div style={voiceControlsStyle}>
+            {status === "recording" ? (
+              <span aria-hidden style={voiceDurationStyle}>{recordingDuration(recordingSeconds)}</span>
+            ) : null}
+            {status === "failed" ? (
+              <>
+                <button
+                  type="button"
+                  aria-label={labels.voiceRetry}
+                  title={labels.voiceRetry}
+                  disabled={Boolean(disabled)}
+                  onPointerDown={rememberSelection}
+                  onClick={retry}
+                  style={voiceButtonStyle}
+                >
+                  <RotateCcwIcon size={15} aria-hidden />
+                </button>
+                <button
+                  type="button"
+                  aria-label={labels.voiceDiscard}
+                  title={labels.voiceDiscard}
+                  onClick={discard}
+                  style={voiceButtonStyle}
+                >
+                  <XIcon size={16} aria-hidden />
+                </button>
+              </>
+            ) : status === "recording" ? (
+              <button
+                type="button"
+                aria-label={labels.voiceStop}
+                title={labels.voiceStop}
+                onClick={finishRecording}
+                style={voiceRecordingButtonStyle}
+              >
+                <CheckIcon size={17} strokeWidth={2.5} aria-hidden />
+              </button>
+            ) : status === "starting" || status === "processing" ? (
+              <button
+                type="button"
+                aria-label={labels.voiceProcessing}
+                title={labels.voiceProcessing}
+                disabled
+                style={disabledButtonStyle(voiceButtonStyle, true)}
+              >
+                <LoaderCircleIcon size={16} aria-hidden />
+              </button>
+            ) : (
+              <button
+                type="button"
+                aria-label={labels.voiceStart}
+                title={labels.voiceStart}
+                disabled={controlDisabled}
+                onPointerDown={rememberSelection}
+                onClick={() => void beginRecording()}
+                style={disabledButtonStyle(voiceButtonStyle, controlDisabled)}
+              >
+                <MicIcon size={16} aria-hidden />
+              </button>
+            )}
+          </div>
+        ) : null}
+      </div>
+      {preview && (status === "recording" || status === "processing") ? (
+        <p aria-live="polite" style={voicePreviewStyle}>{preview}</p>
+      ) : null}
+      {errorCode && errorCode !== "cancelled" ? (
+        <p role="alert" style={overlayErrorStyle}>{annotationVoiceErrorLabel(errorCode, labels)}</p>
+      ) : null}
+    </div>
+  )
+}
+
 export function AnnotationOverlay({
   enabled: enabledProp,
   defaultEnabled = false,
@@ -871,6 +1278,7 @@ export function AnnotationOverlay({
   defaultIntent,
   severity = "suggestion",
   labels,
+  voiceInput,
   onEnable,
   onDisable,
   onSetMode,
@@ -924,6 +1332,8 @@ export function AnnotationOverlay({
   const [screenshotDraft, setScreenshotDraft] = React.useState<ScreenshotDraft | null>(null)
   const [comment, setComment] = React.useState("")
   const [screenshotComment, setScreenshotComment] = React.useState("")
+  const [smartVoiceBusy, setSmartVoiceBusy] = React.useState(false)
+  const [screenshotVoiceBusy, setScreenshotVoiceBusy] = React.useState(false)
   const [drag, setDrag] = React.useState<{ purpose: "smart-area" | "screenshot-region" | "screenshot-item"; startX: number; startY: number; rect: MarkAnchorRect } | null>(null)
   const [submitting, setSubmitting] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
@@ -1116,7 +1526,7 @@ export function AnnotationOverlay({
     // Effective note text: empty when the comment box is hidden (approve fast path, no note expanded),
     // so switching to approve after typing under another intent never submits stale, hidden text.
     const text = selectedIntent === APPROVE_INTENT && !noteExpanded ? "" : comment
-    if (!draft || !canSubmitAnnotation(selectedIntent, text)) return
+    if (!draft || smartVoiceBusy || !canSubmitAnnotation(selectedIntent, text)) return
     const baseAnnotation: ShowAnnotation = {
       scope,
       intent: selectedIntent,
@@ -1145,7 +1555,7 @@ export function AnnotationOverlay({
   }
 
   async function submitScreenshotDraft() {
-    if (!active || !screenshotDraft?.capture || screenshotDraft.items.length === 0) return
+    if (!active || screenshotVoiceBusy || !screenshotDraft?.capture || screenshotDraft.items.length === 0) return
     const annotation = screenshotAnnotationFromDraft({
       scope,
       intent: selectedIntent,
@@ -1272,7 +1682,7 @@ export function AnnotationOverlay({
   }
 
   function addScreenshotComment() {
-    if (!active || !screenshotDraft?.capture || !screenshotComment.trim()) return
+    if (!active || screenshotVoiceBusy || !screenshotDraft?.capture || !screenshotComment.trim()) return
     const label = ++screenshotItemSequenceRef.current
     const id = `shot_item_${label}`
     const capturedRegion = screenshotDraft.capture.capturedRegion
@@ -1358,7 +1768,7 @@ export function AnnotationOverlay({
               <div style={cardFooterStyle}>
                 {/* Hint only when the comment box is shown and Enter-to-send applies (hardware keyboard). */}
                 <span style={footerHintStyle}>{commentVisible && !touchInput ? copy.enterToSend : ""}</span>
-                <button ref={approveSendRef} type="button" disabled={submitting || !canSubmitAnnotation(selectedIntent, comment)} onClick={() => void submit()} style={disabledButtonStyle(primaryButtonStyle, submitting || !canSubmitAnnotation(selectedIntent, comment))}>
+                <button ref={approveSendRef} type="button" disabled={submitting || smartVoiceBusy || !canSubmitAnnotation(selectedIntent, comment)} onClick={() => void submit()} style={disabledButtonStyle(primaryButtonStyle, submitting || smartVoiceBusy || !canSubmitAnnotation(selectedIntent, comment))}>
                   {isApprove ? <IntentIcon intent={APPROVE_INTENT} /> : <SendIcon />}
                   {submitting ? "…" : isApprove ? copy.approve : copy.send}
                 </button>
@@ -1378,13 +1788,17 @@ export function AnnotationOverlay({
                 }}>{copy.byArea}</button>
               </div>
             ) : null}
-            <IntentChips options={intentOptions} value={selectedIntent} onChange={selectIntent} />
+            <IntentChips options={intentOptions} value={selectedIntent} disabled={smartVoiceBusy} onChange={selectIntent} />
             {commentVisible ? (
-              <textarea
+              <AnnotationVoiceTextarea
                 autoFocus
                 placeholder={copy.commentPlaceholder}
                 value={comment}
-                onChange={(event) => setComment(event.target.value)}
+                onValueChange={setComment}
+                voiceInput={voiceInput}
+                labels={copy}
+                disabled={submitting}
+                onVoiceBusyChange={setSmartVoiceBusy}
                 onKeyDown={(event) => {
                   // Enter sends when a hardware keyboard is present (Shift+Enter for a newline); a
                   // touch device keeps Enter as a newline. Keyed on input capability, not layout, so a
@@ -1429,6 +1843,7 @@ export function AnnotationOverlay({
                 draft={screenshotDraft}
                 comment={screenshotComment}
                 submitting={submitting}
+                voiceBusy={screenshotVoiceBusy}
                 labels={copy}
                 onAddComment={addScreenshotComment}
                 onRetake={resetScreenshotState}
@@ -1439,8 +1854,12 @@ export function AnnotationOverlay({
             <ScreenshotBatchBody
               draft={screenshotDraft}
               comment={screenshotComment}
+              commentKey={nextItemLabel}
+              submitting={submitting}
+              voiceInput={voiceInput}
               labels={copy}
               onCommentChange={setScreenshotComment}
+              onVoiceBusyChange={setScreenshotVoiceBusy}
               onRemoveItem={(id) => setScreenshotDraft({ ...screenshotDraft, items: screenshotDraft.items.filter((current) => current.id !== id) })}
             />
             {error ? <p role="alert" style={overlayErrorStyle}>{error}</p> : null}
@@ -2455,7 +2874,7 @@ function ModeTab({ active, onClick, icon, label, compact }: { active: boolean; o
 
 // ── Intent chips, anchor chip, comment surface (popover / mobile bottom-sheet) ──────────
 
-function IntentChips({ options, value, onChange }: { options: AnnotationIntentOption[]; value: string; onChange: (intent: string) => void }) {
+function IntentChips({ options, value, disabled = false, onChange }: { options: AnnotationIntentOption[]; value: string; disabled?: boolean; onChange: (intent: string) => void }) {
   return (
     <div style={intentChipsStyle}>
       {options.map((option) => {
@@ -2464,7 +2883,7 @@ function IntentChips({ options, value, onChange }: { options: AnnotationIntentOp
           // onMouseDown preventDefault: don't take focus on a mouse press, so a clicked-then-unselected
           // chip shows no lingering focus ring (renders identical to its siblings). Keyboard Tab focus
           // is unaffected, so the ring still shows for keyboard users.
-          <button key={option.intent} type="button" aria-pressed={selected} onMouseDown={(event) => event.preventDefault()} onClick={() => onChange(option.intent)} style={selected ? intentChipActiveStyle : intentChipStyle}>
+          <button key={option.intent} type="button" disabled={disabled} aria-pressed={selected} onMouseDown={(event) => event.preventDefault()} onClick={() => onChange(option.intent)} style={disabled ? { ...(selected ? intentChipActiveStyle : intentChipStyle), cursor: "not-allowed", opacity: 0.55 } : selected ? intentChipActiveStyle : intentChipStyle}>
             <IntentIcon intent={option.intent} />
             {option.label}
           </button>
@@ -2572,10 +2991,14 @@ function NumberPin({ point, tone, label, pending }: { point: { x: number; y: num
 type ScreenshotBatchCardProps = {
   draft: ScreenshotDraft
   comment: string
+  commentKey: number
   submitting: boolean
+  voiceBusy: boolean
+  voiceInput?: AnnotationVoiceAdapter
   // Complete: mergeAnnotationLabels() filled every field at the overlay boundary, so nothing downstream re-checks.
   labels: Required<AnnotationOverlayLabels>
   onCommentChange: (value: string) => void
+  onVoiceBusyChange: (busy: boolean) => void
   onAddComment: () => void
   onRemoveItem: (id: string) => void
   onRetake: () => void
@@ -2583,7 +3006,7 @@ type ScreenshotBatchCardProps = {
 }
 
 /** Scrollable body of the screenshot batch card (header, preview, numbered comment list, input). */
-function ScreenshotBatchBody({ draft, comment, labels, onCommentChange, onRemoveItem }: Pick<ScreenshotBatchCardProps, "draft" | "comment" | "labels" | "onCommentChange" | "onRemoveItem">) {
+function ScreenshotBatchBody({ draft, comment, commentKey, submitting, voiceInput, labels, onCommentChange, onVoiceBusyChange, onRemoveItem }: Pick<ScreenshotBatchCardProps, "draft" | "comment" | "commentKey" | "submitting" | "voiceInput" | "labels" | "onCommentChange" | "onVoiceBusyChange" | "onRemoveItem">) {
   const touchInput = useTouchInput() // ≥16px input font on touch so iOS doesn't focus-zoom the send button off-screen
   return (
     <>
@@ -2603,10 +3026,15 @@ function ScreenshotBatchBody({ draft, comment, labels, onCommentChange, onRemove
           ))}
         </ol>
       ) : null}
-      <textarea
+      <AnnotationVoiceTextarea
+        key={commentKey}
         placeholder={labels.screenshotCommentPlaceholder}
         value={comment}
-        onChange={(event) => onCommentChange(event.target.value)}
+        onValueChange={onCommentChange}
+        voiceInput={voiceInput}
+        labels={labels}
+        disabled={submitting}
+        onVoiceBusyChange={onVoiceBusyChange}
         style={touchInput ? overlayTextareaTouchStyle : overlayTextareaStyle}
       />
     </>
@@ -2614,7 +3042,7 @@ function ScreenshotBatchBody({ draft, comment, labels, onCommentChange, onRemove
 }
 
 /** Pinned footer of the screenshot batch card (retake / add comment / send batch). */
-function ScreenshotBatchFooter({ draft, comment, submitting, labels, onAddComment, onRetake, onSend }: Pick<ScreenshotBatchCardProps, "draft" | "comment" | "submitting" | "labels" | "onAddComment" | "onRetake" | "onSend">) {
+function ScreenshotBatchFooter({ draft, comment, submitting, voiceBusy, labels, onAddComment, onRetake, onSend }: Pick<ScreenshotBatchCardProps, "draft" | "comment" | "submitting" | "voiceBusy" | "labels" | "onAddComment" | "onRetake" | "onSend">) {
   return (
     <div style={cardFooterStyle}>
       <button type="button" onClick={onRetake} style={secondaryButtonStyle}>
@@ -2622,8 +3050,8 @@ function ScreenshotBatchFooter({ draft, comment, submitting, labels, onAddCommen
         {labels.retake}
       </button>
       <div style={{ display: "flex", gap: 8 }}>
-        <button type="button" disabled={!comment.trim()} onClick={onAddComment} style={disabledButtonStyle(ghostButtonStyle, !comment.trim())}>{labels.addComment}</button>
-        <button type="button" disabled={submitting || draft.items.length === 0} onClick={onSend} style={disabledButtonStyle(primaryButtonStyle, submitting || draft.items.length === 0)}>
+        <button type="button" disabled={voiceBusy || !comment.trim()} onClick={onAddComment} style={disabledButtonStyle(ghostButtonStyle, voiceBusy || !comment.trim())}>{labels.addComment}</button>
+        <button type="button" disabled={submitting || voiceBusy || draft.items.length === 0} onClick={onSend} style={disabledButtonStyle(primaryButtonStyle, submitting || voiceBusy || draft.items.length === 0)}>
           <SendIcon />
           {submitting ? "…" : labels.sendBatch(draft.items.length)}
         </button>
@@ -3440,6 +3868,7 @@ const closeButtonStyle: React.CSSProperties = {
 }
 
 const overlayTextareaStyle: React.CSSProperties = {
+  display: "block",
   minHeight: 84,
   resize: "vertical",
   color: COLORS.textPrimary,
@@ -3459,6 +3888,61 @@ const overlayTextareaStyle: React.CSSProperties = {
 const overlayTextareaTouchStyle: React.CSSProperties = {
   ...overlayTextareaStyle,
   font: `16px/1.4 ${FONT_STACK}`
+}
+
+const voiceFieldStackStyle: React.CSSProperties = {
+  display: "grid",
+  gap: 6
+}
+
+const voiceFieldStyle: React.CSSProperties = {
+  position: "relative"
+}
+
+const voiceControlsStyle: React.CSSProperties = {
+  position: "absolute",
+  right: 7,
+  bottom: 7,
+  display: "flex",
+  alignItems: "center",
+  gap: 4
+}
+
+const voiceButtonStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  width: 36,
+  height: 36,
+  padding: 0,
+  border: `1px solid ${COLORS.border}`,
+  borderRadius: 8,
+  color: COLORS.textPrimary,
+  background: COLORS.surfaceRaised,
+  cursor: "pointer"
+}
+
+const voiceRecordingButtonStyle: React.CSSProperties = {
+  ...voiceButtonStyle,
+  color: COLORS.onAccent,
+  background: COLORS.human,
+  borderColor: COLORS.human,
+  boxShadow: `0 6px 18px ${COLORS.human}35`
+}
+
+const voiceDurationStyle: React.CSSProperties = {
+  minWidth: 34,
+  color: COLORS.textMuted,
+  font: `500 11px/1 ${FONT_STACK}`,
+  fontVariantNumeric: "tabular-nums",
+  textAlign: "right"
+}
+
+const voicePreviewStyle: React.CSSProperties = {
+  margin: 0,
+  color: COLORS.textMuted,
+  font: `500 12px/1.45 ${FONT_STACK}`,
+  overflowWrap: "anywhere"
 }
 
 const cardFooterStyle: React.CSSProperties = {
@@ -4355,7 +4839,7 @@ export type AnnotationRootProps = {
   config?: RuntimeConfig
   /** Run the `__show/me` auth probe (default true); pass false to skip it. */
   probeAuth?: boolean
-} & Pick<AnnotationOverlayProps, "scope" | "intents" | "defaultIntent" | "severity" | "labels" | "onSubmitted">
+} & Pick<AnnotationOverlayProps, "scope" | "intents" | "defaultIntent" | "severity" | "labels" | "voiceInput" | "onSubmitted">
 
 /**
  * Bridges the framework-agnostic controller to the React overlay: subscribes to control state,
@@ -4366,7 +4850,7 @@ export type AnnotationRootProps = {
  * only a control event created at/after page load may enable it — a stale command replayed by the
  * SSE stream is ignored via `isLiveControlEvent`.
  */
-export function AnnotationRoot({ controller, config = readRuntimeConfig(), probeAuth = true, scope, intents, defaultIntent, severity, labels, onSubmitted }: AnnotationRootProps) {
+export function AnnotationRoot({ controller, config = readRuntimeConfig(), probeAuth = true, scope, intents, defaultIntent, severity, labels, voiceInput, onSubmitted }: AnnotationRootProps) {
   const state = useAnnotationControllerState(controller)
   const [initialEvents, setInitialEvents] = React.useState<ShowEvent[] | null>(null)
   // Page-load timestamp: control events older than this are treated as replay and ignored. Set once.
@@ -4458,6 +4942,7 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
         defaultIntent={defaultIntent}
         severity={severity}
         labels={labels}
+        voiceInput={voiceInput}
         onEnable={(mode) => controller.enable(mode)}
         onDisable={() => controller.disable()}
         onSetMode={(mode) => controller.setMode(mode)}
@@ -4467,7 +4952,7 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
   )
 }
 
-export type MountAnnotationOverlayOptions = Pick<AnnotationRootProps, "scope" | "intents" | "defaultIntent" | "severity" | "labels" | "onSubmitted"> & {
+export type MountAnnotationOverlayOptions = Pick<AnnotationRootProps, "scope" | "intents" | "defaultIntent" | "severity" | "labels" | "voiceInput" | "onSubmitted"> & {
   config?: RuntimeConfig
   controller?: AnnotationController
   container?: HTMLElement
@@ -4504,6 +4989,7 @@ export function mountAnnotationOverlay(options: MountAnnotationOverlayOptions = 
         defaultIntent={options.defaultIntent}
         severity={options.severity}
         labels={options.labels}
+        voiceInput={options.voiceInput}
         onSubmitted={options.onSubmitted}
       />
     </AnnotationErrorBoundary>
