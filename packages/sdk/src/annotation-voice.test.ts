@@ -2,15 +2,14 @@ import { describe, expect, it, vi } from "vitest"
 
 import {
   AnnotationVoiceError,
-  ANNOTATION_VOICE_STATUS_PATH,
-  ANNOTATION_VOICE_TRANSCRIPTION_PATH,
-  ANNOTATION_VOICE_MAX_BYTES,
+  ANNOTATION_VOICE_EVENT_MESSAGE,
+  ANNOTATION_VOICE_REQUEST_MESSAGE,
+  annotationVoiceEventFromPayload,
   annotationVoiceSnapshot,
+  createAnnotationVoiceBridgeAdapter,
   insertAnnotationVoiceTranscript,
-  preferredAnnotationVoiceMimeType,
-  probeAnnotationVoice,
-  startAnnotationVoiceRecording,
-  transcribeAnnotationVoice
+  type AnnotationVoiceEvent,
+  type AnnotationVoiceRequest
 } from "./annotation-voice.js"
 
 describe("annotation voice text insertion", () => {
@@ -39,261 +38,168 @@ describe("annotation voice text insertion", () => {
     })
     expect(insertAnnotationVoiceTranscript("Draft changed", snapshot, "new")).toBeNull()
   })
-})
 
-describe("annotation voice API adapter", () => {
-  it("probes the existing Avibe voice status endpoint", async () => {
-    const availableFetch = vi.fn(async () => new Response(JSON.stringify({ available: true }), { status: 200 }))
-    await expect(probeAnnotationVoice({ fetch: availableFetch as typeof fetch })).resolves.toBe(true)
-    expect(availableFetch).toHaveBeenCalledWith(
-      ANNOTATION_VOICE_STATUS_PATH,
-      { credentials: "same-origin" }
-    )
-
-    const unavailableFetch = vi.fn(async () => new Response(JSON.stringify({ available: false }), { status: 200 }))
-    await expect(probeAnnotationVoice({ fetch: unavailableFetch as typeof fetch })).resolves.toBe(false)
-  })
-
-  it("sends one final dictation with cleanup context through the shared endpoint", async () => {
-    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = []
-    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      requests.push({ input, init })
-      if (String(input) === "/api/csrf-token") {
-        return new Response(JSON.stringify({ csrf_token: "csrf-1" }), { status: 200 })
-      }
-      return new Response(JSON.stringify({ text: "整理后的反馈", cleanup: "success" }), { status: 200 })
+  it("separates dictated sentences from adjacent punctuation and words", () => {
+    const afterSentence = annotationVoiceSnapshot("Please fix.", 11, 11)
+    expect(insertAnnotationVoiceTranscript(afterSentence.text, afterSentence, "Also update tests")).toEqual({
+      text: "Please fix. Also update tests",
+      start: 11,
+      end: 29
     })
 
-    await expect(transcribeAnnotationVoice(
-      {
-        blob: new Blob(["audio"], { type: "audio/webm;codecs=opus" }),
-        before: "前文",
-        after: "后文"
-      },
-      {
-        fetch: fetcher as typeof fetch,
-        encodeBlob: async () => "encoded-audio",
-        readCsrfCookie: () => null
-      }
-    )).resolves.toBe("整理后的反馈")
-
-    expect(requests.map(({ input }) => String(input))).toEqual([
-      "/api/csrf-token",
-      ANNOTATION_VOICE_TRANSCRIPTION_PATH
-    ])
-    const request = requests[1]!.init!
-    expect(new Headers(request.headers).get("X-Vibe-CSRF-Token")).toBe("csrf-1")
-    expect(JSON.parse(String(request.body))).toMatchObject({
-      name: "voice.webm",
-      mime: "audio/webm",
-      data: "encoded-audio",
-      sequence: 0,
-      final: true,
-      finalize_only: false,
-      receipts: [],
-      before: "前文",
-      after: "后文"
+    const beforeWord = annotationVoiceSnapshot("today", 0, 0)
+    expect(insertAnnotationVoiceTranscript(beforeWord.text, beforeWord, "Ready.")).toEqual({
+      text: "Ready. today",
+      start: 0,
+      end: 7
     })
-  })
-
-  it("replays only the rejected CSRF request with the browser's current cookie", async () => {
-    const tokens: string[] = []
-    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      tokens.push(new Headers(init?.headers).get("X-Vibe-CSRF-Token") ?? "")
-      if (tokens.length === 1) {
-        return new Response(JSON.stringify({ message: "Forbidden: invalid csrf token" }), { status: 403 })
-      }
-      return new Response(JSON.stringify({ text: "ok", cleanup: "success" }), { status: 200 })
-    })
-    const cookies = ["stale", "current"]
-
-    await expect(transcribeAnnotationVoice(
-      { blob: new Blob(["audio"], { type: "audio/webm" }), before: "", after: "" },
-      {
-        fetch: fetcher as typeof fetch,
-        encodeBlob: async () => "encoded",
-        readCsrfCookie: () => cookies.shift() ?? null
-      }
-    )).resolves.toBe("ok")
-    expect(tokens).toEqual(["stale", "current"])
-  })
-
-  it("does not replay an unrelated forbidden response", async () => {
-    const fetcher = vi.fn(async () => new Response(
-      JSON.stringify({ error: "forbidden" }),
-      { status: 403 }
-    ))
-
-    const failure = transcribeAnnotationVoice(
-      { blob: new Blob(["audio"], { type: "audio/webm" }), before: "", after: "" },
-      {
-        fetch: fetcher as typeof fetch,
-        encodeBlob: async () => "encoded",
-        readCsrfCookie: () => "csrf"
-      }
-    )
-    await expect(failure).rejects.toMatchObject<Partial<AnnotationVoiceError>>({
-      code: "failed",
-      status: 403
-    })
-    expect(fetcher).toHaveBeenCalledOnce()
-  })
-
-  it("preserves the server's retry-relevant failure class", async () => {
-    const fetcher = vi.fn(async () => new Response(
-      JSON.stringify({ error: "transcription_timeout" }),
-      { status: 504 }
-    ))
-    const failure = transcribeAnnotationVoice(
-      { blob: new Blob(["audio"], { type: "audio/webm" }), before: "", after: "" },
-      {
-        fetch: fetcher as typeof fetch,
-        encodeBlob: async () => "encoded",
-        readCsrfCookie: () => "csrf"
-      }
-    )
-    await expect(failure).rejects.toMatchObject<Partial<AnnotationVoiceError>>({
-      code: "timeout",
-      status: 504
-    })
-  })
-
-  it("rejects an oversized blob before encoding or sending it", async () => {
-    const fetcher = vi.fn()
-    const encodeBlob = vi.fn(async () => "encoded")
-    const failure = transcribeAnnotationVoice(
-      {
-        blob: new Blob([new Uint8Array(ANNOTATION_VOICE_MAX_BYTES + 1)], { type: "audio/webm" }),
-        before: "",
-        after: ""
-      },
-      { fetch: fetcher as typeof fetch, encodeBlob, readCsrfCookie: () => "csrf" }
-    )
-
-    await expect(failure).rejects.toMatchObject<Partial<AnnotationVoiceError>>({ code: "too_large" })
-    expect(encodeBlob).not.toHaveBeenCalled()
-    expect(fetcher).not.toHaveBeenCalled()
   })
 })
 
-class FakeMediaRecorder extends EventTarget {
-  mimeType = "audio/webm;codecs=opus"
-  state: RecordingState = "inactive"
-  startTimeslice: number | undefined
+class FakeBridgeWindow {
+  listener: ((event: MessageEvent) => void) | null = null
 
-  start(timeslice?: number) {
-    this.startTimeslice = timeslice
-    this.state = "recording"
+  addEventListener(_type: "message", listener: (event: MessageEvent) => void) {
+    this.listener = listener
   }
 
-  stop() {
-    this.state = "inactive"
-    const data = new Event("dataavailable")
-    Object.defineProperty(data, "data", {
-      value: new Blob(["captured"], { type: this.mimeType })
-    })
-    this.dispatchEvent(data)
-    this.dispatchEvent(new Event("stop"))
+  removeEventListener(_type: "message", listener: (event: MessageEvent) => void) {
+    if (this.listener === listener) this.listener = null
   }
 
-  emitData(value: string) {
-    const data = new Event("dataavailable")
-    Object.defineProperty(data, "data", {
-      value: new Blob([value], { type: this.mimeType })
-    })
-    this.dispatchEvent(data)
+  dispatch(data: AnnotationVoiceEvent, source: unknown, origin = "https://show.test") {
+    this.listener?.({ data, source, origin } as MessageEvent)
   }
 }
 
-describe("annotation browser recording", () => {
-  it("chooses a supported recording type and releases the microphone after stop", async () => {
-    expect(preferredAnnotationVoiceMimeType((mime) => mime === "audio/webm")).toBe("audio/webm")
-    const stopTrack = vi.fn()
-    const stream = { getTracks: () => [{ stop: stopTrack }] } as unknown as MediaStream
-    const recorder = new FakeMediaRecorder()
-    const recording = await startAnnotationVoiceRecording({
-      getUserMedia: async () => stream,
-      createRecorder: () => recorder as unknown as MediaRecorder,
-      isTypeSupported: (mime) => mime === "audio/webm;codecs=opus"
-    })
+const bridge = () => {
+  const targetWindow = new FakeBridgeWindow()
+  const requests: AnnotationVoiceRequest[] = []
+  const parent = {
+    postMessage: (message: unknown) => requests.push(message as AnnotationVoiceRequest)
+  }
+  const adapter = createAnnotationVoiceBridgeAdapter({
+    window: targetWindow,
+    parent,
+    origin: "https://show.test"
+  })
+  const reply = (message: Omit<AnnotationVoiceEvent, "type">) => {
+    targetWindow.dispatch({ type: ANNOTATION_VOICE_EVENT_MESSAGE, ...message } as AnnotationVoiceEvent, parent)
+  }
+  return { adapter, parent, reply, requests, targetWindow }
+}
 
-    expect(recorder.startTimeslice).toBe(1000)
-    await expect(recording.stop()).resolves.toMatchObject({
-      size: 8,
-      type: "audio/webm;codecs=opus"
-    })
-    expect(stopTrack).toHaveBeenCalledOnce()
+describe("annotation voice host bridge", () => {
+  it("accepts only complete host event payloads", () => {
+    expect(annotationVoiceEventFromPayload({
+      type: ANNOTATION_VOICE_EVENT_MESSAGE,
+      kind: "availability",
+      requestId: "probe-1",
+      available: true
+    })).toMatchObject({ kind: "availability", available: true })
+    expect(annotationVoiceEventFromPayload({
+      type: ANNOTATION_VOICE_EVENT_MESSAGE,
+      kind: "error",
+      requestId: "voice-1",
+      code: "timeout",
+      retryable: true
+    })).toMatchObject({ kind: "error", code: "timeout" })
+    expect(annotationVoiceEventFromPayload({
+      type: ANNOTATION_VOICE_EVENT_MESSAGE,
+      kind: "error",
+      requestId: "voice-1",
+      code: "invented",
+      retryable: false
+    })).toBeUndefined()
   })
 
-  it("releases the microphone and drops buffered audio when cancelled", async () => {
-    const stopTrack = vi.fn()
-    const stream = { getTracks: () => [{ stop: stopTrack }] } as unknown as MediaStream
-    const recorder = new FakeMediaRecorder()
-    const recording = await startAnnotationVoiceRecording({
-      getUserMedia: async () => stream,
-      createRecorder: () => recorder as unknown as MediaRecorder
+  it("queries availability from the owning client", async () => {
+    const { adapter, reply, requests } = bridge()
+    const available = adapter.isAvailable()
+    expect(requests[0]).toMatchObject({
+      type: ANNOTATION_VOICE_REQUEST_MESSAGE,
+      action: "query"
     })
-
-    recording.abort()
-    await expect(recording.done).resolves.toMatchObject({ size: 0 })
-    expect(stopTrack).toHaveBeenCalledOnce()
+    reply({
+      kind: "availability",
+      requestId: requests[0]!.requestId,
+      available: true
+    })
+    await expect(available).resolves.toBe(true)
   })
 
-  it("automatically finalizes at the recording duration bound", async () => {
+  it("ignores foreign availability replies and fails the probe closed", async () => {
     vi.useFakeTimers()
     try {
-      const stopTrack = vi.fn()
-      const stream = { getTracks: () => [{ stop: stopTrack }] } as unknown as MediaStream
-      const recorder = new FakeMediaRecorder()
-      const recording = await startAnnotationVoiceRecording({
-        getUserMedia: async () => stream,
-        createRecorder: () => recorder as unknown as MediaRecorder,
-        maxDurationMs: 1_000
-      })
-
-      await vi.advanceTimersByTimeAsync(1_000)
-      await expect(recording.done).resolves.toMatchObject({ size: 8 })
-      expect(stopTrack).toHaveBeenCalledOnce()
+      const { adapter, parent, requests, targetWindow } = bridge()
+      const available = adapter.isAvailable()
+      const requestId = requests[0]!.requestId
+      targetWindow.dispatch({
+        type: ANNOTATION_VOICE_EVENT_MESSAGE,
+        kind: "availability",
+        requestId,
+        available: true
+      }, parent, "https://evil.test")
+      await vi.advanceTimersByTimeAsync(1_500)
+      await expect(available).resolves.toBe(false)
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it("stops and drops buffered chunks at the byte bound", async () => {
-    const stopTrack = vi.fn()
-    const stream = { getTracks: () => [{ stop: stopTrack }] } as unknown as MediaStream
-    const recorder = new FakeMediaRecorder()
-    const recording = await startAnnotationVoiceRecording({
-      getUserMedia: async () => stream,
-      createRecorder: () => recorder as unknown as MediaRecorder,
-      maxBytes: 4
+  it("starts, previews, stops, and returns the existing client's transcript", async () => {
+    const { adapter, reply, requests } = bridge()
+    const onPreview = vi.fn()
+    const starting = adapter.start({ before: "before", after: "after", onPreview })
+    const start = requests[0]!
+    expect(start).toMatchObject({
+      type: ANNOTATION_VOICE_REQUEST_MESSAGE,
+      action: "start",
+      before: "before",
+      after: "after"
     })
+    reply({ kind: "started", requestId: start.requestId })
+    const session = await starting
 
-    recorder.emitData("12345")
-    await expect(recording.done).rejects.toMatchObject<Partial<AnnotationVoiceError>>({ code: "too_large" })
-    expect(stopTrack).toHaveBeenCalledOnce()
+    reply({ kind: "preview", requestId: start.requestId, text: "实时文字" })
+    expect(onPreview).toHaveBeenCalledWith("实时文字")
+    session.stop()
+    expect(requests.at(-1)).toEqual({
+      type: ANNOTATION_VOICE_REQUEST_MESSAGE,
+      action: "stop",
+      requestId: start.requestId
+    })
+    reply({ kind: "result", requestId: start.requestId, text: "整理后的文字" })
+    await expect(session.done).resolves.toBe("整理后的文字")
   })
 
-  it("classifies a denied microphone grant before creating a recorder", async () => {
-    const denied = Object.assign(new Error("denied"), { name: "NotAllowedError" })
-    const createRecorder = vi.fn()
-    const recording = startAnnotationVoiceRecording({
-      getUserMedia: async () => { throw denied },
-      createRecorder
-    })
-    await expect(recording).rejects.toMatchObject<Partial<AnnotationVoiceError>>({ code: "permission" })
-    expect(createRecorder).not.toHaveBeenCalled()
-  })
+  it("preserves a failed client session for retry and supports explicit discard", async () => {
+    const { adapter, reply, requests } = bridge()
+    const starting = adapter.start({ before: "", after: "" })
+    const requestId = requests[0]!.requestId
+    reply({ kind: "started", requestId })
+    const session = await starting
 
-  it("releases the microphone when recorder construction fails", async () => {
-    const stopTrack = vi.fn()
-    const stream = { getTracks: () => [{ stop: stopTrack }] } as unknown as MediaStream
-    const failure = startAnnotationVoiceRecording({
-      getUserMedia: async () => stream,
-      createRecorder: () => { throw new DOMException("unsupported", "NotSupportedError") }
+    reply({ kind: "error", requestId, code: "timeout", retryable: true })
+    await expect(session.done).rejects.toMatchObject<Partial<AnnotationVoiceError>>({
+      code: "timeout",
+      retryable: true
     })
 
-    await expect(failure).rejects.toMatchObject<Partial<AnnotationVoiceError>>({ code: "start_failed" })
-    expect(stopTrack).toHaveBeenCalledOnce()
+    const retried = session.retry()
+    expect(requests.at(-1)).toEqual({
+      type: ANNOTATION_VOICE_REQUEST_MESSAGE,
+      action: "retry",
+      requestId
+    })
+    reply({ kind: "result", requestId, text: "retry worked" })
+    await expect(retried).resolves.toBe("retry worked")
+
+    session.abort()
+    expect(requests.at(-1)).toEqual({
+      type: ANNOTATION_VOICE_REQUEST_MESSAGE,
+      action: "abort",
+      requestId
+    })
   })
 })

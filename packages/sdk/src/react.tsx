@@ -107,10 +107,9 @@ import {
   AnnotationVoiceError,
   annotationVoiceSnapshot,
   insertAnnotationVoiceTranscript,
-  startAnnotationVoiceRecording,
   type AnnotationVoiceAdapter,
   type AnnotationVoiceErrorCode,
-  type AnnotationVoiceRecording,
+  type AnnotationVoiceSession,
   type AnnotationVoiceSnapshot
 } from "./annotation-voice.js"
 
@@ -959,8 +958,9 @@ function AnnotationVoiceTextarea({
   const textareaRef = React.useRef<HTMLTextAreaElement | null>(null)
   const valueRef = React.useRef(value)
   const operationRef = React.useRef(0)
-  const recordingRef = React.useRef<AnnotationVoiceRecording | null>(null)
-  const retainedBlobRef = React.useRef<Blob | null>(null)
+  const recordingRef = React.useRef<AnnotationVoiceSession | null>(null)
+  const retainedSessionRef = React.useRef<AnnotationVoiceSession | null>(null)
+  const retainedTranscriptRef = React.useRef<string | null>(null)
   const pendingSnapshotRef = React.useRef<AnnotationVoiceSnapshot | null>(null)
   const requestRef = React.useRef<AbortController | null>(null)
   const timerRef = React.useRef<ReturnType<typeof setInterval> | null>(null)
@@ -968,6 +968,7 @@ function AnnotationVoiceTextarea({
   const [status, setStatus] = React.useState<AnnotationVoiceStatus>("idle")
   const [errorCode, setErrorCode] = React.useState<AnnotationVoiceErrorCode | null>(null)
   const [recordingSeconds, setRecordingSeconds] = React.useState(0)
+  const [preview, setPreview] = React.useState("")
   valueRef.current = value
 
   const clearTimer = React.useCallback(() => {
@@ -1013,6 +1014,9 @@ function AnnotationVoiceTextarea({
     clearTimer()
     recordingRef.current?.abort()
     recordingRef.current = null
+    retainedSessionRef.current?.abort()
+    retainedSessionRef.current = null
+    retainedTranscriptRef.current = null
     requestRef.current?.abort()
     requestRef.current = null
     onVoiceBusyChange?.(false)
@@ -1025,66 +1029,80 @@ function AnnotationVoiceTextarea({
     })
   }, [])
 
-  const processBlob = React.useCallback(async (
-    blob: Blob,
+  const commitTranscript = React.useCallback((
+    transcript: string,
+    snapshot: AnnotationVoiceSnapshot,
+    operation: number
+  ): boolean => {
+    if (operationRef.current !== operation) return false
+    const insertion = insertAnnotationVoiceTranscript(valueRef.current, snapshot, transcript)
+    if (!insertion) {
+      retainedTranscriptRef.current = transcript
+      retainedSessionRef.current = null
+      setStatus("failed")
+      setErrorCode("draft_changed")
+      return false
+    }
+    retainedTranscriptRef.current = null
+    retainedSessionRef.current = null
+    setStatus("idle")
+    setErrorCode(null)
+    setPreview("")
+    onValueChange(insertion.text)
+    restoreSelection(insertion.start, insertion.end)
+    return true
+  }, [onValueChange, restoreSelection])
+
+  const processResult = React.useCallback(async (
+    result: Promise<string>,
+    session: AnnotationVoiceSession,
     snapshot: AnnotationVoiceSnapshot,
     operation: number
   ) => {
-    if (!voiceInput || operationRef.current !== operation) return
-    if (!blob.size) {
-      retainedBlobRef.current = null
-      setStatus("idle")
-      setErrorCode("empty")
-      return
-    }
+    if (operationRef.current !== operation) return
     clearTimer()
     setStatus("processing")
     setErrorCode(null)
-    const controller = new AbortController()
-    requestRef.current?.abort()
-    requestRef.current = controller
     try {
-      const transcript = await voiceInput.transcribe({
-        blob,
-        before: snapshot.before,
-        after: snapshot.after,
-        signal: controller.signal
-      })
+      const transcript = await result
       if (operationRef.current !== operation) return
-      const insertion = insertAnnotationVoiceTranscript(valueRef.current, snapshot, transcript)
-      if (!insertion) {
-        retainedBlobRef.current = blob
-        setStatus("failed")
-        setErrorCode("draft_changed")
-        return
-      }
-      retainedBlobRef.current = null
-      setStatus("idle")
-      setErrorCode(null)
-      onValueChange(insertion.text)
-      restoreSelection(insertion.start, insertion.end)
+      recordingRef.current = null
+      commitTranscript(transcript, snapshot, operation)
     } catch (error) {
-      if (operationRef.current !== operation || controller.signal.aborted) return
+      if (operationRef.current !== operation || requestRef.current?.signal.aborted) return
+      recordingRef.current = null
       const code = error instanceof AnnotationVoiceError ? error.code : "failed"
-      const retryable = code !== "empty" && code !== "too_large"
-      retainedBlobRef.current = retryable ? blob : null
+      const retryable = error instanceof AnnotationVoiceError && error.retryable
+      retainedSessionRef.current = retryable ? session : null
+      retainedTranscriptRef.current = null
       setStatus(retryable ? "failed" : "idle")
       setErrorCode(code)
-    } finally {
-      if (requestRef.current === controller) requestRef.current = null
     }
-  }, [clearTimer, onValueChange, restoreSelection, voiceInput])
+  }, [clearTimer, commitTranscript])
 
   const beginRecording = React.useCallback(async () => {
     if (!voiceInput || available !== true || disabled || voiceBusy(status)) return
     const operation = ++operationRef.current
     const snapshot = pendingSnapshotRef.current ?? captureSnapshot()
     pendingSnapshotRef.current = null
-    retainedBlobRef.current = null
+    retainedSessionRef.current?.abort()
+    retainedSessionRef.current = null
+    retainedTranscriptRef.current = null
+    setPreview("")
     setErrorCode(null)
     setStatus("starting")
+    const controller = new AbortController()
+    requestRef.current?.abort()
+    requestRef.current = controller
     try {
-      const recording = await startAnnotationVoiceRecording()
+      const recording = await voiceInput.start({
+        before: snapshot.before,
+        after: snapshot.after,
+        signal: controller.signal,
+        onPreview: (text) => {
+          if (operationRef.current === operation) setPreview(text)
+        }
+      })
       if (operationRef.current !== operation) {
         recording.abort()
         return
@@ -1097,55 +1115,61 @@ function AnnotationVoiceTextarea({
         setRecordingSeconds(Math.floor((Date.now() - startedAt) / 1000))
       }, 1000)
       void recording.done.then(
-        (blob) => {
+        (transcript) => {
           if (operationRef.current !== operation || recordingRef.current !== recording) return
-          recordingRef.current = null
-          void processBlob(blob, snapshot, operation)
+          void processResult(Promise.resolve(transcript), recording, snapshot, operation)
         },
         (error) => {
           if (operationRef.current !== operation || recordingRef.current !== recording) return
-          recordingRef.current = null
-          clearTimer()
-          setStatus("idle")
-          setErrorCode(error instanceof AnnotationVoiceError ? error.code : "start_failed")
+          void processResult(Promise.reject(error), recording, snapshot, operation)
         }
       )
     } catch (error) {
-      if (operationRef.current !== operation) return
+      if (operationRef.current !== operation || controller.signal.aborted) return
       clearTimer()
       setStatus("idle")
       setErrorCode(error instanceof AnnotationVoiceError ? error.code : "start_failed")
     }
-  }, [available, captureSnapshot, clearTimer, disabled, processBlob, status, voiceInput])
+  }, [available, captureSnapshot, clearTimer, disabled, processResult, status, voiceInput])
 
   const finishRecording = React.useCallback(() => {
     const recording = recordingRef.current
     if (!recording || status !== "recording") return
     clearTimer()
     setStatus("processing")
-    void recording.stop().catch(() => undefined)
+    recording.stop()
   }, [clearTimer, status])
 
   const retry = React.useCallback(() => {
-    const blob = retainedBlobRef.current
-    if (!blob || !voiceInput || disabled) return
+    if (disabled) return
     const operation = ++operationRef.current
     const snapshot = pendingSnapshotRef.current ?? captureSnapshot()
     pendingSnapshotRef.current = null
-    void processBlob(blob, snapshot, operation)
-  }, [captureSnapshot, disabled, processBlob, voiceInput])
+    const transcript = retainedTranscriptRef.current
+    if (transcript) {
+      commitTranscript(transcript, snapshot, operation)
+      return
+    }
+    const session = retainedSessionRef.current
+    if (!session) return
+    setPreview("")
+    void processResult(session.retry(), session, snapshot, operation)
+  }, [captureSnapshot, commitTranscript, disabled, processResult])
 
   const discard = React.useCallback(() => {
     operationRef.current += 1
     clearTimer()
     recordingRef.current?.abort()
     recordingRef.current = null
+    retainedSessionRef.current?.abort()
+    retainedSessionRef.current = null
+    retainedTranscriptRef.current = null
     requestRef.current?.abort()
     requestRef.current = null
-    retainedBlobRef.current = null
     pendingSnapshotRef.current = null
     setStatus("idle")
     setErrorCode(null)
+    setPreview("")
   }, [clearTimer])
 
   const rememberSelection = () => {
@@ -1232,6 +1256,9 @@ function AnnotationVoiceTextarea({
           </div>
         ) : null}
       </div>
+      {preview && (status === "recording" || status === "processing") ? (
+        <p aria-live="polite" style={voicePreviewStyle}>{preview}</p>
+      ) : null}
       {errorCode && errorCode !== "cancelled" ? (
         <p role="alert" style={overlayErrorStyle}>{annotationVoiceErrorLabel(errorCode, labels)}</p>
       ) : null}
@@ -1827,6 +1854,7 @@ export function AnnotationOverlay({
             <ScreenshotBatchBody
               draft={screenshotDraft}
               comment={screenshotComment}
+              commentKey={nextItemLabel}
               submitting={submitting}
               voiceInput={voiceInput}
               labels={copy}
@@ -2963,6 +2991,7 @@ function NumberPin({ point, tone, label, pending }: { point: { x: number; y: num
 type ScreenshotBatchCardProps = {
   draft: ScreenshotDraft
   comment: string
+  commentKey: number
   submitting: boolean
   voiceBusy: boolean
   voiceInput?: AnnotationVoiceAdapter
@@ -2977,7 +3006,7 @@ type ScreenshotBatchCardProps = {
 }
 
 /** Scrollable body of the screenshot batch card (header, preview, numbered comment list, input). */
-function ScreenshotBatchBody({ draft, comment, submitting, voiceInput, labels, onCommentChange, onVoiceBusyChange, onRemoveItem }: Pick<ScreenshotBatchCardProps, "draft" | "comment" | "submitting" | "voiceInput" | "labels" | "onCommentChange" | "onVoiceBusyChange" | "onRemoveItem">) {
+function ScreenshotBatchBody({ draft, comment, commentKey, submitting, voiceInput, labels, onCommentChange, onVoiceBusyChange, onRemoveItem }: Pick<ScreenshotBatchCardProps, "draft" | "comment" | "commentKey" | "submitting" | "voiceInput" | "labels" | "onCommentChange" | "onVoiceBusyChange" | "onRemoveItem">) {
   const touchInput = useTouchInput() // ≥16px input font on touch so iOS doesn't focus-zoom the send button off-screen
   return (
     <>
@@ -2998,6 +3027,7 @@ function ScreenshotBatchBody({ draft, comment, submitting, voiceInput, labels, o
         </ol>
       ) : null}
       <AnnotationVoiceTextarea
+        key={commentKey}
         placeholder={labels.screenshotCommentPlaceholder}
         value={comment}
         onValueChange={onCommentChange}
@@ -3906,6 +3936,13 @@ const voiceDurationStyle: React.CSSProperties = {
   font: `500 11px/1 ${FONT_STACK}`,
   fontVariantNumeric: "tabular-nums",
   textAlign: "right"
+}
+
+const voicePreviewStyle: React.CSSProperties = {
+  margin: 0,
+  color: COLORS.textMuted,
+  font: `500 12px/1.45 ${FONT_STACK}`,
+  overflowWrap: "anywhere"
 }
 
 const cardFooterStyle: React.CSSProperties = {

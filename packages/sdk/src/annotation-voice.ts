@@ -1,12 +1,7 @@
-const CSRF_COOKIE_NAME = "vibe_csrf_token"
-const CSRF_HEADER_NAME = "X-Vibe-CSRF-Token"
-
-export const ANNOTATION_VOICE_STATUS_PATH = "/api/asr/status"
-export const ANNOTATION_VOICE_TRANSCRIPTION_PATH = "/api/asr/transcribe"
 export const ANNOTATION_VOICE_CONTEXT_BEFORE_CHARS = 500
 export const ANNOTATION_VOICE_CONTEXT_AFTER_CHARS = 200
-export const ANNOTATION_VOICE_MAX_DURATION_MS = 60_000
-export const ANNOTATION_VOICE_MAX_BYTES = 16 * 1024 * 1024
+export const ANNOTATION_VOICE_REQUEST_MESSAGE = "avibe:annotation:voice:request"
+export const ANNOTATION_VOICE_EVENT_MESSAGE = "avibe:annotation:voice:event"
 
 export type AnnotationVoiceErrorCode =
   | "cancelled"
@@ -21,13 +16,13 @@ export type AnnotationVoiceErrorCode =
 
 export class AnnotationVoiceError extends Error {
   readonly code: AnnotationVoiceErrorCode
-  readonly status?: number
+  readonly retryable: boolean
 
-  constructor(code: AnnotationVoiceErrorCode, options: { cause?: unknown; status?: number } = {}) {
+  constructor(code: AnnotationVoiceErrorCode, options: { cause?: unknown; retryable?: boolean } = {}) {
     super(code, { cause: options.cause })
     this.name = "AnnotationVoiceError"
     this.code = code
-    this.status = options.status
+    this.retryable = options.retryable === true
   }
 }
 
@@ -39,30 +34,71 @@ export type AnnotationVoiceSnapshot = {
   after: string
 }
 
-export type AnnotationVoiceTranscriptionInput = {
-  blob: Blob
+export type AnnotationVoiceSession = {
+  readonly done: Promise<string>
+  stop(): void
+  retry(): Promise<string>
+  abort(): void
+}
+
+export type AnnotationVoiceStartInput = {
   before: string
   after: string
   signal?: AbortSignal
+  onPreview?: (text: string) => void
 }
 
 export type AnnotationVoiceAdapter = {
   isAvailable(): Promise<boolean>
-  transcribe(input: AnnotationVoiceTranscriptionInput): Promise<string>
+  start(input: AnnotationVoiceStartInput): Promise<AnnotationVoiceSession>
 }
 
-type VoiceFetch = typeof fetch
+export type AnnotationVoiceRequest =
+  | { type: typeof ANNOTATION_VOICE_REQUEST_MESSAGE; action: "query"; requestId: string }
+  | {
+      type: typeof ANNOTATION_VOICE_REQUEST_MESSAGE
+      action: "start"
+      requestId: string
+      before: string
+      after: string
+    }
+  | { type: typeof ANNOTATION_VOICE_REQUEST_MESSAGE; action: "stop" | "retry" | "abort"; requestId: string }
 
-const positiveIntegerLimit = (value: number | undefined, fallback: number): number =>
-  typeof value === "number" && Number.isFinite(value) && value > 0
-    ? Math.floor(value)
-    : fallback
+export type AnnotationVoiceEvent =
+  | {
+      type: typeof ANNOTATION_VOICE_EVENT_MESSAGE
+      kind: "availability"
+      requestId: string
+      available: boolean
+    }
+  | {
+      type: typeof ANNOTATION_VOICE_EVENT_MESSAGE
+      kind: "started" | "preview" | "result"
+      requestId: string
+      text?: string
+    }
+  | {
+      type: typeof ANNOTATION_VOICE_EVENT_MESSAGE
+      kind: "error"
+      requestId: string
+      code: AnnotationVoiceErrorCode
+      retryable: boolean
+    }
 
-export type AnnotationVoiceRequestDependencies = {
-  fetch?: VoiceFetch
-  encodeBlob?: (blob: Blob) => Promise<string>
-  readCsrfCookie?: () => string | null
-  maxBytes?: number
+type Deferred<T> = {
+  promise: Promise<T>
+  resolve(value: T): void
+  reject(reason: unknown): void
+}
+
+const deferred = <T>(): Deferred<T> => {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve
+    reject = nextReject
+  })
+  return { promise, resolve, reject }
 }
 
 const boundedSelection = (text: string, start: number, end: number): [number, number] => {
@@ -88,16 +124,55 @@ export function annotationVoiceSnapshot(
 
 const WORD_CHARACTER = /[\p{L}\p{N}_]/u
 const NO_SPACE_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u
+const LEADING_SENTENCE_PUNCTUATION = /^[.,!?:;…，。！？：；、](?:\s|$)/u
+const LEADING_OUTER_BOUNDARY = /^[\p{P}\p{S}]+/u
+const TRAILING_OUTER_BOUNDARY = /[\p{P}\p{S}]+$/u
+const LEADING_WORD_GRAPHEME = /^[\p{L}\p{N}_]\p{M}*/u
+const TRAILING_WORD_GRAPHEME = /[\p{L}\p{N}_]\p{M}*$/u
+const OPENING_DELIMITER = /^[\p{Ps}\p{Pi}]$/u
+const SYMMETRIC_DELIMITER = /^["'`]$/u
+const TRAILING_TOKEN_JOINER = /(?:[/\\]|::|->|\?\.)$/u
+const LEADING_CALL_DELIMITER = /^[([{]/u
 
 const edgeCharacter = (text: string, side: "start" | "end"): string => {
-  const characters = Array.from(text.trim())
+  const wordGrapheme = side === "start"
+    ? text.match(LEADING_WORD_GRAPHEME)
+    : text.match(TRAILING_WORD_GRAPHEME)
+  if (wordGrapheme) return wordGrapheme[0]
+  const characters = Array.from(text)
   return side === "start" ? (characters[0] ?? "") : (characters.at(-1) ?? "")
 }
 
-const needsBoundarySpace = (left: string, right: string): boolean => {
-  if (/\s$/u.test(left) || /^\s/u.test(right)) return false
-  const leftCharacter = edgeCharacter(left, "end")
-  const rightCharacter = edgeCharacter(right, "start")
+const endsWithOpeningDelimiter = (text: string): boolean => {
+  const characters = Array.from(text)
+  const delimiter = characters.at(-1) ?? ""
+  if (OPENING_DELIMITER.test(delimiter)) return true
+  if (!SYMMETRIC_DELIMITER.test(delimiter)) return false
+  return !TRAILING_WORD_GRAPHEME.test(characters.slice(0, -1).join(""))
+}
+
+const joiningBoundaryCharacter = (text: string, followingText: string): string | undefined => {
+  if (TRAILING_TOKEN_JOINER.test(text)) return edgeCharacter(text, "end")
+  if (text.endsWith(".") && LEADING_CALL_DELIMITER.test(followingText)) return "."
+  return undefined
+}
+
+const boundaryCharacter = (text: string, side: "start" | "end"): string => {
+  if (side === "end" && endsWithOpeningDelimiter(text)) return edgeCharacter(text, side)
+  const boundaryText = side === "start"
+    ? (LEADING_SENTENCE_PUNCTUATION.test(text) ? text : text.replace(LEADING_OUTER_BOUNDARY, ""))
+    : text.replace(TRAILING_OUTER_BOUNDARY, "")
+  return edgeCharacter(boundaryText, side)
+}
+
+const needsBoundarySpace = (
+  left: string,
+  right: string,
+  leftBoundary?: string,
+  rightBoundary?: string
+): boolean => {
+  const leftCharacter = leftBoundary ?? boundaryCharacter(left, "end")
+  const rightCharacter = rightBoundary ?? boundaryCharacter(right, "start")
   return (
     WORD_CHARACTER.test(leftCharacter)
     && WORD_CHARACTER.test(rightCharacter)
@@ -121,352 +196,226 @@ export function insertAnnotationVoiceTranscript(
   const selected = currentText.slice(snapshot.start, snapshot.end)
   const leadingWhitespace = selected.match(/^\s+/u)?.[0] ?? ""
   const trailingWhitespace = selected.match(/\s+$/u)?.[0] ?? ""
+  const leftBoundary = joiningBoundaryCharacter(left, right)
+  const transcriptBoundary = joiningBoundaryCharacter(normalized, right)
   const insertion = snapshot.start === snapshot.end
-    ? `${needsBoundarySpace(left, normalized) ? " " : ""}${normalized}${needsBoundarySpace(normalized, right) ? " " : ""}`
+    ? `${needsBoundarySpace(left, normalized, leftBoundary) ? " " : ""}${normalized}${needsBoundarySpace(normalized, right, transcriptBoundary) ? " " : ""}`
     : `${leadingWhitespace}${normalized}${trailingWhitespace}`
   const text = `${left}${insertion}${right}`
-  const start = snapshot.start
-  return { text, start, end: start + insertion.length }
+  return { text, start: snapshot.start, end: snapshot.start + insertion.length }
 }
 
-function readDocumentCsrfCookie(): string | null {
-  if (typeof document === "undefined") return null
-  const prefix = `${CSRF_COOKIE_NAME}=`
-  for (const part of document.cookie.split(";")) {
-    const value = part.trim()
-    if (value.startsWith(prefix)) return decodeURIComponent(value.slice(prefix.length))
-  }
-  return null
-}
-
-async function fetchCsrfToken(fetcher: VoiceFetch, signal?: AbortSignal): Promise<string> {
-  const response = await fetcher("/api/csrf-token", {
-    credentials: "same-origin",
-    signal
-  })
-  const payload = await response.json().catch(() => null) as { csrf_token?: unknown } | null
-  if (!response.ok || typeof payload?.csrf_token !== "string" || !payload.csrf_token) {
-    throw new AnnotationVoiceError("unavailable", { status: response.status })
-  }
-  return payload.csrf_token
-}
-
-async function blobAsBase64(blob: Blob): Promise<string> {
-  if (typeof FileReader !== "undefined") {
-    return new Promise<string>((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onerror = () => reject(reader.error)
-      reader.onload = () => {
-        const value = String(reader.result ?? "")
-        const comma = value.indexOf(",")
-        resolve(comma === -1 ? value : value.slice(comma + 1))
-      }
-      reader.readAsDataURL(blob)
-    })
-  }
-
-  const bytes = new Uint8Array(await blob.arrayBuffer())
-  let binary = ""
-  const blockSize = 0x8000
-  for (let offset = 0; offset < bytes.length; offset += blockSize) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + blockSize))
-  }
-  return globalThis.btoa(binary)
-}
-
-const normalizedMimeType = (blob: Blob): string =>
-  blob.type.split(";", 1)[0]?.trim().toLowerCase() || "audio/webm"
-
-const VOICE_EXTENSION_BY_MIME: Record<string, string> = {
-  "audio/aac": "aac",
-  "audio/mp4": "mp4",
-  "audio/mpeg": "mp3",
-  "audio/ogg": "ogg",
-  "audio/opus": "opus",
-  "audio/wav": "wav",
-  "audio/webm": "webm",
-  "audio/x-m4a": "m4a"
-}
-
-export const annotationVoiceFileName = (blob: Blob): string =>
-  `voice.${VOICE_EXTENSION_BY_MIME[normalizedMimeType(blob)] ?? "webm"}`
-
-const newDictationId = (): string =>
+const newRequestId = (): string =>
   globalThis.crypto?.randomUUID?.()
-  ?? `annotation-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`
+  ?? `annotation-voice-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`
 
-const voiceResponseError = (response: Response, payload: unknown): AnnotationVoiceError => {
-  const upstream = payload && typeof payload === "object" && !Array.isArray(payload)
-    ? (payload as { error?: unknown }).error
-    : undefined
-  if (response.status === 413 || upstream === "file_too_large") {
-    return new AnnotationVoiceError("too_large", { status: response.status })
+const isVoiceErrorCode = (value: unknown): value is AnnotationVoiceErrorCode =>
+  value === "cancelled"
+  || value === "draft_changed"
+  || value === "empty"
+  || value === "failed"
+  || value === "permission"
+  || value === "start_failed"
+  || value === "timeout"
+  || value === "too_large"
+  || value === "unavailable"
+
+export function annotationVoiceEventFromPayload(value: unknown): AnnotationVoiceEvent | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const payload = value as Record<string, unknown>
+  if (
+    payload.type !== ANNOTATION_VOICE_EVENT_MESSAGE
+    || typeof payload.requestId !== "string"
+    || !payload.requestId
+  ) {
+    return undefined
   }
-  if (response.status === 504 || upstream === "transcription_timeout") {
-    return new AnnotationVoiceError("timeout", { status: response.status })
+  if (payload.kind === "availability" && typeof payload.available === "boolean") {
+    return {
+      type: ANNOTATION_VOICE_EVENT_MESSAGE,
+      kind: "availability",
+      requestId: payload.requestId,
+      available: payload.available
+    }
   }
-  if (upstream === "transcription_empty") {
-    return new AnnotationVoiceError("empty", { status: response.status })
+  if (payload.kind === "started") {
+    return { type: ANNOTATION_VOICE_EVENT_MESSAGE, kind: "started", requestId: payload.requestId }
+  }
+  if ((payload.kind === "preview" || payload.kind === "result") && typeof payload.text === "string") {
+    return {
+      type: ANNOTATION_VOICE_EVENT_MESSAGE,
+      kind: payload.kind,
+      requestId: payload.requestId,
+      text: payload.text
+    }
   }
   if (
-    response.status === 503
-    || upstream === "asr_not_configured"
-    || upstream === "asr_unavailable"
+    payload.kind === "error"
+    && isVoiceErrorCode(payload.code)
+    && typeof payload.retryable === "boolean"
   ) {
-    return new AnnotationVoiceError("unavailable", { status: response.status })
-  }
-  return new AnnotationVoiceError("failed", { status: response.status })
-}
-
-const invalidCsrfResponse = (response: Response, payload: unknown): boolean =>
-  response.status === 403
-  && Boolean(payload && typeof payload === "object" && (payload as { message?: unknown }).message === "Forbidden: invalid csrf token")
-
-export async function probeAnnotationVoice(
-  dependencies: Pick<AnnotationVoiceRequestDependencies, "fetch"> = {}
-): Promise<boolean> {
-  const fetcher = dependencies.fetch ?? globalThis.fetch
-  if (!fetcher) return false
-  try {
-    const response = await fetcher(ANNOTATION_VOICE_STATUS_PATH, { credentials: "same-origin" })
-    const payload = await response.json().catch(() => null) as { available?: unknown } | null
-    return response.ok && payload?.available === true
-  } catch {
-    return false
-  }
-}
-
-export async function transcribeAnnotationVoice(
-  input: AnnotationVoiceTranscriptionInput,
-  dependencies: AnnotationVoiceRequestDependencies = {}
-): Promise<string> {
-  const fetcher = dependencies.fetch ?? globalThis.fetch
-  if (!fetcher) throw new AnnotationVoiceError("unavailable")
-  const readCsrfCookie = dependencies.readCsrfCookie ?? readDocumentCsrfCookie
-  const encodeBlob = dependencies.encodeBlob ?? blobAsBase64
-  const maxBytes = positiveIntegerLimit(dependencies.maxBytes, ANNOTATION_VOICE_MAX_BYTES)
-  if (input.blob.size > maxBytes) throw new AnnotationVoiceError("too_large")
-  const data = await encodeBlob(input.blob)
-  const body = JSON.stringify({
-    name: annotationVoiceFileName(input.blob),
-    mime: normalizedMimeType(input.blob),
-    data,
-    dictation_id: newDictationId(),
-    sequence: 0,
-    overlap_ms: 0,
-    final: true,
-    finalize_only: false,
-    receipts: [],
-    before: input.before,
-    after: input.after
-  })
-
-  let csrfToken = readCsrfCookie() ?? await fetchCsrfToken(fetcher, input.signal)
-  const send = (token: string) => fetcher(ANNOTATION_VOICE_TRANSCRIPTION_PATH, {
-    method: "POST",
-    credentials: "same-origin",
-    headers: {
-      "Accept": "application/json",
-      "Content-Type": "application/json",
-      [CSRF_HEADER_NAME]: token
-    },
-    body,
-    signal: input.signal
-  })
-
-  try {
-    let response = await send(csrfToken)
-    let payload = await response.json().catch(() => null) as unknown
-    if (invalidCsrfResponse(response, payload)) {
-      csrfToken = readCsrfCookie() ?? await fetchCsrfToken(fetcher, input.signal)
-      response = await send(csrfToken)
-      payload = await response.json().catch(() => null)
+    return {
+      type: ANNOTATION_VOICE_EVENT_MESSAGE,
+      kind: "error",
+      requestId: payload.requestId,
+      code: payload.code,
+      retryable: payload.retryable
     }
-    if (!response.ok) throw voiceResponseError(response, payload)
-    const text = payload && typeof payload === "object" && !Array.isArray(payload)
-      ? (payload as { text?: unknown }).text
-      : undefined
-    if (typeof text !== "string" || !text.trim()) throw new AnnotationVoiceError("empty", { status: response.status })
-    return text
-  } catch (error) {
-    if (error instanceof AnnotationVoiceError) throw error
-    if (input.signal?.aborted) throw new AnnotationVoiceError("cancelled", { cause: error })
-    throw new AnnotationVoiceError("unavailable", { cause: error })
   }
+  return undefined
 }
 
-export const defaultAnnotationVoiceAdapter: AnnotationVoiceAdapter = {
-  isAvailable: () => probeAnnotationVoice(),
-  transcribe: (input) => transcribeAnnotationVoice(input)
+type AnnotationVoiceBridgeWindow = {
+  addEventListener(type: "message", listener: (event: MessageEvent) => void): void
+  removeEventListener(type: "message", listener: (event: MessageEvent) => void): void
 }
 
-export type AnnotationVoiceRecording = {
-  readonly done: Promise<Blob>
-  stop(): Promise<Blob>
-  abort(): void
+type AnnotationVoiceBridgeTarget = {
+  postMessage(message: unknown, targetOrigin: string): void
 }
 
-type AnnotationMediaRecorder = Pick<
-  MediaRecorder,
-  "addEventListener" | "mimeType" | "removeEventListener" | "start" | "state" | "stop"
->
-
-export type AnnotationVoiceRecordingDependencies = {
-  getUserMedia?: () => Promise<MediaStream>
-  createRecorder?: (stream: MediaStream, options?: MediaRecorderOptions) => AnnotationMediaRecorder
-  isTypeSupported?: (mimeType: string) => boolean
-  maxDurationMs?: number
-  maxBytes?: number
+export type AnnotationVoiceBridgeDependencies = {
+  window?: AnnotationVoiceBridgeWindow
+  parent?: AnnotationVoiceBridgeTarget
+  origin?: string
+  availabilityTimeoutMs?: number
+  setTimeout?: typeof globalThis.setTimeout
+  clearTimeout?: typeof globalThis.clearTimeout
 }
 
-const RECORDING_MIME_TYPES = [
-  "audio/webm;codecs=opus",
-  "audio/webm",
-  "audio/mp4",
-  "audio/ogg;codecs=opus"
-] as const
-
-export function preferredAnnotationVoiceMimeType(
-  isTypeSupported: ((mimeType: string) => boolean) | undefined
-): string | undefined {
-  return isTypeSupported ? RECORDING_MIME_TYPES.find((mimeType) => isTypeSupported(mimeType)) : undefined
+type BridgeSessionState = {
+  started: Deferred<void>
+  result: Deferred<string>
+  onPreview?: (text: string) => void
+  signal?: AbortSignal
+  abortFromSignal?: () => void
 }
 
-const stopMediaStream = (stream: MediaStream): void => {
-  for (const track of stream.getTracks()) track.stop()
-}
+/** Use the owning Avibe client as the one voice implementation for an embedded Show Page. */
+export function createAnnotationVoiceBridgeAdapter(
+  dependencies: AnnotationVoiceBridgeDependencies = {}
+): AnnotationVoiceAdapter {
+  const targetWindow: AnnotationVoiceBridgeWindow | undefined = dependencies.window
+    ?? (typeof window !== "undefined" ? window : undefined)
+  const parent: AnnotationVoiceBridgeTarget | undefined = dependencies.parent
+    ?? (typeof window !== "undefined" ? window.parent : undefined)
+  const origin = dependencies.origin
+    ?? (typeof location !== "undefined" ? location.origin : "*")
+  const schedule = dependencies.setTimeout ?? globalThis.setTimeout
+  const cancelTimer = dependencies.clearTimeout ?? globalThis.clearTimeout
+  const availabilityTimeoutMs = dependencies.availabilityTimeoutMs ?? 1_500
+  const availability = new Map<string, Deferred<boolean>>()
+  const sessions = new Map<string, BridgeSessionState>()
 
-const recordingStartError = (error: unknown): AnnotationVoiceError => {
-  const name = error && typeof error === "object" ? (error as { name?: unknown }).name : undefined
-  return new AnnotationVoiceError(
-    name === "NotAllowedError" || name === "SecurityError" ? "permission" : "start_failed",
-    { cause: error }
-  )
-}
-
-/** Start a bounded browser-owned recording and release every media track on all terminal paths. */
-export async function startAnnotationVoiceRecording(
-  dependencies: AnnotationVoiceRecordingDependencies = {}
-): Promise<AnnotationVoiceRecording> {
-  const getUserMedia = dependencies.getUserMedia
-    ?? (globalThis.navigator?.mediaDevices?.getUserMedia
-      ? () => globalThis.navigator.mediaDevices.getUserMedia({ audio: true })
-      : undefined)
-  const MediaRecorderConstructor = globalThis.MediaRecorder
-  const createRecorder = dependencies.createRecorder
-    ?? (MediaRecorderConstructor
-      ? (stream: MediaStream, options?: MediaRecorderOptions) => new MediaRecorderConstructor(stream, options)
-      : undefined)
-  if (!getUserMedia || !createRecorder) throw new AnnotationVoiceError("start_failed")
-
-  let stream: MediaStream
-  try {
-    stream = await getUserMedia()
-  } catch (error) {
-    throw recordingStartError(error)
+  const post = (request: AnnotationVoiceRequest): void => {
+    parent?.postMessage(request, origin)
   }
-
-  const isTypeSupported = dependencies.isTypeSupported
-    ?? MediaRecorderConstructor?.isTypeSupported?.bind(MediaRecorderConstructor)
-  const mimeType = preferredAnnotationVoiceMimeType(isTypeSupported)
-  let recorder: AnnotationMediaRecorder
-  try {
-    recorder = createRecorder(stream, mimeType ? { mimeType } : undefined)
-  } catch (error) {
-    stopMediaStream(stream)
-    throw recordingStartError(error)
+  const releaseSession = (requestId: string, state: BridgeSessionState): void => {
+    if (sessions.get(requestId) !== state) return
+    sessions.delete(requestId)
+    if (state.abortFromSignal) state.signal?.removeEventListener("abort", state.abortFromSignal)
   }
-
-  const chunks: Blob[] = []
-  const maxDurationMs = positiveIntegerLimit(
-    dependencies.maxDurationMs,
-    ANNOTATION_VOICE_MAX_DURATION_MS
-  )
-  const maxBytes = positiveIntegerLimit(dependencies.maxBytes, ANNOTATION_VOICE_MAX_BYTES)
-  let bufferedBytes = 0
-  let limitError: AnnotationVoiceError | null = null
-  let aborted = false
-  let settled = false
-  let durationTimer: ReturnType<typeof setTimeout> | null = null
-  let resolveDone: (blob: Blob) => void
-  let rejectDone: (error: unknown) => void
-  const done = new Promise<Blob>((resolve, reject) => {
-    resolveDone = resolve
-    rejectDone = reject
-  })
-  // A recorder can fail before its owner asks to stop. Keep that rejection
-  // observed while still returning the original promise to callers.
-  void done.catch(() => undefined)
-
-  const cleanup = () => {
-    if (durationTimer !== null) clearTimeout(durationTimer)
-    durationTimer = null
-    recorder.removeEventListener("dataavailable", onData as EventListener)
-    recorder.removeEventListener("error", onError)
-    recorder.removeEventListener("stop", onStop)
-    stopMediaStream(stream)
-  }
-  const settle = (result: Blob | AnnotationVoiceError) => {
-    if (settled) return
-    settled = true
-    cleanup()
-    if (result instanceof AnnotationVoiceError) rejectDone(result)
-    else resolveDone(result)
-  }
-  const onData = (event: Event) => {
-    const data = (event as BlobEvent).data
-    if (aborted || limitError || !data?.size) return
-    if (bufferedBytes + data.size > maxBytes) {
-      limitError = new AnnotationVoiceError("too_large")
-      chunks.length = 0
-      bufferedBytes = 0
-      if (recorder.state !== "inactive") recorder.stop()
-      else settle(limitError)
+  const listener = (event: MessageEvent) => {
+    if (origin !== "*" && event.origin !== origin) return
+    if (parent && event.source !== parent) return
+    const message = annotationVoiceEventFromPayload(event.data)
+    if (!message) return
+    if (message.kind === "availability") {
+      availability.get(message.requestId)?.resolve(message.available)
+      availability.delete(message.requestId)
       return
     }
-    chunks.push(data)
-    bufferedBytes += data.size
-  }
-  const onError = (event: Event) => {
-    const error = (event as Event & { error?: unknown }).error
-    settle(new AnnotationVoiceError("start_failed", { cause: error }))
-  }
-  const onStop = () => {
-    if (limitError) {
-      settle(limitError)
-      return
+    const state = sessions.get(message.requestId)
+    if (!state) return
+    if (message.kind === "started") {
+      state.started.resolve()
+    } else if (message.kind === "preview") {
+      state.onPreview?.(message.text ?? "")
+    } else if (message.kind === "result") {
+      state.result.resolve(message.text ?? "")
+      releaseSession(message.requestId, state)
+    } else if (message.kind === "error") {
+      const error = new AnnotationVoiceError(message.code, { retryable: message.retryable })
+      state.started.reject(error)
+      state.result.reject(error)
     }
-    const type = recorder.mimeType || mimeType || chunks[0]?.type || "audio/webm"
-    settle(new Blob(aborted ? [] : chunks, { type }))
   }
-
-  recorder.addEventListener("dataavailable", onData as EventListener)
-  recorder.addEventListener("error", onError)
-  recorder.addEventListener("stop", onStop)
-  try {
-    recorder.start(1000)
-  } catch (error) {
-    const normalized = recordingStartError(error)
-    settle(normalized)
-    throw normalized
-  }
-  if (!settled) {
-    durationTimer = setTimeout(() => {
-      if (!settled && recorder.state !== "inactive") recorder.stop()
-    }, maxDurationMs)
-  }
+  targetWindow?.addEventListener("message", listener)
 
   return {
-    done,
-    stop: () => {
-      if (!settled && recorder.state !== "inactive") recorder.stop()
-      return done
+    async isAvailable() {
+      if (!targetWindow || !parent || Object.is(parent, targetWindow)) return false
+      const requestId = newRequestId()
+      const response = deferred<boolean>()
+      availability.set(requestId, response)
+      const timer = schedule(() => {
+        if (availability.delete(requestId)) response.resolve(false)
+      }, availabilityTimeoutMs)
+      post({ type: ANNOTATION_VOICE_REQUEST_MESSAGE, action: "query", requestId })
+      try {
+        return await response.promise
+      } finally {
+        cancelTimer(timer)
+        availability.delete(requestId)
+      }
     },
-    abort: () => {
-      if (settled) return
-      aborted = true
-      if (recorder.state !== "inactive") recorder.stop()
-      else settle(new Blob([], { type: recorder.mimeType || mimeType || "audio/webm" }))
+
+    async start(input) {
+      if (!targetWindow || !parent || Object.is(parent, targetWindow)) {
+        throw new AnnotationVoiceError("unavailable")
+      }
+      const requestId = newRequestId()
+      const state: BridgeSessionState = {
+        started: deferred<void>(),
+        result: deferred<string>(),
+        onPreview: input.onPreview,
+        signal: input.signal
+      }
+      void state.result.promise.catch(() => undefined)
+      sessions.set(requestId, state)
+      const abort = () => {
+        post({ type: ANNOTATION_VOICE_REQUEST_MESSAGE, action: "abort", requestId })
+        const error = new AnnotationVoiceError("cancelled")
+        state.started.reject(error)
+        state.result.reject(error)
+        releaseSession(requestId, state)
+      }
+      state.abortFromSignal = abort
+      if (input.signal?.aborted) {
+        abort()
+        throw new AnnotationVoiceError("cancelled")
+      }
+      input.signal?.addEventListener("abort", abort, { once: true })
+      post({
+        type: ANNOTATION_VOICE_REQUEST_MESSAGE,
+        action: "start",
+        requestId,
+        before: input.before,
+        after: input.after
+      })
+      try {
+        await state.started.promise
+      } catch (error) {
+        releaseSession(requestId, state)
+        throw error
+      }
+
+      const session: AnnotationVoiceSession = {
+        done: state.result.promise,
+        stop: () => post({ type: ANNOTATION_VOICE_REQUEST_MESSAGE, action: "stop", requestId }),
+        retry: () => {
+          const nextResult = deferred<string>()
+          void nextResult.promise.catch(() => undefined)
+          state.result = nextResult
+          sessions.set(requestId, state)
+          post({ type: ANNOTATION_VOICE_REQUEST_MESSAGE, action: "retry", requestId })
+          return nextResult.promise
+        },
+        abort
+      }
+      return session
     }
   }
 }
+
+export const defaultAnnotationVoiceAdapter = createAnnotationVoiceBridgeAdapter()
