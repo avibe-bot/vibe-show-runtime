@@ -10,6 +10,7 @@ import {
   edgeHandleAnchor,
   edgeHandleVisual,
   createChromeFocusController,
+  annotationVoiceErrorLabel,
   TOUCH_CAPABLE_QUERY
 } from "./react.js"
 import {
@@ -403,6 +404,25 @@ describe("screenshot comment card polish (Lane R8)", () => {
     expect(DEFAULT_ANNOTATION_LABELS.sendBatch(0)).toBe("发送评论") // avoids the odd '发送 0 条评论'
     expect(DEFAULT_ANNOTATION_LABELS.sendBatch(1)).toBe("发送 1 条评论")
     expect(DEFAULT_ANNOTATION_LABELS.sendBatch(3)).toBe("发送 3 条评论")
+  })
+})
+
+describe("annotation voice copy", () => {
+  it("maps every terminal voice class to complete localized copy", () => {
+    const labels = DEFAULT_ANNOTATION_LABELS
+    const codes = [
+      "permission",
+      "start_failed",
+      "failed",
+      "timeout",
+      "unavailable",
+      "too_large",
+      "empty",
+      "draft_changed"
+    ] as const
+    for (const code of codes) {
+      expect(annotationVoiceErrorLabel(code, labels).trim()).not.toBe("")
+    }
   })
 })
 

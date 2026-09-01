@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url"
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 // The built SDK react entry (build order guarantees @avibe/show-sdk is compiled first).
 const sdkReactEntry = resolve(packageRoot, "..", "sdk", "dist", "react.js")
+const sdkVoiceEntry = resolve(packageRoot, "..", "sdk", "dist", "annotation-voice.js")
 const outDir = join(packageRoot, "dist", "annotation")
 
 // React specifiers resolved by the Show Page vendor import map (never bundled into the overlay).
@@ -32,8 +33,9 @@ await build({
   stdin: {
     contents: [
       `import { mountAnnotationOverlay } from ${JSON.stringify(sdkReactEntry)}`,
+      `import { defaultAnnotationVoiceAdapter } from ${JSON.stringify(sdkVoiceEntry)}`,
       // Top-level guard: a mount failure must degrade silently and never break the host page.
-      `try { mountAnnotationOverlay() } catch (error) { console.warn("[avibe-show] annotation bootstrap failed", error) }`,
+      `try { mountAnnotationOverlay({ voiceInput: defaultAnnotationVoiceAdapter }) } catch (error) { console.warn("[avibe-show] annotation bootstrap failed", error) }`,
       ""
     ].join("\n"),
     resolveDir: packageRoot,
