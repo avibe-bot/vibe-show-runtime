@@ -4,6 +4,7 @@ import {
   AnnotationVoiceError,
   ANNOTATION_VOICE_STATUS_PATH,
   ANNOTATION_VOICE_TRANSCRIPTION_PATH,
+  ANNOTATION_VOICE_MAX_BYTES,
   annotationVoiceSnapshot,
   insertAnnotationVoiceTranscript,
   preferredAnnotationVoiceMimeType,
@@ -156,6 +157,23 @@ describe("annotation voice API adapter", () => {
       status: 504
     })
   })
+
+  it("rejects an oversized blob before encoding or sending it", async () => {
+    const fetcher = vi.fn()
+    const encodeBlob = vi.fn(async () => "encoded")
+    const failure = transcribeAnnotationVoice(
+      {
+        blob: new Blob([new Uint8Array(ANNOTATION_VOICE_MAX_BYTES + 1)], { type: "audio/webm" }),
+        before: "",
+        after: ""
+      },
+      { fetch: fetcher as typeof fetch, encodeBlob, readCsrfCookie: () => "csrf" }
+    )
+
+    await expect(failure).rejects.toMatchObject<Partial<AnnotationVoiceError>>({ code: "too_large" })
+    expect(encodeBlob).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+  })
 })
 
 class FakeMediaRecorder extends EventTarget {
@@ -169,13 +187,21 @@ class FakeMediaRecorder extends EventTarget {
   }
 
   stop() {
+    this.state = "inactive"
     const data = new Event("dataavailable")
     Object.defineProperty(data, "data", {
       value: new Blob(["captured"], { type: this.mimeType })
     })
     this.dispatchEvent(data)
-    this.state = "inactive"
     this.dispatchEvent(new Event("stop"))
+  }
+
+  emitData(value: string) {
+    const data = new Event("dataavailable")
+    Object.defineProperty(data, "data", {
+      value: new Blob([value], { type: this.mimeType })
+    })
+    this.dispatchEvent(data)
   }
 }
 
@@ -210,6 +236,41 @@ describe("annotation browser recording", () => {
 
     recording.abort()
     await expect(recording.done).resolves.toMatchObject({ size: 0 })
+    expect(stopTrack).toHaveBeenCalledOnce()
+  })
+
+  it("automatically finalizes at the recording duration bound", async () => {
+    vi.useFakeTimers()
+    try {
+      const stopTrack = vi.fn()
+      const stream = { getTracks: () => [{ stop: stopTrack }] } as unknown as MediaStream
+      const recorder = new FakeMediaRecorder()
+      const recording = await startAnnotationVoiceRecording({
+        getUserMedia: async () => stream,
+        createRecorder: () => recorder as unknown as MediaRecorder,
+        maxDurationMs: 1_000
+      })
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      await expect(recording.done).resolves.toMatchObject({ size: 8 })
+      expect(stopTrack).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("stops and drops buffered chunks at the byte bound", async () => {
+    const stopTrack = vi.fn()
+    const stream = { getTracks: () => [{ stop: stopTrack }] } as unknown as MediaStream
+    const recorder = new FakeMediaRecorder()
+    const recording = await startAnnotationVoiceRecording({
+      getUserMedia: async () => stream,
+      createRecorder: () => recorder as unknown as MediaRecorder,
+      maxBytes: 4
+    })
+
+    recorder.emitData("12345")
+    await expect(recording.done).rejects.toMatchObject<Partial<AnnotationVoiceError>>({ code: "too_large" })
     expect(stopTrack).toHaveBeenCalledOnce()
   })
 

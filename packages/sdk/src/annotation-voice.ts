@@ -5,6 +5,8 @@ export const ANNOTATION_VOICE_STATUS_PATH = "/api/asr/status"
 export const ANNOTATION_VOICE_TRANSCRIPTION_PATH = "/api/asr/transcribe"
 export const ANNOTATION_VOICE_CONTEXT_BEFORE_CHARS = 500
 export const ANNOTATION_VOICE_CONTEXT_AFTER_CHARS = 200
+export const ANNOTATION_VOICE_MAX_DURATION_MS = 60_000
+export const ANNOTATION_VOICE_MAX_BYTES = 16 * 1024 * 1024
 
 export type AnnotationVoiceErrorCode =
   | "cancelled"
@@ -51,10 +53,16 @@ export type AnnotationVoiceAdapter = {
 
 type VoiceFetch = typeof fetch
 
+const positiveIntegerLimit = (value: number | undefined, fallback: number): number =>
+  typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : fallback
+
 export type AnnotationVoiceRequestDependencies = {
   fetch?: VoiceFetch
   encodeBlob?: (blob: Blob) => Promise<string>
   readCsrfCookie?: () => string | null
+  maxBytes?: number
 }
 
 const boundedSelection = (text: string, start: number, end: number): [number, number] => {
@@ -236,6 +244,8 @@ export async function transcribeAnnotationVoice(
   if (!fetcher) throw new AnnotationVoiceError("unavailable")
   const readCsrfCookie = dependencies.readCsrfCookie ?? readDocumentCsrfCookie
   const encodeBlob = dependencies.encodeBlob ?? blobAsBase64
+  const maxBytes = positiveIntegerLimit(dependencies.maxBytes, ANNOTATION_VOICE_MAX_BYTES)
+  if (input.blob.size > maxBytes) throw new AnnotationVoiceError("too_large")
   const data = await encodeBlob(input.blob)
   const body = JSON.stringify({
     name: annotationVoiceFileName(input.blob),
@@ -305,6 +315,8 @@ export type AnnotationVoiceRecordingDependencies = {
   getUserMedia?: () => Promise<MediaStream>
   createRecorder?: (stream: MediaStream, options?: MediaRecorderOptions) => AnnotationMediaRecorder
   isTypeSupported?: (mimeType: string) => boolean
+  maxDurationMs?: number
+  maxBytes?: number
 }
 
 const RECORDING_MIME_TYPES = [
@@ -366,8 +378,16 @@ export async function startAnnotationVoiceRecording(
   }
 
   const chunks: Blob[] = []
+  const maxDurationMs = positiveIntegerLimit(
+    dependencies.maxDurationMs,
+    ANNOTATION_VOICE_MAX_DURATION_MS
+  )
+  const maxBytes = positiveIntegerLimit(dependencies.maxBytes, ANNOTATION_VOICE_MAX_BYTES)
+  let bufferedBytes = 0
+  let limitError: AnnotationVoiceError | null = null
   let aborted = false
   let settled = false
+  let durationTimer: ReturnType<typeof setTimeout> | null = null
   let resolveDone: (blob: Blob) => void
   let rejectDone: (error: unknown) => void
   const done = new Promise<Blob>((resolve, reject) => {
@@ -379,6 +399,8 @@ export async function startAnnotationVoiceRecording(
   void done.catch(() => undefined)
 
   const cleanup = () => {
+    if (durationTimer !== null) clearTimeout(durationTimer)
+    durationTimer = null
     recorder.removeEventListener("dataavailable", onData as EventListener)
     recorder.removeEventListener("error", onError)
     recorder.removeEventListener("stop", onStop)
@@ -393,13 +415,27 @@ export async function startAnnotationVoiceRecording(
   }
   const onData = (event: Event) => {
     const data = (event as BlobEvent).data
-    if (!aborted && data?.size) chunks.push(data)
+    if (aborted || limitError || !data?.size) return
+    if (bufferedBytes + data.size > maxBytes) {
+      limitError = new AnnotationVoiceError("too_large")
+      chunks.length = 0
+      bufferedBytes = 0
+      if (recorder.state !== "inactive") recorder.stop()
+      else settle(limitError)
+      return
+    }
+    chunks.push(data)
+    bufferedBytes += data.size
   }
   const onError = (event: Event) => {
     const error = (event as Event & { error?: unknown }).error
     settle(new AnnotationVoiceError("start_failed", { cause: error }))
   }
   const onStop = () => {
+    if (limitError) {
+      settle(limitError)
+      return
+    }
     const type = recorder.mimeType || mimeType || chunks[0]?.type || "audio/webm"
     settle(new Blob(aborted ? [] : chunks, { type }))
   }
@@ -413,6 +449,11 @@ export async function startAnnotationVoiceRecording(
     const normalized = recordingStartError(error)
     settle(normalized)
     throw normalized
+  }
+  if (!settled) {
+    durationTimer = setTimeout(() => {
+      if (!settled && recorder.state !== "inactive") recorder.stop()
+    }, maxDurationMs)
   }
 
   return {
