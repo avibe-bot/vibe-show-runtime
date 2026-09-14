@@ -162,6 +162,44 @@ function legacyLocationReport(markdown: string): Record<string, any> {
   return JSON.parse(match[1]) as Record<string, any>
 }
 
+function routerContractReport(markdown: string): Record<string, any> {
+  const match = /RouterContractReport:(\{.+\})/.exec(markdown)
+  if (!match) throw new Error(`Router contract report was absent from Markdown: ${markdown}`)
+  return JSON.parse(match[1]) as Record<string, any>
+}
+
+async function prepareLegacyContractConsumer(
+  runtime: Awaited<ReturnType<typeof startFixtureServer>>,
+  newline: "LF" | "CRLF" | "custom",
+  consumer: "RouteContractPage" | "MotionContractPage" | "location"
+) {
+  const src = join(runtime.workspaceRoot, "legacy-router-field", "src")
+  const routerPath = join(src, "router.tsx")
+  const original = (await readFile(routerPath, "utf8")).replaceAll("\r\n", "\n")
+  const source = newline === "CRLF" ? original.replaceAll("\n", "\r\n")
+    : newline === "custom" ? `${original}\n// Semantically unchanged legacy fallback\n` : original
+  await writeFile(routerPath, source)
+  await cp(join(fixtureRoot, "legacy-contract-consumers.tsx"), join(src, "contract-consumers.tsx"))
+  const pageConsumer = consumer === "location" ? "RouteContractPage" : consumer
+  for (const [page, relative] of [
+    ["index.tsx", "../contract-consumers"],
+    ["second.tsx", "../contract-consumers"],
+    ["teams/[team].tsx", "../../contract-consumers"]
+  ]) {
+    await writeFile(
+      join(src, "pages", page),
+      `export { ${pageConsumer} as default } from "${relative}"\n`
+    )
+  }
+  if (consumer === "location") {
+    const page = await readFile(join(fixtureRoot, "legacy-location-facade/src/App.tsx"), "utf8")
+    await writeFile(join(src, "pages/index.tsx"), `
+if (typeof window !== "undefined") throw new Error("No location facade is allowed during module load")
+${page}`)
+  }
+  return { routerPath, source }
+}
+
 function capturedError(operation: () => unknown) {
   try {
     operation()
@@ -734,6 +772,149 @@ describe("SSR Markdown endpoint", () => {
     await render()
     await readApi()
   }, 60_000)
+
+  it.each(["LF", "CRLF"] as const)("preserves stock %s route exports for root and nested Markdown consumers", async (newline) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    const { routerPath, source } = await prepareLegacyContractConsumer(runtime, newline, "RouteContractPage")
+    for (const base of ["/p/contract-token/", "/show/contract-private/"]) {
+      for (const target of ["/", "/teams/%E7%A0%94%E5%8F%91", "/second"]) {
+        const response = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+          headers: {
+            "x-vibe-show-base": base,
+            "x-vibe-show-target": `${target}?period=%E5%9B%9B%E5%AD%A3%E5%BA%A6&vibe-embed=1`
+          }
+        })
+        const body = await response.text()
+        expect(response.status, body).toBe(200)
+        expect(routerContractReport(body)).toEqual({
+          pathname: target,
+          params: target.startsWith("/teams") ? { team: "研发" } : {},
+          query: { period: "四季度", "vibe-embed": "1" },
+          exports: { useRoutePath: "function", Link: "function", navigate: "function", RouterView: "function" },
+          routes: [
+            { path: "/", dynamic: false, segments: [], sameComponent: true },
+            { path: "/second", dynamic: false, segments: [{ name: "second", dynamic: false }], sameComponent: true },
+            {
+              path: "/teams/:team", dynamic: true,
+              segments: [{ name: "teams", dynamic: false }, { name: "team", dynamic: true }],
+              sameComponent: true
+            }
+          ],
+          windowDuringLoad: false,
+          windowDuringRender: target === "/"
+        })
+        expect(body).toContain(`[Second](${base}second?vibe-embed=1)`)
+      }
+    }
+    expect(await readFile(routerPath, "utf8")).toBe(source)
+  }, 60_000)
+
+  it.each(["LF", "CRLF", "custom"] as const)("preserves the legacy %s RouterView root not-found output", async (newline) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    await prepareLegacyContractConsumer(runtime, newline, "RouteContractPage")
+    await rm(join(runtime.workspaceRoot, "legacy-router-field", "src/pages/index.tsx"))
+    const response = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+      headers: { "x-vibe-show-base": "/p/not-found/", "x-vibe-show-target": "/?period=%E7%A0%94%E5%8F%91" }
+    })
+    const body = await response.text()
+    expect(response.status, body).toBe(200)
+    expect(body).toContain("# Page not found")
+    expect(body).toContain("No route matches `/`.")
+    expect(body).toContain("[Back to Home](/p/not-found/)")
+  }, 60_000)
+
+  it.each(["LF", "CRLF"] as const)("retains the stock %s root location facade without leaking between requests", async (newline) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    const { routerPath, source } = await prepareLegacyContractConsumer(runtime, newline, "location")
+    for (const [base, search] of [
+      ["/p/contract-token/", "?period=%E7%A0%94%E5%8F%91"],
+      ["/show/contract-private/", "?period=%E5%9B%9B%E5%AD%A3%E5%BA%A6"],
+      ["/p/contract-token/", "?period=%E6%96%B0%E8%AF%B7%E6%B1%82"]
+    ]) {
+      const response = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+        headers: { "x-vibe-show-base": base, "x-vibe-show-target": `/${search}` }
+      })
+      const body = await response.text()
+      expect(response.status, body).toBe(200)
+      expect(legacyLocationReport(body)).toEqual({
+        pathname: base,
+        search,
+        hash: "",
+        href: new URL(`${base}${search}`, runtime.url).href,
+        origin: new URL(runtime.url).origin,
+        windowKeys: ["location"],
+        locationKeys: ["hash", "href", "origin", "pathname", "search"],
+        windowPrototypeNull: true,
+        locationPrototypeNull: true,
+        windowFrozen: true,
+        locationFrozen: true,
+        documentPresent: false,
+        historyPresent: false,
+        eventLifecyclePresent: false,
+        mutationError: "TypeError",
+        pathnameUnchanged: true
+      })
+    }
+    expect(await readFile(routerPath, "utf8")).toBe(source)
+  }, 60_000)
+
+  it.each(["LF", "CRLF"] as const)("retains static Motion rendering for stock %s root and nested routes", async (newline) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    await prepareLegacyContractConsumer(runtime, newline, "MotionContractPage")
+    for (const target of ["/", "/teams/%E7%A0%94%E5%8F%91", "/second"]) {
+      const response = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+        headers: {
+          "x-vibe-show-base": "/p/contract-token/",
+          "x-vibe-show-target": `${target}?period=%E5%9B%9B%E5%AD%A3%E5%BA%A6`
+        }
+      })
+      const body = await response.text()
+      expect(response.status, body).toBe(200)
+      expect(routerContractReport(body)).toEqual({
+        isStatic: true,
+        windowDuringLoad: false,
+        windowDuringRender: target === "/"
+      })
+    }
+  }, 60_000)
+
+  it.each(["RouteContractPage", "location", "MotionContractPage"] as const)(
+    "preserves baseline custom legacy root behavior for %s",
+    async (consumer) => {
+      const runtime = await startFixtureServer(["legacy-router-field"])
+      await prepareLegacyContractConsumer(runtime, "custom", consumer)
+      const response = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+        headers: { "x-vibe-show-base": "/p/baseline/", "x-vibe-show-target": "/?period=%E7%A0%94%E5%8F%91" }
+      })
+      const body = await response.text()
+      expect(response.status, body).toBe(200)
+      if (consumer === "location") {
+        expect(legacyLocationReport(body)).toMatchObject({
+          pathname: "/p/baseline/", search: "?period=%E7%A0%94%E5%8F%91",
+          windowFrozen: true, locationFrozen: true, windowPrototypeNull: true, locationPrototypeNull: true
+        })
+      } else if (consumer === "MotionContractPage") {
+        expect(routerContractReport(body)).toEqual({
+          isStatic: true, windowDuringLoad: false, windowDuringRender: true
+        })
+      } else {
+        expect(routerContractReport(body)).toMatchObject({
+          pathname: "/", params: {}, query: null,
+          routes: [
+            { path: "/", dynamic: false, sameComponent: true },
+            { path: "/second", dynamic: false, sameComponent: true },
+            { path: "/teams/:team", dynamic: true, sameComponent: true }
+          ],
+          windowDuringLoad: false, windowDuringRender: true
+        })
+      }
+      const nested = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+        headers: { "x-vibe-show-target": "/second" }
+      })
+      expect(nested.status).toBe(502)
+      expect(await renderError(nested)).toEqual({ error: routerCapabilityError })
+    }, 60_000
+  )
 
   it("exposes a request-scoped read-only location only to the legacy fallback", async () => {
     const runtime = await startFixtureServer([

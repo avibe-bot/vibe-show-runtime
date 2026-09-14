@@ -243,7 +243,9 @@ export default function App() {
 }
 
 /** @internal Shared by fresh scaffolding and read-only legacy SSR compatibility. */
-export function routerTsx() {
+export function routerTsx(
+  { legacySsrCompatibility = false }: { legacySsrCompatibility?: boolean } = {}
+) {
   return `import type { ComponentType, MouseEvent, ReactNode } from "react"
 import { createContext, useContext, useSyncExternalStore } from "react"
 
@@ -265,12 +267,14 @@ type Route = {
   path: string
   segments: Segment[]
   Component: ComponentType<PageProps>
-}
+${legacySsrCompatibility ? "  dynamic: boolean\n" : ""}}
 
 const PAGES_PREFIX = "./pages/"
 const PAGE_SUFFIX = ".tsx"
 const modules = import.meta.glob<PageModule>("./pages/**/*.tsx", { eager: true })
-const SsrRouterContext = createContext<SsrRouteLocation | null>(null)
+const SsrRouterContext = createContext<SsrRouteLocation | null>(null)${legacySsrCompatibility
+    ? "\nexport const __avibeLegacySsrCompatibility = true"
+    : ""}
 
 export function SsrRouterProvider({
   location,
@@ -314,7 +318,10 @@ export const routes: Route[] = Object.entries(modules)
   .map(([file, mod]): Route | null => {
     const path = filePathToRoute(file)
     if (!path || !isRenderablePage(mod.default)) return null
-    return { path, segments: toSegments(path), Component: mod.default }
+    ${legacySsrCompatibility
+    ? `const segments = toSegments(path)
+    return { path, segments, Component: mod.default, dynamic: segments.some(segment => segment.dynamic) }`
+    : "return { path, segments: toSegments(path), Component: mod.default }"}
   })
   .filter((route): route is Route => route !== null)
   .sort((a, b) => {
@@ -446,8 +453,12 @@ export function RouterView() {
     return (
       <div className="rounded-lg border border-border bg-card p-6 text-card-foreground">
         <h1 className="text-lg font-semibold">Page not found</h1>
-        <p className="mt-2 text-sm text-muted-foreground">No route matches {path}.</p>
-        <p className="mt-4 text-sm"><Link className="font-medium underline" to="/">Back to Home</Link></p>
+        <p className="mt-2 text-sm text-muted-foreground">${legacySsrCompatibility ? `
+          No route matches <code className="rounded bg-muted px-1.5 py-0.5">{path}</code>.
+        ` : "No route matches {path}."}</p>
+        <p className="mt-4 text-sm"><Link className="${legacySsrCompatibility
+    ? "font-medium underline underline-offset-4"
+    : "font-medium underline"}" to="/">Back to Home</Link></p>
       </div>
     )
   }

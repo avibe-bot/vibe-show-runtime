@@ -35,12 +35,19 @@ function isRenderableComponent(value, seen = new Set()) {
 }
 
 export const hasSsrRouterProvider = isRenderableComponent(RouterModule.SsrRouterProvider)
+// This is compatibility metadata, not a trust or privilege signal. The worker
+// still limits the old location-only facade to root render commands.
+export const usesLegacyRenderContext =
+  !hasSsrRouterProvider || RouterModule.__avibeLegacySsrCompatibility === true
 
 export function render(location) {
   const app = createElement(App)
-  return renderToStaticMarkup(hasSsrRouterProvider
+  const content = hasSsrRouterProvider
     ? createElement(RouterModule.SsrRouterProvider, { location }, app)
-    : createElement(MotionConfig, { isStatic: true }, app))
+    : app
+  return renderToStaticMarkup(usesLegacyRenderContext
+    ? createElement(MotionConfig, { isStatic: true }, content)
+    : content)
 }
 `
 
@@ -51,6 +58,7 @@ import { MotionConfig } from "motion/react"
 import App from "/src/App.tsx"
 
 export const hasSsrRouterProvider = false
+export const usesLegacyRenderContext = true
 
 export function render() {
   return renderToStaticMarkup(createElement(
@@ -110,7 +118,7 @@ export function ssrMarkdownEntryPlugin(): Plugin {
         throw error
       }
       // Keep the original module identity and its existing invalidation path.
-      return { code: routerTsx(), map: null }
+      return { code: routerTsx({ legacySsrCompatibility: true }), map: null }
     }
   }
 }

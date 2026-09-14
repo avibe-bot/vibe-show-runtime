@@ -84,7 +84,8 @@ async function executeCommand(command) {
           !entry ||
           typeof entry !== "object" ||
           typeof entry.render !== "function" ||
-          typeof entry.hasSsrRouterProvider !== "boolean"
+          typeof entry.hasSsrRouterProvider !== "boolean" ||
+          typeof entry.usesLegacyRenderContext !== "boolean"
         ) {
           throw new Error("The Show Page SSR entry is incomplete")
         }
@@ -104,9 +105,9 @@ async function executeCommand(command) {
         ) {
           throw new RouterNotSsrCapableError()
         }
-        const legacyLocation = state.entry.hasSsrRouterProvider
-          ? undefined
-          : legacyWindowLocation(command.options.documentUrl)
+        const legacyLocation = state.entry.usesLegacyRenderContext && command.location?.pathname === "/"
+          ? legacyWindowLocation(command.options.documentUrl)
+          : undefined
         const html = await runWorkspaceCommand(
           command,
           state.evaluator,
