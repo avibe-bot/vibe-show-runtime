@@ -92,7 +92,11 @@ export function ssrMarkdownEntryPlugin(): Plugin {
     },
     async transform(source, id, options) {
       const routerPath = join(workspace, "src", "router.tsx")
-      if (!options?.ssr || id !== normalizePath(routerPath)) return null
+      if (
+        this.environment.name !== SSR_MARKDOWN_ENVIRONMENT ||
+        !options?.ssr ||
+        id !== normalizePath(routerPath)
+      ) return null
       // Match the exact snapshot Vite loaded, before TS/React transforms. Never
       // reread the source from disk: an editor may have saved a newer snapshot.
       if (!LEGACY_HISTORY_ROUTER_HASHES.has(createHash("sha256").update(source).digest("hex"))) {

@@ -27,9 +27,19 @@ matches the released LF or CRLF SHA-256:
 
 Reuse the existing `templates.ts` author; never copy its implementation, reread
 another source snapshot for matching, or create temporary workspaces. The
-compatibility does not write files or change HTML/client modules. Unknown,
+compatibility is limited to the `avibe_show_markdown` environment: ordinary API
+SSR and HTML/client modules keep their original exports and behavior, regardless
+of which environment imports the router first. No files are written. Unknown,
 custom, hash, routerless, and symlink routers retain their behavior. Later edits
 must take effect through existing module/cache invalidation.
+
+A request overlapping an editor save is not guaranteed a single filesystem
+snapshot, but each transform must match its own supplied source. After the real
+file-change handler and worker invalidation finish, a single subsequent request
+must reflect the saved router. Regression tests observe those actual completion
+promises, without triggering invalidation or retrying HTTP requests. HMR may
+legitimately send no reload for a module still being analyzed; Vite's initial
+request-crawl promise is not a later-edit completion boundary.
 
 Keep the public template API and dependencies unchanged. The Avibe fresh
 scaffold uses the already shipped `ensureSessionTemplate()` and SSR provider

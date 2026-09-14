@@ -1,4 +1,4 @@
-import { EventEmitter } from "node:events"
+import { EventEmitter, once } from "node:events"
 import { fork, spawn, type ChildProcess, type ForkOptions } from "node:child_process"
 import { createHash } from "node:crypto"
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
@@ -65,13 +65,17 @@ async function startFixtureServer(
   for (const fixture of fixtures) {
     await cp(join(fixtureRoot, fixture), join(workspaceRoot, fixture), { recursive: true })
   }
+  const markdownWorker = dependencies.markdownWorker ?? createModuleGraphSsrWorker(
+    dependencies.markdownRendererOptions?.childFactory,
+    workspaceRoot
+  )
   const server = await startShowRuntimeServer({
     workspaceRoot,
     dependencyRoot,
     cacheRoot: join(workspaceRoot, ".vite-cache"),
     idlePruneIntervalMs: 0,
     ...options
-  }, dependencies)
+  }, { ...dependencies, markdownWorker })
   cleanups.push(async () => {
     await server.close()
     await rm(workspaceRoot, {
@@ -81,11 +85,69 @@ async function startFixtureServer(
       retryDelay: 100
     })
   })
-  return { ...server, workspaceRoot }
+  return { ...server, workspaceRoot, markdownWorker }
 }
 
 function markdownUrl(runtimeUrl: string, sessionId: string): string {
   return `${runtimeUrl}/sessions/${sessionId}/render-markdown`
+}
+
+async function observeRouterChanges(
+  vite: ViteDevServer,
+  routerPath: string,
+  worker: SsrMarkdownWorker,
+  sessionId: string
+) {
+  // Attach before the first Markdown request binds its own watcher listener.
+  // Chokidar's ready event is one-shot; Vite exposes the watcher but no ready
+  // promise, so check its scan-complete flag before subscribing.
+  if (!(vite.watcher as typeof vite.watcher & { _readyEmitted: boolean })._readyEmitted) {
+    await once(vite.watcher, "ready")
+  }
+  const modulePath = (await realpath(routerPath)).replaceAll("\\", "/")
+  const listeners = vite.watcher.listeners("change")
+  expect(listeners).toHaveLength(1)
+  const [onViteChange] = listeners
+  let pending: { resolve(): void; reject(error: unknown): void } | undefined
+  let pendingWorker: typeof pending
+  const invalidate = worker.invalidateSession.bind(worker)
+  vi.spyOn(worker, "invalidateSession").mockImplementation((id) => {
+    const completion = invalidate(id)
+    if (id === sessionId && pendingWorker) {
+      const change = pendingWorker
+      pendingWorker = undefined
+      void completion.then(change.resolve, change.reject)
+    }
+    return completion
+  })
+  const onChange = (file: string, ...args: unknown[]) => {
+    // Preserve Vite's real handler and native filesystem event. Its returned
+    // promise covers watchChange hooks, module invalidation, and HMR propagation,
+    // including changes that correctly produce no hot.send payload.
+    const completion: unknown = onViteChange.call(vite.watcher, file, ...args)
+    if (!(completion instanceof Promise)) {
+      throw new Error("Vite's file-change handler no longer exposes completion")
+    }
+    if (file.replaceAll("\\", "/") === modulePath && pending) {
+      const change = pending
+      pending = undefined
+      void completion.then(change.resolve, change.reject)
+    }
+  }
+  vite.watcher.off("change", onViteChange)
+  vite.watcher.on("change", onChange)
+  cleanups.push(async () => {
+    vite.watcher.off("change", onChange)
+    vite.watcher.on("change", onViteChange)
+  })
+  return () => {
+    expect(pending).toBeUndefined()
+    expect(pendingWorker).toBeUndefined()
+    return {
+      viteDone: new Promise<void>((resolve, reject) => { pending = { resolve, reject } }),
+      workerDone: new Promise<void>((resolve, reject) => { pendingWorker = { resolve, reject } })
+    }
+  }
 }
 
 function intrinsicReport(markdown: string): Record<string, any> {
@@ -552,16 +614,26 @@ describe("SSR Markdown endpoint", () => {
     const source = await readFile(routerPath, "utf8")
     const headers = { "x-vibe-show-target": "/second" }
     const url = markdownUrl(runtime.url, "legacy-router-field")
+    await runtime.runtime.ensureSession("legacy-router-field", "/show/legacy-router-field/")
+    const vite = runtime.runtime.getSession("legacy-router-field")?.vite
+    if (!vite) throw new Error("The fixture Vite server was not created")
+    const nextRouterChange = await observeRouterChanges(
+      vite, routerPath, runtime.markdownWorker, "legacy-router-field"
+    )
     const first = await fetch(url, { headers })
     expect(first.status, await first.text()).toBe(200)
     expect((await fetch(url, { headers })).headers.get("x-avibe-render-cache")).toBe("hit")
 
+    const customChange = nextRouterChange()
     await writeFile(routerPath, `${source}\n// User edit must invalidate the SSR substitute\n`)
+    await Promise.all([customChange.viteDone, customChange.workerDone])
     const customized = await fetch(url, { headers })
     expect(customized.status).toBe(502)
     expect(await renderError(customized)).toEqual({ error: routerCapabilityError })
 
+    const stockChange = nextRouterChange()
     await writeFile(routerPath, source)
+    await Promise.all([stockChange.viteDone, stockChange.workerDone])
     const restored = await fetch(url, { headers })
     expect(restored.status, await restored.text()).toBe(200)
     expect(restored.headers.get("x-avibe-render-cache")).toBe("miss")
@@ -579,6 +651,9 @@ describe("SSR Markdown endpoint", () => {
     await runtime.runtime.ensureSession(sessionId, `/show/${sessionId}/`)
     const vite = runtime.runtime.getSession(sessionId)?.vite
     if (!vite) throw new Error("The fixture Vite server was not created")
+    const nextRouterChange = await observeRouterChanges(
+      vite, routerPath, runtime.markdownWorker, sessionId
+    )
     const environment = vite.environments[SSR_MARKDOWN_ENVIRONMENT]
     const hotSend = vi.spyOn(environment.hot, "send")
     const plugin = environment.plugins.find(
@@ -590,6 +665,7 @@ describe("SSR Markdown endpoint", () => {
     const transform = plugin.transform
     const modulePath = (await realpath(routerPath)).replaceAll("\\", "/")
     let captured: { source: string; substituted: boolean } | undefined
+    let savedChange: ReturnType<typeof nextRouterChange> | undefined
     vi.spyOn(plugin as { transform: typeof transform }, "transform").mockImplementation(async function (
       this: ThisParameterType<typeof transform>,
       ...args: Parameters<typeof transform>
@@ -598,7 +674,12 @@ describe("SSR Markdown endpoint", () => {
       if (!captured && options?.ssr && id === modulePath) {
         const snapshot = { source, substituted: false }
         captured = snapshot
+        savedChange = nextRouterChange()
         await writeFile(routerPath, saved)
+        // Finish the real change handler while this module is still being
+        // transformed. An unanalyzed module has no HMR update boundary yet.
+        await savedChange.viteDone
+        expect(hotSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: "full-reload" }))
         const result = await transform.apply(this, args)
         snapshot.substituted = result !== null && result !== undefined
         return result
@@ -613,15 +694,45 @@ describe("SSR Markdown endpoint", () => {
     expect([200, 502]).toContain(first.status)
     await first.text()
     expect(captured).toEqual({ source: initial, substituted: stock })
-    await vi.waitFor(() => {
-      expect(hotSend).toHaveBeenCalledWith(expect.objectContaining({ type: "full-reload" }))
-    })
-    await environment.waitForRequestsIdle()
+    // The real renderer queues worker invalidation behind the overlapping
+    // request. Observe its completion too, without forcing invalidation.
+    if (!savedChange) throw new Error("The concurrent save did not run")
+    await savedChange.workerDone
     const next = await fetch(url, { headers })
     const body = await next.text()
     expect(next.status, body).toBe(stock ? 502 : 200)
     expect(body).toContain(stock ? "router_not_ssr_capable" : "# Stock second page")
     expect(await readFile(routerPath, "utf8")).toBe(saved)
+  }, 60_000)
+
+  it.each([true, false])("keeps stock router exports in API SSR with markdownFirst=%s", async (markdownFirst) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    const sessionId = "legacy-router-field"
+    const apiUrl = `${runtime.url}/sessions/${sessionId}/app/api/router`
+    const render = async () => {
+      const response = await fetch(markdownUrl(runtime.url, sessionId), {
+        headers: { "x-vibe-show-target": "/second" }
+      })
+      const body = await response.text()
+      expect(response.status, body).toBe(200)
+      expect(body).toContain("# Stock second page")
+    }
+    const readApi = async () => {
+      const response = await fetch(apiUrl)
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({
+        hasSsrRouterProvider: false,
+        routes: [
+          { path: "/", dynamic: false },
+          { path: "/second", dynamic: false },
+          { path: "/teams/:team", dynamic: true }
+        ]
+      })
+    }
+    if (markdownFirst) await render()
+    await readApi()
+    await render()
+    await readApi()
   }, 60_000)
 
   it("exposes a request-scoped read-only location only to the legacy fallback", async () => {
