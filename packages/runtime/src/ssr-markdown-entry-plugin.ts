@@ -1,11 +1,19 @@
-import { access } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { access, lstat, realpath } from "node:fs/promises"
 import { join } from "node:path"
-import type { Plugin } from "vite"
+import { normalizePath, type Plugin } from "vite"
+import { routerTsx } from "./templates.js"
 
 export const SSR_MARKDOWN_ENTRY_ID = "virtual:avibe-show-ssr-markdown-entry"
 export const SSR_MARKDOWN_ENVIRONMENT = "avibe_show_markdown"
 
 const RESOLVED_SSR_MARKDOWN_ENTRY_ID = `\0${SSR_MARKDOWN_ENTRY_ID}`
+// Released Python History-router source, LF and CRLF respectively. Custom and
+// older hash routers are intentionally not eligible for this compatibility.
+const LEGACY_HISTORY_ROUTER_HASHES = new Set([
+  "1154739b3e21e2f1c7f45e3d0b7454dc5541fdf15e2c79bbc2f96f766338706e",
+  "ed7cbd0aa11a491ac8b7621b8a7ea64d7c83c0b53ec46e950cca95b7f4d0079e"
+])
 const ROUTED_SSR_MARKDOWN_ENTRY_SOURCE = `
 import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server.browser"
@@ -67,8 +75,9 @@ export function ssrMarkdownEntryPlugin(): Plugin {
   let workspace = ""
   return {
     name: "avibe-show-ssr-markdown-entry",
-    configResolved(config) {
-      workspace = config.root
+    enforce: "pre",
+    async configResolved(config) {
+      workspace = await realpath(config.root)
     },
     resolveId(source, _importer, options) {
       if (!options.ssr) return null
@@ -80,6 +89,24 @@ export function ssrMarkdownEntryPlugin(): Plugin {
       return await fileExists(join(workspace, "src", "router.tsx"))
         ? ROUTED_SSR_MARKDOWN_ENTRY_SOURCE
         : ROUTERLESS_SSR_MARKDOWN_ENTRY_SOURCE
+    },
+    async transform(source, id, options) {
+      const routerPath = join(workspace, "src", "router.tsx")
+      if (!options?.ssr || id !== normalizePath(routerPath)) return null
+      // Match the exact snapshot Vite loaded, before TS/React transforms. Never
+      // reread the source from disk: an editor may have saved a newer snapshot.
+      if (!LEGACY_HISTORY_ROUTER_HASHES.has(createHash("sha256").update(source).digest("hex"))) {
+        return null
+      }
+      try {
+        if (!(await lstat(routerPath)).isFile()) return null
+        if (!(await lstat(join(workspace, "src"))).isDirectory()) return null
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null
+        throw error
+      }
+      // Keep the original module identity and its existing invalidation path.
+      return { code: routerTsx(), map: null }
     }
   }
 }

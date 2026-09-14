@@ -242,7 +242,8 @@ export default function App() {
 `
 }
 
-function routerTsx() {
+/** @internal Shared by fresh scaffolding and read-only legacy SSR compatibility. */
+export function routerTsx() {
   return `import type { ComponentType, MouseEvent, ReactNode } from "react"
 import { createContext, useContext, useSyncExternalStore } from "react"
 

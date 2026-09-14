@@ -1,9 +1,10 @@
 # Router SSR error contract
 
 Companion to avibe-bot/avibe#1984. The Avibe orchestrator owns scaffold resource
-generation, migration of byte-exact old Python templates, packaging, and the
-Python-to-Runtime integration test. This Runtime change owns only the typed
-failure boundary and its endpoint/log regression coverage.
+generation, packaging, and the Python-to-Runtime integration test. This Runtime
+change owns the typed failure boundary and read-only SSR compatibility for the
+released stock Python History router. The scope was updated by the orchestrator
+in Avibe commit `3a49e340d`, `docs/plans/show-router-ssr-scaffold.md`.
 
 When a non-root Markdown request has no renderable `SsrRouterProvider`, the worker
 must send `code: "router_not_ssr_capable"` through the existing error protocol.
@@ -17,6 +18,19 @@ fallback, browser HTML, and all workspace files retain their existing behavior.
 Use real endpoint/worker tests for legacy, absent, and invalid providers; include
 a log assertion and preserve generic-error sanitization coverage.
 
-Do not change the router template API or add dependencies. The companion Avibe
-change uses the already shipped `ensureSessionTemplate()` and SSR provider
-contracts, so neither PR needs to be stacked on the other.
+The existing SSR module plugin substitutes the current Runtime-authored router
+only for the ordinary workspace `src/router.tsx` whose exact transform input
+matches the released LF or CRLF SHA-256:
+
+- LF: `1154739b3e21e2f1c7f45e3d0b7454dc5541fdf15e2c79bbc2f96f766338706e`
+- CRLF: `ed7cbd0aa11a491ac8b7621b8a7ea64d7c83c0b53ec46e950cca95b7f4d0079e`
+
+Reuse the existing `templates.ts` author; never copy its implementation, reread
+another source snapshot for matching, or create temporary workspaces. The
+compatibility does not write files or change HTML/client modules. Unknown,
+custom, hash, routerless, and symlink routers retain their behavior. Later edits
+must take effect through existing module/cache invalidation.
+
+Keep the public template API and dependencies unchanged. The Avibe fresh
+scaffold uses the already shipped `ensureSessionTemplate()` and SSR provider
+contracts. Old-stock SSR compatibility additionally requires Runtime PR #70.
