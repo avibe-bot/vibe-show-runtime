@@ -1,12 +1,19 @@
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
-import { ensureSessionTemplate } from "./templates.js"
+import { ensureSessionTemplate, routerTsx } from "./templates.js"
 
 const workspaces: string[] = []
 afterEach(async () => {
   await Promise.all(workspaces.splice(0).map((workspace) => rm(workspace, { force: true, recursive: true })))
+})
+
+it("keeps the default fresh router source byte-identical through legacy compatibility changes", () => {
+  // Default output at 0c9d99c; Avibe's generated resource uses these exact bytes.
+  expect(createHash("sha256").update(routerTsx()).digest("hex"))
+    .toBe("8c52b21c4b71edfc1dcfefaa8c02d61c3f67ad741719dce6d9dbe78e5240c489")
 })
 
 async function workspaceWithStyles(styles: string): Promise<string> {

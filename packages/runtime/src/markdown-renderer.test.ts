@@ -1,7 +1,7 @@
-import { EventEmitter } from "node:events"
+import { EventEmitter, once } from "node:events"
 import { fork, spawn, type ChildProcess, type ForkOptions } from "node:child_process"
 import { createHash } from "node:crypto"
-import { access, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { get as httpGet } from "node:http"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
@@ -45,6 +45,10 @@ const dependencyRoot = resolve(sourceDirectory, "../../..")
 const SCHEDULED_WORK_LOAD_TIMEOUT_MS = 30_000
 const SCHEDULED_WORK_INTERVAL_DELAY_MS = 35_000
 const cleanups: Array<() => Promise<void>> = []
+const routerCapabilityError = {
+  code: "router_not_ssr_capable",
+  message: "This Show Page router does not support Markdown for subpages. Export an SSR-capable SsrRouterProvider from src/router.tsx."
+}
 
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
@@ -61,13 +65,17 @@ async function startFixtureServer(
   for (const fixture of fixtures) {
     await cp(join(fixtureRoot, fixture), join(workspaceRoot, fixture), { recursive: true })
   }
+  const markdownWorker = dependencies.markdownWorker ?? createModuleGraphSsrWorker(
+    dependencies.markdownRendererOptions?.childFactory,
+    workspaceRoot
+  )
   const server = await startShowRuntimeServer({
     workspaceRoot,
     dependencyRoot,
     cacheRoot: join(workspaceRoot, ".vite-cache"),
     idlePruneIntervalMs: 0,
     ...options
-  }, dependencies)
+  }, { ...dependencies, markdownWorker })
   cleanups.push(async () => {
     await server.close()
     await rm(workspaceRoot, {
@@ -77,11 +85,69 @@ async function startFixtureServer(
       retryDelay: 100
     })
   })
-  return { ...server, workspaceRoot }
+  return { ...server, workspaceRoot, markdownWorker }
 }
 
 function markdownUrl(runtimeUrl: string, sessionId: string): string {
   return `${runtimeUrl}/sessions/${sessionId}/render-markdown`
+}
+
+async function observeRouterChanges(
+  vite: ViteDevServer,
+  routerPath: string,
+  worker: SsrMarkdownWorker,
+  sessionId: string
+) {
+  // Attach before the first Markdown request binds its own watcher listener.
+  // Chokidar's ready event is one-shot; Vite exposes the watcher but no ready
+  // promise, so check its scan-complete flag before subscribing.
+  if (!(vite.watcher as typeof vite.watcher & { _readyEmitted: boolean })._readyEmitted) {
+    await once(vite.watcher, "ready")
+  }
+  const modulePath = (await realpath(routerPath)).replaceAll("\\", "/")
+  const listeners = vite.watcher.listeners("change")
+  expect(listeners).toHaveLength(1)
+  const [onViteChange] = listeners
+  let pending: { resolve(): void; reject(error: unknown): void } | undefined
+  let pendingWorker: typeof pending
+  const invalidate = worker.invalidateSession.bind(worker)
+  vi.spyOn(worker, "invalidateSession").mockImplementation((id) => {
+    const completion = invalidate(id)
+    if (id === sessionId && pendingWorker) {
+      const change = pendingWorker
+      pendingWorker = undefined
+      void completion.then(change.resolve, change.reject)
+    }
+    return completion
+  })
+  const onChange = (file: string, ...args: unknown[]) => {
+    // Preserve Vite's real handler and native filesystem event. Its returned
+    // promise covers watchChange hooks, module invalidation, and HMR propagation,
+    // including changes that correctly produce no hot.send payload.
+    const completion: unknown = onViteChange.call(vite.watcher, file, ...args)
+    if (!(completion instanceof Promise)) {
+      throw new Error("Vite's file-change handler no longer exposes completion")
+    }
+    if (file.replaceAll("\\", "/") === modulePath && pending) {
+      const change = pending
+      pending = undefined
+      void completion.then(change.resolve, change.reject)
+    }
+  }
+  vite.watcher.off("change", onViteChange)
+  vite.watcher.on("change", onChange)
+  cleanups.push(async () => {
+    vite.watcher.off("change", onChange)
+    vite.watcher.on("change", onViteChange)
+  })
+  return () => {
+    expect(pending).toBeUndefined()
+    expect(pendingWorker).toBeUndefined()
+    return {
+      viteDone: new Promise<void>((resolve, reject) => { pending = { resolve, reject } }),
+      workerDone: new Promise<void>((resolve, reject) => { pendingWorker = { resolve, reject } })
+    }
+  }
 }
 
 function intrinsicReport(markdown: string): Record<string, any> {
@@ -94,6 +160,44 @@ function legacyLocationReport(markdown: string): Record<string, any> {
   const match = /LegacyLocationReport:(\{.+\})/.exec(markdown)
   if (!match) throw new Error(`Legacy location report was absent from Markdown: ${markdown}`)
   return JSON.parse(match[1]) as Record<string, any>
+}
+
+function routerContractReport(markdown: string): Record<string, any> {
+  const match = /RouterContractReport:(\{.+\})/.exec(markdown)
+  if (!match) throw new Error(`Router contract report was absent from Markdown: ${markdown}`)
+  return JSON.parse(match[1]) as Record<string, any>
+}
+
+async function prepareLegacyContractConsumer(
+  runtime: Awaited<ReturnType<typeof startFixtureServer>>,
+  newline: "LF" | "CRLF" | "custom",
+  consumer: "RouteContractPage" | "MotionContractPage" | "location"
+) {
+  const src = join(runtime.workspaceRoot, "legacy-router-field", "src")
+  const routerPath = join(src, "router.tsx")
+  const original = (await readFile(routerPath, "utf8")).replaceAll("\r\n", "\n")
+  const source = newline === "CRLF" ? original.replaceAll("\n", "\r\n")
+    : newline === "custom" ? `${original}\n// Semantically unchanged legacy fallback\n` : original
+  await writeFile(routerPath, source)
+  await cp(join(fixtureRoot, "legacy-contract-consumers.tsx"), join(src, "contract-consumers.tsx"))
+  const pageConsumer = consumer === "location" ? "RouteContractPage" : consumer
+  for (const [page, relative] of [
+    ["index.tsx", "../contract-consumers"],
+    ["second.tsx", "../contract-consumers"],
+    ["teams/[team].tsx", "../../contract-consumers"]
+  ]) {
+    await writeFile(
+      join(src, "pages", page),
+      `export { ${pageConsumer} as default } from "${relative}"\n`
+    )
+  }
+  if (consumer === "location") {
+    const page = await readFile(join(fixtureRoot, "legacy-location-facade/src/App.tsx"), "utf8")
+    await writeFile(join(src, "pages/index.tsx"), `
+if (typeof window !== "undefined") throw new Error("No location facade is allowed during module load")
+${page}`)
+  }
+  return { routerPath, source }
 }
 
 function capturedError(operation: () => unknown) {
@@ -391,7 +495,72 @@ describe("SSR Markdown process protocol", () => {
 })
 
 describe("SSR Markdown endpoint", () => {
-  it("renders a field legacy router only at the root without modifying it", async () => {
+  it.each([
+    { newline: "LF", htmlFirst: true },
+    { newline: "LF", htmlFirst: false },
+    { newline: "CRLF", htmlFirst: true },
+    { newline: "CRLF", htmlFirst: false }
+  ])("renders stock $newline routes with htmlFirst=$htmlFirst without rewriting sources", async ({
+    newline,
+    htmlFirst
+  }) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    const sessionId = "legacy-router-field"
+    const routerPath = join(runtime.workspaceRoot, sessionId, "src", "router.tsx")
+    const original = (await readFile(routerPath, "utf8")).replaceAll("\r\n", "\n")
+    const source = newline === "CRLF" ? original.replaceAll("\n", "\r\n") : original
+    expect(createHash("sha256").update(source).digest("hex")).toBe(newline === "LF"
+      ? "1154739b3e21e2f1c7f45e3d0b7454dc5541fdf15e2c79bbc2f96f766338706e"
+      : "ed7cbd0aa11a491ac8b7621b8a7ea64d7c83c0b53ec46e950cca95b7f4d0079e")
+    await writeFile(routerPath, source)
+    await chmod(routerPath, 0o444)
+    cleanups.push(() => chmod(routerPath, 0o644))
+    const before = await lstat(routerPath, { bigint: true })
+    const appUrl = `${runtime.url}/sessions/${sessionId}/app/`
+    const browserSource = async () => {
+      const html = await fetch(`${appUrl}teams/acme`)
+      expect(html.status).toBe(200)
+      expect(html.headers.get("content-type")).toContain("text/html")
+      const module = await fetch(`${appUrl}src/router.tsx`)
+      expect(module.status).toBe(200)
+      const moduleSource = await module.text()
+      expect(moduleSource).not.toContain("SsrRouterProvider")
+      return { html: await html.text(), moduleSource }
+    }
+    const initialBrowser = htmlFirst ? await browserSource() : undefined
+    for (const basePath of ["/show/stock/", "/p/public-token/"]) {
+      const response = await fetch(markdownUrl(runtime.url, sessionId), {
+        headers: {
+          "x-vibe-show-base": basePath,
+          "x-vibe-show-target": "/teams/%E7%A0%94%E5%8F%91?period=%E5%9B%9B%E5%AD%A3%E5%BA%A6&vibe-embed=1"
+        }
+      })
+      const markdown = await response.text()
+      expect(response.status, markdown).toBe(200)
+      expect(markdown).toContain("# Stock team 研发")
+      expect(markdown).toContain("Period: 四季度")
+      expect(markdown).toContain(`[Back to home](${basePath}?vibe-embed=1)`)
+    }
+    const afterMarkdown = await browserSource()
+    if (initialBrowser) expect(afterMarkdown).toEqual(initialBrowser)
+    for (const [target, heading] of [["/", "# Vibe Show Runtime"], ["/second", "# Stock second page"]]) {
+      const response = await fetch(markdownUrl(runtime.url, sessionId), {
+        headers: { "x-vibe-show-target": target }
+      })
+      const markdown = await response.text()
+      expect(response.status, markdown).toBe(200)
+      expect(markdown).toContain(heading)
+    }
+    expect(await browserSource()).toEqual(afterMarkdown)
+    expect(await readFile(routerPath, "utf8")).toBe(source)
+    const after = await lstat(routerPath, { bigint: true })
+    for (const key of ["ino", "mode", "mtimeNs", "ctimeNs", "size"] as const) {
+      expect(after[key], key).toBe(before[key])
+    }
+  }, 60_000)
+
+  it("keeps customized legacy routers root-only with an actionable error", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined)
     const fixtureRouterPath = join(fixtureRoot, "legacy-router-field", "src", "router.tsx")
     const fixtureHomePath = join(
       fixtureRoot,
@@ -400,9 +569,10 @@ describe("SSR Markdown endpoint", () => {
       "pages",
       "index.tsx"
     )
-    const fixtureRouter = await readFile(fixtureRouterPath, "utf8")
+    const fixtureRouter = `${await readFile(fixtureRouterPath, "utf8")}\n// User customization\n`
     const fixtureHome = await readFile(fixtureHomePath, "utf8")
     const runtime = await startFixtureServer(["legacy-router-field"])
+    await writeFile(join(runtime.workspaceRoot, "legacy-router-field", "src", "router.tsx"), fixtureRouter)
 
     const headers = { "x-vibe-show-base": "/p/public-token/" }
     const root = await fetch(markdownUrl(runtime.url, "legacy-router-field"), { headers })
@@ -421,13 +591,330 @@ describe("SSR Markdown endpoint", () => {
     )).toBe(fixtureHome)
 
     const nested = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
-      headers: { ...headers, "x-vibe-show-target": "/other" }
+      headers: { ...headers, "x-vibe-show-target": "/%E5%9B%A2%E9%98%9F?period=Q4" }
     })
     expect(nested.status).toBe(502)
-    expect(await renderError(nested)).toEqual({
-      error: { code: "render_failed", message: "Show Page rendering failed." }
+    expect(await renderError(nested)).toEqual({ error: routerCapabilityError })
+    const failures = log.mock.calls.flatMap(([line]) => {
+      try {
+        const event = JSON.parse(String(line))
+        return event.event === "ssr-markdown-render-failed" ? [event] : []
+      } catch {
+        return []
+      }
     })
+    expect(failures).toEqual([{
+      level: "error",
+      source: "show-runtime",
+      event: "ssr-markdown-render-failed",
+      sessionId: "legacy-router-field",
+      phase: "render",
+      errorClass: "WorkerCommandError",
+      ...routerCapabilityError
+    }])
+    const browser = await fetch(`${runtime.url}/sessions/legacy-router-field/app/other`)
+    expect(browser.status).toBe(200)
+    expect(browser.headers.get("content-type")).toContain("text/html")
+    expect(await readFile(
+      join(runtime.workspaceRoot, "legacy-router-field", "src", "router.tsx"),
+      "utf8"
+    )).toBe(fixtureRouter)
   }, 60_000)
+
+  it.each(["hash", "symlink"])("leaves a %s router outside stock compatibility", async (kind) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    const routerPath = join(runtime.workspaceRoot, "legacy-router-field", "src", "router.tsx")
+    let source = await readFile(routerPath, "utf8")
+    if (kind === "hash") {
+      source = source.replaceAll('"popstate"', '"hashchange"')
+        .replaceAll("window.location.pathname", 'window.location.hash.slice(1) || "/"')
+      await writeFile(routerPath, source)
+    } else {
+      const target = join(dirname(routerPath), "linked-router.tsx")
+      await writeFile(target, source)
+      await rm(routerPath)
+      await symlink(target, routerPath, "file")
+    }
+    const root = await fetch(markdownUrl(runtime.url, "legacy-router-field"))
+    expect(root.status, await root.text()).toBe(200)
+    const nested = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+      headers: { "x-vibe-show-target": "/second" }
+    })
+    expect(nested.status).toBe(502)
+    expect(await renderError(nested)).toEqual({ error: routerCapabilityError })
+    expect(await readFile(routerPath, "utf8")).toBe(source)
+    expect((await lstat(routerPath)).isSymbolicLink()).toBe(kind === "symlink")
+  }, 60_000)
+
+  it("invalidates stock compatibility after a custom router edit and restores it for stock", async () => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    const routerPath = join(runtime.workspaceRoot, "legacy-router-field", "src", "router.tsx")
+    const source = await readFile(routerPath, "utf8")
+    const headers = { "x-vibe-show-target": "/second" }
+    const url = markdownUrl(runtime.url, "legacy-router-field")
+    await runtime.runtime.ensureSession("legacy-router-field", "/show/legacy-router-field/")
+    const vite = runtime.runtime.getSession("legacy-router-field")?.vite
+    if (!vite) throw new Error("The fixture Vite server was not created")
+    const nextRouterChange = await observeRouterChanges(
+      vite, routerPath, runtime.markdownWorker, "legacy-router-field"
+    )
+    const first = await fetch(url, { headers })
+    expect(first.status, await first.text()).toBe(200)
+    expect((await fetch(url, { headers })).headers.get("x-avibe-render-cache")).toBe("hit")
+
+    const customChange = nextRouterChange()
+    await writeFile(routerPath, `${source}\n// User edit must invalidate the SSR substitute\n`)
+    await Promise.all([customChange.viteDone, customChange.workerDone])
+    const customized = await fetch(url, { headers })
+    expect(customized.status).toBe(502)
+    expect(await renderError(customized)).toEqual({ error: routerCapabilityError })
+
+    const stockChange = nextRouterChange()
+    await writeFile(routerPath, source)
+    await Promise.all([stockChange.viteDone, stockChange.workerDone])
+    const restored = await fetch(url, { headers })
+    expect(restored.status, await restored.text()).toBe(200)
+    expect(restored.headers.get("x-avibe-render-cache")).toBe("miss")
+  }, 60_000)
+
+  it.each([true, false])("matches the loaded snapshot when an editor saves during transform (stock=%s)", async (stock) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    const sessionId = "legacy-router-field"
+    const routerPath = join(runtime.workspaceRoot, sessionId, "src", "router.tsx")
+    const original = await readFile(routerPath, "utf8")
+    const custom = `${original}\n// Concurrent user save\n`
+    const initial = stock ? original : custom
+    const saved = stock ? custom : original
+    await writeFile(routerPath, initial)
+    await runtime.runtime.ensureSession(sessionId, `/show/${sessionId}/`)
+    const vite = runtime.runtime.getSession(sessionId)?.vite
+    if (!vite) throw new Error("The fixture Vite server was not created")
+    const nextRouterChange = await observeRouterChanges(
+      vite, routerPath, runtime.markdownWorker, sessionId
+    )
+    const environment = vite.environments[SSR_MARKDOWN_ENVIRONMENT]
+    const hotSend = vi.spyOn(environment.hot, "send")
+    const plugin = environment.plugins.find(
+      (candidate) => candidate.name === "avibe-show-ssr-markdown-entry"
+    )
+    if (!plugin || typeof plugin.transform !== "function") {
+      throw new Error("The SSR compatibility transform was not found")
+    }
+    const transform = plugin.transform
+    const modulePath = (await realpath(routerPath)).replaceAll("\\", "/")
+    let captured: { source: string; substituted: boolean } | undefined
+    let savedChange: ReturnType<typeof nextRouterChange> | undefined
+    vi.spyOn(plugin as { transform: typeof transform }, "transform").mockImplementation(async function (
+      this: ThisParameterType<typeof transform>,
+      ...args: Parameters<typeof transform>
+    ) {
+      const [source, id, options] = args
+      if (!captured && options?.ssr && id === modulePath) {
+        const snapshot = { source, substituted: false }
+        captured = snapshot
+        savedChange = nextRouterChange()
+        await writeFile(routerPath, saved)
+        // Finish the real change handler while this module is still being
+        // transformed. An unanalyzed module has no HMR update boundary yet.
+        await savedChange.viteDone
+        expect(hotSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: "full-reload" }))
+        const result = await transform.apply(this, args)
+        snapshot.substituted = result !== null && result !== undefined
+        return result
+      }
+      return await transform.apply(this, args)
+    })
+    const url = markdownUrl(runtime.url, sessionId)
+    const headers = { "x-vibe-show-target": "/second" }
+    const first = await fetch(url, { headers })
+    // The request overlaps the save, so Vite may fetch the changed module
+    // again. Assert the snapshot decision itself, then the settled request.
+    expect([200, 502]).toContain(first.status)
+    await first.text()
+    expect(captured).toEqual({ source: initial, substituted: stock })
+    // The real renderer queues worker invalidation behind the overlapping
+    // request. Observe its completion too, without forcing invalidation.
+    if (!savedChange) throw new Error("The concurrent save did not run")
+    await savedChange.workerDone
+    const next = await fetch(url, { headers })
+    const body = await next.text()
+    expect(next.status, body).toBe(stock ? 502 : 200)
+    expect(body).toContain(stock ? "router_not_ssr_capable" : "# Stock second page")
+    expect(await readFile(routerPath, "utf8")).toBe(saved)
+  }, 60_000)
+
+  it.each([true, false])("keeps stock router exports in API SSR with markdownFirst=%s", async (markdownFirst) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    const sessionId = "legacy-router-field"
+    const apiUrl = `${runtime.url}/sessions/${sessionId}/app/api/router`
+    const render = async () => {
+      const response = await fetch(markdownUrl(runtime.url, sessionId), {
+        headers: { "x-vibe-show-target": "/second" }
+      })
+      const body = await response.text()
+      expect(response.status, body).toBe(200)
+      expect(body).toContain("# Stock second page")
+    }
+    const readApi = async () => {
+      const response = await fetch(apiUrl)
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({
+        hasSsrRouterProvider: false,
+        routes: [
+          { path: "/", dynamic: false },
+          { path: "/second", dynamic: false },
+          { path: "/teams/:team", dynamic: true }
+        ]
+      })
+    }
+    if (markdownFirst) await render()
+    await readApi()
+    await render()
+    await readApi()
+  }, 60_000)
+
+  it.each(["LF", "CRLF"] as const)("preserves stock %s route exports for root and nested Markdown consumers", async (newline) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    const { routerPath, source } = await prepareLegacyContractConsumer(runtime, newline, "RouteContractPage")
+    for (const base of ["/p/contract-token/", "/show/contract-private/"]) {
+      for (const target of ["/", "/teams/%E7%A0%94%E5%8F%91", "/second"]) {
+        const response = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+          headers: {
+            "x-vibe-show-base": base,
+            "x-vibe-show-target": `${target}?period=%E5%9B%9B%E5%AD%A3%E5%BA%A6&vibe-embed=1`
+          }
+        })
+        const body = await response.text()
+        expect(response.status, body).toBe(200)
+        expect(routerContractReport(body)).toEqual({
+          pathname: target,
+          params: target.startsWith("/teams") ? { team: "研发" } : {},
+          query: { period: "四季度", "vibe-embed": "1" },
+          exports: { useRoutePath: "function", Link: "function", navigate: "function", RouterView: "function" },
+          routes: [
+            { path: "/", dynamic: false, segments: [], sameComponent: true },
+            { path: "/second", dynamic: false, segments: [{ name: "second", dynamic: false }], sameComponent: true },
+            {
+              path: "/teams/:team", dynamic: true,
+              segments: [{ name: "teams", dynamic: false }, { name: "team", dynamic: true }],
+              sameComponent: true
+            }
+          ],
+          windowDuringLoad: false,
+          windowDuringRender: target === "/"
+        })
+        expect(body).toContain(`[Second](${base}second?vibe-embed=1)`)
+      }
+    }
+    expect(await readFile(routerPath, "utf8")).toBe(source)
+  }, 60_000)
+
+  it.each(["LF", "CRLF", "custom"] as const)("preserves the legacy %s RouterView root not-found output", async (newline) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    await prepareLegacyContractConsumer(runtime, newline, "RouteContractPage")
+    await rm(join(runtime.workspaceRoot, "legacy-router-field", "src/pages/index.tsx"))
+    const response = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+      headers: { "x-vibe-show-base": "/p/not-found/", "x-vibe-show-target": "/?period=%E7%A0%94%E5%8F%91" }
+    })
+    const body = await response.text()
+    expect(response.status, body).toBe(200)
+    expect(body).toContain("# Page not found")
+    expect(body).toContain("No route matches `/`.")
+    expect(body).toContain("[Back to Home](/p/not-found/)")
+  }, 60_000)
+
+  it.each(["LF", "CRLF"] as const)("retains the stock %s root location facade without leaking between requests", async (newline) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    const { routerPath, source } = await prepareLegacyContractConsumer(runtime, newline, "location")
+    for (const [base, search] of [
+      ["/p/contract-token/", "?period=%E7%A0%94%E5%8F%91"],
+      ["/show/contract-private/", "?period=%E5%9B%9B%E5%AD%A3%E5%BA%A6"],
+      ["/p/contract-token/", "?period=%E6%96%B0%E8%AF%B7%E6%B1%82"]
+    ]) {
+      const response = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+        headers: { "x-vibe-show-base": base, "x-vibe-show-target": `/${search}` }
+      })
+      const body = await response.text()
+      expect(response.status, body).toBe(200)
+      expect(legacyLocationReport(body)).toEqual({
+        pathname: base,
+        search,
+        hash: "",
+        href: new URL(`${base}${search}`, runtime.url).href,
+        origin: new URL(runtime.url).origin,
+        windowKeys: ["location"],
+        locationKeys: ["hash", "href", "origin", "pathname", "search"],
+        windowPrototypeNull: true,
+        locationPrototypeNull: true,
+        windowFrozen: true,
+        locationFrozen: true,
+        documentPresent: false,
+        historyPresent: false,
+        eventLifecyclePresent: false,
+        mutationError: "TypeError",
+        pathnameUnchanged: true
+      })
+    }
+    expect(await readFile(routerPath, "utf8")).toBe(source)
+  }, 60_000)
+
+  it.each(["LF", "CRLF"] as const)("retains static Motion rendering for stock %s root and nested routes", async (newline) => {
+    const runtime = await startFixtureServer(["legacy-router-field"])
+    await prepareLegacyContractConsumer(runtime, newline, "MotionContractPage")
+    for (const target of ["/", "/teams/%E7%A0%94%E5%8F%91", "/second"]) {
+      const response = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+        headers: {
+          "x-vibe-show-base": "/p/contract-token/",
+          "x-vibe-show-target": `${target}?period=%E5%9B%9B%E5%AD%A3%E5%BA%A6`
+        }
+      })
+      const body = await response.text()
+      expect(response.status, body).toBe(200)
+      expect(routerContractReport(body)).toEqual({
+        isStatic: true,
+        windowDuringLoad: false,
+        windowDuringRender: target === "/"
+      })
+    }
+  }, 60_000)
+
+  it.each(["RouteContractPage", "location", "MotionContractPage"] as const)(
+    "preserves baseline custom legacy root behavior for %s",
+    async (consumer) => {
+      const runtime = await startFixtureServer(["legacy-router-field"])
+      await prepareLegacyContractConsumer(runtime, "custom", consumer)
+      const response = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+        headers: { "x-vibe-show-base": "/p/baseline/", "x-vibe-show-target": "/?period=%E7%A0%94%E5%8F%91" }
+      })
+      const body = await response.text()
+      expect(response.status, body).toBe(200)
+      if (consumer === "location") {
+        expect(legacyLocationReport(body)).toMatchObject({
+          pathname: "/p/baseline/", search: "?period=%E7%A0%94%E5%8F%91",
+          windowFrozen: true, locationFrozen: true, windowPrototypeNull: true, locationPrototypeNull: true
+        })
+      } else if (consumer === "MotionContractPage") {
+        expect(routerContractReport(body)).toEqual({
+          isStatic: true, windowDuringLoad: false, windowDuringRender: true
+        })
+      } else {
+        expect(routerContractReport(body)).toMatchObject({
+          pathname: "/", params: {}, query: null,
+          routes: [
+            { path: "/", dynamic: false, sameComponent: true },
+            { path: "/second", dynamic: false, sameComponent: true },
+            { path: "/teams/:team", dynamic: true, sameComponent: true }
+          ],
+          windowDuringLoad: false, windowDuringRender: true
+        })
+      }
+      const nested = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
+        headers: { "x-vibe-show-target": "/second" }
+      })
+      expect(nested.status).toBe(502)
+      expect(await renderError(nested)).toEqual({ error: routerCapabilityError })
+    }, 60_000
+  )
 
   it("exposes a request-scoped read-only location only to the legacy fallback", async () => {
     const runtime = await startFixtureServer([
@@ -504,9 +991,7 @@ describe("SSR Markdown endpoint", () => {
       headers: { "x-vibe-show-target": "/other" }
     })
     expect(legacyNested.status).toBe(502)
-    expect(await renderError(legacyNested)).toEqual({
-      error: { code: "render_failed", message: "Show Page rendering failed." }
-    })
+    expect(await renderError(legacyNested)).toEqual({ error: routerCapabilityError })
 
     const elementRoot = await fetch(markdownUrl(runtime.url, "element-router-provider"))
     const elementMarkdown = await elementRoot.text()
@@ -517,9 +1002,7 @@ describe("SSR Markdown endpoint", () => {
       headers: { "x-vibe-show-target": "/other" }
     })
     expect(elementNested.status).toBe(502)
-    expect(await renderError(elementNested)).toEqual({
-      error: { code: "render_failed", message: "Show Page rendering failed." }
-    })
+    expect(await renderError(elementNested)).toEqual({ error: routerCapabilityError })
 
     const lazyRoot = await fetch(markdownUrl(runtime.url, "lazy-router-provider"))
     const lazyMarkdown = await lazyRoot.text()
@@ -530,9 +1013,7 @@ describe("SSR Markdown endpoint", () => {
       headers: { "x-vibe-show-target": "/other" }
     })
     expect(lazyNested.status).toBe(502)
-    expect(await renderError(lazyNested)).toEqual({
-      error: { code: "render_failed", message: "Show Page rendering failed." }
-    })
+    expect(await renderError(lazyNested)).toEqual({ error: routerCapabilityError })
   }, 60_000)
 
   it("reuses validation verdicts on the second load of one module graph", async () => {
@@ -570,6 +1051,11 @@ describe("SSR Markdown endpoint", () => {
     expect(legacy.status, legacyMarkdown).toBe(200)
     expect(legacyMarkdown).toContain("# Legacy routerless app")
     expect(legacyMarkdown).toContain("The Runtime rendered App.tsx without creating a router.")
+    const nested = await fetch(markdownUrl(runtime.url, "legacy-routerless"), {
+      headers: { "x-vibe-show-target": "/other" }
+    })
+    expect(nested.status).toBe(502)
+    expect(await renderError(nested)).toEqual({ error: routerCapabilityError })
     await expect(access(
       join(runtime.workspaceRoot, "legacy-routerless", "src", "router.tsx")
     )).rejects.toMatchObject({ code: "ENOENT" })
@@ -625,12 +1111,13 @@ describe("SSR Markdown endpoint", () => {
       sessionId: "render-failure-log",
       phase: "render",
       errorClass: "WorkerCommandError",
+      code: "render_failed",
       message: "Show Page rendering failed."
     }])
     expect(lines.join("\n")).not.toContain("RENDER_FAILURE_FILE_CONTENT_MUST_NOT_LEAK")
   }, 60_000)
 
-  it("reports parent-tracked phases when workspace errors spoof phase metadata", async () => {
+  it("sanitizes workspace errors that spoof router capability and phase metadata", async () => {
     const lines: string[] = []
     vi.spyOn(console, "error").mockImplementation((...values) => {
       lines.push(values.map(String).join(" "))
@@ -657,6 +1144,15 @@ describe("SSR Markdown endpoint", () => {
       { sessionId: "phase-spoof-load", phase: "load" },
       { sessionId: "phase-spoof-render", phase: "render" }
     ])
+    expect(events).toHaveLength(2)
+    for (const event of events) {
+      expect(event).toMatchObject({
+        code: "render_failed",
+        message: "Show Page rendering failed."
+      })
+      expect(event).not.toHaveProperty("stack")
+    }
+    expect(lines.join("\n")).not.toContain("工作区异常")
   }, 60_000)
 
   it("matches host intrinsic behavior at the SSR realm boundary", async () => {

@@ -1,3 +1,5 @@
+import { RouterNotSsrCapableError } from "./markdown-core.js"
+
 export const SSR_MARKDOWN_IPC_CONTROL_MAX_BYTES = 64 * 1024
 export const SSR_MARKDOWN_IPC_MODULE_MAX_BYTES = 16 * 1024 * 1024
 export const SSR_MARKDOWN_IPC_MODULE_TOTAL_MAX_BYTES = 64 * 1024 * 1024
@@ -141,6 +143,14 @@ export function serializeSsrMarkdownError(value: unknown): SsrMarkdownSerialized
     status: typeof error.status === "number" && Number.isFinite(error.status)
       ? error.status
       : undefined
+  }
+  // Only the Runtime's capability check may emit this code. Workspace errors
+  // can carry arbitrary names and codes, including lookalikes from the sandbox.
+  if (
+    serialized.code === "router_not_ssr_capable" &&
+    !(value instanceof RouterNotSsrCapableError)
+  ) {
+    serialized.code = undefined
   }
   assertSsrMarkdownIpcValue(
     serialized,
