@@ -45,6 +45,10 @@ const dependencyRoot = resolve(sourceDirectory, "../../..")
 const SCHEDULED_WORK_LOAD_TIMEOUT_MS = 30_000
 const SCHEDULED_WORK_INTERVAL_DELAY_MS = 35_000
 const cleanups: Array<() => Promise<void>> = []
+const routerCapabilityError = {
+  code: "router_not_ssr_capable",
+  message: "This Show Page router does not support Markdown for subpages. Export an SSR-capable SsrRouterProvider from src/router.tsx."
+}
 
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
@@ -392,6 +396,7 @@ describe("SSR Markdown process protocol", () => {
 
 describe("SSR Markdown endpoint", () => {
   it("renders a field legacy router only at the root without modifying it", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined)
     const fixtureRouterPath = join(fixtureRoot, "legacy-router-field", "src", "router.tsx")
     const fixtureHomePath = join(
       fixtureRoot,
@@ -421,12 +426,34 @@ describe("SSR Markdown endpoint", () => {
     )).toBe(fixtureHome)
 
     const nested = await fetch(markdownUrl(runtime.url, "legacy-router-field"), {
-      headers: { ...headers, "x-vibe-show-target": "/other" }
+      headers: { ...headers, "x-vibe-show-target": "/%E5%9B%A2%E9%98%9F?period=Q4" }
     })
     expect(nested.status).toBe(502)
-    expect(await renderError(nested)).toEqual({
-      error: { code: "render_failed", message: "Show Page rendering failed." }
+    expect(await renderError(nested)).toEqual({ error: routerCapabilityError })
+    const failures = log.mock.calls.flatMap(([line]) => {
+      try {
+        const event = JSON.parse(String(line))
+        return event.event === "ssr-markdown-render-failed" ? [event] : []
+      } catch {
+        return []
+      }
     })
+    expect(failures).toEqual([{
+      level: "error",
+      source: "show-runtime",
+      event: "ssr-markdown-render-failed",
+      sessionId: "legacy-router-field",
+      phase: "render",
+      errorClass: "WorkerCommandError",
+      ...routerCapabilityError
+    }])
+    const browser = await fetch(`${runtime.url}/sessions/legacy-router-field/app/other`)
+    expect(browser.status).toBe(200)
+    expect(browser.headers.get("content-type")).toContain("text/html")
+    expect(await readFile(
+      join(runtime.workspaceRoot, "legacy-router-field", "src", "router.tsx"),
+      "utf8"
+    )).toBe(fixtureRouter)
   }, 60_000)
 
   it("exposes a request-scoped read-only location only to the legacy fallback", async () => {
@@ -504,9 +531,7 @@ describe("SSR Markdown endpoint", () => {
       headers: { "x-vibe-show-target": "/other" }
     })
     expect(legacyNested.status).toBe(502)
-    expect(await renderError(legacyNested)).toEqual({
-      error: { code: "render_failed", message: "Show Page rendering failed." }
-    })
+    expect(await renderError(legacyNested)).toEqual({ error: routerCapabilityError })
 
     const elementRoot = await fetch(markdownUrl(runtime.url, "element-router-provider"))
     const elementMarkdown = await elementRoot.text()
@@ -517,9 +542,7 @@ describe("SSR Markdown endpoint", () => {
       headers: { "x-vibe-show-target": "/other" }
     })
     expect(elementNested.status).toBe(502)
-    expect(await renderError(elementNested)).toEqual({
-      error: { code: "render_failed", message: "Show Page rendering failed." }
-    })
+    expect(await renderError(elementNested)).toEqual({ error: routerCapabilityError })
 
     const lazyRoot = await fetch(markdownUrl(runtime.url, "lazy-router-provider"))
     const lazyMarkdown = await lazyRoot.text()
@@ -530,9 +553,7 @@ describe("SSR Markdown endpoint", () => {
       headers: { "x-vibe-show-target": "/other" }
     })
     expect(lazyNested.status).toBe(502)
-    expect(await renderError(lazyNested)).toEqual({
-      error: { code: "render_failed", message: "Show Page rendering failed." }
-    })
+    expect(await renderError(lazyNested)).toEqual({ error: routerCapabilityError })
   }, 60_000)
 
   it("reuses validation verdicts on the second load of one module graph", async () => {
@@ -570,6 +591,11 @@ describe("SSR Markdown endpoint", () => {
     expect(legacy.status, legacyMarkdown).toBe(200)
     expect(legacyMarkdown).toContain("# Legacy routerless app")
     expect(legacyMarkdown).toContain("The Runtime rendered App.tsx without creating a router.")
+    const nested = await fetch(markdownUrl(runtime.url, "legacy-routerless"), {
+      headers: { "x-vibe-show-target": "/other" }
+    })
+    expect(nested.status).toBe(502)
+    expect(await renderError(nested)).toEqual({ error: routerCapabilityError })
     await expect(access(
       join(runtime.workspaceRoot, "legacy-routerless", "src", "router.tsx")
     )).rejects.toMatchObject({ code: "ENOENT" })
@@ -625,12 +651,13 @@ describe("SSR Markdown endpoint", () => {
       sessionId: "render-failure-log",
       phase: "render",
       errorClass: "WorkerCommandError",
+      code: "render_failed",
       message: "Show Page rendering failed."
     }])
     expect(lines.join("\n")).not.toContain("RENDER_FAILURE_FILE_CONTENT_MUST_NOT_LEAK")
   }, 60_000)
 
-  it("reports parent-tracked phases when workspace errors spoof phase metadata", async () => {
+  it("sanitizes workspace errors that spoof router capability and phase metadata", async () => {
     const lines: string[] = []
     vi.spyOn(console, "error").mockImplementation((...values) => {
       lines.push(values.map(String).join(" "))
@@ -657,6 +684,15 @@ describe("SSR Markdown endpoint", () => {
       { sessionId: "phase-spoof-load", phase: "load" },
       { sessionId: "phase-spoof-render", phase: "render" }
     ])
+    expect(events).toHaveLength(2)
+    for (const event of events) {
+      expect(event).toMatchObject({
+        code: "render_failed",
+        message: "Show Page rendering failed."
+      })
+      expect(event).not.toHaveProperty("stack")
+    }
+    expect(lines.join("\n")).not.toContain("工作区异常")
   }, 60_000)
 
   it("matches host intrinsic behavior at the SSR realm boundary", async () => {

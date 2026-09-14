@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs"
 import { ModuleRunner } from "vite/module-runner"
+import { RouterNotSsrCapableError } from "./markdown-core.js"
 import {
   cleanupSsrRenderedHtml,
   convertCleanedSsrHtmlToMarkdown
@@ -101,9 +102,7 @@ async function executeCommand(command) {
           !state.entry.hasSsrRouterProvider &&
           command.location?.pathname !== "/"
         ) {
-          throw new Error(
-            "This Show Page router supports SSR Markdown only for the root document"
-          )
+          throw new RouterNotSsrCapableError()
         }
         const legacyLocation = state.entry.hasSsrRouterProvider
           ? undefined

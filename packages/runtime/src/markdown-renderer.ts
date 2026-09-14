@@ -20,6 +20,7 @@ import type { FetchFunctionOptions } from "vite/module-runner"
 import {
   convertRenderedHtmlToMarkdown,
   MarkdownRenderError,
+  RouterNotSsrCapableError,
   type MarkdownRenderErrorCode
 } from "./markdown-core.js"
 import type {
@@ -410,7 +411,8 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
           request.sessionId,
           phase,
           error,
-          normalized.message
+          normalized.message,
+          normalized.code
         )
         throw normalized
       } finally {
@@ -481,7 +483,8 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
     sessionId: string,
     phase: MarkdownRenderFailurePhase,
     error: unknown,
-    safeMessage: string
+    safeMessage: string,
+    code?: MarkdownRenderErrorCode
   ): void {
     console.error(JSON.stringify({
       level: "error",
@@ -490,6 +493,7 @@ export function createMarkdownRenderer(options: MarkdownRendererOptions = {}): M
       sessionId,
       phase,
       errorClass: renderFailureClass(error),
+      code,
       message: boundedLogMessage(safeMessage, RENDER_FAILURE_MESSAGE_MAX_BYTES)
     }))
   }
@@ -1391,6 +1395,13 @@ function normalizeRenderError(
   }
   if (error instanceof SsrWorkerUnavailableError) {
     return rendererUnavailable("The SSR Markdown worker is unavailable.", error)
+  }
+  if (
+    error instanceof WorkerCommandError &&
+    error.command === "render-markdown" &&
+    error.code === "router_not_ssr_capable"
+  ) {
+    return new RouterNotSsrCapableError({ cause: error })
   }
   if (
     error instanceof WorkerCommandError &&

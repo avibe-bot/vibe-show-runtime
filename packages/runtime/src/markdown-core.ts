@@ -7,6 +7,7 @@ export type MarkdownRenderErrorCode =
   | "renderer_unavailable"
   | "render_timeout"
   | "render_failed"
+  | "router_not_ssr_capable"
   | "output_too_large"
 
 export class MarkdownRenderError extends Error {
@@ -18,6 +19,18 @@ export class MarkdownRenderError extends Error {
   ) {
     super(message, options)
     this.name = "MarkdownRenderError"
+  }
+}
+
+export class RouterNotSsrCapableError extends MarkdownRenderError {
+  constructor(options?: ErrorOptions) {
+    super(
+      "router_not_ssr_capable",
+      502,
+      "This Show Page router does not support Markdown for subpages. Export an SSR-capable SsrRouterProvider from src/router.tsx.",
+      options
+    )
+    this.name = "RouterNotSsrCapableError"
   }
 }
 
