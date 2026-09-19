@@ -510,6 +510,11 @@ const standaloneErrorCode = (error: unknown): AnnotationVoiceErrorCode => {
   return "failed"
 }
 
+const standaloneStartErrorCode = (error: unknown): AnnotationVoiceErrorCode => {
+  const code = standaloneErrorCode(error)
+  return code === "permission" || code === "cancelled" ? code : "start_failed"
+}
+
 const standaloneRecorderMimeType = (
   isTypeSupported: (mimeType: string) => boolean,
 ): string | undefined => STANDALONE_MIME_TYPES.find((mimeType) => {
@@ -617,10 +622,10 @@ export function createAnnotationVoiceStandaloneAdapter(
     })
   }
 
-  const ensureCsrfToken = async (): Promise<string> => {
+  const ensureCsrfToken = async (signal?: AbortSignal): Promise<string> => {
     const existing = readCookie("vibe_csrf_token")
     if (existing) return existing
-    const response = await request(STANDALONE_CSRF_PATH)
+    const response = await request(STANDALONE_CSRF_PATH, { signal })
     if (!response.ok) throw standaloneVoiceError("unavailable")
     const payload = await response.json().catch(() => null) as { csrf_token?: unknown } | null
     if (typeof payload?.csrf_token !== "string" || !payload.csrf_token) {
@@ -643,7 +648,7 @@ export function createAnnotationVoiceStandaloneAdapter(
     if (signal.aborted) abortFromCaller()
     else signal.addEventListener("abort", abortFromCaller, { once: true })
     try {
-      const csrfToken = await ensureCsrfToken()
+      const csrfToken = await ensureCsrfToken(controller.signal)
       const response = await request(STANDALONE_ASR_TRANSCRIBE_PATH, {
         method: "POST",
         headers: {
@@ -702,10 +707,17 @@ export function createAnnotationVoiceStandaloneAdapter(
         throw standaloneVoiceError("unavailable")
       }
       let stream: MediaStream
+      if (input.signal?.aborted) {
+        throw standaloneVoiceError("cancelled")
+      }
       try {
         stream = await getUserMedia()
       } catch (error) {
-        throw standaloneVoiceError(standaloneErrorCode(error), { cause: error })
+        throw standaloneVoiceError(standaloneStartErrorCode(error), { cause: error })
+      }
+      if (input.signal?.aborted) {
+        stream.getTracks().forEach((track) => track.stop())
+        throw standaloneVoiceError("cancelled")
       }
 
       const mimeType = standaloneRecorderMimeType(isTypeSupported)
@@ -714,13 +726,12 @@ export function createAnnotationVoiceStandaloneAdapter(
         recorder = createRecorder(stream, mimeType)
       } catch (error) {
         stream.getTracks().forEach((track) => track.stop())
-        throw standaloneVoiceError(standaloneErrorCode(error), { cause: error })
+        throw standaloneVoiceError(standaloneStartErrorCode(error), { cause: error })
       }
 
       const localAbort = new AbortController()
       const chunks: Blob[] = []
       let settled = false
-      let recordingStopped = false
       let retainedBlob: Blob | null = null
       let resolveDone!: (text: string) => void
       let rejectDone!: (error: unknown) => void
@@ -744,7 +755,9 @@ export function createAnnotationVoiceStandaloneAdapter(
         rejectDone(standaloneVoiceError("cancelled"))
       }
       const transcribeBlob = (blob: Blob, context: AnnotationVoiceRetryInput): Promise<string> => {
-        localAbort.signal.throwIfAborted?.()
+        if (localAbort.signal.aborted) {
+          return Promise.reject(standaloneVoiceError("cancelled"))
+        }
         return transcribe(blob, context, localAbort.signal)
       }
       const onData = (event: Event): void => {
@@ -755,14 +768,19 @@ export function createAnnotationVoiceStandaloneAdapter(
         if (settled) return
         settled = true
         cleanup()
-        rejectDone(standaloneVoiceError("failed", { retryable: true }))
+        rejectDone(standaloneVoiceError("failed"))
       }
       const onStop = (): void => {
-        if (settled || !recordingStopped) return
+        if (settled) return
         retainedBlob = chunks.length > 0
           ? new Blob(chunks, { type: chunks[0]?.type || mimeType || "audio/webm" })
           : null
         cleanup()
+        if (localAbort.signal.aborted) {
+          settled = true
+          rejectDone(standaloneVoiceError("cancelled"))
+          return
+        }
         if (!retainedBlob) {
           settled = true
           rejectDone(standaloneVoiceError("empty"))
@@ -787,7 +805,6 @@ export function createAnnotationVoiceStandaloneAdapter(
         localAbort.abort(input.signal?.reason)
         if (!settled) {
           if (recorder.state !== "inactive") {
-            recordingStopped = true
             recorder.stop()
           } else {
             rejectCancelled()
@@ -809,7 +826,6 @@ export function createAnnotationVoiceStandaloneAdapter(
         done: result,
         stop: () => {
           if (settled || recorder.state === "inactive") return
-          recordingStopped = true
           recorder.stop()
         },
         retry: (retryInput) => {
@@ -823,7 +839,6 @@ export function createAnnotationVoiceStandaloneAdapter(
         abort: () => {
           localAbort.abort()
           if (recorder.state !== "inactive") {
-            recordingStopped = true
             recorder.stop()
           } else {
             rejectCancelled()
