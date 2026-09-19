@@ -405,6 +405,115 @@ describe("standalone annotation voice adapter", () => {
     }
   })
 
+  it("keeps caller cancellation wired through a pending transcription response", async () => {
+    const recorder = new FakeStandaloneRecorder()
+    const stream = fakeStream()
+    const controller = new AbortController()
+    let responseSignal: AbortSignal | undefined
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (input === "/api/csrf-token") {
+        return new Response(JSON.stringify({ csrf_token: "csrf-4" }), { status: 200 })
+      }
+      responseSignal = init?.signal ?? undefined
+      return {
+        ok: true,
+        json: () => new Promise<unknown>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("aborted", "AbortError"))
+          }, { once: true })
+        })
+      } as Response
+    })
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: fetchMock,
+      getUserMedia: async () => stream.stream,
+      createRecorder: () => recorder,
+      isTypeSupported: () => false
+    })
+
+    const session = await adapter.start({ before: "", after: "", signal: controller.signal })
+    session.stop()
+    await vi.waitFor(() => expect(responseSignal).toBeDefined())
+
+    const outcome = Promise.race([
+      session.done.then(() => "resolved", (error) => error),
+      new Promise<"hung">((resolve) => globalThis.setTimeout(() => resolve("hung"), 100))
+    ])
+    controller.abort()
+
+    await expect(outcome).resolves.toMatchObject({ code: "cancelled" })
+    expect(responseSignal?.aborted).toBe(true)
+  })
+
+  it("bounds a stalled availability probe", async () => {
+    vi.useFakeTimers()
+    try {
+      const recorder = new FakeStandaloneRecorder()
+      const stream = fakeStream()
+      let statusSignal: AbortSignal | undefined
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(input).toBe("/api/asr/status")
+        statusSignal = init?.signal ?? undefined
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("aborted", "AbortError"))
+          }, { once: true })
+        })
+      })
+      const adapter = createAnnotationVoiceStandaloneAdapter({
+        fetch: fetchMock,
+        getUserMedia: async () => stream.stream,
+        createRecorder: () => recorder,
+        isTypeSupported: () => false
+      })
+
+      const available = adapter.isAvailable()
+      await vi.advanceTimersByTimeAsync(1_500)
+
+      await expect(available).resolves.toBe(false)
+      expect(statusSignal?.aborted).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("does not advertise voice without browser microphone capture support", async () => {
+    vi.stubGlobal("navigator", { mediaDevices: {} })
+    try {
+      const fetchMock = vi.fn()
+      const adapter = createAnnotationVoiceStandaloneAdapter({
+        fetch: fetchMock,
+        createRecorder: () => new FakeStandaloneRecorder(),
+        isTypeSupported: () => false
+      })
+
+      await expect(adapter.isAvailable()).resolves.toBe(false)
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it("classifies recorder start failures as start failures", async () => {
+    const recorder = new FakeStandaloneRecorder()
+    vi.spyOn(recorder, "start").mockImplementation(() => {
+      throw new DOMException("unsupported", "NotSupportedError")
+    })
+    const stream = fakeStream()
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: vi.fn(),
+      getUserMedia: async () => stream.stream,
+      createRecorder: () => recorder,
+      isTypeSupported: () => false
+    })
+
+    await expect(adapter.start({ before: "", after: "" })).rejects.toMatchObject({
+      code: "start_failed",
+      retryable: false
+    })
+    expect(stream.stop).toHaveBeenCalledOnce()
+  })
+
   it("settles cancellation if the signal changes during microphone acquisition", async () => {
     const recorder = new FakeStandaloneRecorder()
     const stream = fakeStream()

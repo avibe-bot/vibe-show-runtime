@@ -483,6 +483,7 @@ export function createAnnotationVoiceBridgeAdapter(
 const STANDALONE_ASR_STATUS_PATH = "/api/asr/status"
 const STANDALONE_ASR_TRANSCRIBE_PATH = "/api/asr/transcribe"
 const STANDALONE_CSRF_PATH = "/api/csrf-token"
+const STANDALONE_AVAILABILITY_TIMEOUT_MS = 1_500
 const STANDALONE_TRANSCRIPTION_TIMEOUT_MS = 180_000
 const STANDALONE_MIME_TYPES = [
   "audio/webm;codecs=opus",
@@ -551,10 +552,27 @@ const standaloneCookie = (name: string): string | undefined => {
   return undefined
 }
 
+const standaloneResponseJson = async <T>(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<T | null> => {
+  try {
+    const payload = await response.json() as T
+    if (signal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError")
+    }
+    return payload
+  } catch (error) {
+    if (signal?.aborted) throw error
+    return null
+  }
+}
+
 const standaloneResponseError = async (
   response: Response,
+  signal?: AbortSignal,
 ): Promise<AnnotationVoiceError> => {
-  const payload = await response.json().catch(() => null) as StandaloneVoiceResponse | null
+  const payload = await standaloneResponseJson<StandaloneVoiceResponse>(response, signal)
   const upstreamCode = typeof payload?.error === "string" ? payload.error : ""
   if (response.status === 413 || upstreamCode === "file_too_large") {
     return standaloneVoiceError("too_large")
@@ -589,6 +607,11 @@ export function createAnnotationVoiceStandaloneAdapter(
 ): AnnotationVoiceAdapter {
   const fetchImpl = dependencies.fetch
     ?? (typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : undefined)
+  const canCaptureAudio = dependencies.getUserMedia !== undefined
+    || (
+      typeof navigator !== "undefined"
+      && typeof navigator.mediaDevices?.getUserMedia === "function"
+    )
   const getUserMedia = dependencies.getUserMedia
     ?? (() => navigator.mediaDevices.getUserMedia({ audio: true }))
   const canCreateRecorder = dependencies.createRecorder !== undefined
@@ -627,7 +650,7 @@ export function createAnnotationVoiceStandaloneAdapter(
     if (existing) return existing
     const response = await request(STANDALONE_CSRF_PATH, { signal })
     if (!response.ok) throw standaloneVoiceError("unavailable")
-    const payload = await response.json().catch(() => null) as { csrf_token?: unknown } | null
+    const payload = await standaloneResponseJson<{ csrf_token?: unknown }>(response, signal)
     if (typeof payload?.csrf_token !== "string" || !payload.csrf_token) {
       throw standaloneVoiceError("unavailable")
     }
@@ -664,8 +687,8 @@ export function createAnnotationVoiceStandaloneAdapter(
         }),
         signal: controller.signal,
       })
-      if (!response.ok) throw await standaloneResponseError(response)
-      const payload = await response.json().catch(() => null) as StandaloneVoiceResponse | null
+      if (!response.ok) throw await standaloneResponseError(response, controller.signal)
+      const payload = await standaloneResponseJson<StandaloneVoiceResponse>(response, controller.signal)
       if (typeof payload?.text !== "string" || !payload.text.trim()) {
         throw standaloneVoiceError("empty")
       }
@@ -691,19 +714,26 @@ export function createAnnotationVoiceStandaloneAdapter(
 
   return {
     async isAvailable(): Promise<boolean> {
-      if (!canCreateRecorder || !fetchImpl) return false
+      if (!canCreateRecorder || !canCaptureAudio || !fetchImpl) return false
+      const controller = new AbortController()
+      const timeout = globalThis.setTimeout(
+        () => controller.abort(),
+        STANDALONE_AVAILABILITY_TIMEOUT_MS,
+      )
       try {
-        const response = await request(STANDALONE_ASR_STATUS_PATH)
+        const response = await request(STANDALONE_ASR_STATUS_PATH, { signal: controller.signal })
         if (!response.ok) return false
-        const payload = await response.json().catch(() => null) as { available?: unknown } | null
+        const payload = await standaloneResponseJson<{ available?: unknown }>(response, controller.signal)
         return payload?.available === true
       } catch {
         return false
+      } finally {
+        globalThis.clearTimeout(timeout)
       }
     },
 
     async start(input): Promise<AnnotationVoiceSession> {
-      if (!canCreateRecorder || !fetchImpl) {
+      if (!canCreateRecorder || !canCaptureAudio || !fetchImpl) {
         throw standaloneVoiceError("unavailable")
       }
       let stream: MediaStream
@@ -728,11 +758,16 @@ export function createAnnotationVoiceStandaloneAdapter(
         stream.getTracks().forEach((track) => track.stop())
         throw standaloneVoiceError(standaloneStartErrorCode(error), { cause: error })
       }
+      if (input.signal?.aborted) {
+        stream.getTracks().forEach((track) => track.stop())
+        throw standaloneVoiceError("cancelled")
+      }
 
       const localAbort = new AbortController()
       const chunks: Blob[] = []
       let settled = false
       let retainedBlob: Blob | null = null
+      let recorderCleaned = false
       let resolveDone!: (text: string) => void
       let rejectDone!: (error: unknown) => void
       let result = new Promise<string>((resolve, reject) => {
@@ -741,18 +776,32 @@ export function createAnnotationVoiceStandaloneAdapter(
       })
       void result.catch(() => undefined)
 
-      const cleanup = (): void => {
-        input.signal?.removeEventListener("abort", abortFromSignal)
+      const cleanupRecorder = (): void => {
+        if (recorderCleaned) return
+        recorderCleaned = true
         stream.getTracks().forEach((track) => track.stop())
         recorder.removeEventListener("dataavailable", onData)
         recorder.removeEventListener("error", onError)
         recorder.removeEventListener("stop", onStop)
       }
-      const rejectCancelled = (): void => {
+      const cleanup = (): void => {
+        input.signal?.removeEventListener("abort", abortFromSignal)
+        cleanupRecorder()
+      }
+      const resolveSession = (text: string): void => {
         if (settled) return
         settled = true
         cleanup()
-        rejectDone(standaloneVoiceError("cancelled"))
+        resolveDone(text)
+      }
+      const rejectSession = (error: unknown): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        rejectDone(error)
+      }
+      const rejectCancelled = (): void => {
+        rejectSession(standaloneVoiceError("cancelled"))
       }
       const transcribeBlob = (blob: Blob, context: AnnotationVoiceRetryInput): Promise<string> => {
         if (localAbort.signal.aborted) {
@@ -760,46 +809,63 @@ export function createAnnotationVoiceStandaloneAdapter(
         }
         return transcribe(blob, context, localAbort.signal)
       }
+      const runTranscription = (
+        blob: Blob,
+        context: AnnotationVoiceRetryInput,
+        rejectInitialDone: boolean,
+      ): Promise<string> => {
+        const attempt = transcribeBlob(blob, context)
+        const result = attempt.then(
+          (text) => {
+            resolveSession(text)
+            return text
+          },
+          (error) => {
+            if (localAbort.signal.aborted) {
+              const cancellation = standaloneVoiceError("cancelled", { cause: error })
+              rejectSession(cancellation)
+              throw cancellation
+            }
+            const retryable = error instanceof AnnotationVoiceError && error.retryable
+            if (!retryable) {
+              rejectSession(error)
+            } else if (rejectInitialDone) {
+              // Keep the recording session alive so the retained blob can be retried.
+              rejectDone(error)
+            }
+            throw error
+          },
+        )
+        void result.catch(() => undefined)
+        return result
+      }
       const onData = (event: Event): void => {
         const blob = (event as BlobEvent).data
         if (blob && blob.size > 0) chunks.push(blob)
       }
       const onError = (): void => {
         if (settled) return
-        settled = true
-        cleanup()
-        rejectDone(standaloneVoiceError("failed"))
+        if (localAbort.signal.aborted) {
+          rejectCancelled()
+          return
+        }
+        rejectSession(standaloneVoiceError("failed"))
       }
       const onStop = (): void => {
         if (settled) return
         retainedBlob = chunks.length > 0
           ? new Blob(chunks, { type: chunks[0]?.type || mimeType || "audio/webm" })
           : null
-        cleanup()
+        cleanupRecorder()
         if (localAbort.signal.aborted) {
-          settled = true
-          rejectDone(standaloneVoiceError("cancelled"))
+          rejectCancelled()
           return
         }
         if (!retainedBlob) {
-          settled = true
-          rejectDone(standaloneVoiceError("empty"))
+          rejectSession(standaloneVoiceError("empty"))
           return
         }
-        void transcribeBlob(retainedBlob, input).then(
-          (text) => {
-            if (settled) return
-            settled = true
-            resolveDone(text)
-          },
-          (error) => {
-            if (localAbort.signal.aborted) {
-              rejectCancelled()
-              return
-            }
-            rejectDone(error)
-          },
-        )
+        void runTranscription(retainedBlob, input, true)
       }
       const abortFromSignal = (): void => {
         localAbort.abort(input.signal?.reason)
@@ -819,7 +885,7 @@ export function createAnnotationVoiceStandaloneAdapter(
         recorder.start()
       } catch (error) {
         cleanup()
-        throw standaloneVoiceError(standaloneErrorCode(error), { cause: error })
+        throw standaloneVoiceError(standaloneStartErrorCode(error), { cause: error })
       }
 
       const session: AnnotationVoiceSession = {
@@ -832,9 +898,7 @@ export function createAnnotationVoiceStandaloneAdapter(
           if (!retainedBlob) {
             return Promise.reject(standaloneVoiceError("failed"))
           }
-          result = transcribeBlob(retainedBlob, retryInput)
-          void result.catch(() => undefined)
-          return result
+          return runTranscription(retainedBlob, retryInput, false)
         },
         abort: () => {
           localAbort.abort()
