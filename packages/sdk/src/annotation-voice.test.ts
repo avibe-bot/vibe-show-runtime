@@ -7,6 +7,7 @@ import {
   annotationVoiceEventFromPayload,
   annotationVoiceSnapshot,
   createAnnotationVoiceBridgeAdapter,
+  createAnnotationVoiceStandaloneAdapter,
   insertAnnotationVoiceTranscript,
   type AnnotationVoiceEvent,
   type AnnotationVoiceRequest
@@ -236,6 +237,360 @@ describe("annotation voice host bridge", () => {
       type: ANNOTATION_VOICE_REQUEST_MESSAGE,
       action: "abort",
       requestId
+    })
+  })
+})
+
+class FakeStandaloneRecorder {
+  state = "inactive"
+  private readonly listeners = new Map<string, Set<(event: Event) => void>>()
+
+  addEventListener(type: "dataavailable" | "error" | "stop", listener: (event: Event) => void) {
+    const listeners = this.listeners.get(type) ?? new Set<(event: Event) => void>()
+    listeners.add(listener)
+    this.listeners.set(type, listeners)
+  }
+
+  removeEventListener(type: "dataavailable" | "error" | "stop", listener: (event: Event) => void) {
+    this.listeners.get(type)?.delete(listener)
+  }
+
+  start() {
+    this.state = "recording"
+  }
+
+  stop() {
+    if (this.state === "inactive") return
+    this.state = "inactive"
+    this.emit("dataavailable", new Blob(["spoken"], { type: "audio/webm" }))
+    this.emit("stop")
+  }
+
+  endUnexpectedly() {
+    if (this.state === "inactive") return
+    this.state = "inactive"
+    this.emit("dataavailable", new Blob(["spoken"], { type: "audio/webm" }))
+    this.emit("stop")
+  }
+
+  fail() {
+    this.state = "inactive"
+    this.emit("error")
+  }
+
+  private emit(type: "dataavailable" | "error" | "stop", data?: Blob) {
+    const event = data
+      ? ({ type, data } as unknown as Event)
+      : ({ type } as Event)
+    for (const listener of this.listeners.get(type) ?? []) listener(event)
+  }
+}
+
+const fakeStream = () => {
+  const stop = vi.fn()
+  return {
+    stream: { getTracks: () => [{ stop }] } as unknown as MediaStream,
+    stop
+  }
+}
+
+describe("standalone annotation voice adapter", () => {
+  it("uses same-origin status, CSRF, and transcription endpoints", async () => {
+    const recorder = new FakeStandaloneRecorder()
+    const stream = fakeStream()
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (input === "/api/asr/status") {
+        return new Response(JSON.stringify({ available: true }), { status: 200 })
+      }
+      if (input === "/api/csrf-token") {
+        return new Response(JSON.stringify({ csrf_token: "csrf-1" }), { status: 200 })
+      }
+      expect(input).toBe("/api/asr/transcribe")
+      expect(init?.credentials).toBe("same-origin")
+      expect(new Headers(init?.headers).get("X-Vibe-CSRF-Token")).toBe("csrf-1")
+      const body = JSON.parse(String(init?.body)) as { data?: unknown; before?: string; after?: string }
+      expect(body.data).toEqual(expect.any(String))
+      expect(body.before).toBe("前")
+      expect(body.after).toBe("后")
+      return new Response(JSON.stringify({ text: "语音结果" }), { status: 200 })
+    })
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: fetchMock,
+      getUserMedia: async () => stream.stream,
+      createRecorder: () => recorder,
+      isTypeSupported: (mimeType) => mimeType === "audio/webm"
+    })
+
+    await expect(adapter.isAvailable()).resolves.toBe(true)
+    const session = await adapter.start({ before: "前", after: "后" })
+    session.stop()
+
+    await expect(session.done).resolves.toBe("语音结果")
+    expect(stream.stop).toHaveBeenCalledOnce()
+    expect(fetchMock).toHaveBeenCalledWith("/api/asr/status", expect.objectContaining({
+      credentials: "same-origin"
+    }))
+  })
+
+  it("retains the recording for a retryable transcription failure", async () => {
+    const recorder = new FakeStandaloneRecorder()
+    const stream = fakeStream()
+    let transcriptionAttempts = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (input === "/api/asr/status") {
+        return new Response(JSON.stringify({ available: true }), { status: 200 })
+      }
+      if (input === "/api/csrf-token") {
+        return new Response(JSON.stringify({ csrf_token: "csrf-2" }), { status: 200 })
+      }
+      transcriptionAttempts += 1
+      return transcriptionAttempts === 1
+        ? new Response(JSON.stringify({ error: "transcription_timeout" }), { status: 504 })
+        : new Response(JSON.stringify({ text: "重试结果" }), { status: 200 })
+    })
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: fetchMock,
+      getUserMedia: async () => stream.stream,
+      createRecorder: () => recorder,
+      isTypeSupported: () => false
+    })
+
+    const session = await adapter.start({ before: "", after: "" })
+    session.stop()
+    await expect(session.done).rejects.toMatchObject<Partial<AnnotationVoiceError>>({
+      code: "timeout",
+      retryable: true
+    })
+
+    await expect(session.retry({ before: "最新", after: "" })).resolves.toBe("重试结果")
+    expect(transcriptionAttempts).toBe(2)
+  })
+
+  it("applies the transcription timeout while acquiring a CSRF token", async () => {
+    vi.useFakeTimers()
+    try {
+      const recorder = new FakeStandaloneRecorder()
+      const stream = fakeStream()
+      let csrfSignal: AbortSignal | undefined
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (input !== "/api/csrf-token") {
+          throw new Error(`Unexpected request: ${String(input)}`)
+        }
+        csrfSignal = init?.signal ?? undefined
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("aborted", "AbortError"))
+          }, { once: true })
+        })
+      })
+      const adapter = createAnnotationVoiceStandaloneAdapter({
+        fetch: fetchMock,
+        getUserMedia: async () => stream.stream,
+        createRecorder: () => recorder,
+        isTypeSupported: () => false
+      })
+
+      const session = await adapter.start({ before: "", after: "" })
+      session.stop()
+      const completed = expect(session.done).rejects.toMatchObject<Partial<AnnotationVoiceError>>({
+        code: "timeout",
+        retryable: true
+      })
+
+      await vi.advanceTimersByTimeAsync(180_000)
+      await completed
+      expect(csrfSignal?.aborted).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("keeps caller cancellation wired through a pending transcription response", async () => {
+    const recorder = new FakeStandaloneRecorder()
+    const stream = fakeStream()
+    const controller = new AbortController()
+    let responseSignal: AbortSignal | undefined
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (input === "/api/csrf-token") {
+        return new Response(JSON.stringify({ csrf_token: "csrf-4" }), { status: 200 })
+      }
+      responseSignal = init?.signal ?? undefined
+      return {
+        ok: true,
+        json: () => new Promise<unknown>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("aborted", "AbortError"))
+          }, { once: true })
+        })
+      } as Response
+    })
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: fetchMock,
+      getUserMedia: async () => stream.stream,
+      createRecorder: () => recorder,
+      isTypeSupported: () => false
+    })
+
+    const session = await adapter.start({ before: "", after: "", signal: controller.signal })
+    session.stop()
+    await vi.waitFor(() => expect(responseSignal).toBeDefined())
+
+    const outcome = Promise.race([
+      session.done.then(() => "resolved", (error) => error),
+      new Promise<"hung">((resolve) => globalThis.setTimeout(() => resolve("hung"), 100))
+    ])
+    controller.abort()
+
+    await expect(outcome).resolves.toMatchObject({ code: "cancelled" })
+    expect(responseSignal?.aborted).toBe(true)
+  })
+
+  it("bounds a stalled availability probe", async () => {
+    vi.useFakeTimers()
+    try {
+      const recorder = new FakeStandaloneRecorder()
+      const stream = fakeStream()
+      let statusSignal: AbortSignal | undefined
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(input).toBe("/api/asr/status")
+        statusSignal = init?.signal ?? undefined
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("aborted", "AbortError"))
+          }, { once: true })
+        })
+      })
+      const adapter = createAnnotationVoiceStandaloneAdapter({
+        fetch: fetchMock,
+        getUserMedia: async () => stream.stream,
+        createRecorder: () => recorder,
+        isTypeSupported: () => false
+      })
+
+      const available = adapter.isAvailable()
+      await vi.advanceTimersByTimeAsync(1_500)
+
+      await expect(available).resolves.toBe(false)
+      expect(statusSignal?.aborted).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("does not advertise voice without browser microphone capture support", async () => {
+    vi.stubGlobal("navigator", { mediaDevices: {} })
+    try {
+      const fetchMock = vi.fn()
+      const adapter = createAnnotationVoiceStandaloneAdapter({
+        fetch: fetchMock,
+        createRecorder: () => new FakeStandaloneRecorder(),
+        isTypeSupported: () => false
+      })
+
+      await expect(adapter.isAvailable()).resolves.toBe(false)
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it("classifies recorder start failures as start failures", async () => {
+    const recorder = new FakeStandaloneRecorder()
+    vi.spyOn(recorder, "start").mockImplementation(() => {
+      throw new DOMException("unsupported", "NotSupportedError")
+    })
+    const stream = fakeStream()
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: vi.fn(),
+      getUserMedia: async () => stream.stream,
+      createRecorder: () => recorder,
+      isTypeSupported: () => false
+    })
+
+    await expect(adapter.start({ before: "", after: "" })).rejects.toMatchObject({
+      code: "start_failed",
+      retryable: false
+    })
+    expect(stream.stop).toHaveBeenCalledOnce()
+  })
+
+  it("settles cancellation if the signal changes during microphone acquisition", async () => {
+    const recorder = new FakeStandaloneRecorder()
+    const stream = fakeStream()
+    const controller = new AbortController()
+    const getUserMedia = vi.fn(async () => {
+      controller.abort()
+      return stream.stream
+    })
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: vi.fn(),
+      getUserMedia,
+      createRecorder: () => recorder,
+      isTypeSupported: () => false
+    })
+
+    await expect(adapter.start({ before: "", after: "", signal: controller.signal })).rejects.toMatchObject({
+      code: "cancelled"
+    })
+    expect(getUserMedia).toHaveBeenCalledOnce()
+    expect(stream.stop).toHaveBeenCalledOnce()
+  })
+
+  it("settles cancellation when an active recording is aborted", async () => {
+    const recorder = new FakeStandaloneRecorder()
+    const stream = fakeStream()
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: vi.fn(),
+      getUserMedia: async () => stream.stream,
+      createRecorder: () => recorder,
+      isTypeSupported: () => false
+    })
+
+    const session = await adapter.start({ before: "", after: "" })
+    session.abort()
+
+    await expect(session.done).rejects.toMatchObject({ code: "cancelled" })
+    expect(stream.stop).toHaveBeenCalledOnce()
+  })
+
+  it("transcribes an unexpected recorder stop and does not offer a retry after recorder failure", async () => {
+    const stream = fakeStream()
+    let transcriptionCalls = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (input === "/api/csrf-token") {
+        return new Response(JSON.stringify({ csrf_token: "csrf-3" }), { status: 200 })
+      }
+      transcriptionCalls += 1
+      return new Response(JSON.stringify({ text: "设备停止后的结果" }), { status: 200 })
+    })
+    const unexpectedRecorder = new FakeStandaloneRecorder()
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: fetchMock,
+      getUserMedia: async () => stream.stream,
+      createRecorder: () => unexpectedRecorder,
+      isTypeSupported: () => false
+    })
+
+    const session = await adapter.start({ before: "", after: "" })
+    unexpectedRecorder.endUnexpectedly()
+    await expect(session.done).resolves.toBe("设备停止后的结果")
+    expect(transcriptionCalls).toBe(1)
+
+    const failedRecorder = new FakeStandaloneRecorder()
+    const failedAdapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: fetchMock,
+      getUserMedia: async () => stream.stream,
+      createRecorder: () => failedRecorder,
+      isTypeSupported: () => false
+    })
+    const failedSession = await failedAdapter.start({ before: "", after: "" })
+    failedRecorder.fail()
+    await expect(failedSession.done).rejects.toMatchObject<Partial<AnnotationVoiceError>>({
+      code: "failed",
+      retryable: false
+    })
+    await expect(failedSession.retry({ before: "", after: "" })).rejects.toMatchObject({
+      code: "failed"
     })
   })
 })

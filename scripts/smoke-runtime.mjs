@@ -461,7 +461,10 @@ try {
     throw new Error("Expected the annotation bootstrap to mount the overlay root")
   }
   if (!annotationBootstrapBody.includes("avibe:annotation:voice:request") || !annotationBootstrapBody.includes("avibe:annotation:voice:event")) {
-    throw new Error("Expected the annotation bootstrap to include the Avibe client voice bridge")
+    throw new Error("Expected the annotation bootstrap to include the Avibe voice adapter")
+  }
+  if (!annotationBootstrapBody.includes("/api/asr/status") || !annotationBootstrapBody.includes("/api/asr/transcribe")) {
+    throw new Error("Expected the standalone annotation voice adapter to use the same-origin ASR API")
   }
   // Served for a pre-existing/second session too, and without warming it through Vite.
   const annotationBootstrapTwo = await fetch(`${runtime.url}/sessions/smoke-two/app/__show/annotation.js`)

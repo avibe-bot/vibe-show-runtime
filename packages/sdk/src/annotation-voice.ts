@@ -300,6 +300,22 @@ export type AnnotationVoiceBridgeDependencies = {
   clearTimeout?: typeof globalThis.clearTimeout
 }
 
+type StandaloneVoiceRecorder = {
+  readonly state: string
+  start(): void
+  stop(): void
+  addEventListener(type: "dataavailable" | "error" | "stop", listener: (event: Event) => void): void
+  removeEventListener(type: "dataavailable" | "error" | "stop", listener: (event: Event) => void): void
+}
+
+export type AnnotationVoiceStandaloneDependencies = {
+  fetch?: typeof globalThis.fetch
+  getUserMedia?: () => Promise<MediaStream>
+  createRecorder?: (stream: MediaStream, mimeType?: string) => StandaloneVoiceRecorder
+  isTypeSupported?: (mimeType: string) => boolean
+  readCookie?: (name: string) => string | undefined
+}
+
 type BridgeSessionState = {
   started: Deferred<void>
   result: Deferred<string>
@@ -464,4 +480,446 @@ export function createAnnotationVoiceBridgeAdapter(
   }
 }
 
-export const defaultAnnotationVoiceAdapter = createAnnotationVoiceBridgeAdapter()
+const STANDALONE_ASR_STATUS_PATH = "/api/asr/status"
+const STANDALONE_ASR_TRANSCRIBE_PATH = "/api/asr/transcribe"
+const STANDALONE_CSRF_PATH = "/api/csrf-token"
+const STANDALONE_AVAILABILITY_TIMEOUT_MS = 1_500
+const STANDALONE_TRANSCRIPTION_TIMEOUT_MS = 180_000
+const STANDALONE_MIME_TYPES = [
+  "audio/webm;codecs=opus",
+  "audio/webm",
+  "audio/mp4",
+] as const
+
+type StandaloneVoiceResponse = {
+  error?: unknown
+  text?: unknown
+}
+
+const standaloneVoiceError = (
+  code: AnnotationVoiceErrorCode,
+  options: { cause?: unknown; retryable?: boolean } = {},
+): AnnotationVoiceError => new AnnotationVoiceError(code, options)
+
+const standaloneErrorCode = (error: unknown): AnnotationVoiceErrorCode => {
+  if (error instanceof AnnotationVoiceError) return error.code
+  const name = error && typeof error === "object"
+    ? (error as { name?: unknown }).name
+    : undefined
+  if (name === "NotAllowedError" || name === "SecurityError") return "permission"
+  if (name === "AbortError") return "cancelled"
+  return "failed"
+}
+
+const standaloneStartErrorCode = (error: unknown): AnnotationVoiceErrorCode => {
+  const code = standaloneErrorCode(error)
+  return code === "permission" || code === "cancelled" ? code : "start_failed"
+}
+
+const standaloneRecorderMimeType = (
+  isTypeSupported: (mimeType: string) => boolean,
+): string | undefined => STANDALONE_MIME_TYPES.find((mimeType) => {
+  try {
+    return isTypeSupported(mimeType)
+  } catch {
+    return false
+  }
+})
+
+const standaloneVoiceFileName = (blob: Blob): string => {
+  const mimeType = blob.type.split(";", 1)[0]?.trim().toLowerCase()
+  if (mimeType === "audio/mp4") return "voice.mp4"
+  return "voice.webm"
+}
+
+const standaloneBase64 = async (blob: Blob): Promise<string> => {
+  const bytes = new Uint8Array(await blob.arrayBuffer())
+  let binary = ""
+  const blockSize = 0x8000
+  for (let offset = 0; offset < bytes.length; offset += blockSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + blockSize))
+  }
+  return btoa(binary)
+}
+
+const standaloneCookie = (name: string): string | undefined => {
+  if (typeof document === "undefined") return undefined
+  const prefix = `${name}=`
+  for (const part of document.cookie.split(";")) {
+    const trimmed = part.trim()
+    if (trimmed.startsWith(prefix)) return decodeURIComponent(trimmed.slice(prefix.length))
+  }
+  return undefined
+}
+
+const standaloneResponseJson = async <T>(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<T | null> => {
+  try {
+    const payload = await response.json() as T
+    if (signal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError")
+    }
+    return payload
+  } catch (error) {
+    if (signal?.aborted) throw error
+    return null
+  }
+}
+
+const standaloneResponseError = async (
+  response: Response,
+  signal?: AbortSignal,
+): Promise<AnnotationVoiceError> => {
+  const payload = await standaloneResponseJson<StandaloneVoiceResponse>(response, signal)
+  const upstreamCode = typeof payload?.error === "string" ? payload.error : ""
+  if (response.status === 413 || upstreamCode === "file_too_large") {
+    return standaloneVoiceError("too_large")
+  }
+  if (response.status === 422 && upstreamCode === "transcription_empty") {
+    return standaloneVoiceError("empty")
+  }
+  if (response.status === 504 || upstreamCode === "transcription_timeout") {
+    return standaloneVoiceError("timeout", { retryable: true })
+  }
+  if (
+    response.status === 400
+    || response.status === 503
+    || upstreamCode === "asr_unavailable"
+  ) {
+    return standaloneVoiceError("unavailable")
+  }
+  return standaloneVoiceError("failed", { retryable: response.status >= 500 })
+}
+
+/**
+ * Use the authenticated Show Page's same-origin Avibe APIs directly.
+ *
+ * Standalone pages do not have a Workbench parent to own the microphone. This
+ * adapter deliberately uses the existing instance ASR endpoint instead of
+ * inventing a Show-specific voice protocol. It records one browser blob,
+ * submits it after the user stops, and retains it for a retry when the
+ * transcription request fails.
+ */
+export function createAnnotationVoiceStandaloneAdapter(
+  dependencies: AnnotationVoiceStandaloneDependencies = {},
+): AnnotationVoiceAdapter {
+  const fetchImpl = dependencies.fetch
+    ?? (typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : undefined)
+  const canCaptureAudio = dependencies.getUserMedia !== undefined
+    || (
+      typeof navigator !== "undefined"
+      && typeof navigator.mediaDevices?.getUserMedia === "function"
+    )
+  const getUserMedia = dependencies.getUserMedia
+    ?? (() => navigator.mediaDevices.getUserMedia({ audio: true }))
+  const canCreateRecorder = dependencies.createRecorder !== undefined
+    || typeof MediaRecorder !== "undefined"
+  const isTypeSupported = dependencies.isTypeSupported
+    ?? ((mimeType: string) => (
+      typeof MediaRecorder !== "undefined"
+      && typeof MediaRecorder.isTypeSupported === "function"
+      && MediaRecorder.isTypeSupported(mimeType)
+    ))
+  const createRecorder = dependencies.createRecorder
+    ?? ((stream: MediaStream, mimeType?: string): StandaloneVoiceRecorder => {
+      if (typeof MediaRecorder === "undefined") {
+        throw standaloneVoiceError("unavailable")
+      }
+      const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream)
+      return recorder
+    })
+  const readCookie = dependencies.readCookie ?? standaloneCookie
+
+  const request = async (
+    path: string,
+    init: RequestInit = {},
+  ): Promise<Response> => {
+    if (!fetchImpl) throw standaloneVoiceError("unavailable")
+    return fetchImpl(path, {
+      ...init,
+      credentials: "same-origin",
+    })
+  }
+
+  const ensureCsrfToken = async (signal?: AbortSignal): Promise<string> => {
+    const existing = readCookie("vibe_csrf_token")
+    if (existing) return existing
+    const response = await request(STANDALONE_CSRF_PATH, { signal })
+    if (!response.ok) throw standaloneVoiceError("unavailable")
+    const payload = await standaloneResponseJson<{ csrf_token?: unknown }>(response, signal)
+    if (typeof payload?.csrf_token !== "string" || !payload.csrf_token) {
+      throw standaloneVoiceError("unavailable")
+    }
+    return readCookie("vibe_csrf_token") ?? payload.csrf_token
+  }
+
+  const transcribe = async (
+    blob: Blob,
+    input: AnnotationVoiceStartInput | AnnotationVoiceRetryInput,
+    signal: AbortSignal,
+  ): Promise<string> => {
+    const controller = new AbortController()
+    const abortFromCaller = () => controller.abort(signal.reason)
+    const timeout = globalThis.setTimeout(
+      () => controller.abort(new DOMException("transcription timed out", "TimeoutError")),
+      STANDALONE_TRANSCRIPTION_TIMEOUT_MS,
+    )
+    if (signal.aborted) abortFromCaller()
+    else signal.addEventListener("abort", abortFromCaller, { once: true })
+    try {
+      const csrfToken = await ensureCsrfToken(controller.signal)
+      const response = await request(STANDALONE_ASR_TRANSCRIBE_PATH, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Vibe-CSRF-Token": csrfToken,
+        },
+        body: JSON.stringify({
+          name: standaloneVoiceFileName(blob),
+          mime: blob.type || "audio/webm",
+          data: await standaloneBase64(blob),
+          before: input.before,
+          after: input.after,
+        }),
+        signal: controller.signal,
+      })
+      if (!response.ok) throw await standaloneResponseError(response, controller.signal)
+      const payload = await standaloneResponseJson<StandaloneVoiceResponse>(response, controller.signal)
+      if (typeof payload?.text !== "string" || !payload.text.trim()) {
+        throw standaloneVoiceError("empty")
+      }
+      return payload.text
+    } catch (error) {
+      if (error instanceof AnnotationVoiceError) throw error
+      if (controller.signal.aborted) {
+        const reason = controller.signal.reason
+        if (reason instanceof DOMException && reason.name === "TimeoutError") {
+          throw standaloneVoiceError("timeout", { cause: error, retryable: true })
+        }
+        throw standaloneVoiceError("cancelled", { cause: error })
+      }
+      throw standaloneVoiceError(standaloneErrorCode(error), {
+        cause: error,
+        retryable: standaloneErrorCode(error) === "failed",
+      })
+    } finally {
+      globalThis.clearTimeout(timeout)
+      signal.removeEventListener("abort", abortFromCaller)
+    }
+  }
+
+  return {
+    async isAvailable(): Promise<boolean> {
+      if (!canCreateRecorder || !canCaptureAudio || !fetchImpl) return false
+      const controller = new AbortController()
+      const timeout = globalThis.setTimeout(
+        () => controller.abort(),
+        STANDALONE_AVAILABILITY_TIMEOUT_MS,
+      )
+      try {
+        const response = await request(STANDALONE_ASR_STATUS_PATH, { signal: controller.signal })
+        if (!response.ok) return false
+        const payload = await standaloneResponseJson<{ available?: unknown }>(response, controller.signal)
+        return payload?.available === true
+      } catch {
+        return false
+      } finally {
+        globalThis.clearTimeout(timeout)
+      }
+    },
+
+    async start(input): Promise<AnnotationVoiceSession> {
+      if (!canCreateRecorder || !canCaptureAudio || !fetchImpl) {
+        throw standaloneVoiceError("unavailable")
+      }
+      let stream: MediaStream
+      if (input.signal?.aborted) {
+        throw standaloneVoiceError("cancelled")
+      }
+      try {
+        stream = await getUserMedia()
+      } catch (error) {
+        throw standaloneVoiceError(standaloneStartErrorCode(error), { cause: error })
+      }
+      if (input.signal?.aborted) {
+        stream.getTracks().forEach((track) => track.stop())
+        throw standaloneVoiceError("cancelled")
+      }
+
+      const mimeType = standaloneRecorderMimeType(isTypeSupported)
+      let recorder: StandaloneVoiceRecorder
+      try {
+        recorder = createRecorder(stream, mimeType)
+      } catch (error) {
+        stream.getTracks().forEach((track) => track.stop())
+        throw standaloneVoiceError(standaloneStartErrorCode(error), { cause: error })
+      }
+      if (input.signal?.aborted) {
+        stream.getTracks().forEach((track) => track.stop())
+        throw standaloneVoiceError("cancelled")
+      }
+
+      const localAbort = new AbortController()
+      const chunks: Blob[] = []
+      let settled = false
+      let retainedBlob: Blob | null = null
+      let recorderCleaned = false
+      let resolveDone!: (text: string) => void
+      let rejectDone!: (error: unknown) => void
+      let result = new Promise<string>((resolve, reject) => {
+        resolveDone = resolve
+        rejectDone = reject
+      })
+      void result.catch(() => undefined)
+
+      const cleanupRecorder = (): void => {
+        if (recorderCleaned) return
+        recorderCleaned = true
+        stream.getTracks().forEach((track) => track.stop())
+        recorder.removeEventListener("dataavailable", onData)
+        recorder.removeEventListener("error", onError)
+        recorder.removeEventListener("stop", onStop)
+      }
+      const cleanup = (): void => {
+        input.signal?.removeEventListener("abort", abortFromSignal)
+        cleanupRecorder()
+      }
+      const resolveSession = (text: string): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolveDone(text)
+      }
+      const rejectSession = (error: unknown): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        rejectDone(error)
+      }
+      const rejectCancelled = (): void => {
+        rejectSession(standaloneVoiceError("cancelled"))
+      }
+      const transcribeBlob = (blob: Blob, context: AnnotationVoiceRetryInput): Promise<string> => {
+        if (localAbort.signal.aborted) {
+          return Promise.reject(standaloneVoiceError("cancelled"))
+        }
+        return transcribe(blob, context, localAbort.signal)
+      }
+      const runTranscription = (
+        blob: Blob,
+        context: AnnotationVoiceRetryInput,
+        rejectInitialDone: boolean,
+      ): Promise<string> => {
+        const attempt = transcribeBlob(blob, context)
+        const result = attempt.then(
+          (text) => {
+            resolveSession(text)
+            return text
+          },
+          (error) => {
+            if (localAbort.signal.aborted) {
+              const cancellation = standaloneVoiceError("cancelled", { cause: error })
+              rejectSession(cancellation)
+              throw cancellation
+            }
+            const retryable = error instanceof AnnotationVoiceError && error.retryable
+            if (!retryable) {
+              rejectSession(error)
+            } else if (rejectInitialDone) {
+              // Keep the recording session alive so the retained blob can be retried.
+              rejectDone(error)
+            }
+            throw error
+          },
+        )
+        void result.catch(() => undefined)
+        return result
+      }
+      const onData = (event: Event): void => {
+        const blob = (event as BlobEvent).data
+        if (blob && blob.size > 0) chunks.push(blob)
+      }
+      const onError = (): void => {
+        if (settled) return
+        if (localAbort.signal.aborted) {
+          rejectCancelled()
+          return
+        }
+        rejectSession(standaloneVoiceError("failed"))
+      }
+      const onStop = (): void => {
+        if (settled) return
+        retainedBlob = chunks.length > 0
+          ? new Blob(chunks, { type: chunks[0]?.type || mimeType || "audio/webm" })
+          : null
+        cleanupRecorder()
+        if (localAbort.signal.aborted) {
+          rejectCancelled()
+          return
+        }
+        if (!retainedBlob) {
+          rejectSession(standaloneVoiceError("empty"))
+          return
+        }
+        void runTranscription(retainedBlob, input, true)
+      }
+      const abortFromSignal = (): void => {
+        localAbort.abort(input.signal?.reason)
+        if (!settled) {
+          if (recorder.state !== "inactive") {
+            recorder.stop()
+          } else {
+            rejectCancelled()
+          }
+        }
+      }
+      recorder.addEventListener("dataavailable", onData)
+      recorder.addEventListener("error", onError)
+      recorder.addEventListener("stop", onStop)
+      input.signal?.addEventListener("abort", abortFromSignal, { once: true })
+      try {
+        recorder.start()
+      } catch (error) {
+        cleanup()
+        throw standaloneVoiceError(standaloneStartErrorCode(error), { cause: error })
+      }
+
+      const session: AnnotationVoiceSession = {
+        done: result,
+        stop: () => {
+          if (settled || recorder.state === "inactive") return
+          recorder.stop()
+        },
+        retry: (retryInput) => {
+          if (!retainedBlob) {
+            return Promise.reject(standaloneVoiceError("failed"))
+          }
+          return runTranscription(retainedBlob, retryInput, false)
+        },
+        abort: () => {
+          localAbort.abort()
+          if (recorder.state !== "inactive") {
+            recorder.stop()
+          } else {
+            rejectCancelled()
+          }
+        },
+      }
+      return session
+    },
+  }
+}
+
+/** Select the voice owner from the page host without changing the annotation UI contract. */
+export function createDefaultAnnotationVoiceAdapter(): AnnotationVoiceAdapter {
+  const embedded = typeof window !== "undefined" && window.parent !== window
+  return embedded
+    ? createAnnotationVoiceBridgeAdapter()
+    : createAnnotationVoiceStandaloneAdapter()
+}
+
+export const defaultAnnotationVoiceAdapter = createDefaultAnnotationVoiceAdapter()
