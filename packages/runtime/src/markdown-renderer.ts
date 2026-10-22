@@ -999,7 +999,7 @@ export class SsrWorkerUnavailableError extends Error {
 }
 
 function nodePermissionProfile(workspaceRoot: string | undefined): NodePermissionProfile {
-  const workspaceReads = workspaceRoot ? [workspaceRoot] : []
+  const workspaceReads = workspaceRoot ? workspaceReadPaths(workspaceRoot) : []
   if (process.allowedNodeEnvironmentFlags.has("--permission")) {
     const allowedReadPaths = [
       RUNTIME_PACKAGE_ROOT,
@@ -1034,6 +1034,19 @@ function nodePermissionProfile(workspaceRoot: string | undefined): NodePermissio
     }
   }
   throw new SsrWorkerUnavailableError("The Node.js permission model is unavailable")
+}
+
+// The worker canonicalizes the asset paths it reads (`realpathSync`), and the
+// permission model checks the canonical path since Node 22.23.4 / 24.22.1 /
+// 26.12.1 (CVE-2026-106073). A workspace reached through a symlink, such as
+// macOS's /var -> /private/var, must therefore be granted in canonical form.
+function workspaceReadPaths(workspaceRoot: string): string[] {
+  try {
+    const canonicalRoot = realpathSync(workspaceRoot)
+    return canonicalRoot === workspaceRoot ? [workspaceRoot] : [workspaceRoot, canonicalRoot]
+  } catch {
+    return [workspaceRoot]
+  }
 }
 
 function activeSsrImportMetaEnv(vite: ViteDevServer): SsrImportMetaEnv {

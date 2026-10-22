@@ -33,8 +33,8 @@
     "@types/node": "^25.9.1",
     "@vitejs/plugin-react": "^5.1.1",
     "typescript": "^5.9.3",
-    "vite": "^7.2.4",
-    "vitest": "^4.0.14"
+    "vite": "^7.3.7",
+    "vitest": "^4.1.12"
   },
   "keywords": [
     "vibe-remote",
