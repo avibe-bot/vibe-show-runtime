@@ -7,7 +7,10 @@ import {
   LoaderCircle as LoaderCircleIcon,
   Mic as MicIcon,
   RotateCcw as RotateCcwIcon,
-  Trash2 as Trash2Icon
+  Trash2 as Trash2Icon,
+  BotMessageSquare as BotMessageSquareIcon,
+  CheckCheck as CheckCheckIcon,
+  X as XIcon
 } from "lucide-react"
 import {
   annotationFromAreaSelection,
@@ -3480,7 +3483,7 @@ function MarkDot({ rect, read, onClick }: { rect: MarkAnchorRect; read: boolean;
 }
 
 function MarkBubble({ mark, onClose }: { mark: ResolvedMarkCandidate; onClose: () => void }) {
-  const width = 300
+  const width = 320
   const rect = mark.rect
   const left = rect ? Math.min(window.innerWidth - width - 12, Math.max(12, rect.x)) : Math.max(12, (window.innerWidth - width) / 2)
   const top = rect ? Math.min(window.innerHeight - 180, Math.max(12, rect.y + rect.height + 12)) : Math.max(12, window.innerHeight / 2 - 90)
@@ -3488,40 +3491,44 @@ function MarkBubble({ mark, onClose }: { mark: ResolvedMarkCandidate; onClose: (
   // is never cut off past the viewport (the bubble is position:fixed, so page scroll can't reach it) (#576).
   const maxHeight = Math.max(140, window.innerHeight - top - 16)
   return (
-    <div data-show-annotation-ui="" role="dialog" onClick={(event) => event.stopPropagation()} style={{ ...markBubbleShellStyle, left, top, width, maxHeight, display: "flex", flexDirection: "column" }}>
-      <div style={{ ...markBubbleHeaderStyle, flex: "0 0 auto" }}>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-          <span style={markBubbleAuthorDotStyle} />
-          <strong style={{ color: COLORS.textPrimary, font: `600 13px/1 ${FONT_STACK}` }}>Agent</strong>
-          {mark.createdAt ? <span style={{ color: COLORS.textMuted, font: `400 12px/1 ${FONT_STACK}` }}>{formatRelativeTime(mark.createdAt)}</span> : null}
+    <div data-show-annotation-ui="" role="dialog" onClick={(event) => event.stopPropagation()} style={{ ...markBubbleStyle, left, top, width, maxHeight }}>
+      <div style={markBubbleHeaderStyle}>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          <span style={markBubbleAvatarStyle}><BotMessageSquareIcon size={13} /></span>
+          <strong style={{ font: `600 13px/1 ${FONT_STACK}` }}>Agent</strong>
+          {mark.createdAt ? <span style={{ color: MARK_CHROME.faint, font: `400 12px/1 ${FONT_STACK}` }}>{formatRelativeTime(mark.createdAt)}</span> : null}
         </span>
-        <button type="button" aria-label="Close" onClick={onClose} style={markBubbleCloseStyle}>×</button>
+        <MarkIconButton label="Close" onClick={onClose}><XIcon size={15} /></MarkIconButton>
       </div>
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", color: COLORS.textPrimary, font: `400 13px/1.5 ${FONT_STACK}`, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", font: `400 13.5px/1.55 ${FONT_STACK}`, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
         {mark.body}
-        {!mark.anchored ? <div style={{ marginTop: 8, color: COLORS.textMuted, font: `400 12px/1.4 ${FONT_STACK}` }}>原位置已更新</div> : null}
+        {!mark.anchored ? <div style={{ marginTop: 8, color: MARK_CHROME.faint, font: `400 12px/1.4 ${FONT_STACK}` }}>原位置已更新</div> : null}
       </div>
     </div>
   )
 }
 
 function MarkBadge({ count, host, sessionId, onClick }: { count: number; host: AnnotationHost; sessionId?: string; onClick: () => void }) {
-  const drag = useDraggable("badge", sessionId, 48) // badge is 48px tall
+  const drag = useDraggable("badge", sessionId, MARK_BADGE_HEIGHT)
+  const label = `${count} 条 Agent 标注待读`
   return (
     <button
       type="button"
       data-show-annotation-ui=""
-      aria-label={`${count} 条 Agent 标注待读`}
+      aria-label={label}
+      title={label}
       {...drag.pointerHandlers}
       onClick={() => {
         if (drag.consumeDragClick()) return // a drag, not a tap — don't open the list
         onClick()
       }}
-      // Default bottom-right (clear of the bottom-center pill); a saved/dragged position overrides it.
-      style={{ ...markBadgeBaseStyle, bottom: host === "embedded" ? 26 : 92, ...drag.style }}
+      // Default: right-aligned above the annotate button (or in its corner when the host owns that
+      // control); a saved/dragged position overrides it.
+      style={{ ...markBadgeStyle, bottom: markBadgeBottom(host), ...drag.style }}
     >
-      <BotIcon />
-      <span style={{ fontVariantNumeric: "tabular-nums" }}>{count}</span>
+      <span style={markUnreadDotStyle} />
+      <span style={{ fontVariantNumeric: "tabular-nums" }}>{count > 99 ? "99+" : count}</span>
+      <span style={{ marginLeft: -2, color: MARK_CHROME.muted, fontWeight: 500 }}>条标注</span>
     </button>
   )
 }
@@ -3534,36 +3541,74 @@ function MarkList({ marks, unreadCount, host, onOpen, onMarkAllRead, onClose }: 
   onMarkAllRead: () => void
   onClose: () => void
 }) {
-  return (
+  const cramped = useCrampedLayout()
+  const placement: React.CSSProperties = cramped
+    ? { left: 0, right: 0, bottom: 0, width: "100%", maxHeight: "72vh", borderRadius: "20px 20px 0 0", paddingBottom: "env(safe-area-inset-bottom)" }
+    : { right: MARK_CHROME_INSET, bottom: markBadgeBottom(host) + MARK_BADGE_HEIGHT + 10, width: 360, maxHeight: "min(60vh, 540px)", borderRadius: 16 }
+  const panel = (
     <div
       data-show-annotation-ui=""
       role="dialog"
+      aria-label="Agent 标注"
       onClick={(event) => event.stopPropagation()}
-      // The header stays put while the rows scroll, so "mark all read" is reachable from anywhere in a long list.
-      style={{ ...markBubbleShellStyle, right: 20, bottom: host === "embedded" ? 72 : 140, width: 320, maxHeight: "60vh", display: "flex", flexDirection: "column" }}
+      // overflow:hidden keeps the end fade inside the rounded corners.
+      style={{ ...markFloatingStyle, ...placement, position: "fixed", boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden", pointerEvents: "auto", zIndex: CARD_Z }}
     >
-      <div style={{ ...markBubbleHeaderStyle, flex: "0 0 auto" }}>
-        <strong style={{ color: COLORS.textPrimary, font: `600 13px/1 ${FONT_STACK}` }}>Agent 标注</strong>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 12, flex: "0 0 auto" }}>
+      {cramped ? <div style={markSheetHandleStyle} /> : null}
+      {/* The header stays put while the rows scroll, so "mark all read" is reachable anywhere in a long list. */}
+      <div style={{ ...markListHeaderStyle, padding: cramped ? "10px 12px 8px 18px" : "12px 10px 8px 16px" }}>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          <strong style={{ font: `600 14px/1 ${FONT_STACK}` }}>Agent 标注</strong>
+          {unreadCount > 0 ? <span style={markListCountStyle}>{unreadCount} 未读</span> : null}
+        </span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 4, flex: "0 0 auto" }}>
           {unreadCount > 0 ? (
-            <button type="button" data-show-mark-all-read="" onClick={onMarkAllRead} style={markListActionStyle}>全部已读</button>
+            <button type="button" data-show-mark-all-read="" onClick={onMarkAllRead} style={markListActionStyle}>
+              <CheckCheckIcon size={14} />全部已读
+            </button>
           ) : null}
-          <button type="button" aria-label="Close" onClick={onClose} style={markBubbleCloseStyle}>×</button>
+          <MarkIconButton label="Close" onClick={onClose}><XIcon size={16} /></MarkIconButton>
         </span>
       </div>
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
+      <div style={markListScrollStyle}>
         {marks.map((mark) => (
           <button key={mark.readKey} type="button" onClick={() => onOpen(mark)} style={markListRowStyle}>
-            <span style={{ ...markListKindDotStyle, background: mark.read ? COLORS.resolved : COLORS.agent }} />
-            <span style={{ flex: 1, minWidth: 0, textAlign: "left" }}>
-              <span style={markListTargetStyle}>{mark.anchored ? mark.targetLabel : "原位置已更新"}</span>
-              <span style={markListBodyStyle}>{mark.body}</span>
+            <span style={mark.read ? markReadDotStyle : { ...markUnreadDotStyle, marginTop: 6 }} />
+            <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 4 }}>
+              <span style={{ ...markListBodyStyle, fontWeight: mark.read ? 400 : 500, color: mark.read ? MARK_CHROME.muted : MARK_CHROME.text }}>{mark.body}</span>
+              <span style={markListMetaStyle}>
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{mark.anchored ? mark.targetLabel : "原位置已更新"}</span>
+                {mark.createdAt ? <><span aria-hidden>·</span><span style={{ flex: "0 0 auto" }}>{formatRelativeTime(mark.createdAt)}</span></> : null}
+              </span>
             </span>
           </button>
         ))}
+        {/* End fade: pinned to the bottom while rows pass under it, so a cut-off row reads as "more below";
+            in flow it is the list's end padding, so the last row is never faded once scrolled to. */}
+        <div aria-hidden style={markListFadeStyle} />
       </div>
     </div>
   )
+  if (!cramped) return panel
+  // Phone: a bottom sheet over a light scrim, portaled to the body so it covers the annotate button
+  // (the mark layer is its own stacking context below the chrome). Tapping the scrim closes it.
+  return createPortal(
+    <div data-show-annotation-ui="" style={{ position: "fixed", inset: 0, zIndex: CARD_Z, pointerEvents: "auto" }}>
+      <div onClick={onClose} style={markSheetScrimStyle} />
+      {panel}
+    </div>,
+    document.body
+  )
+}
+
+function MarkIconButton({ label, onClick, children }: { label: string; onClick: () => void; children: React.ReactNode }) {
+  return <button type="button" aria-label={label} title={label} onClick={onClick} style={markIconButtonStyle}>{children}</button>
+}
+
+/** Badge resting bottom: above the standalone annotate button (52px at bottom 26, plus a 12px gap), or in
+ *  the corner when an embedding host owns the annotate control. */
+function markBadgeBottom(host: AnnotationHost): number {
+  return host === "embedded" ? MARK_CHROME_INSET : MARK_CHROME_INSET + 52 + 12
 }
 
 function formatRelativeTime(iso: string): string {
@@ -3846,6 +3891,26 @@ const COLORS = {
   border: "rgba(245, 246, 250, 0.12)",
   borderStrong: "rgba(245, 246, 250, 0.2)"
 } as const
+
+// ── Agent-mark chrome: badge, list, bubble ─────────────────────────────────────────────
+// The same fixed-dark family as the annotate button, drawn the Web UI way: no stroke, a 1px top
+// highlight, tinted soft shadows, a frosted fill. A faint hairline ring (part of the shadow, not a
+// border) keeps the edge readable on dark pages, where a drop shadow cannot show.
+const MARK_CHROME = {
+  // Web UI dark --popover #161622; opaque enough that page markers do not ghost through the frost.
+  surface: "rgba(22, 22, 34, 0.97)",
+  edge: "inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 0 0 1px rgba(255, 255, 255, 0.06)",
+  raised: "0 2px 6px -2px rgba(8, 8, 18, 0.32), 0 12px 32px -8px rgba(8, 8, 18, 0.42)",
+  floating: "0 4px 12px -4px rgba(8, 8, 18, 0.34), 0 24px 56px -12px rgba(8, 8, 18, 0.5)",
+  violetInk: "#A48BFF",
+  violetSoft: "rgba(124, 91, 255, 0.18)",
+  text: "#F5F6FA",
+  muted: "rgba(245, 246, 250, 0.6)",
+  faint: "rgba(245, 246, 250, 0.42)",
+  wash: "rgba(255, 255, 255, 0.06)"
+} as const
+const MARK_CHROME_INSET = 26 // right/bottom inset shared with the annotate button
+const MARK_BADGE_HEIGHT = 36
 
 const FONT_STACK = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
 const COMMENT_CARD_WIDTH = 340
@@ -4207,11 +4272,11 @@ const fabStyle: React.CSSProperties = {
   placeItems: "center",
   borderRadius: 16,
   color: COLORS.human,
-  background: COLORS.surfacePopover,
-  border: `1px solid ${COLORS.border}`,
-  // Softer, less down-biased than the card shadow so it renders fully near the viewport bottom edge
-  // rather than being clipped in half (owner mobile report).
-  boxShadow: "0 8px 28px rgba(4, 4, 10, 0.5)",
+  // Same no-stroke surface as the agent-mark chrome: top highlight + hairline ring + a soft, low-offset
+  // shadow that still renders fully near the viewport bottom edge (owner mobile report).
+  background: MARK_CHROME.surface,
+  border: "none",
+  boxShadow: `${MARK_CHROME.edge}, ${MARK_CHROME.raised}`,
   cursor: "pointer",
   backdropFilter: "blur(16px)",
   WebkitBackdropFilter: "blur(16px)"
@@ -4446,30 +4511,6 @@ const toastCopyStyle: React.CSSProperties = {
   cursor: "pointer"
 }
 
-// Violet agent-mark badge — soft violet glow, tabular count, sized/weighted to match the FAB family.
-const markBadgeBaseStyle: React.CSSProperties = {
-  position: "fixed",
-  right: 20,
-  minWidth: 48,
-  height: 48,
-  padding: "0 14px",
-  borderRadius: 999,
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
-  gap: 6,
-  cursor: "pointer",
-  border: "1px solid rgba(124, 91, 255, 0.5)",
-  background: COLORS.agent,
-  color: COLORS.onAccent,
-  font: `700 15px/1 ${FONT_STACK}`,
-  // Soft violet glow: a low-offset drop + a faint ring, so it reads as a glow and isn't clipped at the
-  // viewport bottom edge (matches the FAB shadow treatment).
-  boxShadow: "0 6px 24px rgba(124, 91, 255, 0.42), 0 0 0 3px rgba(124, 91, 255, 0.14)",
-  pointerEvents: "auto",
-  zIndex: CHROME_Z
-}
-
 // Embedded mode pill (bottom-center status indicator).
 const modePillStyle: React.CSSProperties = {
   position: "fixed",
@@ -4673,95 +4714,195 @@ const layerStyle: React.CSSProperties = {
   zIndex: AGENT_LAYER_Z
 }
 
-// ── Agent-mark bubble / badge / list chrome (dark floating, matches the overlay) ────────
-const markBubbleShellStyle: React.CSSProperties = {
+// ── Agent-mark chrome styles (palette above, next to COLORS) ───────────────────────────
+
+const markFloatingStyle: React.CSSProperties = {
+  background: MARK_CHROME.surface,
+  backdropFilter: "blur(20px) saturate(140%)",
+  WebkitBackdropFilter: "blur(20px) saturate(140%)",
+  boxShadow: `${MARK_CHROME.edge}, ${MARK_CHROME.floating}`,
+  border: "none",
+  color: MARK_CHROME.text
+}
+
+const markBadgeStyle: React.CSSProperties = {
+  ...markFloatingStyle,
+  boxShadow: `${MARK_CHROME.edge}, ${MARK_CHROME.raised}`,
+  position: "fixed",
+  right: MARK_CHROME_INSET,
+  boxSizing: "border-box",
+  height: MARK_BADGE_HEIGHT,
+  padding: "0 12px 0 11px",
+  borderRadius: 999,
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 7,
+  whiteSpace: "nowrap",
+  font: `600 13px/1 ${FONT_STACK}`,
+  cursor: "pointer",
+  pointerEvents: "auto",
+  zIndex: CHROME_Z
+}
+
+const markUnreadDotStyle: React.CSSProperties = {
+  width: 8,
+  height: 8,
+  flex: "0 0 auto",
+  borderRadius: 999,
+  background: COLORS.agent,
+  boxShadow: `0 0 0 3px ${MARK_CHROME.violetSoft}`
+}
+
+const markReadDotStyle: React.CSSProperties = {
+  width: 8,
+  height: 8,
+  marginTop: 6,
+  flex: "0 0 auto",
+  borderRadius: 999,
+  boxShadow: `inset 0 0 0 1.5px ${MARK_CHROME.faint}`
+}
+
+const markBubbleStyle: React.CSSProperties = {
+  ...markFloatingStyle,
   position: "fixed",
   boxSizing: "border-box",
-  padding: 14,
-  borderRadius: 14,
-  background: COLORS.surfacePopover,
-  border: `1px solid ${COLORS.borderStrong}`,
-  boxShadow: "0 18px 48px rgba(0, 0, 0, 0.5)",
-  backdropFilter: "blur(12px)",
-  WebkitBackdropFilter: "blur(12px)",
+  padding: "12px 14px 14px",
+  borderRadius: 16,
+  display: "flex",
+  flexDirection: "column",
+  gap: 8,
   pointerEvents: "auto",
   zIndex: CARD_Z
 }
 
 const markBubbleHeaderStyle: React.CSSProperties = {
+  flex: "0 0 auto",
   display: "flex",
   alignItems: "center",
   justifyContent: "space-between",
-  gap: 8,
-  marginBottom: 8
+  gap: 8
 }
 
-const markBubbleAuthorDotStyle: React.CSSProperties = {
-  width: 8,
-  height: 8,
-  borderRadius: 999,
-  background: COLORS.agent,
-  flex: "0 0 auto"
+const markBubbleAvatarStyle: React.CSSProperties = {
+  width: 22,
+  height: 22,
+  borderRadius: 7,
+  display: "grid",
+  placeItems: "center",
+  background: MARK_CHROME.violetSoft,
+  color: MARK_CHROME.violetInk
 }
 
-const markBubbleCloseStyle: React.CSSProperties = {
-  border: "none",
-  background: "transparent",
-  color: COLORS.textMuted,
-  font: `400 18px/1 ${FONT_STACK}`,
-  cursor: "pointer",
+const markIconButtonStyle: React.CSSProperties = {
+  width: 28,
+  height: 28,
+  display: "grid",
+  placeItems: "center",
   padding: 0,
-  lineHeight: 1,
-  flex: "0 0 auto"
-}
-
-const markListRowStyle: React.CSSProperties = {
-  display: "flex",
-  alignItems: "flex-start",
-  gap: 8,
-  width: "100%",
-  padding: "8px 6px",
   border: "none",
   borderRadius: 8,
   background: "transparent",
-  cursor: "pointer",
-  textAlign: "left"
+  color: MARK_CHROME.muted,
+  cursor: "pointer"
+}
+
+const markListHeaderStyle: React.CSSProperties = {
+  flex: "0 0 auto",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8
+}
+
+const markListCountStyle: React.CSSProperties = {
+  padding: "3px 7px",
+  borderRadius: 999,
+  background: MARK_CHROME.violetSoft,
+  color: MARK_CHROME.violetInk,
+  font: `600 11px/1 ${FONT_STACK}`,
+  fontVariantNumeric: "tabular-nums"
 }
 
 const markListActionStyle: React.CSSProperties = {
+  height: 28,
+  padding: "0 10px",
   border: "none",
-  background: "transparent",
-  padding: 0,
-  color: COLORS.textMuted,
+  borderRadius: 8,
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+  background: MARK_CHROME.wash,
+  color: MARK_CHROME.text,
   font: `500 12px/1 ${FONT_STACK}`,
   cursor: "pointer",
   whiteSpace: "nowrap"
 }
 
-const markListKindDotStyle: React.CSSProperties = {
-  width: 8,
-  height: 8,
-  marginTop: 5,
-  borderRadius: 999,
-  flex: "0 0 auto"
+const markListScrollStyle: React.CSSProperties = {
+  flex: 1,
+  minHeight: 0,
+  overflowY: "auto",
+  display: "flex",
+  flexDirection: "column",
+  gap: 2,
+  padding: "0 6px"
 }
 
-const markListTargetStyle: React.CSSProperties = {
-  display: "block",
-  color: COLORS.textPrimary,
-  font: `500 12px/1.3 ${FONT_STACK}`,
-  overflow: "hidden",
-  textOverflow: "ellipsis",
-  whiteSpace: "nowrap"
+const markListRowStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "flex-start",
+  gap: 10,
+  width: "100%",
+  padding: 10,
+  border: "none",
+  borderRadius: 10,
+  background: "transparent",
+  cursor: "pointer",
+  textAlign: "left",
+  color: MARK_CHROME.text
 }
 
 const markListBodyStyle: React.CSSProperties = {
-  display: "block",
-  color: COLORS.textMuted,
-  font: `400 12px/1.3 ${FONT_STACK}`,
+  font: `500 13px/1.45 ${FONT_STACK}`,
+  display: "-webkit-box",
+  WebkitLineClamp: 2,
+  WebkitBoxOrient: "vertical",
   overflow: "hidden",
-  textOverflow: "ellipsis",
-  whiteSpace: "nowrap"
+  wordBreak: "break-word"
+}
+
+const markListMetaStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  minWidth: 0,
+  color: MARK_CHROME.faint,
+  font: `400 11.5px/1.2 ${FONT_STACK}`
+}
+
+const markListFadeStyle: React.CSSProperties = {
+  position: "sticky",
+  bottom: 0,
+  flex: "0 0 auto",
+  height: 28,
+  margin: "0 -6px",
+  background: "linear-gradient(to bottom, rgba(22, 22, 34, 0), rgba(22, 22, 34, 0.97) 85%)",
+  pointerEvents: "none"
+}
+
+const markSheetHandleStyle: React.CSSProperties = {
+  width: 36,
+  height: 4,
+  borderRadius: 999,
+  background: "rgba(245, 246, 250, 0.22)",
+  margin: "8px auto 0",
+  flex: "0 0 auto"
+}
+
+const markSheetScrimStyle: React.CSSProperties = {
+  position: "absolute",
+  inset: 0,
+  background: "rgba(8, 8, 18, 0.32)"
 }
 
 const REGION_HANDLES = ["nw", "ne", "sw", "se"] as const
@@ -4835,15 +4976,6 @@ function AnchorIcon({ size = 13 }: IconProps) {
     <svg {...svgProps(size)}>
       <rect x="3" y="3" width="7" height="7" rx="1.5" />
       <path d="M14 8h5a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-5" />
-    </svg>
-  )
-}
-
-function BotIcon({ size = 13 }: IconProps) {
-  return (
-    <svg {...svgProps(size)}>
-      <rect x="4" y="8" width="16" height="12" rx="2" />
-      <path d="M12 8V4M9 14h.01M15 14h.01" />
     </svg>
   )
 }
