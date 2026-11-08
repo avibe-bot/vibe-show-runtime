@@ -3572,7 +3572,9 @@ function MarkList({ marks, unreadCount, host, onOpen, onMarkAllRead, onClose }: 
       </div>
       <div style={markListScrollStyle}>
         {marks.map((mark) => (
-          <button key={mark.readKey} type="button" onClick={() => onOpen(mark)} style={markListRowStyle}>
+          // On a phone the sheet covers the page, so opening a mark closes it first: the answer bubble
+          // opens beside its element instead of underneath the sheet.
+          <button key={mark.readKey} type="button" onClick={() => { if (cramped) onClose(); onOpen(mark) }} style={markListRowStyle}>
             <span style={mark.read ? markReadDotStyle : { ...markUnreadDotStyle, marginTop: 6 }} />
             <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 4 }}>
               <span style={{ ...markListBodyStyle, fontWeight: mark.read ? 400 : 500, color: mark.read ? MARK_CHROME.muted : MARK_CHROME.text }}>{mark.body}</span>
