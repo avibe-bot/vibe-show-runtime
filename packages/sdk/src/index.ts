@@ -895,6 +895,32 @@ export function partitionAgentMarks<T extends RenderableAgentMark>(marks: readon
   return { inlineUnread, inlineRead, overflow, failed, unreadCount, showBadge: overflow.length > 0 || failed.length > 0 }
 }
 
+export type ReadableAgentMark = { read: boolean; readKey: string; kind: AgentMarkKind | "attribute-note" }
+
+export type AgentMarkReadPlan<T> = {
+  /** Event-backed marks that need an `assistant.mark.resolved` receipt (cross-device). */
+  receipts: T[]
+  /** Read tokens kept on this device: declarative notes, or every mark for a viewer that cannot post. */
+  localTokens: string[]
+}
+
+/**
+ * How the UNREAD marks among `marks` become durably read — the single rule shared by opening one mark
+ * and "mark all read", so both persist reads identically. An event-backed mark gets a read receipt when
+ * this viewer can post; a declarative `agent-note` (no event identity) or an anonymous viewer keeps a
+ * local token instead. Marks already read in this view need nothing. Pure — no DOM.
+ */
+export function planAgentMarkReads<T extends ReadableAgentMark>(marks: readonly T[], canPost: boolean): AgentMarkReadPlan<T> {
+  const receipts: T[] = []
+  const localTokens: string[] = []
+  for (const mark of marks) {
+    if (mark.read) continue
+    if (mark.kind === "attribute-note" || !canPost) localTokens.push(mark.readKey)
+    else receipts.push(mark)
+  }
+  return { receipts, localTokens }
+}
+
 /** localStorage key holding the set of read attribute-note tokens for a session. */
 export const AGENT_MARK_READ_STORAGE_PREFIX = "avibe:mark-read:"
 

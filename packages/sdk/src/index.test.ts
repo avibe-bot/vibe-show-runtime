@@ -13,6 +13,7 @@ import {
   agentMarkIdentity,
   reduceAgentMarkEvents,
   partitionAgentMarks,
+  planAgentMarkReads,
   attributeNoteReadToken,
   hashMarkText,
   isMarkAnchored,
@@ -660,6 +661,28 @@ describe("agent-mark render partition (partitionAgentMarks — cap / overflow / 
     expect(part.inlineRead).toHaveLength(1)
     expect(part.overflow).toHaveLength(0)
     expect(part.unreadCount).toBe(5)
+  })
+})
+
+describe("agent-mark read plan (planAgentMarkReads — open one / mark all read)", () => {
+  const marks = [
+    { readKey: "reply-unread", kind: "reply" as const, read: false },
+    { readKey: "note-unread", kind: "note" as const, read: false },
+    { readKey: "note-read", kind: "note" as const, read: true },
+    { readKey: "attr-unread", kind: "attribute-note" as const, read: false },
+    { readKey: "attr-read", kind: "attribute-note" as const, read: true }
+  ]
+
+  it("a signed-in viewer sends one receipt per unread event-backed mark and keeps declarative notes local", () => {
+    const plan = planAgentMarkReads(marks, true)
+    expect(plan.receipts.map((mark) => mark.readKey)).toEqual(["reply-unread", "note-unread"])
+    expect(plan.localTokens).toEqual(["attr-unread"])
+  })
+
+  it("a viewer who cannot post keeps every unread read on this device and sends nothing", () => {
+    const plan = planAgentMarkReads(marks, false)
+    expect(plan.receipts).toEqual([])
+    expect(plan.localTokens).toEqual(["reply-unread", "note-unread", "attr-unread"])
   })
 })
 
