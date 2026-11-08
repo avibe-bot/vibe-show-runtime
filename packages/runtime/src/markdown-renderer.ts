@@ -1038,15 +1038,24 @@ function nodePermissionProfile(workspaceRoot: string | undefined): NodePermissio
 
 // The worker canonicalizes the asset paths it reads (`realpathSync`), and the
 // permission model checks the canonical path since Node 22.23.4 / 24.22.1 /
-// 26.12.1 (CVE-2026-106073). A workspace reached through a symlink, such as
-// macOS's /var -> /private/var, must therefore be granted in canonical form.
+// 26.12.1 (CVE-2026-106073). Every spelling the worker can be handed must
+// therefore be granted:
+// - a workspace reached through a symlink, such as macOS's /var -> /private/var;
+// - on Windows, a root spelled with 8.3 short names, such as the GitHub runner's
+//   C:\Users\RUNNER~1\AppData\Local\Temp. The JS `realpathSync` keeps short
+//   names, but Vite resolves modules with the native realpath, so `/@fs` asset
+//   URLs name the long path (C:\Users\runneradmin\...). Only
+//   `realpathSync.native` yields that spelling.
 function workspaceReadPaths(workspaceRoot: string): string[] {
-  try {
-    const canonicalRoot = realpathSync(workspaceRoot)
-    return canonicalRoot === workspaceRoot ? [workspaceRoot] : [workspaceRoot, canonicalRoot]
-  } catch {
-    return [workspaceRoot]
+  const paths = new Set([workspaceRoot])
+  for (const canonicalize of [realpathSync, realpathSync.native]) {
+    try {
+      paths.add(canonicalize(workspaceRoot))
+    } catch {
+      // An unreadable root keeps the spellings already collected.
+    }
   }
+  return [...paths]
 }
 
 function activeSsrImportMetaEnv(vite: ViteDevServer): SsrImportMetaEnv {

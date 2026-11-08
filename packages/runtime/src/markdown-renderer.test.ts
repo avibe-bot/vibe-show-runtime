@@ -1873,10 +1873,16 @@ describe("SSR Markdown endpoint", () => {
 
   it("kills a hung React render at its deadline and respawns for the next render", async () => {
     const children: ChildProcess[] = []
+    const phaseTimings: MarkdownRenderPhaseTiming[] = []
     const runtime = await startFixtureServer(
       ["hung-render", "semantic"],
       { renderReactTimeoutMs: 3_000 },
-      { markdownRendererOptions: { childFactory: recordingChildFactory(children) } }
+      {
+        markdownRendererOptions: {
+          childFactory: recordingChildFactory(children),
+          onPhaseTiming: (timing) => phaseTimings.push(timing)
+        }
+      }
     )
     await runtime.runtime.ensureSession("hung-render", "/show/hung-render/")
     await runtime.runtime.ensureSession("semantic", "/show/semantic/")
@@ -1885,7 +1891,17 @@ describe("SSR Markdown endpoint", () => {
     const timedOut = await fetch(markdownUrl(runtime.url, "hung-render"))
     expect(timedOut.status).toBe(504)
     expect(await renderError(timedOut)).toMatchObject({ error: { code: "render_timeout" } })
-    expect(performance.now() - started).toBeLessThan(8_000)
+    const elapsed = performance.now() - started
+    const hungTimings = phaseTimings.filter((timing) => timing.sessionId === "hung-render")
+    const load = hungTimings.find((timing) => timing.phase === "load")
+    const render = hungTimings.find((timing) => timing.phase === "render")
+    expect(load?.outcome).toBe("ok")
+    // The render ends at the configured 3 s deadline, not the 5 s default.
+    expect(render?.outcome).toBe("timeout")
+    expect(render?.durationMs).toBeLessThan(4_000)
+    // Module loading has its own deadline and takes 3-5 s on shared Windows runners, so the bound
+    // covers what follows it: the render deadline plus killing the child and answering.
+    expect(elapsed - (load?.durationMs ?? 0)).toBeLessThan(5_000)
     expect(children).toHaveLength(1)
     expect(children[0]?.killed).toBe(true)
 
