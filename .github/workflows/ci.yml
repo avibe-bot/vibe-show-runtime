@@ -19,6 +19,11 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # TEMPORARY diagnostic (removed before review): the temp path forms the SSR worker sees.
+      - name: Diagnose temp path spellings
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: node -e "const fs=require('fs'),os=require('os');const t=fs.mkdtempSync(require('path').join(os.tmpdir(),'diag-'));console.log(JSON.stringify({node:process.version,TEMP:process.env.TEMP,tmpdir:os.tmpdir(),dir:t,realpathSync:fs.realpathSync(t),native:fs.realpathSync.native(t)},null,1))"
       - run: npm run check
       # Smoke boots the runtime server and asserts Tailwind utilities reach the served and
       # built CSS (the regression against pages rendering silently unstyled). Gated on Linux
