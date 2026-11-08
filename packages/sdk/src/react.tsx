@@ -20,6 +20,7 @@ import {
   partitionAgentMarks,
   attributeNoteReadToken,
   reconcileReadReceipt,
+  planAgentMarkReads,
   agentMarkReadStorageKey,
   agentMarkOf,
   normalizeAgentMarkEvent,
@@ -3284,6 +3285,9 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
   const storage = React.useMemo(() => safeLocalStorage(), [])
   const readTokensAtLoad = React.useMemo(() => loadReadTokens(sessionId, storage), [sessionId, storage])
   const [readInView, setReadInView] = React.useState<ReadonlySet<string>>(() => new Set())
+  // Versions the user cleared with "mark all read": gone from this view at once, as a read receipt makes
+  // them gone after a reload. Keyed by version so an agent re-mark of the same target shows again.
+  const [clearedInView, setClearedInView] = React.useState<ReadonlySet<string>>(() => new Set())
   const [expandedKey, setExpandedKey] = React.useState<string | null>(null)
   const [listOpen, setListOpen] = React.useState(false)
   const [flashKey, setFlashKey] = React.useState<string | null>(null)
@@ -3346,8 +3350,8 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
         return { ...candidate, rect: anchored ? anchorResult?.rect : undefined, element: anchorResult?.element, anchored, read: readInView.has(candidate.readKey) }
       })
       // Retired on a fresh load and not re-read this view ⇒ gone (created − resolved on replay).
-      .filter((candidate) => !candidate.retiredAtLoad || candidate.read)
-  }, [candidates, readInView, tick])
+      .filter((candidate) => !clearedInView.has(markVersionKey(candidate)) && (!candidate.retiredAtLoad || candidate.read))
+  }, [candidates, readInView, clearedInView, tick])
 
   const partition = React.useMemo(() => partitionAgentMarks(resolved, 5), [resolved])
   const rendered = React.useMemo(
@@ -3355,29 +3359,52 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
     [partition]
   )
 
-  const markRead = React.useCallback((candidate: ResolvedMarkCandidate) => {
-    if (readInView.has(candidate.readKey)) return
-    setReadInView((prev) => reconcileReadReceipt(prev, candidate.readKey, "read"))
-    if (candidate.kind === "attribute-note" || !canPost) {
-      // Declarative note (no event identity) or anonymous viewer (cannot POST) ⇒ localStorage only.
-      writeReadToken(sessionId, storage, candidate.readKey)
-    } else if (candidate.mark) {
-      // Read receipt: event-backed, cross-device. Author is stamped server-side (the reading user).
-      // Empty message content ⇒ metadata-only: the runtime's recordShowEvent skips empty content, so
-      // opening a bubble never re-appends the answer to chat history (#61). The bubble reads the mark
-      // body directly, so the answer is still shown. Uses the normalized mark (shape-agnostic, R5).
-      const submit = context?.submitEvent({
+  // Optimistic read-state is only durable once the backend ACCEPTS the receipt. If the POST fails
+  // (non-2xx — e.g. `mark_version_conflict`), ROLL BACK to unread so the badge is honest and the user
+  // can retry; never persist a read-state the backend rejected (cross-device divergence otherwise).
+  const rollbackRead = React.useCallback((candidate: ResolvedMarkCandidate) => {
+    setReadInView((prev) => reconcileReadReceipt(prev, candidate.readKey, "rollback"))
+    setClearedInView((prev) => reconcileReadReceipt(prev, markVersionKey(candidate), "rollback"))
+  }, [])
+
+  // Read receipt: event-backed, cross-device. Author is stamped server-side (the reading user).
+  // Empty message content ⇒ metadata-only: the runtime's recordShowEvent skips empty content, so
+  // opening a bubble never re-appends the answer to chat history (#61). The bubble reads the mark
+  // body directly, so the answer is still shown. Uses the normalized mark (shape-agnostic, R5).
+  const sendReadReceipt = React.useCallback(async (candidate: ResolvedMarkCandidate) => {
+    if (!candidate.mark || !context) return
+    try {
+      await context.submitEvent({
         type: "assistant.mark.resolved",
         mark: candidate.mark,
         anchor: candidate.event?.anchor,
         message: { role: "assistant", content: "" }
       })
-      // Optimistic read-state is only durable once the backend ACCEPTS the receipt. If the POST fails
-      // (non-2xx — e.g. `mark_version_conflict`), ROLL BACK to unread so the badge is honest and the user
-      // can retry; never persist a read-state the backend rejected (cross-device divergence otherwise).
-      void submit?.catch(() => setReadInView((prev) => reconcileReadReceipt(prev, candidate.readKey, "rollback")))
+    } catch {
+      rollbackRead(candidate)
     }
-  }, [readInView, canPost, sessionId, storage, context])
+  }, [context, rollbackRead])
+
+  const markRead = React.useCallback((candidate: ResolvedMarkCandidate) => {
+    if (readInView.has(candidate.readKey)) return
+    setReadInView((prev) => reconcileReadReceipt(prev, candidate.readKey, "read"))
+    // Declarative note (no event identity) or anonymous viewer (cannot POST) ⇒ localStorage only.
+    const plan = planAgentMarkReads([candidate], canPost)
+    writeReadTokens(sessionId, storage, plan.localTokens)
+    for (const receipt of plan.receipts) void sendReadReceipt(receipt)
+  }, [readInView, canPost, sessionId, storage, sendReadReceipt])
+
+  // "Mark all read": every listed mark leaves this view at once, and each unread one is read exactly
+  // as opening it would read it — one receipt per event-backed mark (so every open client retires it
+  // through the event stream), local tokens otherwise. A rejected receipt brings its mark back unread.
+  const markAllRead = React.useCallback((marks: readonly ResolvedMarkCandidate[]) => {
+    const plan = planAgentMarkReads(marks, canPost)
+    setClearedInView((prev) => new Set([...prev, ...marks.map(markVersionKey)]))
+    setExpandedKey(null)
+    setListOpen(false)
+    writeReadTokens(sessionId, storage, plan.localTokens)
+    void forEachWithLimit(plan.receipts, READ_RECEIPT_CONCURRENCY, sendReadReceipt)
+  }, [canPost, sessionId, storage, sendReadReceipt])
 
   const openMark = React.useCallback((candidate: ResolvedMarkCandidate) => {
     setExpandedKey(candidate.readKey)
@@ -3407,7 +3434,16 @@ function AgentMarkConversation({ events, scope, className, canAnnotate, host }: 
       )}
       {flashed?.rect ? <AnnotationMarker rect={flashed.rect} tone="assistant" variant="selected" /> : null}
       {partition.showBadge ? <MarkBadge count={partition.unreadCount} host={host} sessionId={sessionId} onClick={() => setListOpen((value) => !value)} /> : null}
-      {listOpen ? <MarkList marks={rendered} host={host} onOpen={openFromList} onClose={() => setListOpen(false)} /> : null}
+      {listOpen ? (
+        <MarkList
+          marks={rendered}
+          unreadCount={partition.unreadCount}
+          host={host}
+          onOpen={openFromList}
+          onMarkAllRead={() => markAllRead(rendered)}
+          onClose={() => setListOpen(false)}
+        />
+      ) : null}
       {expanded ? <MarkBubble mark={expanded} onClose={() => setExpandedKey(null)} /> : null}
     </div>,
     document.body
@@ -3490,19 +3526,32 @@ function MarkBadge({ count, host, sessionId, onClick }: { count: number; host: A
   )
 }
 
-function MarkList({ marks, host, onOpen, onClose }: { marks: ResolvedMarkCandidate[]; host: AnnotationHost; onOpen: (mark: ResolvedMarkCandidate) => void; onClose: () => void }) {
+function MarkList({ marks, unreadCount, host, onOpen, onMarkAllRead, onClose }: {
+  marks: ResolvedMarkCandidate[]
+  unreadCount: number
+  host: AnnotationHost
+  onOpen: (mark: ResolvedMarkCandidate) => void
+  onMarkAllRead: () => void
+  onClose: () => void
+}) {
   return (
     <div
       data-show-annotation-ui=""
       role="dialog"
       onClick={(event) => event.stopPropagation()}
-      style={{ ...markBubbleShellStyle, right: 20, bottom: host === "embedded" ? 72 : 140, width: 320, maxHeight: "60vh", overflowY: "auto" }}
+      // The header stays put while the rows scroll, so "mark all read" is reachable from anywhere in a long list.
+      style={{ ...markBubbleShellStyle, right: 20, bottom: host === "embedded" ? 72 : 140, width: 320, maxHeight: "60vh", display: "flex", flexDirection: "column" }}
     >
-      <div style={markBubbleHeaderStyle}>
+      <div style={{ ...markBubbleHeaderStyle, flex: "0 0 auto" }}>
         <strong style={{ color: COLORS.textPrimary, font: `600 13px/1 ${FONT_STACK}` }}>Agent 标注</strong>
-        <button type="button" aria-label="Close" onClick={onClose} style={markBubbleCloseStyle}>×</button>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 12, flex: "0 0 auto" }}>
+          {unreadCount > 0 ? (
+            <button type="button" data-show-mark-all-read="" onClick={onMarkAllRead} style={markListActionStyle}>全部已读</button>
+          ) : null}
+          <button type="button" aria-label="Close" onClick={onClose} style={markBubbleCloseStyle}>×</button>
+        </span>
       </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
         {marks.map((mark) => (
           <button key={mark.readKey} type="button" onClick={() => onOpen(mark)} style={markListRowStyle}>
             <span style={{ ...markListKindDotStyle, background: mark.read ? COLORS.resolved : COLORS.agent }} />
@@ -3540,12 +3589,30 @@ function loadReadTokens(sessionId: string | undefined, storage: AnnotationModeSt
   }
 }
 
-function writeReadToken(sessionId: string | undefined, storage: AnnotationModeStorage | undefined, token: string): void {
-  if (!storage) return
+/** A mark's version identity: event-backed marks add the active version's event id to the read key,
+ *  since a CLI re-mark keeps its stable mark id; a declarative note's read key already hashes its text. */
+function markVersionKey(candidate: MarkCandidate): string {
+  return candidate.event?.id ? `${candidate.readKey}@${candidate.event.id}` : candidate.readKey
+}
+
+/** At most this many read receipts in flight at once, so clearing dozens of marks stays gentle. */
+const READ_RECEIPT_CONCURRENCY = 4
+
+async function forEachWithLimit<T>(items: readonly T[], limit: number, run: (item: T) => Promise<void>): Promise<void> {
+  let next = 0
+  const worker = async () => {
+    while (next < items.length) await run(items[next++])
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+}
+
+function writeReadTokens(sessionId: string | undefined, storage: AnnotationModeStorage | undefined, newTokens: readonly string[]): void {
+  if (!storage || newTokens.length === 0) return
   try {
     const tokens = loadReadTokens(sessionId, storage)
-    if (tokens.has(token)) return
-    tokens.add(token)
+    const before = tokens.size
+    for (const token of newTokens) tokens.add(token)
+    if (tokens.size === before) return
     storage.setItem(agentMarkReadStorageKey(sessionId), JSON.stringify(Array.from(tokens)))
   } catch {
     // Best-effort: storage may be unavailable or full. Losing read state must never break rendering.
@@ -4659,6 +4726,16 @@ const markListRowStyle: React.CSSProperties = {
   background: "transparent",
   cursor: "pointer",
   textAlign: "left"
+}
+
+const markListActionStyle: React.CSSProperties = {
+  border: "none",
+  background: "transparent",
+  padding: 0,
+  color: COLORS.textMuted,
+  font: `500 12px/1 ${FONT_STACK}`,
+  cursor: "pointer",
+  whiteSpace: "nowrap"
 }
 
 const markListKindDotStyle: React.CSSProperties = {
