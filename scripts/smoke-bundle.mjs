@@ -1,7 +1,8 @@
 // Smoke the actual distributable, never the checkout's node_modules.
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises"
+import { realpathSync } from "node:fs"
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { createRequire } from "node:module"
 import { tmpdir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve } from "node:path"
@@ -19,10 +20,14 @@ try {
     assert.deepEqual(await readFile(join(bundle, name)), await readFile(join(repoRoot, "distribution", name)), `${name} changed during bundling`)
   }
   const require = createRequire(join(bundle, "package.json"))
-  const realBundle = await realpath(bundle)
+  // On Windows the JS realpath preserves RUNNER~1 while Node's resolver
+  // expands it to runneradmin. Compare native spellings on both sides, never
+  // weaken containment or accidentally accept the checkout's dependencies.
+  const realBundle = realpathSync.native(bundle)
   for (const name of ["esbuild", "lightningcss", "@tailwindcss/oxide", "vite"]) {
-    const path = relative(realBundle, require.resolve(name))
-    assert.ok(!isAbsolute(path) && !path.startsWith(".."), `${name} escaped the extracted archive`)
+    const resolved = realpathSync.native(require.resolve(name))
+    const path = relative(realBundle, resolved)
+    assert.ok(!isAbsolute(path) && !path.startsWith(".."), `${name} escaped the extracted archive: ${resolved} (root ${realBundle})`)
   }
   const esbuild = require("esbuild")
   const transformed = await esbuild.transform("const value: number = 42", { loader: "ts" })
