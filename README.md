@@ -164,6 +164,12 @@ The `examples/shadcn-alias` app demonstrates the agent-facing alias model.
 The `examples/service-handler` package demonstrates the first handler type
 shape.
 
+## Locked Runtime Archives
+
+Production archives use a committed distribution lock and disable dependency
+lifecycle scripts. See [Locked production archives](docs/distribution-lock.md)
+for the dependency-update workflow and extracted-archive smoke checks.
+
 ## Runtime Server
 
 The first runtime server is available through `@avibe/show-runtime`:

@@ -18,7 +18,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts --include=optional
       - run: npm run check
       # Smoke boots the runtime server and asserts Tailwind utilities reach the served and
       # built CSS (the regression against pages rendering silently unstyled). Gated on Linux
@@ -27,6 +27,7 @@ jobs:
       - run: npm run smoke
         if: matrix.os == 'ubuntu-latest'
       - run: npm run bundle:vibe-remote
+      - run: npm run smoke:bundle
       - uses: actions/upload-artifact@v4
         with:
           name: vibe-show-runtime-node-${{ matrix.os }}
@@ -40,7 +41,7 @@ jobs:
         with:
           node-version: 20.19.0
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts --include=optional
       - run: npm run build -w @avibe/show-sdk
       - run: npm run build -w @avibe/show-ui
       - run: npm run test -w @avibe/show-runtime

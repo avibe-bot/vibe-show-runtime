@@ -21,9 +21,12 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "check": "npm run build && npm run typecheck && npm run test",
+    "test:bundle": "node --test scripts/bundle-project.test.mjs",
+    "check": "npm run build && npm run typecheck && npm run test && npm run test:bundle",
     "benchmark:ssr-markdown": "npm run build -w @avibe/show-sdk && npm run build -w @avibe/show-ui && npm run build -w @avibe/show-runtime && node --expose-gc packages/runtime/scripts/benchmark-ssr-markdown.mjs",
+    "lock:bundle": "node scripts/update-bundle-lock.mjs",
     "bundle:vibe-remote": "node scripts/bundle-vibe-remote.mjs",
+    "smoke:bundle": "node scripts/smoke-bundle.mjs",
     "smoke": "node scripts/smoke-runtime.mjs"
   },
   "engines": {

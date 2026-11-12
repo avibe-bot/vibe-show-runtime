@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process"
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+import { runtimePackages as packages, stageBundlePackages, verifyBundleInputs } from "./bundle-project.mjs"
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const outDir = join(repoRoot, "dist")
@@ -10,57 +11,17 @@ const stage = mkdtempSync(join(tmpdir(), "vibe-show-runtime-bundle-"))
 const platform = runtimePlatform()
 const archivePath = join(outDir, `vibe-show-runtime-node-${platform}.tgz`)
 
-const packages = ["runtime", "ui", "sdk"]
 const isWindows = process.platform === "win32"
-const rootPackage = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"))
-const rootLockfile = JSON.parse(readFileSync(join(repoRoot, "package-lock.json"), "utf8"))
-const nodeEngine = rootPackage.engines?.node
-
-if (!nodeEngine) {
-  throw new Error("Missing root package engines.node")
-}
 
 try {
-  mkdirSync(join(stage, "packages"), { recursive: true })
-  for (const name of packages) {
-    const source = join(repoRoot, "packages", name)
-    const target = join(stage, "packages", name)
-    const dist = join(source, "dist")
-    if (!existsSync(dist)) {
-      throw new Error(`Missing built package: ${dist}. Run npm run build first.`)
-    }
-    mkdirSync(target, { recursive: true })
-    cpSync(join(source, "package.json"), join(target, "package.json"))
-    cpSync(dist, join(target, "dist"), { recursive: true })
-  }
+  const distribution = join(repoRoot, "distribution")
+  const manifest = JSON.parse(readFileSync(join(distribution, "package.json"), "utf8"))
+  const lock = JSON.parse(readFileSync(join(distribution, "package-lock.json"), "utf8"))
+  verifyBundleInputs(repoRoot, manifest, lock)
+  stageBundlePackages(repoRoot, stage)
+  for (const name of ["package.json", "package-lock.json"]) cpSync(join(distribution, name), join(stage, name))
 
-  writeFileSync(
-    join(stage, "package.json"),
-    `${JSON.stringify(
-      {
-        private: true,
-        type: "module",
-        engines: {
-          node: nodeEngine
-        },
-        dependencies: {
-          "@avibe/show-runtime": "file:./packages/runtime",
-          "@avibe/show-ui": "file:./packages/ui",
-          "@avibe/show-sdk": "file:./packages/sdk",
-          "@vitejs/plugin-react": lockedDependencyVersion("@vitejs/plugin-react"),
-          esbuild: lockedDependencyVersion("esbuild"),
-          react: lockedDependencyVersion("react"),
-          "react-dom": lockedDependencyVersion("react-dom"),
-          vite: lockedDependencyVersion("vite")
-        }
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  )
-
-  execFileSync("npm", ["install", "--omit=dev", "--no-audit", "--no-fund"], {
+  execFileSync("npm", ["ci", "--ignore-scripts", "--omit=dev", "--include=optional", "--install-links=false", "--no-audit", "--no-fund"], {
     cwd: stage,
     stdio: "inherit",
     shell: isWindows
@@ -117,15 +78,6 @@ function assertNoBrowserRuntime(root) {
   if (present.length) {
     throw new Error(`Show Runtime bundle contains browser automation dependencies: ${present.join(", ")}`)
   }
-}
-
-function lockedDependencyVersion(packageName) {
-  const packagePath = `node_modules/${packageName}`
-  const version = rootLockfile.packages?.[packagePath]?.version
-  if (!version) {
-    throw new Error(`Missing locked package version for ${packageName}`)
-  }
-  return version
 }
 
 function runtimePlatform() {
