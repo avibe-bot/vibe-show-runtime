@@ -1,0 +1,18 @@
+{
+  "name": "avibe-show-runtime-distribution",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "dependencies": {
+    "@avibe/show-runtime": "file:./packages/runtime",
+    "@avibe/show-ui": "file:./packages/ui",
+    "@avibe/show-sdk": "file:./packages/sdk",
+    "@vitejs/plugin-react": "5.2.0",
+    "esbuild": "0.28.2",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "vite": "7.3.7"
+  }
+}
