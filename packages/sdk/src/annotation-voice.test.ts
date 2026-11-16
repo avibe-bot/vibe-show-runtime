@@ -332,6 +332,53 @@ describe("standalone annotation voice adapter", () => {
     }))
   })
 
+  // Avibe asks each account before voice input sends speech to a third-party AI service.
+  it.each([
+    ["declined", { available: true, consent: "declined" }],
+    ["not asked yet", { available: true, consent: null }],
+  ])("opens no microphone when this account has %s voice input", async (_label, status) => {
+    const getUserMedia = vi.fn(async () => fakeStream().stream)
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: vi.fn(async () => new Response(JSON.stringify(status), { status: 200 })),
+      getUserMedia,
+      createRecorder: () => new FakeStandaloneRecorder(),
+      isTypeSupported: () => false
+    })
+
+    await expect(adapter.start({ before: "", after: "" })).rejects.toMatchObject<Partial<AnnotationVoiceError>>({
+      code: "voice_off",
+      retryable: false
+    })
+    expect(getUserMedia).not.toHaveBeenCalled()
+  })
+
+  it("reads a refused upload as voice input turned off, not a failure to retry", async () => {
+    const recorder = new FakeStandaloneRecorder()
+    const stream = fakeStream()
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (input === "/api/asr/status") {
+        return new Response(JSON.stringify({ available: true, consent: "granted" }), { status: 200 })
+      }
+      if (input === "/api/csrf-token") {
+        return new Response(JSON.stringify({ csrf_token: "csrf-3" }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ ok: false, error: "voice_consent_required" }), { status: 403 })
+    })
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: fetchMock,
+      getUserMedia: async () => stream.stream,
+      createRecorder: () => recorder,
+      isTypeSupported: () => false
+    })
+
+    const session = await adapter.start({ before: "", after: "" })
+    session.stop()
+    await expect(session.done).rejects.toMatchObject<Partial<AnnotationVoiceError>>({
+      code: "voice_off",
+      retryable: false
+    })
+  })
+
   it("retains the recording for a retryable transcription failure", async () => {
     const recorder = new FakeStandaloneRecorder()
     const stream = fakeStream()
@@ -557,6 +604,9 @@ describe("standalone annotation voice adapter", () => {
     const stream = fakeStream()
     let transcriptionCalls = 0
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (input === "/api/asr/status") {
+        return new Response(JSON.stringify({ available: true, consent: "granted" }), { status: 200 })
+      }
       if (input === "/api/csrf-token") {
         return new Response(JSON.stringify({ csrf_token: "csrf-3" }), { status: 200 })
       }

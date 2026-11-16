@@ -13,6 +13,9 @@ export type AnnotationVoiceErrorCode =
   | "timeout"
   | "too_large"
   | "unavailable"
+  /** This account has not allowed voice input on the instance (it asks once before speech goes to
+   *  a third-party AI service); nothing was recorded or sent. */
+  | "voice_off"
 
 export class AnnotationVoiceError extends Error {
   readonly code: AnnotationVoiceErrorCode
@@ -235,6 +238,7 @@ const isVoiceErrorCode = (value: unknown): value is AnnotationVoiceErrorCode =>
   || value === "timeout"
   || value === "too_large"
   || value === "unavailable"
+  || value === "voice_off"
 
 export function annotationVoiceEventFromPayload(value: unknown): AnnotationVoiceEvent | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
@@ -496,6 +500,16 @@ type StandaloneVoiceResponse = {
   text?: unknown
 }
 
+type StandaloneVoiceStatus = {
+  available?: unknown
+  consent?: unknown
+}
+
+/** Whether the instance's answer lets this account's speech go out. An instance that predates the
+ *  question sends no `consent` field, and asks nothing. */
+const standaloneConsentAllows = (status: StandaloneVoiceStatus): boolean =>
+  !("consent" in status) || status.consent === "granted"
+
 const standaloneVoiceError = (
   code: AnnotationVoiceErrorCode,
   options: { cause?: unknown; retryable?: boolean } = {},
@@ -574,6 +588,9 @@ const standaloneResponseError = async (
 ): Promise<AnnotationVoiceError> => {
   const payload = await standaloneResponseJson<StandaloneVoiceResponse>(response, signal)
   const upstreamCode = typeof payload?.error === "string" ? payload.error : ""
+  if (response.status === 403 && upstreamCode === "voice_consent_required") {
+    return standaloneVoiceError("voice_off")
+  }
   if (response.status === 413 || upstreamCode === "file_too_large") {
     return standaloneVoiceError("too_large")
   }
@@ -712,24 +729,28 @@ export function createAnnotationVoiceStandaloneAdapter(
     }
   }
 
+  const readStatus = async (): Promise<StandaloneVoiceStatus | null> => {
+    const controller = new AbortController()
+    const timeout = globalThis.setTimeout(
+      () => controller.abort(),
+      STANDALONE_AVAILABILITY_TIMEOUT_MS,
+    )
+    try {
+      const response = await request(STANDALONE_ASR_STATUS_PATH, { signal: controller.signal })
+      if (!response.ok) return null
+      return await standaloneResponseJson<StandaloneVoiceStatus>(response, controller.signal)
+    } catch {
+      return null
+    } finally {
+      globalThis.clearTimeout(timeout)
+    }
+  }
+
   return {
     async isAvailable(): Promise<boolean> {
       if (!canCreateRecorder || !canCaptureAudio || !fetchImpl) return false
-      const controller = new AbortController()
-      const timeout = globalThis.setTimeout(
-        () => controller.abort(),
-        STANDALONE_AVAILABILITY_TIMEOUT_MS,
-      )
-      try {
-        const response = await request(STANDALONE_ASR_STATUS_PATH, { signal: controller.signal })
-        if (!response.ok) return false
-        const payload = await standaloneResponseJson<{ available?: unknown }>(response, controller.signal)
-        return payload?.available === true
-      } catch {
-        return false
-      } finally {
-        globalThis.clearTimeout(timeout)
-      }
+      const status = await readStatus()
+      return status?.available === true
     },
 
     async start(input): Promise<AnnotationVoiceSession> {
@@ -737,6 +758,15 @@ export function createAnnotationVoiceStandaloneAdapter(
         throw standaloneVoiceError("unavailable")
       }
       let stream: MediaStream
+      if (input.signal?.aborted) {
+        throw standaloneVoiceError("cancelled")
+      }
+      // Speech goes to a third-party AI service only after this account allowed voice input in
+      // Avibe: read its answer before the microphone opens (the instance refuses uploads anyway).
+      // A status that cannot be read leaves the decision to the instance, which refuses the upload
+      // without a yes (mapped to `voice_off` below).
+      const status = await readStatus()
+      if (status && !standaloneConsentAllows(status)) throw standaloneVoiceError("voice_off")
       if (input.signal?.aborted) {
         throw standaloneVoiceError("cancelled")
       }
