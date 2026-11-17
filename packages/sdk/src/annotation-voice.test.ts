@@ -122,6 +122,13 @@ describe("annotation voice host bridge", () => {
       type: ANNOTATION_VOICE_EVENT_MESSAGE,
       kind: "error",
       requestId: "voice-1",
+      code: "voice_off",
+      retryable: false
+    })).toMatchObject({ kind: "error", code: "voice_off" })
+    expect(annotationVoiceEventFromPayload({
+      type: ANNOTATION_VOICE_EVENT_MESSAGE,
+      kind: "error",
+      requestId: "voice-1",
       code: "invented",
       retryable: false
     })).toBeUndefined()
@@ -294,6 +301,16 @@ const fakeStream = () => {
   }
 }
 
+/** The instance's ASR status for an account that allowed voice input, answered before any other
+ *  request the case serves: the adapter reads it before the microphone opens. */
+const withVoiceStatus = (
+  serve: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> = async () => new Response("{}", { status: 500 }),
+) => vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => (
+  input === "/api/asr/status"
+    ? new Response(JSON.stringify({ available: true, consent: "granted" }), { status: 200 })
+    : serve(input, init)
+))
+
 describe("standalone annotation voice adapter", () => {
   it("uses same-origin status, CSRF, and transcription endpoints", async () => {
     const recorder = new FakeStandaloneRecorder()
@@ -330,6 +347,83 @@ describe("standalone annotation voice adapter", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/asr/status", expect.objectContaining({
       credentials: "same-origin"
     }))
+  })
+
+  // Avibe asks each account before voice input sends speech to a third-party AI service.
+  it.each([
+    ["declined", { available: true, consent: "declined" }],
+    ["not asked yet", { available: true, consent: null }],
+  ])("opens no microphone when this account has %s voice input", async (_label, status) => {
+    const getUserMedia = vi.fn(async () => fakeStream().stream)
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: vi.fn(async () => new Response(JSON.stringify(status), { status: 200 })),
+      getUserMedia,
+      createRecorder: () => new FakeStandaloneRecorder(),
+      isTypeSupported: () => false
+    })
+
+    await expect(adapter.start({ before: "", after: "" })).rejects.toMatchObject<Partial<AnnotationVoiceError>>({
+      code: "voice_off",
+      retryable: false
+    })
+    expect(getUserMedia).not.toHaveBeenCalled()
+  })
+
+  it("reads a refused upload as voice input turned off, not a failure to retry", async () => {
+    const recorder = new FakeStandaloneRecorder()
+    const stream = fakeStream()
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (input === "/api/asr/status") {
+        return new Response(JSON.stringify({ available: true, consent: "granted" }), { status: 200 })
+      }
+      if (input === "/api/csrf-token") {
+        return new Response(JSON.stringify({ csrf_token: "csrf-3" }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ ok: false, error: "voice_consent_required" }), { status: 403 })
+    })
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: fetchMock,
+      getUserMedia: async () => stream.stream,
+      createRecorder: () => recorder,
+      isTypeSupported: () => false
+    })
+
+    const session = await adapter.start({ before: "", after: "" })
+    session.stop()
+    await expect(session.done).rejects.toMatchObject<Partial<AnnotationVoiceError>>({
+      code: "voice_off",
+      retryable: false
+    })
+  })
+
+  it("opens no microphone when the instance's answer cannot be read", async () => {
+    const getUserMedia = vi.fn(async () => fakeStream().stream)
+    for (const status of [
+      () => new Response("{}", { status: 503 }),
+      () => new Response(JSON.stringify("granted"), { status: 200 }),
+    ]) {
+      const adapter = createAnnotationVoiceStandaloneAdapter({
+        fetch: vi.fn(async () => status()),
+        getUserMedia,
+        createRecorder: () => new FakeStandaloneRecorder(),
+        isTypeSupported: () => false
+      })
+      await expect(adapter.start({ before: "", after: "" })).rejects.toMatchObject({ code: "unavailable", retryable: false })
+    }
+    expect(getUserMedia).not.toHaveBeenCalled()
+  })
+
+  it("records as before on an instance that asks nothing (no consent field)", async () => {
+    const getUserMedia = vi.fn(async () => fakeStream().stream)
+    const adapter = createAnnotationVoiceStandaloneAdapter({
+      fetch: vi.fn(async () => new Response(JSON.stringify({ available: true }), { status: 200 })),
+      getUserMedia,
+      createRecorder: () => new FakeStandaloneRecorder(),
+      isTypeSupported: () => false
+    })
+    const session = await adapter.start({ before: "", after: "" })
+    expect(getUserMedia).toHaveBeenCalledOnce()
+    session.abort()
   })
 
   it("retains the recording for a retryable transcription failure", async () => {
@@ -372,7 +466,7 @@ describe("standalone annotation voice adapter", () => {
       const recorder = new FakeStandaloneRecorder()
       const stream = fakeStream()
       let csrfSignal: AbortSignal | undefined
-      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const fetchMock = withVoiceStatus(async (input: RequestInfo | URL, init?: RequestInit) => {
         if (input !== "/api/csrf-token") {
           throw new Error(`Unexpected request: ${String(input)}`)
         }
@@ -410,7 +504,7 @@ describe("standalone annotation voice adapter", () => {
     const stream = fakeStream()
     const controller = new AbortController()
     let responseSignal: AbortSignal | undefined
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = withVoiceStatus(async (input: RequestInfo | URL, init?: RequestInit) => {
       if (input === "/api/csrf-token") {
         return new Response(JSON.stringify({ csrf_token: "csrf-4" }), { status: 200 })
       }
@@ -501,7 +595,7 @@ describe("standalone annotation voice adapter", () => {
     })
     const stream = fakeStream()
     const adapter = createAnnotationVoiceStandaloneAdapter({
-      fetch: vi.fn(),
+      fetch: withVoiceStatus(),
       getUserMedia: async () => stream.stream,
       createRecorder: () => recorder,
       isTypeSupported: () => false
@@ -523,7 +617,7 @@ describe("standalone annotation voice adapter", () => {
       return stream.stream
     })
     const adapter = createAnnotationVoiceStandaloneAdapter({
-      fetch: vi.fn(),
+      fetch: withVoiceStatus(),
       getUserMedia,
       createRecorder: () => recorder,
       isTypeSupported: () => false
@@ -540,7 +634,7 @@ describe("standalone annotation voice adapter", () => {
     const recorder = new FakeStandaloneRecorder()
     const stream = fakeStream()
     const adapter = createAnnotationVoiceStandaloneAdapter({
-      fetch: vi.fn(),
+      fetch: withVoiceStatus(),
       getUserMedia: async () => stream.stream,
       createRecorder: () => recorder,
       isTypeSupported: () => false
@@ -557,6 +651,9 @@ describe("standalone annotation voice adapter", () => {
     const stream = fakeStream()
     let transcriptionCalls = 0
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (input === "/api/asr/status") {
+        return new Response(JSON.stringify({ available: true, consent: "granted" }), { status: 200 })
+      }
       if (input === "/api/csrf-token") {
         return new Response(JSON.stringify({ csrf_token: "csrf-3" }), { status: 200 })
       }

@@ -311,6 +311,8 @@ export type AnnotationOverlayLabels = {
   voiceTooLarge?: string
   voiceEmpty?: string
   voiceDraftChanged?: string
+  /** This account has not allowed voice input on the instance: where to turn it on. */
+  voiceOff?: string
 }
 
 // Required<> so the built-in defaults must stay complete (every field, incl. the optional ones)
@@ -386,7 +388,8 @@ export const DEFAULT_ANNOTATION_LABELS: Required<AnnotationOverlayLabels> = {
   voiceUnavailable: "语音转写暂时不可用。",
   voiceTooLarge: "这段录音太大，无法转写。",
   voiceEmpty: "这段录音中没有检测到语音。",
-  voiceDraftChanged: "标注文字已发生变化，录音已保留，可以重试。"
+  voiceDraftChanged: "标注文字已发生变化，录音已保留，可以重试。",
+  voiceOff: "语音输入已关闭，可以在 Avibe 的设置 › 常规里开启。"
 }
 
 /**
@@ -939,6 +942,7 @@ export function annotationVoiceErrorLabel(
   if (code === "too_large") return labels.voiceTooLarge
   if (code === "empty") return labels.voiceEmpty
   if (code === "draft_changed") return labels.voiceDraftChanged
+  if (code === "voice_off") return labels.voiceOff
   return labels.voiceFailed
 }
 
