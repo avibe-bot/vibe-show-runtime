@@ -738,7 +738,10 @@ export function createAnnotationVoiceStandaloneAdapter(
     try {
       const response = await request(STANDALONE_ASR_STATUS_PATH, { signal: controller.signal })
       if (!response.ok) return null
-      return await standaloneResponseJson<StandaloneVoiceStatus>(response, controller.signal)
+      const status = await standaloneResponseJson<unknown>(response, controller.signal)
+      return status && typeof status === "object" && !Array.isArray(status)
+        ? status as StandaloneVoiceStatus
+        : null
     } catch {
       return null
     } finally {
@@ -763,10 +766,10 @@ export function createAnnotationVoiceStandaloneAdapter(
       }
       // Speech goes to a third-party AI service only after this account allowed voice input in
       // Avibe: read its answer before the microphone opens (the instance refuses uploads anyway).
-      // A status that cannot be read leaves the decision to the instance, which refuses the upload
-      // without a yes (mapped to `voice_off` below).
+      // An answer that cannot be read opens no microphone, as in the Workbench.
       const status = await readStatus()
-      if (status && !standaloneConsentAllows(status)) throw standaloneVoiceError("voice_off")
+      if (!status) throw standaloneVoiceError("unavailable")
+      if (!standaloneConsentAllows(status)) throw standaloneVoiceError("voice_off")
       if (input.signal?.aborted) {
         throw standaloneVoiceError("cancelled")
       }
