@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto"
 import { lstat, readdir, realpath } from "node:fs/promises"
 import { join } from "node:path"
 import type { ViteDevServer } from "vite"
 
+export const workspaceRevisions = new WeakMap<ViteDevServer, string>()
 const POLL_MS = 1_000
 const excluded = new Set(["node_modules", ".git", "dist", "build", ".vite-cache", ".show-vendor"])
 type FileStamp = { identity: string; mtime: bigint; link: boolean }
@@ -43,6 +45,7 @@ export async function workspaceSnapshot(workspace: string, excludeDir?: string):
 export function observeWorkspace(
   workspace: string, sessionId: string, vite: ViteDevServer, initial: Snapshot, excludeDir?: string
 ) {
+  workspaceRevisions.set(vite, randomUUID())
   let previous = initial
   let requiresWarm = false
   let closed = false
@@ -74,8 +77,13 @@ export function observeWorkspace(
       // A cached module may inline other inputs (e.g. CSS @import), or have
       // multiple URL/query variants. Invalidate before ANY conditional GET;
       // then let Vite deliver its normal plugin hooks and React HMR messages.
+      workspaceRevisions.set(vite, randomUUID())
       for (const env of Object.values(vite.environments)) env.moduleGraph.invalidateAll()
+      const graph = vite.environments.client.moduleGraph
+      const needsReload = changed.some((file) => !graph.getModulesByFile(file.replaceAll("\\", "/"))?.size)
       for (const file of changed) vite.watcher.emit("change", file)
+      // A plain <script src> served by public middleware never entered the HMR graph.
+      if (needsReload) vite.ws.send({ type: "full-reload" })
     }
   }
   function startScan() {

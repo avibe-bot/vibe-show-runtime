@@ -1,3 +1,5 @@
+import { scopeStaticValidators } from "./static-validators.js"
+import { workspaceRevisions } from "./workspace-freshness.js"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { readFile, stat } from "node:fs/promises"
 import { isAbsolute, join, relative, resolve } from "node:path"
@@ -298,13 +300,7 @@ async function routeRequest(
     // (`?inline`, `?url`, `?raw`, `?worker`, ...) selects a Vite transform, so dropping it
     // here would make Vite fall back to the default handling (e.g. CSS injected as a style
     // tag instead of returned as an inline string). `parsed.search` keeps the leading `?`.
-    // Vite's static middleware (including JavaScript in public/) uses a weak
-    // size/mtime ETag; an atomic same-size save can preserve both. Only allow
-    // Vite to revalidate content ETags, not metadata-only validators.
-    if (/^W\/"\d+--?\d+"$/.test(String(request.headers["if-none-match"] ?? ""))) {
-      delete request.headers["if-none-match"]
-    }
-    delete request.headers["if-modified-since"]
+    scopeStaticValidators(request, response, workspaceRevisions.get(vite)!)
     const appSearch = parsed.search ?? ""
     request.url = appPath === "/" ? `/${appSearch}` : `${appPath}${appSearch}`
     const middlewareStarted = performance.now()

@@ -474,6 +474,7 @@ export function createShowRuntime(
   }, maintenanceIntervalMs)
   maintenanceTimer.unref?.()
 
+  const retryLiveRefresh = new WeakSet<ShowSession>()
   const observers = new WeakMap<ViteDevServer, ReturnType<typeof observeWorkspace>>()
 
   async function ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus> {
@@ -491,14 +492,17 @@ export function createShowRuntime(
       const generation = existing.vite
       if (await canReuseActiveSession(existing, normalizedBasePath)) break
       if (existing.warming || existing.closing || generation !== existing.vite) continue
-      const initializeTemplate = existing.state !== "active"
+      const initializeTemplate = existing.state !== "active" && !retryLiveRefresh.has(existing)
       existing.warming = (async () => {
         if (generation) await closeSession(existing)
         existing.state = "warming"
         existing.updatedAt = new Date()
         try {
-          return await warmSession(existing, normalizedBasePath, initializeTemplate)
+          const warmed = await warmSession(existing, normalizedBasePath, initializeTemplate)
+          retryLiveRefresh.delete(existing)
+          return warmed
         } catch (error) {
+          if (!initializeTemplate) retryLiveRefresh.add(existing)
           await closeSession(existing)
           throw error
         }

@@ -246,6 +246,11 @@ rebuild Vite on the next request. The same fallback covers preserved timestamps 
 Vite configs. Concurrent requests share one rebuild; a live refresh does not recreate
 deliberately deleted scaffold files.
 
+This guarantee covers page source, routes and assets, not changes to custom build tools.
+For example, Node can cache a helper imported by `postcss.config.mjs` beyond the lifetime
+of one Vite session. If restarting the session does not pick up custom plugin code,
+restart the Show Runtime process.
+
 ## Status
 
 This project is pre-release. The current server is a minimal sidecar suitable

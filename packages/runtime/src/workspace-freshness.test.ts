@@ -34,6 +34,7 @@ it("keeps cached HTTP/ETags, route membership and an open HMR client current wit
   await writeFile(join(src, "theme.css"), ".before { color: red }")
   await mkdir(join(root, "public"))
   await writeFile(join(root, "public/asset.txt"), "unchanged")
+  await writeFile(join(root, "public/widget.js"), "window.widget = 1")
   // A root symlink must still be scanned, but never descend into nested links.
   const workspaceRoot = join(temp, "linked")
   await symlink(join(temp, "workspaces"), workspaceRoot, process.platform === "win32" ? "junction" : "dir")
@@ -73,6 +74,10 @@ it("keeps cached HTTP/ETags, route membership and an open HMR client current wit
     await expect.poll(() => messages.some((m) => m.type === "connected")).toBe(true)
   }
   await connect()
+  await (await get("widget.js")).text()
+  await writeFile(join(root, "public/widget.js"), "window.widget = 2")
+  if (ws) await expect.poll(() => messages.some((m) => m.type === "full-reload"), { timeout: 8_000 }).toBe(true)
+  messages.length = 0
   // Same size, older mtime, atomic rename: Chokidar polling misses this save.
   await writeFile(join(temp, "replacement"), pageSource("final!"))
   await utimes(join(temp, "replacement"), 1_000, 1_000)
@@ -93,12 +98,17 @@ it("keeps cached HTTP/ETags, route membership and an open HMR client current wit
   await utimes(asset, 1000, 1000)
   const before = await get("asset.txt")
   expect(await before.text()).toBe("unchanged")
+  expect((await get("asset.txt", { "if-none-match": before.headers.get("etag")! })).status).toBe(304)
   await writeFile(asset, "modified!")
   await utimes(asset, 1000, 1000)
   expect(await (await get("asset.txt", { "if-none-match": before.headers.get("etag")! })).text()).toBe("modified!")
   // One live refresh; racing ensure calls must not re-scaffold the deleted file.
   const config = join(src, "show-runtime-config.ts")
   await rm(config)
+  const invalidConfig = join(root, "vite.config.mjs")
+  await writeFile(invalidConfig, "export default !")
+  expect((await get("asset.txt")).status).toBe(500)
+  await rm(invalidConfig)
   const session = server.runtime.getSession("test")!
   const generations = await Promise.all([1, 2, 3].map(async () => {
     await server!.runtime.ensureSession("test", session.basePath)
