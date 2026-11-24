@@ -1,3 +1,5 @@
+import { scopeStaticValidators } from "./static-validators.js"
+import { workspaceRevisions } from "./workspace-freshness.js"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { readFile, stat } from "node:fs/promises"
 import { isAbsolute, join, relative, resolve } from "node:path"
@@ -298,6 +300,7 @@ async function routeRequest(
     // (`?inline`, `?url`, `?raw`, `?worker`, ...) selects a Vite transform, so dropping it
     // here would make Vite fall back to the default handling (e.g. CSS injected as a style
     // tag instead of returned as an inline string). `parsed.search` keeps the leading `?`.
+    scopeStaticValidators(request, response, workspaceRevisions.get(vite)!)
     const appSearch = parsed.search ?? ""
     request.url = appPath === "/" ? `/${appSearch}` : `${appPath}${appSearch}`
     const middlewareStarted = performance.now()

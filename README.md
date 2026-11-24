@@ -223,6 +223,34 @@ export function GET(_request: Request, context: VibeContext) {
 }
 ```
 
+### Workspace updates
+
+Each warm session polls its own workspace once a second, so an open Show Page receives
+Vite updates even on filesystems that drop native events. It does
+not poll the shared install, symlink targets outside the workspace, `node_modules`, `.git`,
+`dist`, or `build`. Suspending or pruning the session closes its watcher. Look in the Show
+Runtime log for this line (substitute the session ID):
+
+```json
+{"level":"info","source":"show-runtime","event":"workspace-watch","sessionId":"<id>","mode":"polling","intervalMs":1000}
+```
+
+Cost is one metadata check per file plus one directory listing per directory per pass.
+In a local arm64 Mac test with 50 source files and three directories, a warmed idle Vite
+process used about 0.23% of one CPU core over ten seconds; a request-triggered scan took
+about 1.1 ms. These are examples, not bounds for large workspaces or network mounts.
+The same check runs before a request reuses a session. Ordinary JS/TS edits invalidate
+transforms before Vite handles conditional GETs. Changes to tree membership, symlinks,
+package metadata, stylesheets, or other compiler/configuration inputs reload the page and
+rebuild Vite on the next request. The same fallback covers preserved timestamps and custom
+Vite configs. Concurrent requests share one rebuild; a live refresh does not recreate
+deliberately deleted scaffold files.
+
+This guarantee covers page source, routes and assets, not changes to custom build tools.
+For example, Node can cache a helper imported by `postcss.config.mjs` beyond the lifetime
+of one Vite session. If restarting the session does not pick up custom plugin code,
+restart the Show Runtime process.
+
 ## Status
 
 This project is pre-release. The current server is a minimal sidecar suitable
