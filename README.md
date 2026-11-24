@@ -239,10 +239,12 @@ Cost is one metadata check per file plus one directory listing per directory per
 In a local arm64 Mac test with 50 source files and three directories, a warmed idle Vite
 process used about 0.23% of one CPU core over ten seconds; a request-triggered scan took
 about 1.1 ms. These are examples, not bounds for large workspaces or network mounts.
-The same check runs before a request reuses a session. Changed files invalidate transforms
-before Vite handles conditional GETs. Adding, removing or retargeting a file triggers a
-page reload and rebuilds Vite on the next request, so even directory globs and resolution
-caches use the new tree. This refresh does not recreate deliberately deleted scaffold files.
+The same check runs before a request reuses a session. Ordinary JS/TS edits invalidate
+transforms before Vite handles conditional GETs. Changes to tree membership, symlinks,
+package metadata, stylesheets, or other compiler/configuration inputs reload the page and
+rebuild Vite on the next request. The same fallback covers preserved timestamps and custom
+Vite configs. Concurrent requests share one rebuild; a live refresh does not recreate
+deliberately deleted scaffold files.
 
 ## Status
 

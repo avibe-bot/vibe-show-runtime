@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises"
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -79,6 +79,7 @@ it("keeps cached HTTP/ETags, route membership and an open HMR client current wit
   await rename(join(temp, "replacement"), first)
   if (ws) await expect.poll(() => messages.some((m) => m.type === "full-reload" || m.updates?.some((u) => u.path === "/src/pages/first.tsx")), { timeout: 8_000 }).toBe(true)
   expect(await (await get(page)).text()).toContain('"final!"')
+  await connect() // A preserved-mtime replacement starts a new Vite generation.
   for (const router of ["src/router.ts", "src/lazy.ts"]) expect(await (await get(router)).text()).not.toContain("second.tsx")
   messages.length = 0
   await writeFile(join(src, "pages/second.tsx"), "export default 2")
@@ -87,7 +88,53 @@ it("keeps cached HTTP/ETags, route membership and an open HMR client current wit
   await rm(first)
   expect(await (await get("src/router.ts")).text()).not.toContain("first.tsx")
   expect((await get(page)).status).toBe(404)
+  // Weak static validators based only on mtime and size must not produce 304.
+  const asset = join(root, "public/asset.txt")
+  await utimes(asset, 1000, 1000)
+  const before = await get("asset.txt")
+  expect(await before.text()).toBe("unchanged")
+  await writeFile(asset, "modified!")
+  await utimes(asset, 1000, 1000)
+  expect(await (await get("asset.txt", { "if-none-match": before.headers.get("etag")! })).text()).toBe("modified!")
+  // One live refresh; racing ensure calls must not re-scaffold the deleted file.
+  const config = join(src, "show-runtime-config.ts")
+  await rm(config)
+  const session = server.runtime.getSession("test")!
+  const generations = await Promise.all([1, 2, 3].map(async () => {
+    await server!.runtime.ensureSession("test", session.basePath)
+    return session.vite
+  }))
+  expect(new Set(generations).size).toBe(1)
+  await expect(access(config)).rejects.toMatchObject({ code: "ENOENT" })
+  await writeFile(config, "// restored by the author")
+  // Resolver metadata and env/config are generation inputs, not modules.
+  const pkg = join(src, "pkg")
+  await mkdir(pkg)
+  await writeFile(join(pkg, "a.js"), 'export default "pkgA"')
+  await writeFile(join(pkg, "b.js"), 'export default "pkgB"')
+  await writeFile(join(pkg, "package.json"), '{"main":"a.js"}')
+  expect(await (await get("src/pkg")).text()).toContain("pkgA")
+  await writeFile(join(pkg, "package.json"), '{"main":"b.js"}')
+  expect(await (await get("src/pkg")).text()).toContain("pkgB")
+  await writeFile(join(src, "env.ts"), "export default import.meta.env.VITE_SHOW_FRESH_FIXTURE")
+  await writeFile(join(root, ".env"), "VITE_SHOW_FRESH_FIXTURE=alpha")
+  expect(await (await get("src/env.ts")).text()).toContain("alpha")
+  await writeFile(join(root, ".env"), "VITE_SHOW_FRESH_FIXTURE=bravo")
+  expect(await (await get("src/env.ts")).text()).toContain("bravo")
+  const css = join(src, "styles.css")
+  const prefix = await readFile(css, "utf8")
+  await writeFile(css, prefix + "\n.precise { color: red }")
+  const red = await get("src/styles.css", { accept: "text/css" })
+  expect(await red.text()).toContain(".precise")
+  await writeFile(css, prefix + "\n.updated { color: red }")
+  await utimes(css, 1000, 1000)
+  expect(await (await get("src/styles.css", { accept: "text/css", "if-none-match": red.headers.get("etag")! })).text()).toContain(".updated")
   if (process.platform !== "win32") {
+    const unreadable = join(root, "unreadable")
+    await mkdir(unreadable)
+    await chmod(unreadable, 0)
+    try { expect(await (await get("asset.txt")).text()).toBe("modified!") }
+    finally { await chmod(unreadable, 0o700) }
     await symlink("pages/second.tsx", join(src, "alias.tsx"))
     expect(await (await get("src/alias.tsx")).text()).toContain("default 2")
     await rm(join(src, "alias.tsx"))

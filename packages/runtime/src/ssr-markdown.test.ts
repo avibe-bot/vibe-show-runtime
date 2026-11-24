@@ -376,9 +376,10 @@ describe("Vite SSR Markdown spike", () => {
       target: "/",
       basePath: "/show/semantic/"
     })
+    const canonicalPagePath = await realpath(pagePath)
     const watcherChange = new Promise<void>((resolveChange) => {
       const onChange = (changedPath: string) => {
-        if (resolve(changedPath) !== resolve(pagePath)) return
+        if (resolve(changedPath) !== canonicalPagePath) return
         vite.watcher.off("change", onChange)
         resolveChange()
       }

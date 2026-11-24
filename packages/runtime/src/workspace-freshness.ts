@@ -4,7 +4,8 @@ import type { ViteDevServer } from "vite"
 
 const POLL_MS = 1_000
 const excluded = new Set(["node_modules", ".git", "dist", "build", ".vite-cache", ".show-vendor"])
-type Snapshot = Map<string, string>
+type FileStamp = { identity: string; mtime: bigint; link: boolean }
+type Snapshot = Map<string, FileStamp>
 
 // Metadata only. Follow the workspace root (it can itself be a symlink),
 // never directory entries that point elsewhere. A symlink's own identity is
@@ -12,18 +13,23 @@ type Snapshot = Map<string, string>
 export async function workspaceSnapshot(workspace: string, excludeDir?: string): Promise<Snapshot> {
   const files: Snapshot = new Map()
   async function visit(dir: string) {
-    for (const entry of await readdir(dir, { withFileTypes: true })) {
+    // Dirent is a hint from the parent listing. Recheck before and after the
+    // listing so a replaced directory cannot admit its target's children.
+    if (await realpath(dir) !== dir) return
+    const entries = await readdir(dir, { withFileTypes: true })
+    if (await realpath(dir) !== dir) return
+    for (const entry of entries) {
       const file = join(dir, entry.name)
       if (excluded.has(entry.name) || file === excludeDir) continue
       try {
         if (entry.isDirectory()) await visit(file)
         else {
           const s = await lstat(file, { bigint: true })
-          files.set(file, `${s.isSymbolicLink() ? "link" : "file"}:${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`)
+          files.set(file, { identity: `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`, mtime: s.mtimeMs, link: s.isSymbolicLink() })
         }
       } catch (error) {
         // A save/rename overlapped the scan. Never follow a vanished entry.
-        if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error
+        if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM", "ELOOP"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error
       }
     }
   }
@@ -49,8 +55,12 @@ export function observeWorkspace(
     const changed: string[] = []
     for (const [file, signature] of current) {
       const old = previous.get(file)
-      if (old === signature) continue
-      if (!old || old.startsWith("link:") || signature.startsWith("link:")) requiresWarm = true
+      if (old?.identity === signature.identity) continue
+      // Fast path only for ordinary source edits with the runtime-owned plugin
+      // stack. Config, resolution and compiler inputs have caches outside the
+      // graph; a non-increasing mtime can fool Tailwind's internal scanner.
+      if (!old || old.link || signature.link || signature.mtime <= old.mtime || vite.config.configFile ||
+          !/\.[cm]?[jt]sx?$/i.test(file) || /(?:^|[\\/])[^\\/]*config\.[^\\/]+$/i.test(file)) requiresWarm = true
       changed.push(file)
     }
     if (previous.size !== current.size) requiresWarm = true

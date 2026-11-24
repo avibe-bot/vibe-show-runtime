@@ -480,46 +480,35 @@ export function createShowRuntime(
     const started = performance.now()
     const existing = getOrCreateSession(sessionId)
     const normalizedBasePath = normalizeBasePath(basePath, sessionId)
-    if (await canReuseActiveSession(existing, normalizedBasePath)) {
-      existing.lastAccessedAt = new Date()
-      existing.updatedAt = new Date()
-      logTiming("ensureSession", sessionId, started, { state: "active", reused: true })
-      return toStatus(existing)
-    }
-
-    existing.lastAccessedAt = new Date()
-    if (existing.closing) {
-      await existing.closing
-      existing.lastAccessedAt = new Date()
-    }
-    if (await canReuseActiveSession(existing, normalizedBasePath)) {
-      existing.updatedAt = new Date()
-      logTiming("ensureSession", sessionId, started, { state: "active", reused: true })
-      return toStatus(existing)
-    }
-    const wasActive = existing.state === "active"
-    if (wasActive) {
-      const closeStarted = performance.now()
-      await closeSession(existing)
-      logTiming("closeSessionForWarmChange", sessionId, closeStarted, { from: existing.basePath, to: normalizedBasePath })
-    }
-    if (!existing.warming) {
-      if (existing.vite) {
-        const closeStarted = performance.now()
-        await closeSession(existing, existing.state === "closing" ? "suspended" : existing.state)
-        logTiming("closeStaleSessionBeforeWarm", sessionId, closeStarted, { state: existing.state })
+    for (;;) {
+      // A single promise owns close -> create -> warm, not just the last step.
+      // Publish it before yielding so concurrent module requests cannot create
+      // competing generations or mistake a live refresh for a fresh session.
+      if (existing.warming || existing.closing) {
+        await (existing.warming ?? existing.closing)
+        continue
       }
-      existing.state = "warming"
-      existing.updatedAt = new Date()
-      existing.warming = warmSession(existing, normalizedBasePath, !wasActive).catch(async (error) => {
-        await closeSession(existing)
-        throw error
-      })
+      const generation = existing.vite
+      if (await canReuseActiveSession(existing, normalizedBasePath)) break
+      if (existing.warming || existing.closing || generation !== existing.vite) continue
+      const initializeTemplate = existing.state !== "active"
+      existing.warming = (async () => {
+        if (generation) await closeSession(existing)
+        existing.state = "warming"
+        existing.updatedAt = new Date()
+        try {
+          return await warmSession(existing, normalizedBasePath, initializeTemplate)
+        } catch (error) {
+          await closeSession(existing)
+          throw error
+        }
+      })().finally(() => { existing.warming = undefined })
+      await existing.warming
+      break
     }
-    const warmed = await existing.warming
-    warmed.lastAccessedAt = new Date()
-    logTiming("ensureSession", sessionId, started, { state: warmed.state, reused: false, basePath: warmed.basePath })
-    return toStatus(warmed)
+    existing.lastAccessedAt = existing.updatedAt = new Date()
+    logTiming("ensureSession", sessionId, started, { state: existing.state })
+    return toStatus(existing)
   }
 
   async function canReuseActiveSession(session: ShowSession, basePath: string): Promise<boolean> {
@@ -562,7 +551,7 @@ export function createShowRuntime(
 
   async function close() {
     clearInterval(maintenanceTimer)
-    await Promise.all([...sessions.values()].map((session) => closeSession(session)))
+    await Promise.all([...sessions.values()].map((session) => suspendSession(session.id)))
     await disposeSharedInstallResolvers()
   }
 
@@ -878,7 +867,6 @@ export function createShowRuntime(
     session.basePath = basePath
     session.dependencySignature = sourceDependencies.signature
     session.updatedAt = new Date()
-    session.warming = undefined
     logTiming("warmSession.total", session.id, started, { cacheDir, basePath })
     return session
   }
@@ -899,13 +887,11 @@ export function createShowRuntime(
     if (!vite) {
       session.state = nextState
       session.updatedAt = new Date()
-      session.warming = undefined
       return
     }
     observers.get(vite)?.close()
     session.state = "closing"
     session.updatedAt = new Date()
-    session.warming = undefined
     session.closing = (async () => {
       try {
         await vite.waitForRequestsIdle()
