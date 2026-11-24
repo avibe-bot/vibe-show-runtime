@@ -1,4 +1,4 @@
-import { EventEmitter, once } from "node:events"
+import { EventEmitter } from "node:events"
 import { fork, spawn, type ChildProcess, type ForkOptions } from "node:child_process"
 import { createHash } from "node:crypto"
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
@@ -99,11 +99,7 @@ async function observeRouterChanges(
   sessionId: string
 ) {
   // Attach before the first Markdown request binds its own watcher listener.
-  // Chokidar's ready event is one-shot; Vite exposes the watcher but no ready
-  // promise, so check its scan-complete flag before subscribing.
-  if (!(vite.watcher as typeof vite.watcher & { _readyEmitted: boolean })._readyEmitted) {
-    await once(vite.watcher, "ready")
-  }
+  // Session readiness includes the workspace observer's initial snapshot.
   const modulePath = (await realpath(routerPath)).replaceAll("\\", "/")
   const listeners = vite.watcher.listeners("change")
   expect(listeners).toHaveLength(1)
@@ -121,7 +117,7 @@ async function observeRouterChanges(
     return completion
   })
   const onChange = (file: string, ...args: unknown[]) => {
-    // Preserve Vite's real handler and native filesystem event. Its returned
+    // Preserve Vite's real handler and the observer's file-change event. Its returned
     // promise covers watchChange hooks, module invalidation, and HMR propagation,
     // including changes that correctly produce no hot.send payload.
     const completion: unknown = onViteChange.call(vite.watcher, file, ...args)

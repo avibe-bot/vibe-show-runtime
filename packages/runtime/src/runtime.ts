@@ -31,7 +31,7 @@ import {
   ssrMarkdownEntryPlugin
 } from "./ssr-markdown-entry-plugin.js"
 import { registerSsrModuleValidationInvalidator } from "./ssr-module-validation-cache.js"
-import { workspaceFreshnessPlugin, workspaceWatchOptions } from "./workspace-freshness.js"
+import { observeWorkspace, workspaceSnapshot } from "./workspace-freshness.js"
 import { ensureSessionTemplate } from "./templates.js"
 import { createVendorExternalizePlugins, isProvidedVendorSpecifier } from "./vendor-externalize-plugin.js"
 import {
@@ -474,6 +474,8 @@ export function createShowRuntime(
   }, maintenanceIntervalMs)
   maintenanceTimer.unref?.()
 
+  const observers = new WeakMap<ViteDevServer, ReturnType<typeof observeWorkspace>>()
+
   async function ensureSession(sessionId: string, basePath?: string): Promise<ShowSessionStatus> {
     const started = performance.now()
     const existing = getOrCreateSession(sessionId)
@@ -495,7 +497,8 @@ export function createShowRuntime(
       logTiming("ensureSession", sessionId, started, { state: "active", reused: true })
       return toStatus(existing)
     }
-    if (existing.state === "active") {
+    const wasActive = existing.state === "active"
+    if (wasActive) {
       const closeStarted = performance.now()
       await closeSession(existing)
       logTiming("closeSessionForWarmChange", sessionId, closeStarted, { from: existing.basePath, to: normalizedBasePath })
@@ -508,7 +511,7 @@ export function createShowRuntime(
       }
       existing.state = "warming"
       existing.updatedAt = new Date()
-      existing.warming = warmSession(existing, normalizedBasePath).catch(async (error) => {
+      existing.warming = warmSession(existing, normalizedBasePath, !wasActive).catch(async (error) => {
         await closeSession(existing)
         throw error
       })
@@ -531,6 +534,7 @@ export function createShowRuntime(
       return false
     }
 
+    if (!await observers.get(vite)?.check()) return false
     const dependencySignature = await sourceDependencySignature(
       session.workspace,
       options.uiPackageName ?? "@avibe/show-ui"
@@ -652,14 +656,16 @@ export function createShowRuntime(
     }
   }
 
-  async function warmSession(session: ShowSession, basePath: string): Promise<ShowSession> {
+  async function warmSession(session: ShowSession, basePath: string, initializeTemplate: boolean): Promise<ShowSession> {
     const started = performance.now()
     const mkdirStarted = performance.now()
     await mkdir(session.workspace, { recursive: true })
     logTiming("warmSession.mkdir", session.id, mkdirStarted)
     const templateStarted = performance.now()
     const uiPackageName = options.uiPackageName ?? "@avibe/show-ui"
-    await ensureSessionTemplate(session.workspace, uiPackageName)
+    // A tree edit may remove a scaffold file deliberately. A live refresh must
+    // not replace it with template contents while rebuilding Vite's indexes.
+    if (initializeTemplate) await ensureSessionTemplate(session.workspace, uiPackageName)
     logTiming("warmSession.template", session.id, templateStarted)
     const dependencyRoot = await resolveDependencyRoot(options.dependencyRoot, uiPackageName)
     const vendorStarted = performance.now()
@@ -760,7 +766,7 @@ export function createShowRuntime(
       root: session.workspace,
       cacheDir,
       server: {
-        watch: workspaceWatchOptions(workspaceRoots),
+        watch: null,
         middlewareMode: options.server ? { server: options.server } : true,
         hmr: {
           server: options.server,
@@ -774,7 +780,6 @@ export function createShowRuntime(
       },
       plugins: [
         workspaceFileBoundaryPlugin(fileBoundary),
-        workspaceFreshnessPlugin(workspaceRoots, session.id),
         ssrMarkdownEntryPlugin(),
         vendorImportMapPlugin(bundle),
         ...createVendorExternalizePlugins(providedSpecifiers),
@@ -849,7 +854,10 @@ export function createShowRuntime(
     } satisfies InlineConfig
     await withViteCacheWarmLock(cacheDir, async () => {
       const viteStarted = performance.now()
+      const excludedCache = await realpath(dirname(cacheDir))
+      const baseline = await workspaceSnapshot(session.workspace, excludedCache)
       session.vite = await createViteServer(viteConfig)
+      observers.set(session.vite, observeWorkspace(session.workspace, session.id, session.vite, baseline, excludedCache))
       registerSsrModuleValidationInvalidator(
         session.vite,
         (changedPath) => {
@@ -894,6 +902,7 @@ export function createShowRuntime(
       session.warming = undefined
       return
     }
+    observers.get(vite)?.close()
     session.state = "closing"
     session.updatedAt = new Date()
     session.warming = undefined
