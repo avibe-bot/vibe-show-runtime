@@ -31,6 +31,7 @@ import {
   ssrMarkdownEntryPlugin
 } from "./ssr-markdown-entry-plugin.js"
 import { registerSsrModuleValidationInvalidator } from "./ssr-module-validation-cache.js"
+import { workspaceFreshnessPlugin, workspaceWatchOptions } from "./workspace-freshness.js"
 import { ensureSessionTemplate } from "./templates.js"
 import { createVendorExternalizePlugins, isProvidedVendorSpecifier } from "./vendor-externalize-plugin.js"
 import {
@@ -759,6 +760,7 @@ export function createShowRuntime(
       root: session.workspace,
       cacheDir,
       server: {
+        watch: workspaceWatchOptions(workspaceRoots),
         middlewareMode: options.server ? { server: options.server } : true,
         hmr: {
           server: options.server,
@@ -772,6 +774,7 @@ export function createShowRuntime(
       },
       plugins: [
         workspaceFileBoundaryPlugin(fileBoundary),
+        workspaceFreshnessPlugin(workspaceRoots, session.id),
         ssrMarkdownEntryPlugin(),
         vendorImportMapPlugin(bundle),
         ...createVendorExternalizePlugins(providedSpecifiers),

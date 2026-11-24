@@ -223,6 +223,26 @@ export function GET(_request: Request, context: VibeContext) {
 }
 ```
 
+### Workspace updates
+
+Each warm session uses a one-second Vite polling watcher for its own workspace, so an open
+Show Page receives normal Vite HMR even on filesystems that drop native events. It does
+not poll the shared install, symlink targets outside the workspace, `node_modules`, `.git`,
+`dist`, or `build`. Suspending or pruning the session closes its watcher. Look in the Show
+Runtime log for this line (substitute the session ID):
+
+```json
+{"level":"info","source":"show-runtime","event":"workspace-watch","sessionId":"<id>","mode":"polling","intervalMs":1000}
+```
+
+Cost is roughly one metadata check per watched file/directory per second, per warm session.
+In a local arm64 Mac test with 50 source files and three directories, a warmed idle Vite
+process used about 0.06% of one CPU core over ten seconds; this is an example, not a bound
+for large workspaces or network mounts. On an HTTP module request the runtime also checks
+the source identity before Vite can serve cached code or a 304. Modules containing
+`import.meta.glob` re-expand the glob when requested, so route additions and deletions
+don't have to wait for the next tick.
+
 ## Status
 
 This project is pre-release. The current server is a minimal sidecar suitable
