@@ -5,18 +5,45 @@ import { createRoot, type Root } from "react-dom/client"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { ShowSessionProvider, useShowSession, type ShowSessionContextValue, type ShowSessionProviderProps } from "./react.js"
 import { TestEventSource, TestWebSocket, showFrame } from "../test/event-stream-fixture.js"
+import { SHOW_EVENT_WRITE_TOKEN_HEADER, type ShowEvent } from "./index.js"
 
 let root: Root
 let container: HTMLDivElement
 let latest: ShowSessionContextValue
+let setDraft: React.Dispatch<React.SetStateAction<string>>
+let mounts: number
+let unmounts: number
+let observed: Array<{ config: ShowSessionContextValue["config"]; ids: string[]; cursor?: string; connected: boolean; error: Error | null }>
 
 function Consumer() {
   latest = useShowSession()
-  return <output>{latest.events.map((event) => event.id).join(",")}</output>
+  const [draft, updateDraft] = React.useState("")
+  setDraft = updateDraft
+  React.useEffect(() => {
+    mounts += 1
+    return () => { unmounts += 1 }
+  }, [])
+  observed.push({ config: latest.config, ids: latest.events.map((event) => event.id), cursor: latest.lastEventId, connected: latest.connected, error: latest.error })
+  return <><input value={draft} onChange={(event) => updateDraft(event.target.value)} /><output>{latest.events.map((event) => event.id).join(",")}</output></>
 }
 
 function render(props: Omit<ShowSessionProviderProps, "children"> = {}) {
   act(() => root.render(<ShowSessionProvider {...props}><Consumer /></ShowSessionProvider>))
+}
+
+function event(id: string): ShowEvent {
+  return JSON.parse(showFrame(id).split("data: ")[1]) as ShowEvent
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+
+function jsonResponse(body: unknown) {
+  return new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } })
 }
 
 beforeEach(() => {
@@ -29,6 +56,9 @@ beforeEach(() => {
   vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://runtime.test/show/s/", eventStreamTransport: "websocket-sse-v1" })
   TestWebSocket.instances = []
   TestEventSource.instances = []
+  mounts = 0
+  unmounts = 0
+  observed = []
   container = document.createElement("div")
   document.body.append(container)
   root = createRoot(container)
@@ -202,5 +232,385 @@ describe("ShowSessionProvider consumes the shared subscription transport", () =>
     act(() => sse.receive(JSON.stringify({ id: "sse-event", type: "system.runtime.status" })))
     expect(container.textContent).toBe("sse-event")
     expect(TestWebSocket.instances).toHaveLength(0)
+  })
+})
+
+describe("ShowSessionProvider source lifetime preserves the application", () => {
+  const changes: Array<[string, Omit<ShowSessionProviderProps, "children">]> = [
+    ["sessionId", { sessionId: "replacement" }],
+    ["basePath", { basePath: "https://replacement.test/show/next/" }],
+    ["streamPath", { streamPath: "/show/next/__show/events?stream=1" }],
+    ["eventsPath", { eventsPath: "/show/next/__show/events" }]
+  ]
+
+  it.each(changes)("preserves consumer draft and mount identity across %s source changes", (_name, replacement) => {
+    render()
+    act(() => {
+      setDraft("unsent draft")
+      TestWebSocket.instances[0].open()
+      TestWebSocket.instances[0].receive(showFrame("old"))
+    })
+    render(replacement)
+    expect(container.querySelector("input")?.value).toBe("unsent draft")
+    expect(mounts).toBe(1)
+    expect(unmounts).toBe(0)
+    expect(latest.events).toEqual([])
+    expect(latest.lastEventId).toBeUndefined()
+    expect(latest.connected).toBe(false)
+    expect(latest.error).toBeNull()
+  })
+
+  it.each(changes)("never exposes prior source state on the first %s switched render, including queued updates", (_name, replacement) => {
+    // Use SSE so queued handlers can be driven directly after disposal too.
+    vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://runtime.test/show/s/" })
+    render()
+    const source = TestEventSource.instances[0]
+    act(() => {
+      source.onopen?.(new Event("open"))
+      source.receive("{malformed")
+      source.receive(JSON.stringify(event("old")))
+    })
+    expect(latest.connected).toBe(true)
+    expect(latest.error).toBeInstanceOf(Error)
+    observed = []
+    act(() => {
+      source.receive(JSON.stringify(event("queued-old")))
+      root.render(<ShowSessionProvider {...replacement}><Consumer /></ShowSessionProvider>)
+    })
+    expect(observed.length).toBeGreaterThan(0)
+    for (const frame of observed) {
+      expect(frame.ids).toEqual([])
+      expect(frame.cursor).toBeUndefined()
+      expect(frame.connected).toBe(false)
+      expect(frame.error).toBeNull()
+    }
+  })
+
+  it("switches effective transport while retaining consumer identity", () => {
+    render()
+    act(() => { setDraft("keep"); TestWebSocket.instances[0].receive(showFrame("old")) })
+    vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://runtime.test/show/s/" })
+    render()
+    expect(TestWebSocket.instances[0].closeCount).toBe(1)
+    expect(TestEventSource.instances).toHaveLength(1)
+    expect(latest.events).toEqual([])
+    expect(container.querySelector("input")?.value).toBe("keep")
+    render({ eventStreamTransport: "websocket-sse-v1" })
+    expect(TestEventSource.instances[0].closeCount).toBe(1)
+    expect(TestWebSocket.instances).toHaveLength(2)
+    expect(mounts).toBe(1)
+    expect(unmounts).toBe(0)
+  })
+
+  it("seeds each source once without reseeding same-source renders", () => {
+    render({ initialEvents: [event("seed-a")] })
+    expect(new URL(TestWebSocket.instances[0].url).searchParams.get("after_id")).toBe("seed-a")
+    render({ initialEvents: [event("ignored-new-seed")] })
+    expect(container.textContent).toBe("seed-a")
+    expect(TestWebSocket.instances).toHaveLength(1)
+    const onEvent = vi.fn()
+    render({ sessionId: "next", initialEvents: [event("seed-b")], onEvent })
+    expect(container.textContent).toBe("seed-b")
+    expect(new URL(TestWebSocket.instances[1].url).searchParams.get("after_id")).toBe("seed-b")
+    act(() => TestWebSocket.instances[1].receive(showFrame("seed-b")))
+    expect(container.textContent).toBe("seed-b")
+    expect(onEvent).not.toHaveBeenCalled()
+    act(() => TestWebSocket.instances[1].receive(showFrame("seed-a")))
+    expect(container.textContent).toBe("seed-b,seed-a")
+  })
+
+  it.each(["source switch", "autoConnect", "options"])("ignores every queued callback from a disposed subscription after %s", (reason) => {
+    vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://runtime.test/show/s/" })
+    const onEvent = vi.fn()
+    const onError = vi.fn()
+    render({ onEvent, onError })
+    const old = TestEventSource.instances[0]
+    const open = old.onopen
+    const error = old.onerror
+    if (reason === "source switch") render({ sessionId: "next", onEvent, onError })
+    if (reason === "autoConnect") render({ autoConnect: false, onEvent, onError })
+    if (reason === "options") render({ writeToken: "replacement", onEvent, onError })
+    expect(old.closeCount).toBe(1)
+    act(() => {
+      open?.(new Event("open"))
+      error?.(new Event("error"))
+      old.receive(JSON.stringify(event("stale")))
+      old.receive("{invalid stale")
+    })
+    expect(latest.connected).toBe(false)
+    expect(latest.error).toBeNull()
+    expect(latest.events).toEqual([])
+    expect(onEvent).not.toHaveBeenCalled()
+    expect(onError).not.toHaveBeenCalled()
+    if (reason === "autoConnect") {
+      render({ onEvent, onError })
+      expect(TestEventSource.instances).toHaveLength(2)
+    }
+  })
+
+  it.each(["HTTP", "JSON"])("ignores refresh completions from a previous source at the %s await", async (boundary) => {
+    const http = deferred<Response>()
+    const body = deferred<{ events: ShowEvent[] }>()
+    const fetchImpl = vi.fn<typeof fetch>().mockReturnValue(http.promise)
+    render({ fetch: fetchImpl })
+    const operation = latest.refresh()
+    expect(fetchImpl).toHaveBeenCalledOnce()
+    if (boundary === "JSON") {
+      await act(async () => http.resolve({ ok: true, json: () => body.promise } as Response))
+    }
+    render({ sessionId: "next", initialEvents: [event("next-seed")] })
+    if (boundary === "HTTP") http.resolve({ ok: true, json: () => body.promise } as Response)
+    body.resolve({ events: [event("old-refresh")] })
+    await act(async () => operation)
+    expect(container.textContent).toBe("next-seed")
+    expect(latest.lastEventId).toBe("next-seed")
+    act(() => TestWebSocket.instances[1].receive(showFrame("old-refresh")))
+    expect(container.textContent).toBe("next-seed,old-refresh")
+  })
+
+  it("keeps refresh rejection semantics after a source switch", async () => {
+    const http = deferred<Response>()
+    render({ fetch: vi.fn<typeof fetch>().mockReturnValue(http.promise) })
+    const operation = latest.refresh()
+    const failure = expect(operation).rejects.toThrow("Show events refresh failed: 403")
+    render({ sessionId: "next" })
+    http.resolve(new Response("denied", { status: 403 }))
+    await act(async () => failure)
+    expect(latest.events).toEqual([])
+    expect(latest.error).toBeNull()
+  })
+
+  it("does not revive an earlier source lifetime when its URL is selected again", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ ok: true, event: event("obsolete") }))
+    render({ sessionId: "original", fetch: fetchImpl })
+    const oldSubmit = latest.submitEvent
+    render({ sessionId: "other", fetch: fetchImpl })
+    render({ sessionId: "original", fetch: fetchImpl })
+    await act(async () => { await oldSubmit(event("retained")) })
+    expect(latest.events).toEqual([])
+    act(() => TestWebSocket.instances[2].receive(showFrame("obsolete")))
+    expect(latest.events.map((value) => value.id)).toEqual(["obsolete"])
+  })
+
+  it.each(["submitEvent", "submitIntent", "submitAnnotation"] as const)("ignores previous-source %s results while preserving caller results", async (method) => {
+    const http = deferred<Response>()
+    const body = deferred<unknown>()
+    const fetchImpl = vi.fn<typeof fetch>().mockReturnValue(http.promise)
+    const onEvent = vi.fn()
+    render({ fetch: fetchImpl, onEvent, sessionId: "original" })
+    const operation = method === "submitEvent" ? latest.submitEvent(event("submitted"))
+      : method === "submitIntent" ? latest.submitIntent({ text: "intent" })
+        : latest.submitAnnotation({ id: "annotation", intent: "comment", text: "comment" })
+    await act(async () => http.resolve({ ok: true, json: () => body.promise } as Response))
+    const replacementCallback = vi.fn()
+    render({ sessionId: "next", onEvent: replacementCallback })
+    const result = { ok: true, event: event("server-result") }
+    body.resolve(result)
+    let received: unknown
+    await act(async () => { received = await operation })
+    expect(received).toBe(result)
+    expect(JSON.parse(String(fetchImpl.mock.calls[0][1]?.body)).sessionId).toBe("original")
+    expect(latest.events).toEqual([])
+    expect(latest.lastEventId).toBeUndefined()
+    expect(onEvent).not.toHaveBeenCalled()
+    expect(replacementCallback).not.toHaveBeenCalled()
+  })
+
+  it("retained old operations cannot affect or retarget a replacement source", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (_url, init) =>
+      jsonResponse(init?.method === "POST" ? { ok: true, event: event("old-submit") } : { events: [event("old-refresh")] }))
+    vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://runtime.test/show/old/", sessionId: "old", writeToken: "old-token", eventStreamTransport: "websocket-sse-v1" })
+    render({ fetch: fetchImpl })
+    const old = latest
+    vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://runtime.test/show/new/", sessionId: "new", writeToken: "new-token", eventStreamTransport: "websocket-sse-v1" })
+    const onEvent = vi.fn()
+    render({ onEvent })
+    await act(async () => {
+      await old.refresh()
+      expect(await old.submitEvent(event("retained"))).toMatchObject({ ok: true })
+    })
+    expect(fetchImpl.mock.calls.map(([url]) => String(url))).toEqual([
+      "https://runtime.test/show/old/__show/events", "https://runtime.test/show/old/__show/events"
+    ])
+    expect(fetchImpl.mock.calls[1][1]?.headers).toMatchObject({ [SHOW_EVENT_WRITE_TOKEN_HEADER]: "old-token" })
+    expect(JSON.parse(String(fetchImpl.mock.calls[1][1]?.body)).sessionId).toBe("old")
+    expect(latest.events).toEqual([])
+    expect(onEvent).not.toHaveBeenCalled()
+  })
+
+  it("updates same-source client options without resetting consumer state", async () => {
+    const fetchA = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ ok: true, event: event("a") }))
+    const fetchB = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse({ ok: true, event: event("b") }))
+    render({ fetch: fetchA, writeToken: "token-a" })
+    act(() => { setDraft("keep"); TestWebSocket.instances[0].receive(showFrame("live")) })
+    render({ fetch: fetchB, writeToken: "token-b" })
+    expect(TestWebSocket.instances[0].closeCount).toBe(1)
+    expect(new URL(TestWebSocket.instances[1].url).searchParams.get("after_id")).toBe("live")
+    expect(container.textContent).toBe("live")
+    expect(container.querySelector("input")?.value).toBe("keep")
+    await act(async () => { await latest.submitEvent(event("request")) })
+    expect(fetchA).not.toHaveBeenCalled()
+    expect(fetchB.mock.calls[0][1]?.headers).toMatchObject({ [SHOW_EVENT_WRITE_TOKEN_HEADER]: "token-b" })
+    expect(container.textContent).toBe("live,b")
+    expect(mounts).toBe(1)
+    expect(unmounts).toBe(0)
+  })
+
+  it("retains per-submit target and token overrides", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ ok: true }))
+    render({ basePath: "https://original.test/show/source/", fetch: fetchImpl, writeToken: "original" })
+    await act(async () => { await latest.submitEvent(event("override"), { basePath: "https://override.test/show/other/", writeToken: "override", sessionId: "other" }) })
+    expect(String(fetchImpl.mock.calls[0][0])).toBe("https://override.test/show/other/__show/events")
+    expect(fetchImpl.mock.calls[0][1]?.headers).toMatchObject({ [SHOW_EVENT_WRITE_TOKEN_HEADER]: "override" })
+    expect(JSON.parse(String(fetchImpl.mock.calls[0][1]?.body)).sessionId).toBe("other")
+  })
+
+  it("updates error callbacks without replacing the subscription", () => {
+    const original = vi.fn()
+    const replacement = vi.fn()
+    render({ onError: original })
+    render({ onError: replacement })
+    act(() => TestWebSocket.instances[0].receive("event: show.event\ndata: {invalid\n\n"))
+    expect(original).not.toHaveBeenCalled()
+    expect(replacement).toHaveBeenCalledOnce()
+    expect(TestWebSocket.instances).toHaveLength(1)
+  })
+
+  it.each(["refresh", "submit"])("unmount isolates a pending %s completion and preserves its caller contract", async (operation) => {
+    const http = deferred<Response>()
+    const fetchImpl = vi.fn<typeof fetch>().mockReturnValue(http.promise)
+    const onEvent = vi.fn()
+    const onError = vi.fn()
+    render({ fetch: fetchImpl, onEvent, onError })
+    const pending = operation === "refresh" ? latest.refresh() : latest.submitEvent(event("submitted"))
+    act(() => root.unmount())
+    const result = operation === "refresh" ? { events: [event("late")] } : { ok: true, event: event("late") }
+    http.resolve(jsonResponse(result))
+    await act(async () => { expect(await pending).toEqual(operation === "refresh" ? undefined : result) })
+    expect(onEvent).not.toHaveBeenCalled()
+    expect(onError).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("refresh replaces cursor and dedup before the next same-source subscription", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ events: [event("refreshed")] }))
+    render({ fetch: fetchImpl, initialEvents: [event("old")] })
+    await act(async () => latest.refresh())
+    render({ fetch: fetchImpl, autoConnect: false })
+    render({ fetch: fetchImpl })
+    expect(new URL(TestWebSocket.instances[1].url).searchParams.get("after_id")).toBe("refreshed")
+    act(() => TestWebSocket.instances[1].receive(showFrame("old")))
+    expect(container.textContent).toBe("refreshed,old")
+  })
+
+  it("keeps one live subscription under StrictMode", () => {
+    const onEvent = vi.fn()
+    act(() => root.render(<React.StrictMode><ShowSessionProvider onEvent={onEvent}><Consumer /></ShowSessionProvider></React.StrictMode>))
+    act(() => setDraft("strict draft"))
+    expect(TestWebSocket.instances.filter((socket) => socket.closeCount === 0)).toHaveLength(1)
+    const live = TestWebSocket.instances.at(-1)!
+    act(() => {
+      for (const socket of TestWebSocket.instances) socket.receive(showFrame("event"))
+      live.receive(showFrame("event"))
+    })
+    expect(onEvent).toHaveBeenCalledOnce()
+    expect(container.textContent).toBe("event")
+    const before = { mounts, unmounts }
+    act(() => root.render(<React.StrictMode><ShowSessionProvider sessionId="next" onEvent={onEvent}><Consumer /></ShowSessionProvider></React.StrictMode>))
+    expect({ mounts, unmounts }).toEqual(before)
+    expect(container.querySelector("input")?.value).toBe("strict draft")
+    expect(latest.events).toEqual([])
+    expect(TestWebSocket.instances.filter((socket) => socket.closeCount === 0)).toHaveLength(1)
+  })
+})
+
+describe("ShowSessionProvider commit and operation boundaries", () => {
+  it("preserves caller rejection from pending and retained submissions", async () => {
+    const http = deferred<Response>()
+    const fetchImpl = vi.fn<typeof fetch>().mockReturnValue(http.promise)
+    render({ fetch: fetchImpl })
+    const old = latest
+    const pending = old.submitEvent(event("pending"))
+    const pendingFailure = expect(pending).rejects.toThrow("Show event submit failed: 403")
+    render({ sessionId: "replacement" })
+    const retained = old.submitIntent({ text: "retained" })
+    const retainedFailure = expect(retained).rejects.toThrow("Show event submit failed: 403")
+    http.resolve(new Response("denied", { status: 403 }))
+    await act(async () => { await Promise.all([pendingFailure, retainedFailure]) })
+    expect(latest.events).toEqual([])
+    expect(latest.error).toBeNull()
+  })
+
+  it("ignores a submit response delayed before its HTTP resolution", async () => {
+    const http = deferred<Response>()
+    const onEvent = vi.fn()
+    render({ fetch: vi.fn<typeof fetch>().mockReturnValue(http.promise), onEvent })
+    const pending = latest.submitEvent(event("pending"))
+    render({ sessionId: "replacement", onEvent })
+    const result = { ok: true, event: event("late") }
+    http.resolve(jsonResponse(result))
+    await act(async () => { expect(await pending).toEqual(result) })
+    expect(latest.events).toEqual([])
+    expect(onEvent).not.toHaveBeenCalled()
+  })
+
+  it("preserves per-event session identity ahead of injected submission defaults", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse({ ok: true }))
+    vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://runtime.test/show/s/", sessionId: "injected", eventStreamTransport: "websocket-sse-v1" })
+    render({ fetch: fetchImpl })
+    await act(async () => {
+      await latest.submitEvent({ ...event("explicit"), sessionId: "event-session" })
+      await latest.submitEvent(event("fallback"))
+    })
+    expect(fetchImpl.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).sessionId)).toEqual(["event-session", "injected"])
+  })
+
+  it("captures the legacy document session fallback for a retained operation", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse({ ok: true }))
+    render({ fetch: fetchImpl })
+    const oldSubmit = latest.submitEvent
+    vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://runtime.test/show/new/", sessionId: "new", eventStreamTransport: "websocket-sse-v1" })
+    render()
+    await act(async () => { await oldSubmit(event("retained")) })
+    expect(JSON.parse(String(fetchImpl.mock.calls[0][1]?.body)).sessionId).toBe("s")
+    expect(latest.events).toEqual([])
+  })
+
+  it("allows an operation started by a child layout effect to update its committed source", async () => {
+    const http = deferred<Response>()
+    let pending!: Promise<void>
+    function LayoutConsumer() {
+      const context = useShowSession()
+      React.useLayoutEffect(() => { pending = context.refresh() }, [context.refresh])
+      return <Consumer />
+    }
+    const fetchImpl = vi.fn<typeof fetch>().mockReturnValue(http.promise)
+    act(() => root.render(<ShowSessionProvider fetch={fetchImpl}><LayoutConsumer /></ShowSessionProvider>))
+    http.resolve(jsonResponse({ events: [event("layout-refresh")] }))
+    await act(async () => pending)
+    expect(latest.events.map((value) => value.id)).toEqual(["layout-refresh"])
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+
+  it("keeps the committed source live when a concurrent replacement render is abandoned", async () => {
+    const never = new Promise<void>(() => {})
+    function SuspendReplacement() {
+      if (useShowSession().config.sessionId === "suspended") throw never
+      return null
+    }
+    function application(sessionId: string) {
+      return <React.Suspense fallback={<span>pending</span>}><ShowSessionProvider sessionId={sessionId}><Consumer /><SuspendReplacement /></ShowSessionProvider></React.Suspense>
+    }
+    await act(async () => root.render(application("original")))
+    act(() => setDraft("committed draft"))
+    const socket = TestWebSocket.instances[0]
+    await act(async () => React.startTransition(() => root.render(application("suspended"))))
+    expect(socket.closeCount).toBe(0)
+    act(() => socket.receive(showFrame("still-current")))
+    await act(async () => root.render(application("original")))
+    expect(latest.events.map((value) => value.id)).toEqual(["still-current"])
+    expect(container.querySelector("input")?.value).toBe("committed draft")
+    expect(TestWebSocket.instances).toHaveLength(1)
+    expect(mounts).toBe(1)
   })
 })

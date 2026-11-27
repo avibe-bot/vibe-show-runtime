@@ -13,6 +13,16 @@ reconnection and resumes with `after_id`. Closing a source cancels reconnection
 and prevents late deliveries. Provider source changes reset source-owned state.
 An overridden stream on another origin cannot inherit the injected capability.
 
+The Provider and its consumer subtree retain their React identity across source
+changes. Only events, initial seed, deduplication, cursor, connection and error
+state belong to the source. Its first exposed render contains that source's
+data; committing a replacement invalidates old socket callbacks and asynchronous
+refresh/submission effects. An abandoned concurrent replacement leaves the
+committed source live. Retained operations keep their original target and public
+result/rejection semantics, while obsolete completions cannot change the new
+source or invoke its callbacks. Callback and same-source option updates preserve
+source data; closing a replaced subscription also invalidates its queued listeners.
+
 The 2026-11-27 security amendment makes an authoritative access denial terminal.
 After WS failure on a same-origin `/show/{id}/__show/events` or
 `/p/{id}/__show/events` URL, the SDK performs one ordinary JSON GET to the same
@@ -39,7 +49,8 @@ installation or production state changes are part of this work.
 - Unit tests exercise fragmented SSE frames, listener semantics, cursor replay,
   bounded reconnect, close cleanup, capability isolation and compatibility.
 - React DOM tests mount the real Provider and exercise live delivery, reconnect,
-  source changes and unmount cleanup.
+  stateful child identity, the first switched render, deferred HTTP/JSON results,
+  retained operations, StrictMode, abandoned concurrent renders and unmount cleanup.
 - Build and typecheck the workspace; run focused SDK tests and workspace tests.
 - Avibe integration tests cover Chromium/WebKit multi-document behavior and
   shared endpoint authorization, revocation and filtering.

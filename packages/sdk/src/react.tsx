@@ -33,6 +33,7 @@ import {
   markAttributes,
   markAttributeName,
   normalizeShowEvent,
+  DEFAULT_SHOW_EVENTS_PATH,
   readRuntimeConfig,
   screenshotAnnotationFromDraft,
   screenshotCaptureScale,
@@ -495,17 +496,28 @@ type ScreenshotDraft = {
 
 const ShowSessionContext = React.createContext<ShowSessionContextValue | null>(null)
 
-export function ShowSessionProvider(props: ShowSessionProviderProps) {
-  // Cursor, deduplication and visible events all belong to one source. A source
-  // change unmounts the old owner before the replacement begins subscribing.
-  const sourceKey = JSON.stringify([
-    props.sessionId, showEventsUrl(props), showEventsStreamUrl(props),
-    props.eventStreamTransport, readRuntimeConfig().eventStreamTransport
-  ])
-  return <ShowSessionProviderState key={sourceKey} {...props} />
+type SessionSource = {
+  eventIds: Set<string>
+  lastEventId?: string
 }
 
-function ShowSessionProviderState({
+type SessionSnapshot = {
+  source: SessionSource
+  events: ShowEvent[]
+  connected: boolean
+  error: Error | null
+}
+
+function sessionSnapshot(events: ShowEvent[]): SessionSnapshot {
+  return {
+    source: { eventIds: new Set(events.map((event) => event.id)), lastEventId: events.at(-1)?.id },
+    events,
+    connected: false,
+    error: null
+  }
+}
+
+export function ShowSessionProvider({
   sessionId,
   children,
   initialEvents = [],
@@ -514,89 +526,114 @@ function ShowSessionProviderState({
   onError,
   ...clientOptions
 }: ShowSessionProviderProps) {
-  const [events, setEvents] = React.useState<ShowEvent[]>(initialEvents)
-  const [connected, setConnected] = React.useState(false)
-  const [error, setError] = React.useState<Error | null>(null)
+  const runtime = readRuntimeConfig()
+  const documentUrl = globalThis.location?.href ?? "http://127.0.0.1/"
+  const eventsUrl = new URL(showEventsUrl(clientOptions), documentUrl).href
+  const streamUrl = new URL(showEventsStreamUrl(clientOptions), documentUrl).href
+  const transport = showEventsStreamTransport(clientOptions)
+  const locationSession = globalThis.location?.pathname.match(/\/show\/([^/]+)/)
+  const defaultSessionId = runtime.sessionId ?? (locationSession ? decodeURIComponent(locationSession[1]) : undefined)
+  const effectiveSessionId = sessionId ?? defaultSessionId
+  const sourceKey = JSON.stringify([effectiveSessionId, eventsUrl, streamUrl, transport])
+  const seed = React.useMemo(() => sessionSnapshot(initialEvents), [sourceKey])
+  const [stored, setSnapshot] = React.useState(seed)
+  // Present the new source immediately, but only replace stored state after
+  // commit. An abandoned concurrent render must leave the live source intact.
+  const snapshot = stored.source === seed.source ? stored : seed
+  const { source: owner, events, connected, error } = snapshot
   const lastEventId = events.at(-1)?.id
-  const lastEventIdRef = React.useRef<string | undefined>(lastEventId)
-  const eventIdsRef = React.useRef(new Set(initialEvents.map((event) => event.id)))
+  const currentSource = React.useRef<SessionSource | null>(null)
   const callbacks = React.useRef({ onEvent, onError })
-  callbacks.current = { onEvent, onError }
+  React.useLayoutEffect(() => {
+    currentSource.current = owner
+    setSnapshot((current) => current.source === owner ? current : seed)
+    return () => {
+      if (currentSource.current === owner) currentSource.current = null
+    }
+  }, [owner, seed])
+  React.useLayoutEffect(() => {
+    callbacks.current = { onEvent, onError }
+  }, [onEvent, onError])
+
+  // Capture injected defaults as well as explicit options. Retained operations
+  // keep their original target/options even if the host replaces its config.
+  const basePath = new URL(clientOptions.basePath ?? runtime.basePath ?? "./", documentUrl).href
+  const eventsPath = clientOptions.eventsPath ?? runtime.eventsPath ?? DEFAULT_SHOW_EVENTS_PATH
+  const streamPath = clientOptions.streamPath ?? runtime.streamPath
+  const writeToken = clientOptions.writeToken ?? runtime.writeToken ?? ""
   const options = React.useMemo(
-    () => ({ ...clientOptions, sessionId }),
-    [clientOptions.basePath, clientOptions.eventsPath, clientOptions.fetch, clientOptions.streamPath, clientOptions.eventStreamTransport, clientOptions.writeToken, sessionId]
+    () => ({ basePath, eventsPath, streamPath, eventStreamTransport: transport, writeToken, fetch: clientOptions.fetch, sessionId }),
+    [basePath, eventsPath, streamPath, transport, writeToken, clientOptions.fetch, sessionId]
   )
 
-  React.useEffect(() => {
-    lastEventIdRef.current = lastEventId
-  }, [lastEventId])
-
-  const appendEvent = React.useCallback(
-    (event: ShowEvent) => {
-      if (eventIdsRef.current.has(event.id)) return
-      eventIdsRef.current.add(event.id)
-      lastEventIdRef.current = event.id
-      setEvents((current) => {
-        return [...current, event]
-      })
-      callbacks.current.onEvent?.(event)
-    },
-    []
-  )
+  const appendEvent = React.useCallback((event: ShowEvent) => {
+    if (currentSource.current !== owner || owner.eventIds.has(event.id)) return
+    owner.eventIds.add(event.id)
+    owner.lastEventId = event.id
+    setSnapshot((current) => current.source === owner ? { ...current, events: [...current.events, event] } : current)
+    callbacks.current.onEvent?.(event)
+  }, [owner])
 
   const refresh = React.useCallback(async () => {
-    const { showEventsUrl } = await import("./index.js")
     const fetchImpl = options.fetch ?? fetch
     const response = await fetchImpl(showEventsUrl(options))
     if (!response.ok) {
       throw new Error(`Show events refresh failed: ${response.status} ${response.statusText}`)
     }
     const body = (await response.json()) as { events?: ShowEvent[] }
+    if (currentSource.current !== owner) return
     const nextEvents = Array.isArray(body.events) ? body.events : []
-    eventIdsRef.current = new Set(nextEvents.map((event) => event.id))
-    setEvents(nextEvents)
-  }, [options])
+    owner.eventIds = new Set(nextEvents.map((event) => event.id))
+    owner.lastEventId = nextEvents.at(-1)?.id
+    setSnapshot((current) => current.source === owner ? { ...current, events: nextEvents } : current)
+  }, [options, owner])
 
   React.useEffect(() => {
     if (!autoConnect) return
     // Preserve the old non-browser/unsupported-WebView no-op only for SSE.
     // An advertised WS source does not depend on the EventSource API.
-    if (typeof EventSource === "undefined" && showEventsStreamTransport(options) !== "websocket-sse-v1") return
+    if (typeof EventSource === "undefined" && transport !== "websocket-sse-v1") return
     let closed = false
-    const source = subscribeShowEvents({ ...options, afterId: lastEventIdRef.current })
+    const active = () => !closed && currentSource.current === owner
+    const source = subscribeShowEvents({ ...options, afterId: owner.lastEventId })
     source.onopen = () => {
-      if (!closed) setConnected(true)
+      if (active()) setSnapshot((current) => active() && current.source === owner ? { ...current, connected: true } : current)
     }
     source.onerror = () => {
-      if (!closed) setConnected(false)
+      if (active()) setSnapshot((current) => active() && current.source === owner ? { ...current, connected: false } : current)
     }
     source.addEventListener("show.event", (message) => {
-      if (closed) return
+      if (!active()) return
       try {
         appendEvent(JSON.parse((message as MessageEvent).data) as ShowEvent)
       } catch (parseError) {
+        if (!active()) return
         const nextError = parseError instanceof Error ? parseError : new Error("Failed to parse Show event")
-        setError(nextError)
+        setSnapshot((current) => current.source === owner ? { ...current, error: nextError } : current)
         callbacks.current.onError?.(nextError)
       }
     })
     return () => {
       closed = true
       source.close()
-      setConnected(false)
+      if (currentSource.current === owner) {
+        setSnapshot((current) => current.source === owner ? { ...current, connected: false } : current)
+      }
     }
-  }, [appendEvent, autoConnect, options])
+  }, [appendEvent, autoConnect, options, owner, transport])
 
   const submitEvent = React.useCallback(
     async (event: ShowEventInput | ShowEvent, submitOptions: SubmitShowEventOptions = {}) => {
       const mergedOptions = { ...options, ...submitOptions }
-      const normalized = normalizeShowEvent(event, mergedOptions.sessionId ?? sessionId)
-      const result = await submitShowEvent(normalized, mergedOptions)
-      const responseEvent = responseEventFromResult(result)
-      appendEvent(responseEvent ?? normalized)
+      const normalized = normalizeShowEvent(event, mergedOptions.sessionId)
+      const result = await submitShowEvent(normalized, {
+        ...mergedOptions,
+        sessionId: mergedOptions.sessionId ?? normalized.sessionId ?? defaultSessionId
+      })
+      if (currentSource.current === owner) appendEvent(responseEventFromResult(result) ?? normalized)
       return result
     },
-    [appendEvent, options, sessionId]
+    [appendEvent, options, owner, defaultSessionId]
   )
 
   const value = React.useMemo<ShowSessionContextValue>(
