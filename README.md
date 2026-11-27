@@ -85,6 +85,24 @@ Supported event families include `human.intent.submitted`,
 `system.runtime.*`. Private Show Pages submit to `__show/events`; the runtime
 also exposes the same endpoint as an SSE stream for replay and live updates.
 
+The SDK supports the optional runtime/client configuration
+`eventStreamTransport: "websocket-sse-v1"`. Both `subscribeShowEvents()` and
+`ShowSessionProvider` then receive the existing SSE frames over WebSocket,
+preserving event names and payloads while avoiding persistent HTTP request
+slots. The SDK changes only the endpoint scheme (`http` to `ws`, `https` to
+`wss`), reconnects with a bounded backoff, and resumes with `after_id`.
+Calling `close()` or unmounting the Provider cancels reconnects.
+
+An absent capability keeps native EventSource for older Runtimes. A WebSocket
+failure never falls back to SSE. An explicitly overridden stream on a different
+origin requires its own capability; it cannot inherit the injected Runtime's.
+
+After a same-origin Show WS failure, the SDK checks admission once through an
+ordinary JSON GET of the same events endpoint with `stream` removed. Explicit
+access denials stop reconnection; network/5xx failures retain backoff. Closing
+cancels the bounded probe. Custom/foreign stream URLs do not inherit this HTTP
+probe policy. See `docs/event-websocket-transport.md` for the status policy.
+
 ## Theme Customization
 
 The workspace theme import exposes the standard shadcn token contract. Define
