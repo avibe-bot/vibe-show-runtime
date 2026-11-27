@@ -1,3 +1,7 @@
+import { WebSocketEventSource, type ShowEventStreamTransport } from "./event-stream.js"
+
+export type { ShowEventStreamTransport } from "./event-stream.js"
+
 export const DEFAULT_MARK_SCOPE = "default"
 export const MARK_ATTRIBUTE_PREFIX = "mark-"
 /**
@@ -397,6 +401,7 @@ export type ShowClientOptions = {
   basePath?: string
   eventsPath?: string
   streamPath?: string
+  eventStreamTransport?: ShowEventStreamTransport
   writeToken?: string
   fetch?: typeof fetch
 }
@@ -422,6 +427,7 @@ export type RuntimeConfig = {
   basePath?: string
   eventsPath?: string
   streamPath?: string
+  eventStreamTransport?: ShowEventStreamTransport
   writeToken?: string
   /** Annotation config injected by the server + control API attached by the runtime (contract §1/§2). */
   annotation?: AnnotationRuntimeConfig
@@ -609,12 +615,20 @@ export function showEventsStreamUrl(options: ShowClientOptions = {}) {
   return streamUrl(options)
 }
 
-export function subscribeShowEvents(options: ShowClientOptions & { afterId?: string } = {}) {
+export function subscribeShowEvents(options: ShowClientOptions & { afterId?: string } = {}): EventSource {
   const url = new URL(streamUrl(options), globalThis.location?.href ?? "http://127.0.0.1/")
   if (options.afterId) {
     url.searchParams.set("after_id", options.afterId)
   }
-  return new EventSource(url.toString())
+  const runtime = readRuntimeConfig()
+  const runtimeUrl = new URL(streamUrl({}), globalThis.location?.href ?? "http://127.0.0.1/")
+  // An explicit capability describes the caller's target. Injected capabilities
+  // belong only to the injected endpoint's origin, never an overridden origin.
+  const transport = options.eventStreamTransport ??
+    (url.origin === runtimeUrl.origin ? runtime.eventStreamTransport : undefined)
+  return transport === "websocket-sse-v1"
+    ? new WebSocketEventSource(url)
+    : new EventSource(url.toString())
 }
 
 export function normalizeShowEvent(event: ShowEventInput | ShowEvent, sessionId?: string): ShowEvent {

@@ -40,6 +40,8 @@ import {
   screenshotRectFromViewport,
   resolveAnchor,
   showEventsUrl,
+  showEventsStreamUrl,
+  subscribeShowEvents,
   submitAgentMark,
   submitAnnotation,
   submitIntent,
@@ -492,7 +494,17 @@ type ScreenshotDraft = {
 
 const ShowSessionContext = React.createContext<ShowSessionContextValue | null>(null)
 
-export function ShowSessionProvider({
+export function ShowSessionProvider(props: ShowSessionProviderProps) {
+  // Cursor, deduplication and visible events all belong to one source. A source
+  // change unmounts the old owner before the replacement begins subscribing.
+  const sourceKey = JSON.stringify([
+    props.sessionId, showEventsUrl(props), showEventsStreamUrl(props),
+    props.eventStreamTransport, readRuntimeConfig().eventStreamTransport
+  ])
+  return <ShowSessionProviderState key={sourceKey} {...props} />
+}
+
+function ShowSessionProviderState({
   sessionId,
   children,
   initialEvents = [],
@@ -507,9 +519,11 @@ export function ShowSessionProvider({
   const lastEventId = events.at(-1)?.id
   const lastEventIdRef = React.useRef<string | undefined>(lastEventId)
   const eventIdsRef = React.useRef(new Set(initialEvents.map((event) => event.id)))
+  const callbacks = React.useRef({ onEvent, onError })
+  callbacks.current = { onEvent, onError }
   const options = React.useMemo(
     () => ({ ...clientOptions, sessionId }),
-    [clientOptions.basePath, clientOptions.eventsPath, clientOptions.fetch, clientOptions.streamPath, clientOptions.writeToken, sessionId]
+    [clientOptions.basePath, clientOptions.eventsPath, clientOptions.fetch, clientOptions.streamPath, clientOptions.eventStreamTransport, clientOptions.writeToken, sessionId]
   )
 
   React.useEffect(() => {
@@ -524,9 +538,9 @@ export function ShowSessionProvider({
       setEvents((current) => {
         return [...current, event]
       })
-      onEvent?.(event)
+      callbacks.current.onEvent?.(event)
     },
-    [onEvent]
+    []
   )
 
   const refresh = React.useCallback(async () => {
@@ -543,43 +557,31 @@ export function ShowSessionProvider({
   }, [options])
 
   React.useEffect(() => {
-    if (!autoConnect || typeof EventSource === "undefined") return
+    if (!autoConnect) return
     let closed = false
-    let source: EventSource | undefined
-    async function connect() {
-      const { showEventsStreamUrl } = await import("./index.js")
-      if (closed) return
-      const url = new URL(showEventsStreamUrl(options), window.location.href)
-      if (lastEventIdRef.current) url.searchParams.set("after_id", lastEventIdRef.current)
-      const nextSource = new EventSource(url.toString())
-      if (closed) {
-        nextSource.close()
-        return
-      }
-      source = nextSource
-      nextSource.onopen = () => {
-        if (!closed) setConnected(true)
-      }
-      nextSource.onerror = () => {
-        if (!closed) setConnected(false)
-      }
-      nextSource.addEventListener("show.event", (message) => {
-        try {
-          appendEvent(JSON.parse((message as MessageEvent).data) as ShowEvent)
-        } catch (parseError) {
-          const nextError = parseError instanceof Error ? parseError : new Error("Failed to parse Show event")
-          setError(nextError)
-          onError?.(nextError)
-        }
-      })
+    const source = subscribeShowEvents({ ...options, afterId: lastEventIdRef.current })
+    source.onopen = () => {
+      if (!closed) setConnected(true)
     }
-    void connect()
+    source.onerror = () => {
+      if (!closed) setConnected(false)
+    }
+    source.addEventListener("show.event", (message) => {
+      if (closed) return
+      try {
+        appendEvent(JSON.parse((message as MessageEvent).data) as ShowEvent)
+      } catch (parseError) {
+        const nextError = parseError instanceof Error ? parseError : new Error("Failed to parse Show event")
+        setError(nextError)
+        callbacks.current.onError?.(nextError)
+      }
+    })
     return () => {
       closed = true
-      source?.close()
+      source.close()
       setConnected(false)
     }
-  }, [appendEvent, autoConnect, onError, options])
+  }, [appendEvent, autoConnect, options])
 
   const submitEvent = React.useCallback(
     async (event: ShowEventInput | ShowEvent, submitOptions: SubmitShowEventOptions = {}) => {
@@ -616,7 +618,7 @@ export function ShowSessionProvider({
         ),
       refresh
     }),
-    [clientOptions.basePath, clientOptions.eventsPath, clientOptions.fetch, clientOptions.streamPath, clientOptions.writeToken, connected, error, events, lastEventId, refresh, sessionId, submitEvent]
+    [clientOptions.basePath, clientOptions.eventsPath, clientOptions.fetch, clientOptions.streamPath, clientOptions.eventStreamTransport, clientOptions.writeToken, connected, error, events, lastEventId, refresh, sessionId, submitEvent]
   )
 
   return <ShowSessionContext.Provider value={value}>{children}</ShowSessionContext.Provider>
@@ -871,6 +873,7 @@ export function ActionButton({
   basePath,
   eventsPath,
   streamPath,
+  eventStreamTransport,
   writeToken,
   fetch: fetchImpl,
   ...buttonProps
@@ -883,6 +886,7 @@ export function ActionButton({
     ...(basePath ? { basePath } : {}),
     ...(eventsPath ? { eventsPath } : {}),
     ...(streamPath ? { streamPath } : {}),
+    ...(eventStreamTransport ? { eventStreamTransport } : {}),
     ...(writeToken ? { writeToken } : {}),
     ...(fetchImpl ? { fetch: fetchImpl } : {})
   }
@@ -5153,6 +5157,7 @@ export function AnnotationRoot({ controller, config = readRuntimeConfig(), probe
       basePath={config.basePath}
       eventsPath={config.eventsPath}
       streamPath={config.streamPath}
+      eventStreamTransport={config.eventStreamTransport}
       writeToken={writeToken}
       initialEvents={initialEvents}
       onEvent={(event) => {
