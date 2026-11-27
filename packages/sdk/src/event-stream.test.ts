@@ -8,6 +8,7 @@ beforeEach(() => {
   TestEventSource.instances = []
   vi.stubGlobal("WebSocket", TestWebSocket)
   vi.stubGlobal("EventSource", TestEventSource)
+  vi.stubGlobal("fetch", vi.fn(async () => new Response("{}")))
   vi.stubGlobal("location", new URL("https://runtime.test/show/session/index.html"))
   vi.stubGlobal("__AVIBE_SHOW__", { basePath: "/show/session/" })
 })
@@ -82,7 +83,7 @@ describe("WebSocket SSE decoding and EventSource interface", () => {
     source.close()
   })
 
-  it("supports open/error/message properties, readyState, removable listeners and once listeners", () => {
+  it("supports open/error/message properties, readyState, removable listeners and once listeners", async () => {
     const source = subscribeShowEvents(websocketOptions)
     expect(source.readyState).toBe(source.CONNECTING)
     const opened = vi.fn()
@@ -105,13 +106,14 @@ describe("WebSocket SSE decoding and EventSource interface", () => {
     expect(once).toHaveBeenCalledOnce()
     expect(removed).not.toHaveBeenCalled()
     socket.fail()
+    await vi.advanceTimersByTimeAsync(0)
     expect(failed).toHaveBeenCalledOnce()
     expect(source.readyState).toBe(source.CONNECTING)
     source.close()
     expect(source.readyState).toBe(source.CLOSED)
   })
 
-  it("does not dispatch incomplete frames or comment heartbeats", () => {
+  it("does not dispatch incomplete frames or comment heartbeats", async () => {
     const source = subscribeShowEvents(websocketOptions)
     const received = vi.fn()
     source.addEventListener("show.event", received)
@@ -120,6 +122,7 @@ describe("WebSocket SSE decoding and EventSource interface", () => {
     socket.receive(": keepalive\n\nid: cursor-only\n\nevent: show.event\ndata: partial")
     expect(received).not.toHaveBeenCalled()
     socket.disconnect()
+    await vi.advanceTimersByTimeAsync(0)
     vi.advanceTimersByTime(500)
     expect(new URL(TestWebSocket.instances[1].url).searchParams.get("after_id")).toBe("cursor-only")
     TestWebSocket.instances[1].receive("data: fresh\n\n")
@@ -130,7 +133,25 @@ describe("WebSocket SSE decoding and EventSource interface", () => {
 })
 
 describe("WebSocket reconnect lifecycle", () => {
-  it("uses only WS through failures, with bounded exponential backoff and cursor replay", () => {
+  it.each(["quiet", "heartbeats"])("resets outage backoff on open even with %s traffic", async (traffic) => {
+    const source = subscribeShowEvents(websocketOptions)
+    for (const delay of [500, 1000, 2000, 4000, 8000, 16000]) {
+      TestWebSocket.instances.at(-1)!.fail()
+      await vi.advanceTimersByTimeAsync(delay)
+    }
+    const recovered = TestWebSocket.instances.at(-1)!
+    const count = TestWebSocket.instances.length
+    recovered.open()
+    if (traffic === "heartbeats") recovered.receive(": idle\n\n")
+    recovered.disconnect()
+    await vi.advanceTimersByTimeAsync(499)
+    expect(TestWebSocket.instances).toHaveLength(count)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(TestWebSocket.instances).toHaveLength(count + 1)
+    source.close()
+  })
+
+  it("uses only WS through failures, with bounded exponential backoff and cursor replay", async () => {
     const source = subscribeShowEvents({ ...websocketOptions, afterId: "seed" })
     const delays = [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000]
     for (const delay of delays) {
@@ -139,6 +160,7 @@ describe("WebSocket reconnect lifecycle", () => {
       const lateClose = socket.onclose
       socket.fail()
       lateClose?.(new Event("close"))
+      await vi.advanceTimersByTimeAsync(0)
       vi.advanceTimersByTime(delay - 1)
       expect(TestWebSocket.instances).toHaveLength(count)
       vi.advanceTimersByTime(1)
@@ -149,13 +171,14 @@ describe("WebSocket reconnect lifecycle", () => {
     recovered.open()
     recovered.receive(showFrame("最新"))
     recovered.disconnect()
+    await vi.advanceTimersByTimeAsync(0)
     vi.advanceTimersByTime(500)
     expect(new URL(TestWebSocket.instances.at(-1)!.url).searchParams.get("after_id")).toBe("最新")
     expect(TestEventSource.instances).toHaveLength(0)
     source.close()
   })
 
-  it("honors empty ID reset and drops obsolete socket deliveries", () => {
+  it("honors empty ID reset and drops obsolete socket deliveries", async () => {
     const source = subscribeShowEvents({ ...websocketOptions, afterId: "seed" })
     const received = vi.fn()
     source.addEventListener("show.event", received)
@@ -164,13 +187,13 @@ describe("WebSocket reconnect lifecycle", () => {
     old.receive("id:\n\n")
     old.disconnect()
     late?.(new MessageEvent("message", { data: showFrame("stale") }))
-    vi.advanceTimersByTime(500)
+    await vi.advanceTimersByTimeAsync(500)
     expect(new URL(TestWebSocket.instances[1].url).searchParams.has("after_id")).toBe(false)
     expect(received).not.toHaveBeenCalled()
     source.close()
   })
 
-  it.each(["connecting", "open", "retry"] as const)("close cancels a source while %s", (state) => {
+  it.each(["connecting", "open", "retry"] as const)("close cancels a source while %s", async (state) => {
     const source = subscribeShowEvents(websocketOptions)
     const socket = TestWebSocket.instances[0]
     const lateMessage = socket.onmessage
@@ -185,7 +208,7 @@ describe("WebSocket reconnect lifecycle", () => {
     source.close()
     lateOpen?.(new Event("open"))
     lateMessage?.(new MessageEvent("message", { data: showFrame("stale") }))
-    vi.advanceTimersByTime(120_000)
+    await vi.advanceTimersByTimeAsync(120_000)
     expect(received).not.toHaveBeenCalled()
     expect(socket.closeCount).toBe(1)
     expect(TestWebSocket.instances).toHaveLength(1)
@@ -198,14 +221,123 @@ describe("WebSocket reconnect lifecycle", () => {
     const source = subscribeShowEvents(websocketOptions)
     const failed = vi.fn()
     source.onerror = failed
-    await vi.runAllTicks()
+    await vi.advanceTimersByTimeAsync(0)
     expect(failed).toHaveBeenCalledOnce()
-    vi.advanceTimersByTime(500)
-    await vi.runAllTicks()
+    await vi.advanceTimersByTimeAsync(500)
     expect(construct).toHaveBeenCalledTimes(2)
     expect(TestEventSource.instances).toHaveLength(0)
     source.close()
     vi.advanceTimersByTime(120_000)
     expect(construct).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe("Show WS admission failure classification", () => {
+  it.each([400, 401, 403, 404, 405, 410])("closes on an authoritative %s without retry or SSE downgrade", async (status) => {
+    const bodyCancelled = vi.fn(async () => {})
+    const fetchImpl = vi.fn(async () => ({ status, body: { cancel: bodyCancelled } }) as unknown as Response)
+    const source = subscribeShowEvents({ ...websocketOptions, afterId: "seed", fetch: fetchImpl })
+    const errorStates: number[] = []
+    source.onerror = () => errorStates.push(source.readyState)
+    TestWebSocket.instances[0].receive(showFrame("最新"))
+    TestWebSocket.instances[0].fail()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(source.readyState).toBe(source.CLOSED)
+    expect(errorStates).toEqual([source.CLOSED])
+    expect(fetchImpl).toHaveBeenCalledOnce()
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [URL, RequestInit]
+    expect(url.toString()).toBe("https://runtime.test/show/session/__show/events?after_id=%E6%9C%80%E6%96%B0")
+    expect(init).toMatchObject({ method: "GET", credentials: "same-origin", redirect: "manual", cache: "no-store" })
+    expect(bodyCancelled).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(TestWebSocket.instances).toHaveLength(1)
+    expect(TestEventSource.instances).toHaveLength(0)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each([200, 408, 425, 429, 500, 503])("keeps %s retryable without consuming its body as events", async (status) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("not an event stream", { status })))
+    const source = subscribeShowEvents(websocketOptions)
+    const event = vi.fn()
+    source.onmessage = event
+    TestWebSocket.instances[0].fail()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(source.readyState).toBe(source.CONNECTING)
+    expect(TestWebSocket.instances).toHaveLength(2)
+    expect(TestEventSource.instances).toHaveLength(0)
+    expect(event).not.toHaveBeenCalled()
+    source.close()
+  })
+
+  it("retries a network failure and preserves the public share path and cursor", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockRejectedValue(new TypeError("network unavailable"))
+    const source = subscribeShowEvents({
+      ...websocketOptions, fetch: fetchImpl, streamPath: "/p/share/__show/events?stream=1&extra=value", afterId: "cursor"
+    })
+    TestWebSocket.instances[0].fail()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(String(fetchImpl.mock.calls[0][0])).toBe("https://runtime.test/p/share/__show/events?extra=value&after_id=cursor")
+    expect(TestWebSocket.instances).toHaveLength(2)
+    expect(new URL(TestWebSocket.instances[1].url).searchParams.get("after_id")).toBe("cursor")
+    source.close()
+  })
+
+  it.each([true, false])("bounds a stalled probe without terminal denial (fetch honors signal=%s)", async (honorsSignal) => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_input, init) =>
+      new Promise((_resolve, reject) => {
+        if (honorsSignal) init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true })
+      })
+    )
+    const source = subscribeShowEvents({ ...websocketOptions, fetch: fetchImpl })
+    TestWebSocket.instances[0].fail()
+    await vi.advanceTimersByTimeAsync(3_499)
+    expect(TestWebSocket.instances).toHaveLength(1)
+    expect(source.readyState).toBe(source.CONNECTING)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(TestWebSocket.instances).toHaveLength(2)
+    source.close()
+  })
+
+  it("close aborts the probe and ignores a late denial from the disposed source", async () => {
+    let resolve!: (response: Response) => void
+    let signal: AbortSignal | null | undefined
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_input, init) => {
+      signal = init?.signal
+      return new Promise((done) => { resolve = done })
+    })
+    const source = subscribeShowEvents({ ...websocketOptions, fetch: fetchImpl })
+    const error = vi.fn()
+    source.onerror = error
+    TestWebSocket.instances[0].fail()
+    expect(signal?.aborted).toBe(false)
+    source.close()
+    expect(signal?.aborted).toBe(true)
+    resolve(new Response("denied", { status: 403 }))
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(error).not.toHaveBeenCalled()
+    expect(TestWebSocket.instances).toHaveLength(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each([
+    "/api/events",
+    "/custom/events?stream=1",
+    "https://foreign.test/p/share/__show/events?stream=1"
+  ])("does not guess non-streaming or credential policy for %s", async (streamPath) => {
+    const source = subscribeShowEvents({ ...websocketOptions, streamPath })
+    TestWebSocket.instances[0].fail()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(fetch).not.toHaveBeenCalled()
+    expect(TestWebSocket.instances).toHaveLength(2)
+    source.close()
+  })
+
+  it("treats a received WS policy-violation close as authoritative without HTTP", async () => {
+    const source = subscribeShowEvents({ ...websocketOptions, streamPath: "/custom/events" })
+    TestWebSocket.instances[0].onclose?.(Object.assign(new Event("close"), { code: 1008 }))
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(source.readyState).toBe(source.CLOSED)
+    expect(TestWebSocket.instances).toHaveLength(1)
+    expect(fetch).not.toHaveBeenCalled()
   })
 })

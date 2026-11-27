@@ -13,6 +13,22 @@ reconnection and resumes with `after_id`. Closing a source cancels reconnection
 and prevents late deliveries. Provider source changes reset source-owned state.
 An overridden stream on another origin cannot inherit the injected capability.
 
+The 2026-11-27 security amendment makes an authoritative access denial terminal.
+After WS failure on a same-origin `/show/{id}/__show/events` or
+`/p/{id}/__show/events` URL, the SDK performs one ordinary JSON GET to the same
+endpoint with `stream` removed, preserving the cursor and other query values.
+These server-owned routes reuse admission and return a non-streaming list.
+The SDK does not follow redirects or consume the response as events. A 4xx
+response closes the source, except temporary 408/425/429 responses. Network
+failures, the three-second probe deadline and 5xx responses retain bounded
+backoff. A successful WS open resets the delay even for an idle stream.
+Closing cancels the probe as well as the socket and reconnect timer.
+
+The SDK never assumes that a custom endpoint, `/api/events`, or a foreign origin
+has this non-streaming GET/credential policy. Their opaque failures retain
+backoff; a received WS policy-violation close (1008) is terminal on every path.
+No handshake failure selects EventSource or changes capability.
+
 The Avibe companion change owns server admission, generators, capability
 injection and joint browser acceptance. This repository owns SDK parsing,
 subscription selection and React consumption. No archive packaging, release,

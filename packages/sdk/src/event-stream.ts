@@ -3,6 +3,7 @@ export type ShowEventStreamTransport = "websocket-sse-v1"
 
 const MIN_RECONNECT_MS = 500
 const MAX_RECONNECT_MS = 30_000
+const ADMISSION_PROBE_TIMEOUT_MS = 3_000
 
 /**
  * EventSource's receive-only interface over the exact SSE endpoint via WS.
@@ -26,14 +27,17 @@ export class WebSocketEventSource extends EventTarget implements EventSource {
   private timer?: ReturnType<typeof setTimeout>
   private lastEventId: string
   private reconnectMs = MIN_RECONNECT_MS
+  private probe?: AbortController
+  private readonly fetchImpl?: typeof fetch
 
-  constructor(url: URL) {
+  constructor(url: URL, fetchImpl?: typeof fetch) {
     super()
     const socketUrl = new URL(url)
     if (socketUrl.protocol === "http:") socketUrl.protocol = "ws:"
     if (socketUrl.protocol === "https:") socketUrl.protocol = "wss:"
     this.url = socketUrl.toString()
     this.lastEventId = socketUrl.searchParams.get("after_id") ?? ""
+    this.fetchImpl = fetchImpl ?? globalThis.fetch
     this.connect()
   }
 
@@ -63,6 +67,8 @@ export class WebSocketEventSource extends EventTarget implements EventSource {
     this.readyState = this.CLOSED
     clearTimeout(this.timer)
     this.timer = undefined
+    this.probe?.abort()
+    this.probe = undefined
     this.releaseSocket()
   }
 
@@ -77,9 +83,9 @@ export class WebSocketEventSource extends EventTarget implements EventSource {
     socket.close()
   }
 
-  private emit(event: Event) {
+  private emit(event: Event, terminal = false) {
     this.dispatchEvent(event)
-    if (this.readyState === this.CLOSED) return
+    if (!terminal && this.readyState === this.CLOSED) return
     if (event.type === "open") this.onopen?.call(this, event)
     if (event.type === "error") this.onerror?.call(this, event)
     if (event.type === "message") this.onmessage?.call(this, event as MessageEvent)
@@ -96,7 +102,7 @@ export class WebSocketEventSource extends EventTarget implements EventSource {
       socket = new WebSocket(url)
     } catch {
       // Allow callers to attach error listeners before reporting construction failure.
-      queueMicrotask(() => this.reconnect())
+      queueMicrotask(() => { void this.reconnect(url) })
       return
     }
     this.socket = socket
@@ -105,33 +111,88 @@ export class WebSocketEventSource extends EventTarget implements EventSource {
       if (!active()) return
       this.lastEventId = id
       if (data === undefined) return
-      this.reconnectMs = MIN_RECONNECT_MS
       const event = new MessageEvent(type, { data, lastEventId: id, origin: url.origin })
       this.emit(event)
     })
     socket.onopen = () => {
       if (!active()) return
       this.readyState = this.OPEN
+      this.reconnectMs = MIN_RECONNECT_MS
       this.emit(new Event("open"))
     }
     socket.onmessage = (event) => {
       if (active() && typeof event.data === "string") parser.push(event.data)
     }
-    socket.onerror = socket.onclose = () => {
-      if (active()) this.reconnect()
+    socket.onerror = () => {
+      if (active()) void this.reconnect(url)
+    }
+    socket.onclose = (event) => {
+      if (active()) void this.reconnect(url, event.code === 1008)
     }
   }
 
-  private reconnect() {
+  private async reconnect(url: URL, policyDenied = false) {
     if (this.readyState === this.CLOSED) return
     this.readyState = this.CONNECTING
     this.releaseSocket()
+    const denied = policyDenied || await this.admissionDenied(url)
+    if (this.readyState === this.CLOSED) return
+    if (denied) {
+      this.close()
+      this.emit(new Event("error"), true)
+      return
+    }
     this.timer = setTimeout(() => {
       this.timer = undefined
       this.connect()
     }, this.reconnectMs)
     this.reconnectMs = Math.min(this.reconnectMs * 2, MAX_RECONNECT_MS)
     this.emit(new Event("error"))
+  }
+
+  private async admissionDenied(socketUrl: URL): Promise<boolean> {
+    const url = new URL(socketUrl)
+    url.protocol = url.protocol === "wss:" ? "https:" : "http:"
+    // Only these server-owned Show routes guarantee a non-streaming JSON GET
+    // when `stream` is absent. Never guess that policy for /api/events or a
+    // custom endpoint. A foreign origin's CORS/credential policy is not ours.
+    if (!this.fetchImpl || url.origin !== globalThis.location?.origin ||
+      !/^\/(?:show|p)\/[^/]+\/__show\/events$/.test(url.pathname)) return false
+    url.searchParams.delete("stream")
+    url.searchParams.delete("after_id")
+    if (this.lastEventId) url.searchParams.set("after_id", this.lastEventId)
+    const controller = new AbortController()
+    this.probe = controller
+    const timeout = setTimeout(() => controller.abort(), ADMISSION_PROBE_TIMEOUT_MS)
+    let onAbort!: () => void
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(controller.signal.reason)
+      controller.signal.addEventListener("abort", onAbort, { once: true })
+    })
+    try {
+      const request = this.fetchImpl(url, {
+        method: "GET",
+        cache: "no-store",
+        credentials: "same-origin",
+        redirect: "manual",
+        headers: { Accept: "application/json" },
+        signal: controller.signal
+      }).then((response) => {
+        // Read only admission status, never consume/replay probe events. Also
+        // dispose late responses if a caller's fetch ignores cancellation.
+        void response.body?.cancel().catch(() => {})
+        return response.status >= 400 && response.status < 500 &&
+          ![408, 425, 429].includes(response.status)
+      })
+      return await Promise.race([request, aborted])
+    } catch {
+      // Network/CORS/deadline failures give no authoritative denial status.
+      return false
+    } finally {
+      clearTimeout(timeout)
+      controller.signal.removeEventListener("abort", onAbort)
+      if (this.probe === controller) this.probe = undefined
+    }
   }
 }
 

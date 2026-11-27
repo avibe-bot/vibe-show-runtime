@@ -24,6 +24,8 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true)
   vi.stubGlobal("WebSocket", TestWebSocket)
   vi.stubGlobal("EventSource", TestEventSource)
+  vi.stubGlobal("location", new URL("https://runtime.test/show/s/index.html"))
+  vi.stubGlobal("fetch", vi.fn(async () => new Response("{}")))
   vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://runtime.test/show/s/", eventStreamTransport: "websocket-sse-v1" })
   TestWebSocket.instances = []
   TestEventSource.instances = []
@@ -49,7 +51,7 @@ describe("ShowSessionProvider consumes the shared subscription transport", () =>
     expect(container.textContent).toBe("injected-capability")
   })
 
-  it("receives actual parsed frames and resumes through its single WS reconnect owner", () => {
+  it("receives actual parsed frames and resumes through its single WS reconnect owner", async () => {
     const onEvent = vi.fn()
     const seed = JSON.parse(showFrame("seed").split("data: ")[1]) // includes only trailing whitespace
     render({ initialEvents: [seed], onEvent })
@@ -63,7 +65,7 @@ describe("ShowSessionProvider consumes the shared subscription transport", () =>
     expect(latest.connected).toBe(true)
     expect(container.textContent).toBe("seed,event_1")
     expect(onEvent).toHaveBeenCalledOnce()
-    act(() => socket.disconnect())
+    await act(async () => socket.disconnect())
     expect(latest.connected).toBe(false)
     act(() => vi.advanceTimersByTime(500))
     expect(TestWebSocket.instances).toHaveLength(2)
@@ -148,6 +150,19 @@ describe("ShowSessionProvider consumes the shared subscription transport", () =>
     render()
     act(() => TestWebSocket.instances[0].receive(showFrame("ws-only")))
     expect(container.textContent).toBe("ws-only")
+  })
+
+  it("disconnects after an authoritative denial without creating a replacement stream", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("denied", { status: 403 })))
+    render()
+    const socket = TestWebSocket.instances[0]
+    act(() => socket.open())
+    expect(latest.connected).toBe(true)
+    await act(async () => socket.fail())
+    expect(latest.connected).toBe(false)
+    await act(async () => vi.advanceTimersByTimeAsync(120_000))
+    expect(TestWebSocket.instances).toHaveLength(1)
+    expect(TestEventSource.instances).toHaveLength(0)
   })
 
   it("leaves an old Runtime disconnected when the host has no EventSource API", () => {

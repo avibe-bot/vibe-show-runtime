@@ -632,7 +632,7 @@ export function subscribeShowEvents(options: ShowClientOptions & { afterId?: str
     url.searchParams.set("after_id", options.afterId)
   }
   return showEventsStreamTransport(options) === "websocket-sse-v1"
-    ? new WebSocketEventSource(url)
+    ? new WebSocketEventSource(url, options.fetch)
     : new EventSource(url.toString())
 }
 
