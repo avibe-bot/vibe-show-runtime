@@ -151,12 +151,13 @@ export class WebSocketEventSource extends EventTarget implements EventSource {
   }
 
   private async admissionDenied(socketUrl: URL): Promise<boolean> {
+    const fetchImpl = this.fetchImpl
     const url = new URL(socketUrl)
     url.protocol = url.protocol === "wss:" ? "https:" : "http:"
     // Only these server-owned Show routes guarantee a non-streaming JSON GET
     // when `stream` is absent. Never guess that policy for /api/events or a
     // custom endpoint. A foreign origin's CORS/credential policy is not ours.
-    if (!this.fetchImpl || url.origin !== globalThis.location?.origin ||
+    if (!fetchImpl || url.origin !== globalThis.location?.origin ||
       !/^\/(?:show|p)\/[^/]+\/__show\/events$/.test(url.pathname)) return false
     url.searchParams.delete("stream")
     url.searchParams.delete("after_id")
@@ -170,7 +171,7 @@ export class WebSocketEventSource extends EventTarget implements EventSource {
       controller.signal.addEventListener("abort", onAbort, { once: true })
     })
     try {
-      const request = this.fetchImpl(url, {
+      const request = fetchImpl(url, {
         method: "GET",
         cache: "no-store",
         credentials: "same-origin",

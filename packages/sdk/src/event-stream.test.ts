@@ -233,6 +233,20 @@ describe("WebSocket reconnect lifecycle", () => {
 })
 
 describe("Show WS admission failure classification", () => {
+  it("calls the browser fetch without binding the EventSource as its receiver", async () => {
+    const fetchImpl = vi.fn(function (this: unknown) {
+      if (this !== undefined) throw new TypeError("Illegal invocation")
+      return Promise.resolve(new Response("denied", { status: 403 }))
+    })
+    vi.stubGlobal("fetch", fetchImpl)
+    const source = subscribeShowEvents(websocketOptions)
+    TestWebSocket.instances[0].fail()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchImpl.mock.contexts).toEqual([undefined])
+    expect(source.readyState).toBe(source.CLOSED)
+    source.close()
+  })
+
   it.each([400, 401, 403, 404, 405, 410])("closes on an authoritative %s without retry or SSE downgrade", async (status) => {
     const bodyCancelled = vi.fn(async () => {})
     const fetchImpl = vi.fn(async () => ({ status, body: { cancel: bodyCancelled } }) as unknown as Response)
