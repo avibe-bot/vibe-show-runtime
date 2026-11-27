@@ -615,18 +615,23 @@ export function showEventsStreamUrl(options: ShowClientOptions = {}) {
   return streamUrl(options)
 }
 
+/** Resolve capability for the actual stream origin, shared by all consumers. */
+export function showEventsStreamTransport(options: ShowClientOptions = {}): ShowEventStreamTransport | undefined {
+  const url = new URL(streamUrl(options), globalThis.location?.href ?? "http://127.0.0.1/")
+  const runtime = readRuntimeConfig()
+  const runtimeUrl = new URL(streamUrl({}), globalThis.location?.href ?? "http://127.0.0.1/")
+  // An explicit capability describes the caller's target. Injected capabilities
+  // belong only to the injected endpoint's origin, never an overridden origin.
+  return options.eventStreamTransport ??
+    (url.origin === runtimeUrl.origin ? runtime.eventStreamTransport : undefined)
+}
+
 export function subscribeShowEvents(options: ShowClientOptions & { afterId?: string } = {}): EventSource {
   const url = new URL(streamUrl(options), globalThis.location?.href ?? "http://127.0.0.1/")
   if (options.afterId) {
     url.searchParams.set("after_id", options.afterId)
   }
-  const runtime = readRuntimeConfig()
-  const runtimeUrl = new URL(streamUrl({}), globalThis.location?.href ?? "http://127.0.0.1/")
-  // An explicit capability describes the caller's target. Injected capabilities
-  // belong only to the injected endpoint's origin, never an overridden origin.
-  const transport = options.eventStreamTransport ??
-    (url.origin === runtimeUrl.origin ? runtime.eventStreamTransport : undefined)
-  return transport === "websocket-sse-v1"
+  return showEventsStreamTransport(options) === "websocket-sse-v1"
     ? new WebSocketEventSource(url)
     : new EventSource(url.toString())
 }

@@ -41,6 +41,7 @@ import {
   resolveAnchor,
   showEventsUrl,
   showEventsStreamUrl,
+  showEventsStreamTransport,
   subscribeShowEvents,
   submitAgentMark,
   submitAnnotation,
@@ -558,6 +559,9 @@ function ShowSessionProviderState({
 
   React.useEffect(() => {
     if (!autoConnect) return
+    // Preserve the old non-browser/unsupported-WebView no-op only for SSE.
+    // An advertised WS source does not depend on the EventSource API.
+    if (typeof EventSource === "undefined" && showEventsStreamTransport(options) !== "websocket-sse-v1") return
     let closed = false
     const source = subscribeShowEvents({ ...options, afterId: lastEventIdRef.current })
     source.onopen = () => {

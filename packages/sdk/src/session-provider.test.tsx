@@ -150,6 +150,32 @@ describe("ShowSessionProvider consumes the shared subscription transport", () =>
     expect(container.textContent).toBe("ws-only")
   })
 
+  it("leaves an old Runtime disconnected when the host has no EventSource API", () => {
+    vi.stubGlobal("EventSource", undefined)
+    vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://old-runtime.test/show/s/" })
+    const onError = vi.fn()
+    render({ onError })
+    expect(latest.connected).toBe(false)
+    expect(latest.error).toBeNull()
+    expect(TestWebSocket.instances).toHaveLength(0)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("keeps the missing-SSE-API no-op scoped to the selected foreign origin", () => {
+    vi.stubGlobal("EventSource", undefined)
+    render({ streamPath: "https://old-runtime.test/p/share/__show/events?stream=1" })
+    expect(latest.connected).toBe(false)
+    expect(latest.error).toBeNull()
+    expect(TestWebSocket.instances).toHaveLength(0)
+    // The explicit capability describes that target and can still select WS.
+    render({
+      streamPath: "https://new-runtime.test/p/share/__show/events?stream=1",
+      eventStreamTransport: "websocket-sse-v1"
+    })
+    act(() => TestWebSocket.instances[0].receive(showFrame("foreign-ws")))
+    expect(container.textContent).toBe("foreign-ws")
+  })
+
   it("preserves old Runtime SSE and reports malformed live payloads through onError", () => {
     vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://old-runtime.test/show/s/" })
     const onError = vi.fn()
