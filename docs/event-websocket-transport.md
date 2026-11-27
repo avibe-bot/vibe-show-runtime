@@ -20,8 +20,19 @@ data; committing a replacement invalidates old socket callbacks and asynchronous
 refresh/submission effects. An abandoned concurrent replacement leaves the
 committed source live. Retained operations keep their original target and public
 result/rejection semantics, while obsolete completions cannot change the new
-source or invoke its callbacks. Callback and same-source option updates preserve
-source data; closing a replaced subscription also invalidates its queued listeners.
+source or invoke its callbacks. Source release follows passive effects, matching
+the subscription: a Suspense-hidden subtree retains its stream and accepts events,
+operation results and connection errors; Activity closes passive subscriptions,
+and revealing it starts disconnected until the replacement stream opens.
+Callback and same-source option updates preserve source data; closing a replaced
+subscription also invalidates its queued listeners.
+
+Source identity uses resolved URLs. Without an absolute injected or explicit
+`basePath`, changing the document route can change those URLs and creates a new
+source on the next render. Generated scaffolds supply an absolute path and do
+not depend on the current document directory. A token available at render is
+captured with its options; an absent token remains undefined so submission keeps
+the existing call-time runtime-token fallback. Explicit tokens retain precedence.
 
 The 2026-11-27 security amendment makes an authoritative access denial terminal.
 After WS failure on a same-origin `/show/{id}/__show/events` or

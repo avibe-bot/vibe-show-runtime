@@ -614,3 +614,125 @@ describe("ShowSessionProvider commit and operation boundaries", () => {
     expect(mounts).toBe(1)
   })
 })
+
+describe("ShowSessionProvider hidden but mounted lifetimes", () => {
+  it("retains events, submit results and connection errors while Suspense hides the Provider", async () => {
+    const submission = deferred<Response>()
+    const suspended = deferred<void>()
+    let hidden = false
+    const onEvent = vi.fn()
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (_input, init) =>
+      init?.method === "POST" ? submission.promise : jsonResponse({ events: [] }))
+    function PendingChild() {
+      if (hidden) throw suspended.promise
+      return null
+    }
+    function application() {
+      return <React.Suspense fallback={<span data-fallback="true">pending</span>}><ShowSessionProvider fetch={fetchImpl} onEvent={onEvent}><Consumer /><PendingChild /></ShowSessionProvider></React.Suspense>
+    }
+    act(() => root.render(application()))
+    const socket = TestWebSocket.instances[0]
+    act(() => {
+      socket.open()
+      setDraft("hidden draft")
+    })
+    const operation = latest.submitEvent(event("pending-submit"))
+    hidden = true
+    // Intentionally NOT a transition: React hides the displayed subtree and
+    // disconnects layout effects, while leaving its passive subscription live.
+    act(() => root.render(application()))
+    expect(container.querySelector("[data-fallback]")).not.toBeNull()
+    expect(socket.closeCount).toBe(0)
+    expect(unmounts).toBe(0)
+    const result = { ok: true, event: event("hidden-submit") }
+    act(() => socket.receive(showFrame("hidden-stream", "隐藏期间")))
+    submission.resolve(jsonResponse(result))
+    await act(async () => { expect(await operation).toEqual(result) })
+    expect(onEvent.mock.calls.map(([value]) => value.id)).toEqual(["hidden-stream", "hidden-submit"])
+    await act(async () => socket.fail())
+    hidden = false
+    suspended.resolve()
+    await act(async () => root.render(application()))
+    expect(container.querySelector("[data-fallback]")).toBeNull()
+    expect(latest.events.map((value) => value.id)).toEqual(["hidden-stream", "hidden-submit"])
+    expect(latest.lastEventId).toBe("hidden-submit")
+    expect(latest.connected).toBe(false)
+    expect(container.querySelector("input")?.value).toBe("hidden draft")
+    expect(mounts).toBe(1)
+    expect(unmounts).toBe(0)
+    await act(async () => vi.advanceTimersByTimeAsync(500))
+    expect(TestWebSocket.instances).toHaveLength(2)
+    // The transport resumes its last received SSE ID; locally appended submit
+    // results do not rewrite an already-owned transport cursor.
+    expect(new URL(TestWebSocket.instances[1].url).searchParams.get("after_id")).toBe("hidden-stream")
+    act(() => TestWebSocket.instances[1].open())
+    expect(latest.connected).toBe(true)
+  })
+
+  it("resets connection state before reopening an Activity-hidden Provider", () => {
+    function application(mode: "visible" | "hidden") {
+      return <React.Activity mode={mode}><ShowSessionProvider><Consumer /></ShowSessionProvider></React.Activity>
+    }
+    act(() => root.render(application("visible")))
+    const first = TestWebSocket.instances[0]
+    act(() => {
+      setDraft("activity draft")
+      first.open()
+      first.receive(showFrame("before-hidden"))
+    })
+    expect(latest.connected).toBe(true)
+    act(() => root.render(application("hidden")))
+    expect(first.closeCount).toBe(1)
+    act(() => root.render(application("visible")))
+    const replacement = TestWebSocket.instances[1]
+    expect(replacement.closeCount).toBe(0)
+    expect(latest.connected).toBe(false)
+    expect(latest.events.map((value) => value.id)).toEqual(["before-hidden"])
+    expect(new URL(replacement.url).searchParams.get("after_id")).toBe("before-hidden")
+    expect(container.querySelector("input")?.value).toBe("activity draft")
+    act(() => replacement.open())
+    expect(latest.connected).toBe(true)
+    expect(TestWebSocket.instances.filter((socket) => socket.closeCount === 0)).toHaveLength(1)
+  })
+
+  it("rejects old stream errors between replacement layout commit and passive disposal", () => {
+    vi.stubGlobal("__AVIBE_SHOW__", { basePath: "https://runtime.test/show/s/" })
+    let original!: TestEventSource
+    let closedDuringLayout: number | undefined
+    const onError = vi.fn()
+    function AfterProvider({ replaced }: { replaced: boolean }) {
+      React.useLayoutEffect(() => {
+        if (!replaced) return
+        // The Provider's layout commit ran; old passive cleanup has not yet run.
+        closedDuringLayout = original.closeCount
+        original.onopen?.(new Event("open"))
+        original.receive("{malformed old stream")
+      }, [replaced])
+      return null
+    }
+    function application(replaced: boolean) {
+      return <><ShowSessionProvider sessionId={replaced ? "next" : "original"} onError={onError}><Consumer /></ShowSessionProvider><AfterProvider replaced={replaced} /></>
+    }
+    act(() => root.render(application(false)))
+    original = TestEventSource.instances[0]
+    act(() => root.render(application(true)))
+    expect(closedDuringLayout).toBe(0)
+    expect(original.closeCount).toBe(1)
+    expect(onError).not.toHaveBeenCalled()
+    expect(latest.error).toBeNull()
+    expect(latest.connected).toBe(false)
+    expect(latest.events).toEqual([])
+  })
+
+  it.each([undefined, "explicit-token"])("uses a runtime token supplied after the last Provider render (explicit=%s)", async (writeToken) => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ ok: true }))
+    render({ fetch: fetchImpl, writeToken })
+    const renderCount = observed.length
+    vi.stubGlobal("__AVIBE_SHOW__", {
+      basePath: "https://runtime.test/show/s/", eventStreamTransport: "websocket-sse-v1", writeToken: "late-token"
+    })
+    expect(observed).toHaveLength(renderCount)
+    await act(async () => { await latest.submitEvent(event("late-token-submit")) })
+    expect(fetchImpl.mock.calls[0][1]?.headers).toMatchObject({ [SHOW_EVENT_WRITE_TOKEN_HEADER]: writeToken ?? "late-token" })
+  })
+})

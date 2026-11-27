@@ -547,20 +547,30 @@ export function ShowSessionProvider({
   React.useLayoutEffect(() => {
     currentSource.current = owner
     setSnapshot((current) => current.source === owner ? current : seed)
-    return () => {
-      if (currentSource.current === owner) currentSource.current = null
-    }
   }, [owner, seed])
+  // Suspense can disconnect layout effects while retaining subscriptions.
+  // Release the owner with passive effects, just like the stream itself.
+  // This precedes subscription cleanup, so Activity also clears connection
+  // state when it closes passive effects without unmounting the Provider.
+  React.useEffect(() => {
+    currentSource.current = owner
+    return () => {
+      if (currentSource.current === owner) {
+        currentSource.current = null
+        setSnapshot((current) => current.source === owner ? { ...current, connected: false } : current)
+      }
+    }
+  }, [owner])
   React.useLayoutEffect(() => {
     callbacks.current = { onEvent, onError }
   }, [onEvent, onError])
 
-  // Capture injected defaults as well as explicit options. Retained operations
-  // keep their original target/options even if the host replaces its config.
+  // Capture targets and available defaults for retained operations. An absent
+  // token keeps submitShowEvent's existing call-time runtime fallback.
   const basePath = new URL(clientOptions.basePath ?? runtime.basePath ?? "./", documentUrl).href
   const eventsPath = clientOptions.eventsPath ?? runtime.eventsPath ?? DEFAULT_SHOW_EVENTS_PATH
   const streamPath = clientOptions.streamPath ?? runtime.streamPath
-  const writeToken = clientOptions.writeToken ?? runtime.writeToken ?? ""
+  const writeToken = clientOptions.writeToken ?? runtime.writeToken
   const options = React.useMemo(
     () => ({ basePath, eventsPath, streamPath, eventStreamTransport: transport, writeToken, fetch: clientOptions.fetch, sessionId }),
     [basePath, eventsPath, streamPath, transport, writeToken, clientOptions.fetch, sessionId]
@@ -630,7 +640,7 @@ export function ShowSessionProvider({
         ...mergedOptions,
         sessionId: mergedOptions.sessionId ?? normalized.sessionId ?? defaultSessionId
       })
-      if (currentSource.current === owner) appendEvent(responseEventFromResult(result) ?? normalized)
+      appendEvent(responseEventFromResult(result) ?? normalized)
       return result
     },
     [appendEvent, options, owner, defaultSessionId]
